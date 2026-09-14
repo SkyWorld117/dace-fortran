@@ -57,7 +57,7 @@ END SUBROUTINE cov_update
 
 
 def test_modulo_intrinsic(tmp_path):
-    """``MODULO(i, n)`` lowers to a 9-op SSA tree collapsed to ``floor_mod(i, n)``;
+    """``MODULO(i, n)`` lowers to a 9-op SSA tree collapsed to ``FtnModulo(i, n)``;
     sibling-pattern to MIN/MAX where collectReads would over-count SSA refs."""
     src = """
 SUBROUTINE wrap_mod(arr, mods, n_arr, n)

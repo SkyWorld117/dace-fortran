@@ -1321,15 +1321,13 @@ std::string buildExpr(mlir::Value val, int d) {
           call.getNumOperands() >= 1) {
         return "ilogb(" + buildExpr(call.getOperand(0), d + 1) + ")";
       }
-      // Fortran MODULO  --  floored-quotient remainder.
-      // ``dace::math::floor_mod`` is the templated helper (uses
-      // ``py_mod`` internally; ``floor`` for floats, sign-aware
-      // ``((a%b)+b)%b`` for ints).  Required because Python's
-      // ``%`` on int floors but C++'s ``%`` on int truncates.
+      // Fortran MODULO  --  floored-quotient remainder.  ``FtnModulo``
+      // is its SDFG spelling (C++ ``ftn_modulo``); a bare ``%`` in an
+      // SDFG is C's truncating remainder.
       if ((cname == "_FortranAModuloReal4" || cname == "_FortranAModuloReal8" || cname == "_FortranAModuloInteger4" ||
            cname == "_FortranAModuloInteger8") &&
           call.getNumOperands() >= 2) {
-        return "floor_mod(" + buildExpr(call.getOperand(0), d + 1) + ", " + buildExpr(call.getOperand(1), d + 1) + ")";
+        return "FtnModulo(" + buildExpr(call.getOperand(0), d + 1) + ", " + buildExpr(call.getOperand(1), d + 1) + ")";
       }
       // Fortran ``base ** exponent`` lowers to a runtime ``pow``
       // helper when the operands are typed combinations the IEEE
@@ -1553,9 +1551,8 @@ std::string buildExpr(mlir::Value val, int d) {
     //
     // Flang inlines this for ``MODULO(int, int)`` instead of
     // emitting a runtime call.  Recognising the shape and emitting
-    // a single ``floor_mod(a, b)`` keeps the tasklet expression
-    // tight (one connector per operand instead of nine) and uses
-    // the existing ``dace::math::floor_mod`` helper.
+    // a single ``FtnModulo(a, b)`` keeps the tasklet expression
+    // tight (one connector per operand instead of nine).
     do {
       auto trueOp = sel.getTrueValue().getDefiningOp();
       auto falseOp = sel.getFalseValue().getDefiningOp();
@@ -1584,7 +1581,7 @@ std::string buildExpr(mlir::Value val, int d) {
         return x && ((x.getLhs() == a && x.getRhs() == b) || (x.getLhs() == b && x.getRhs() == a));
       };
       if (!((isNeR(cm0) && isSltXori(cm1)) || (isNeR(cm1) && isSltXori(cm0)))) break;
-      return "floor_mod(" + buildExpr(a, d + 1) + ", " + buildExpr(b, d + 1) + ")";
+      return "FtnModulo(" + buildExpr(a, d + 1) + ", " + buildExpr(b, d + 1) + ")";
     } while (false);
     // Generic ternary fallback  --  Fortran ``MERGE(t, f, mask)`` lowers
     // to a bare ``arith.select`` (and the SIZE/LBOUND/UBOUND clamps
