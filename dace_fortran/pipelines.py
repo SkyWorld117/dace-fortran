@@ -169,7 +169,18 @@ def optimize(sdfg: SDFG,
     if symbols:
         specialize_symbols(sdfg, symbols)
     if scalars:
-        specialize_scalars(sdfg, scalars)
+        # ConvertLengthOneArraysToScalars (above) stages every non-transient length-1
+        # array into a fresh ``scal_<name>`` transient and rewrites all body reads to
+        # that staged name.  Baking the ARRAY name alone therefore folds only the
+        # copy-in's source: the staged scalar loses its writer, later dead-code cleanup
+        # removes the container, and the tasklet code still references ``scal_<name>``
+        # -- an undeclared identifier at codegen (CPU and CUDA alike).  Bake through
+        # the staging rename as well so the constant reaches the body.
+        staged = {
+            f"scal_{name}": val
+            for name, val in scalars.items() if f"scal_{name}" in sdfg.arrays
+        }
+        specialize_scalars(sdfg, {**scalars, **staged})
 
     ShortLoopUnroll(unroll_limit).apply_pass(sdfg, {})
     # default assign_loop_iterator_post_value=True keeps Fortran counted-DO exit-value semantics;
