@@ -21,6 +21,7 @@ paid for by that kernel's differential gate.
 """
 import dace
 from dace.sdfg import nodes
+from dace.sdfg.state import SDFGState
 
 
 def _mapify(sdfg):
@@ -77,16 +78,37 @@ def _force_inline(sdfg):
     past the check and let the per-kernel bit-exact differential catch an unsound result.  Every
     kernel here is gated that way, and a wrong collapse shows up as a divergence, not as a
     plausible-looking number.
+
+    BUT ONLY THE CONSERVATIVE CHECKS ARE BYPASSED.  `InlineSDFG.can_be_applied` opens with two
+    STRUCTURAL guards -- `no_inline`, and "the nested SDFG is a SINGLE-state SDFG" -- and they are
+    re-checked here, deliberately, because they are not conservatism: they decide whether this
+    transformation is applicable at all.  Forcing past them hands the SINGLE-state inliner a
+    MULTI-state region, and `apply()` does not re-check its own guards, so it returns successfully
+    having produced a WRONG SDFG rather than raising.
+
+    That is not hypothetical -- it is measured.  Applying this pass to the whole library set made
+    the default dispatch path produce NaN at step 1, and re-instrumenting `can_be_applied` per
+    kernel shows why: `mfc_dace_conv`'s surviving nested SDFG is refused at `sdfg_nesting.py:183`
+    (multi-state) while `mfc_dace_fdiff_src_*`'s is refused at `:218` (a conservative connector
+    check, with the in/out memlets actually AGREEING).  Two different refusals, one justified and
+    one not, and only the second is safe to force.
     """
     from dace.transformation.interstate import InlineSDFG
 
-    moved = 0
+    moved, skipped = 0, set()
     for _ in range(20):
         remaining = [(n, st) for st in sdfg.all_states() for n in st.nodes()
                      if isinstance(n, nodes.NestedSDFG)]
         if not remaining:
             break
+        progressed = 0
         for node, state in remaining:
+            # The structural guards, re-checked (see the docstring): bypassing these is what made a
+            # library-wide application silently wrong.
+            if node.no_inline or len(node.sdfg.nodes()) != 1 or not isinstance(
+                    node.sdfg.nodes()[0], SDFGState):
+                skipped.add(id(node))
+                continue
             inliner = InlineSDFG()
             inliner.setup_match(sdfg=sdfg, cfg_id=state.parent_graph.cfg_id,
                                 state_id=state.block_id,
@@ -95,8 +117,17 @@ def _force_inline(sdfg):
             try:
                 inliner.apply(state, sdfg)
                 moved += 1
+                progressed += 1
             except Exception:  # noqa: BLE001 -- a refusal here is not fatal; leave the node
                 pass
+        # Inlining one node can make another inlinable, so iterate -- but a round that moves nothing
+        # will move nothing on the next one either (measured: a second pass over a refused node makes
+        # no progress), so stop rather than spin.
+        if progressed == 0:
+            break
+    if skipped:
+        print(f"[dace_fortran.offload] force_inline: {len(skipped)} node(s) left alone -- they are "
+              f"multi-state, which this transformation cannot lower (see _force_inline)")
     return moved
 
 
