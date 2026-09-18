@@ -146,7 +146,10 @@ def optimize(sdfg: SDFG,
              scalars: Optional[Dict[str, Const]] = None,
              unroll_limit: int = 8,
              validate: bool = True,
-             verify_inputs: Optional[Dict[str, Any]] = None) -> SDFG:
+             verify_inputs: Optional[Dict[str, Any]] = None,
+             gpu: bool = False,
+             gpu_block_size=None,
+             force_inline: bool = False) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
 
     :param sdfg: the SDFG to optimize (mutated in place).
@@ -155,6 +158,12 @@ def optimize(sdfg: SDFG,
     :param unroll_limit: fully unroll constant-trip loops at or below this many iterations.
     :param validate: validate the SDFG after each structural stage. STRUCTURAL only -- it says
                      nothing about whether the transformations preserved values.
+    :param gpu: run the GPU offload pass at the END of the pipeline (see
+                :mod:`dace_fortran.offload`).  Off by default because it changes the schedule and
+                the storage of every array -- this function's contract is otherwise CPU-only.
+    :param gpu_block_size: the CUDA block size to pin, if ``gpu``.
+    :param force_inline: force the nested-SDFG inlining that ``InlineSDFG.can_be_applied`` declines.
+                NOT generally sound -- enabled per kernel, paid for by that kernel's differential.
     :param verify_inputs: call arguments to check numerics with once the pipeline is done. The
                           pre-optimization SDFG is snapshotted and both are run on these inputs,
                           requiring bit-identical results (:func:`verify_numerics`). Costs a
@@ -202,6 +211,15 @@ def optimize(sdfg: SDFG,
 
     from dace.transformation.passes.persistent_transients import MakeTransientsPersistent
     MakeTransientsPersistent().apply_pass(sdfg, {})
+
+    if gpu:
+        # AFTER the CPU pipeline, not inside it: the offload pass reads the map structure the
+        # collapse produced (that is what decides the launch geometry) and then pins the schedule
+        # and the storage.  Running it earlier would hand it maps that are about to be fused.
+        from dace_fortran.offload import offload_device_resident
+        sdfg, n_gpu, n_dev = offload_device_resident(sdfg, block_size=gpu_block_size,
+                                                     force_inline=force_inline)
+        print(f"[dace_fortran.optimize] gpu offload: {n_gpu} device map(s), {n_dev} device array(s)")
 
     if validate:
         sdfg.validate()
