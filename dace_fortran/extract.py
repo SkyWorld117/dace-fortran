@@ -13,6 +13,18 @@ and a general frontend that shipped one project's template engine would be a gen
 project's build system inside it.  A caller that needs it runs it and hands the result here, which is
 exactly the interface these functions take: TEXT in, TEXT out.
 
+THE ORDER MATTERS, AND GETTING IT WRONG IS SILENT.  A templating pass is not the last step: its
+output still carries `#if` directives and `# <line> "<file>"` markers, because the C preprocessor runs
+later, as part of compilation.  Parsing that raw output works for SHAPE discovery (the directives
+contain no `do` and no access subscripts) and fails for anything that reads statements.  So the order
+is: template -> :func:`cpp` -> discovery -> extraction.
+
+And the define list must be the BUILD's, not a guess.  A codebase that guards its accelerator
+directives with `#if defined(SOMETHING)` will, when that macro is omitted, have every anchor line
+stripped -- and the anchors are how nests are located, so the failure mode is a silent zero shapes
+rather than an error.  Take the defines from the build's own flags
+(`CMakeFiles/<target>_lib.dir/flags.make` or equivalent), not from a plausible-looking list.
+
 The three functions were each a hand-rolled step in the porting scripts, reimplemented per generator:
 `subprocess.check_call([... "cpp", "-P", "-C"] + [["-D", d] for d in defines])` in one, a line-slice
 in another, a continuation folder in a third.  Consolidating them is what makes the extraction step
