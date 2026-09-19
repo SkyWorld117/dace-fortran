@@ -206,6 +206,10 @@ _all_tests/
 # the committed, gfortran-compiling .f90 each kernel is extracted to, against
 # which tests/icon/ocean/test_extract_single_tu.py checks for drift.
 !tests/icon/ocean/**/*.f90
+# Loop-shape discovery fixture: a verbatim excerpt of the real routine whose nests
+# tests/discovery_test.py canonicalises, so the parser is exercised by real bodies
+# rather than by shapes it already handles.
+!tests/fixtures/**/*.f90
 # QE exx_bp::vexx_bp_k_gpu parse anchor (pre-processed flat .f90 from the
 # f2dace-qe-source repo's pruning pipeline).  Kept under tests/qe/exx_bp/.
 !tests/qe/exx_bp/**/*.f90
