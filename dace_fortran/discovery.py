@@ -141,6 +141,11 @@ def _access_re(access: str) -> "re.Pattern":
     return re.compile(re.escape(access) + r'\s*\(([^)]*)\)')
 
 
+# Public alias: the statement folding is useful on its own (extraction hands these to a caller), and
+# the leading underscore was only ever an accident of it being written for this module first.
+statements = _join
+
+
 def _difference_position(stmt: str, access: str = ACCESS) -> Optional[int]:
     """The subscript position carrying a ``+1``/``-1`` shift, from the READS on the right-hand side.
 
