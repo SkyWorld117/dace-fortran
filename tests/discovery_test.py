@@ -76,3 +76,46 @@ def test_the_access_idiom_is_a_parameter_not_a_literal():
     assert discovery.discover(text) == {}                     # the default idiom finds nothing
     shapes = discovery.discover(text, access="%val")
     assert list(shapes) == [discovery.Shape("AVG", 0, ("l", "k", "j"))]
+
+
+# --------------------------------------------------------------------------- the ANCHOR
+# `discovery.blocks` used to key on the literal `collapse(3)`: a fixed depth, blind to a project's
+# macro, and silent about both -- the anchor lines simply stop matching, so the failure is zero
+# shapes rather than an error.  It anchors on the directive now and READS the depth from it.
+
+NEST = """  do l = 1, n
+    do j = 1, n
+      do k = 1, n
+        x%sf(k, j, l) = y%sf(k, j, l) - y%sf(k, j - 1, l)
+      end do
+    end do
+  end do
+"""
+
+
+def test_the_macro_form_is_an_anchor():
+    """A project's `$:GPU_PARALLEL_LOOP(...)` is the anchor to prefer where it exists -- it is
+    semantic, it brackets the nest, and it survives the case where the accelerator directives were
+    never defined (the macro may expand to NOTHING, which is exactly when a post-cpp scan goes
+    silently blind)."""
+    text = "$:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l]')\n" + NEST + "  $:END_GPU_PARALLEL_LOOP()\n"
+    assert len(discovery.blocks(text)) == 1
+
+
+def test_the_closer_is_not_an_anchor():
+    """`$:END_GPU_PARALLEL_LOOP()` matches a naive `\\w*PARALLEL_LOOP` pattern, and each nest is then
+    counted TWICE -- once at its opener and once at its closer, where there is no `do` and the body
+    scan runs to end-of-file.  Measured on a real routine: 36 anchors for 18 loops."""
+    text = "$:GPU_PARALLEL_LOOP(collapse=3)\n" + NEST + "  $:END_GPU_PARALLEL_LOOP()\n"
+    starts = [ln for ln, _ in discovery.blocks(text)]
+    assert len(starts) == 1
+    assert len(discovery.blocks(text)[0][1]) < 20      # the nest, not to end-of-file
+
+
+def test_the_depth_is_read_from_the_directive():
+    """A nest the source collapses to FOUR is invisible to a `collapse(3)` key -- and `m_viscous.fpp`
+    really does carry `collapse=2`, `collapse=3` and `collapse=4`."""
+    four = "$:GPU_PARALLEL_LOOP(collapse=4)\n" + NEST + "  $:END_GPU_PARALLEL_LOOP()\n"
+    assert len(discovery.blocks(four)) == 1                       # accepted by default
+    assert len(discovery.blocks(four, collapse=3)) == 0           # and still filterable
+    assert len(discovery.blocks(four, collapse=4)) == 1

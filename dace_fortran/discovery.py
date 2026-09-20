@@ -63,19 +63,59 @@ def scope_to_routine(text: str, routine: str) -> str:
     return '\n'.join(lines[b:e + 1])
 
 
-def blocks(text: str, collapse: int = 3) -> List[Tuple[int, List[str]]]:
+# The two spellings of the same anchor.  A project's macro is the one to prefer where it exists --
+# it is SEMANTIC (a reformat or a line insertion cannot break it), it BRACKETS the nest, and it
+# CARRIES the structure: `collapse=N` is the depth the author intended and `private='[...]'` IS the
+# set of loop variables.  Upstream cannot delete it without deleting their own GPU backend.
+#
+# The OpenACC directive is what the macro EXPANDS to, so it is the fallback -- and it is the reason
+# a project's macro must be matched FIRST: the two agree post-expansion, but only the macro survives
+# the case where the accelerator directives were not defined at all.
+_ANCHORS = (
+    # `$:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l]', ...)` -- MFC's, and a common shape.
+    # The negation is load-bearing: the CLOSER is `$:END_GPU_PARALLEL_LOOP()`, which `\w*` happily
+    # matches, so without it every nest is counted twice -- once at its opener and once at its closer,
+    # where `nest_body` finds no `do` and runs to end-of-file.
+    re.compile(r'\$:\s*(?!END_)\w*PARALLEL_LOOP\s*\(([^)]*)'),
+    # `!$acc parallel loop collapse(3) ...`
+    re.compile(r'!?\$acc\s+parallel\s+loop\b([^\n]*)'),
+)
+
+
+def _anchor_depth(clause: str, default: Optional[int]) -> Optional[int]:
+    """The ``collapse=N`` a directive asks for, or ``default`` when it asks for none.
+
+    READ, NOT ASSUMED.  The previous version keyed on the literal ``collapse(3)``: a fixed depth, so
+    a nest the source collapses to 4 was invisible -- and a SILENT zero shapes is the failure mode
+    here, not an error, because the anchor lines simply stop matching.
+    """
+    m = re.search(r'collapse\s*[=(]\s*(\d+)', clause)
+    if m:
+        return int(m.group(1))
+    return default
+
+
+def blocks(text: str, collapse: Optional[int] = None) -> List[Tuple[int, List[str]]]:
     """Every ``parallel loop collapse(n)`` nest, as ``(start_line, body_lines)``.
 
     The nest is delimited by its OUTERMOST ``do`` and the matching ``end do``: the body is collected
     with a depth counter so a nest whose body itself contains a loop is not mis-split.
+
+    ``collapse`` filters by depth when given and accepts any depth when ``None``.  The default is
+    ``None`` on purpose: the depth is IN the directive, so requiring the caller to already know it
+    is requiring them to know the answer.
     """
     lines = text.split('\n')
     out, i = [], 0
-    pat = re.compile(r'!?\$acc parallel loop.*collapse\(%d\)' % collapse)
     while i < len(lines):
-        if pat.search(lines[i]):
-            out.append((i + 1, nest_body(lines, i + 1)))
-            i += 1
+        for pat in _ANCHORS:
+            m = pat.search(lines[i])
+            if not m:
+                continue
+            d = _anchor_depth(m.group(1), collapse)
+            if collapse is None or d == collapse:
+                out.append((i + 1, nest_body(lines, i + 1)))
+            break
         i += 1
     return out
 
