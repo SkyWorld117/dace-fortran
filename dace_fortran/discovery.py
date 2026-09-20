@@ -112,12 +112,24 @@ def _join(body: List[str]) -> List[str]:
     Necessary, not cosmetic: these lines are wrapped at ~120 columns and the right-hand side of every
     assignment continues onto the next line -- reading them line by line truncates the expression,
     which is how a first version of this classified nineteen averaging loops as unknown.
+
+    THE `&` IS AT BOTH ENDS, and stripping only the trailing one is not a near miss -- it is INVALID
+    FORTRAN.  The house style this was built against wraps as
+
+        dqL_prim_dx_n(2)%vf(i)%sf(k, j, &
+                      & l) + dqR_prim_dx_n(1)%vf(i)%sf(k, j, l)
+
+    so a fold that keeps the leading `&` emits `%sf(k, j, & l)` in the middle of a statement.  That
+    compiles nowhere, and it is the kind of defect that surfaces as "the generator produced
+    something" rather than as a shape that failed to classify.  Both ends are stripped.
     """
     out, cur = [], ''
     for ln in body:
         t = ln.strip()
         if not t or t.startswith('!'):
             continue
+        if t.startswith('&'):
+            t = t[1:].lstrip()
         if t.endswith('&'):
             cur += t[:-1]
             continue
