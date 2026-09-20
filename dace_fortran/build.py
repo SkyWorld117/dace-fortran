@@ -242,7 +242,8 @@ def _emit_hlfir(source: str,
                 external_names: Sequence[str] = (),
                 defines: Sequence[str] = (),
                 kind_map: dict = None,
-                kind_passthrough: bool = False) -> Path:
+                kind_passthrough: bool = False,
+                resolve_intrinsic: Sequence[str] = ()) -> Path:
     """Write ``source`` to ``<out_dir>/<name>.F90``, preprocess
     (module-merge + opt-in rewrites), ``flang -fc1 -cpp -emit-hlfir``
     it, and return the ``.hlfir`` path.
@@ -288,6 +289,7 @@ def _emit_hlfir(source: str,
                                   merge_engine=merge_engine,
                                   merge_entry=merge_entry,
                                   external_names=merge_external,
+                                  resolve_intrinsic=resolve_intrinsic,
                                   if_intvar=preprocess,
                                   kind_map=kind_map,
                                   kind_passthrough=kind_passthrough))
@@ -321,7 +323,8 @@ def make_builder(source: str,
                  defines: Sequence[str] = (),
                  kind_map: dict = None,
                  kind_passthrough: bool = False,
-                 merge_engine: str = "regex") -> SDFGBuilder:
+                 merge_engine: str = "regex",
+                 resolve_intrinsic: Sequence[str] = ()) -> SDFGBuilder:
     """Resolve the entry, lower ``source`` to HLFIR, and return a
     configured (not yet built) :class:`SDFGBuilder`.
 
@@ -358,7 +361,8 @@ def make_builder(source: str,
                             merge_engine=merge_engine,
                             defines=defines,
                             kind_map=kind_map,
-                            kind_passthrough=kind_passthrough)
+                            kind_passthrough=kind_passthrough,
+                            resolve_intrinsic=resolve_intrinsic)
         builder = SDFGBuilder(str(hlfir), pipeline=pipeline, entry=fwd)
         builder._fortran_source = source
         return builder
@@ -372,7 +376,8 @@ def make_builder(source: str,
                             merge_engine=merge_engine,
                             defines=defines,
                             kind_map=kind_map,
-                            kind_passthrough=kind_passthrough)
+                            kind_passthrough=kind_passthrough,
+                            resolve_intrinsic=resolve_intrinsic)
         builder = SDFGBuilder(str(hlfir), pipeline=pipeline, entry=fwd)
         builder._fortran_source = source
         return builder
@@ -388,7 +393,8 @@ def build_sdfg(source: str,
                defines: Sequence[str] = (),
                kind_map: dict = None,
                kind_passthrough: bool = False,
-               merge_engine: str = "regex") -> SDFG:
+               merge_engine: str = "regex",
+               resolve_intrinsic: Sequence[str] = ()) -> SDFG:
     """Build a :class:`dace.SDFG` from a single inline Fortran source.
 
     :param source: Fortran source as one string.
@@ -434,7 +440,8 @@ def build_sdfg(source: str,
                         defines=defines,
                         kind_map=kind_map,
                         kind_passthrough=kind_passthrough,
-                        merge_engine=merge_engine).build()
+                        merge_engine=merge_engine,
+                        resolve_intrinsic=resolve_intrinsic).build()
 
 
 #: ``func.func @<symbol>(`` -- the MLIR opener for a procedure
@@ -613,7 +620,8 @@ def build_sdfg_from_files(files: Sequence[Union[str, Path]],
                           pipeline: Optional[str] = None,
                           out_dir: Optional[Union[str, Path]] = None,
                           preprocess: bool = False,
-                          merge_engine: str = "regex") -> SDFG:
+                          merge_engine: str = "regex",
+                          resolve_intrinsic: Sequence[str] = ()) -> SDFG:
     """Build a :class:`dace.SDFG` from a multi-file Fortran project.
 
     The files (a driver/root plus the modules it ``USE``s, in any
@@ -662,7 +670,8 @@ def build_sdfg_from_files(files: Sequence[Union[str, Path]],
                           pipeline=pipeline,
                           out_dir=d,
                           preprocess=preprocess,
-                          merge_engine=merge_engine)
+                          merge_engine=merge_engine,
+                          resolve_intrinsic=resolve_intrinsic)
 
     if out_dir is not None:
         return _do(Path(out_dir))

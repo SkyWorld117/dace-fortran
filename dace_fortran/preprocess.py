@@ -588,9 +588,16 @@ def _module_blocks(text: str):
         i = end + 1
 
 
-def _used_modules(text: str) -> list:
+def _used_modules(text: str, resolve: frozenset = frozenset()) -> list:
     """Ordered, de-duplicated lowercase names of modules ``USE``-d in
-    ``text`` (intrinsic modules excluded).
+    ``text`` (intrinsic modules excluded, except those named in ``resolve``).
+
+    ``resolve`` exists because a project can legitimately VENDOR a module whose name is also an
+    intrinsic one -- MFC ships a hand-written ``mpi`` stub carrying the MPI constants its sources
+    use, and the compiler has no ``mpi.mod`` to fall back on.  ``_INTRINSIC_MODULES`` is a heuristic
+    ("let the compiler supply this"), and a caller that knows better needs a way to say so; without
+    it the ``USE`` is left dangling and flang fails with ``Cannot parse module file for module
+    'mpi': Source file 'mpi.mod' was not found``.
     """
     seen, out = set(), []
     for raw in text.splitlines():
@@ -598,7 +605,7 @@ def _used_modules(text: str) -> list:
         if not m:
             continue
         nm = m.group(1).lower()
-        if nm in _INTRINSIC_MODULES or nm in seen:
+        if (nm in _INTRINSIC_MODULES and nm not in resolve) or nm in seen:
             continue
         seen.add(nm)
         out.append(nm)
@@ -720,7 +727,8 @@ def _stub_procedure_bodies(text: str, names) -> str:
     return "".join(out)
 
 
-def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do_not_emit=()) -> str:
+def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do_not_emit=(),
+                       resolve_intrinsic=()) -> str:
     """Inline every ``USE``-d module's real source into ``source`` -- one
     self-contained TU, fparser-free (transitive ``USE``-graph resolve +
     dependency-ordered splice, de-duplicated).
@@ -733,12 +741,18 @@ def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do
     analogue of the fparser inliner's ``make_noop``) so halo/MPI/I/O
     internals never enter the TU.  ``external_functions`` gets an EMITted
     external call, ``do_not_emit`` gets the call DROPped.
+
+    ``resolve_intrinsic`` names modules to resolve from ``search_dirs`` EVEN
+    THOUGH they are in :data:`_INTRINSIC_MODULES` -- for a project that vendors
+    a module whose name is also an intrinsic one (MFC's hand-written ``mpi``
+    stub).  Default empty: the intrinsic set is left to the compiler.
     """
     from pathlib import Path
 
     from dace_fortran.external_functions import dont_inline_names, validate
     validate(external_functions, do_not_emit)
     dont_inline = dont_inline_names(external_functions, do_not_emit)
+    resolve = frozenset(n.lower() for n in resolve_intrinsic)
 
     in_source = {nm for nm, _ in _module_blocks(source)}
     index: dict = {}
@@ -761,7 +775,7 @@ def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do
     # deps are visited.  A ``USE`` cycle's back-edge is silently dropped.
     order: list = []
     placed = set(in_source)
-    stack = [(nm, False) for nm in reversed(_used_modules(source))]
+    stack = [(nm, False) for nm in reversed(_used_modules(source, resolve=resolve))]
     while stack:
         nm, expanded = stack.pop()
         if nm in placed or nm not in index:
@@ -771,7 +785,7 @@ def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do
             order.append(index[nm])
             continue
         stack.append((nm, True))
-        for dep in reversed(_used_modules(index[nm])):
+        for dep in reversed(_used_modules(index[nm], resolve=resolve)):
             if dep not in placed and dep in index:
                 stack.append((dep, False))
 
@@ -1251,6 +1265,7 @@ def preprocess_fortran_source(source: str,
                               merge_engine: str = "regex",
                               merge_entry: Optional[str] = None,
                               external_names: Iterable[str] = (),
+                              resolve_intrinsic: Iterable[str] = (),
                               if_intvar: bool = False,
                               kind_map: dict = None,
                               kind_passthrough: bool = False,
@@ -1288,7 +1303,8 @@ def preprocess_fortran_source(source: str,
                                     external_names=external_names,
                                     keep_acc_directives=keep_acc_directives)
         elif merge_engine == "regex":
-            source = merge_used_modules(source, search_dirs=search_dirs, do_not_emit=external_names)
+            source = merge_used_modules(source, search_dirs=search_dirs, do_not_emit=external_names,
+                                    resolve_intrinsic=resolve_intrinsic)
         else:
             raise ValueError(f"merge_engine must be 'regex' or 'fparser', got {merge_engine!r}")
     source = strip_openmp_directives(source)
