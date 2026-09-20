@@ -48,16 +48,17 @@ llvm::StringRef traceToGlobalSym(mlir::Value v) {
       v = boxAddr.getVal();
       continue;
     }
-    // AN ELEMENT SELECT IS PART OF THE PATH, NOT THE END OF IT.  For a module-level ARRAY of
-    // records the component designate does not sit on the global's declare -- it sits on an
-    // element designate: `hlfir.designate %decl(%i)` -> `ref<record>`, then
-    // `hlfir.designate %that{"x"}` -> `ref<f64>`.  Without peeling that hop the trace stops at
-    // the element designate and the root global is never found, which is why this pass skipped
-    // every array of records.
-    if (auto desig = mlir::dyn_cast<hlfir::DesignateOp>(def)) {
-      v = desig.getMemref();
-      continue;
-    }
+    // A DESIGNATE IS NOT TRANSPARENT HERE -- DO NOT PEEL ONE.  For a module-level ARRAY of records
+    // the component read does sit on an element select (`hlfir.designate %decl(%i)` -> ref<record>,
+    // then `hlfir.designate %that{"x"}` -> ref<f64>), so peeling looks like the missing hop.  It is
+    // not: the SCAN already peels that element select before calling this (the `elemDg` capture in
+    // `run()`, which peels only a COMPONENT-LESS designate with indices).  Peeling unconditionally
+    // here additionally collapses a NESTED component: for `eqn_idx%cont%end` the walk also visits
+    // the inner `{"end"}` designate, and with a peel that designate resolves straight to the global
+    // and is accepted with `member = "end"`, emitting `eqn_idx_end` where the rest of the pipeline
+    // binds `eqn_idx_cont_end`.  The unbound leaf then bakes to 0 (`_bake_scalars` bakes every free
+    // symbol it has no value for), and every access of the form `eqn_idx%beg + i - 1` reads `[-1]`:
+    // `Memlet subset negative out-of-bounds`, in four kernel families at once.
     return {};
   }
   return {};
