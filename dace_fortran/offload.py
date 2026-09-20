@@ -131,6 +131,91 @@ def _force_inline(sdfg):
     return moved
 
 
+def _collapsible_pairs(sdfg):
+    """(outer, inner) Map pairs `MapCollapse` WOULD fuse and has not -- the Class-1 loss, asked directly.
+
+    Why not `uncoalesced_device_maps`: that asks whether a Map holds SIBLING Maps, and after a split
+    every Map holds a single child -- so it reports 0 about a Map that is still starved.  A check that
+    says "nothing wrong" where something is wrong is worse than no check, and this is the question
+    that has an answer.
+
+    Why not `apply_transformations_repeated(MapCollapse)`: its pattern graph runs `can_be_applied`
+    with `permissive=False`, which refuses on a SCHEDULE MISMATCH -- and that mismatch is the state
+    the offload itself creates (outer GPU_Device, inner Sequential).  Measured on the real sibling TU:
+    repeated -> 0, permissive manual -> 2, device-map dims [1, 1] -> [3, 3].
+    """
+    from dace.transformation.dataflow import MapCollapse
+    out = []
+    for state in sdfg.all_states():
+        for outer in [n for n in state.nodes() if isinstance(n, nodes.MapEntry)]:
+            for inner in [n for n in state.nodes()
+                          if isinstance(n, nodes.MapEntry) and state.entry_node(n) is outer]:
+                t = MapCollapse()
+                t.setup_match(sdfg=sdfg, cfg_id=state.parent_graph.cfg_id, state_id=state.block_id,
+                              subgraph={MapCollapse.outer_map_entry: outer,
+                                        MapCollapse.inner_map_entry: inner},
+                              expr_index=0, override=True)
+                if t.can_be_applied(state, 0, sdfg, permissive=True):
+                    out.append((outer, inner))
+    return out
+
+
+def _split_siblings(sdfg) -> int:
+    """Clone the enclosing Map per child so each stencil arm's chain can collapse on its own.
+
+    THE LOSS THIS RECOVERS, measured on a real kernel: the sibling form (one loop per arm, the way
+    the source usually writes it) leaves the enclosing Map covering its own dimension ALONE -- 32
+    threads with every access strided -- at **2.0 ms/launch against 5.40 us = 372x**, 81.6% of a run's
+    GPU time against 1.2%.  The arithmetic is right and nothing warns.
+
+    Note what this does NOT need: any relation between the arms' bounds.  The union route is
+    underdetermined (`sympy` cannot decide `ulb >= c_lo`; there is no `Range.union`), which is why
+    this is a split and not a fusion.
+
+    THE COLLAPSE IS RUN HERE, MANUALLY, AND THEN ASSERTED -- because the split is only half a fix and
+    the other half fails SILENTLY.  `apply_transformations_repeated(MapCollapse)` finds none of these
+    (see `_collapsible_pairs`), so wiring the split in beside it produces TWO starved Maps instead of
+    one, while `uncoalesced_device_maps` -- the check T6.3's gate names -- goes quiet about both,
+    since each now has a single child.  A split that does not collapse its chains is worse than no
+    split, and it passes the gate as written; hence the assertion.
+    """
+    from dace.transformation.dataflow.map_collapse import split_sibling_maps
+
+    n = split_sibling_maps(sdfg)
+    if not n:
+        return 0
+    # To a fixpoint: merging a pair can expose another (the merged Map now sits directly under a
+    # grandparent it could join), so one sweep is not enough.  Bounded, because each collapse
+    # strictly reduces the Map count.
+    for _ in range(32):
+        pairs = _collapsible_pairs(sdfg)
+        if not pairs:
+            break
+        for outer, inner in pairs:
+            state = next(st for st in sdfg.all_states() if outer in st.nodes())
+            _collapse_match(sdfg, outer, inner).apply(state, sdfg)
+    left = _collapsible_pairs(sdfg)
+    if left:
+        raise RuntimeError(
+            f"offload: split {n} sibling map(s) but {len(left)} collapsible chain(s) survived -- the "
+            f"split has produced starved Maps that `uncoalesced_device_maps` will NOT report (each "
+            f"now has a single child).  Refusing rather than emitting an uncoalesced kernel that every "
+            f"gate would pass.")
+    return n
+
+
+def _collapse_match(sdfg, outer, inner):
+    """A `MapCollapse` bound to one (outer, inner) pair on the permissive path."""
+    from dace.transformation.dataflow import MapCollapse
+    state = next(st for st in sdfg.all_states() if outer in st.nodes())
+    t = MapCollapse()
+    t.setup_match(sdfg=sdfg, cfg_id=state.parent_graph.cfg_id, state_id=state.block_id,
+                  subgraph={MapCollapse.outer_map_entry: outer,
+                            MapCollapse.inner_map_entry: inner},
+                  expr_index=0, override=True)
+    return t
+
+
 def count_gpu(sdfg):
     """(device maps, device arrays) -- the offload's own yardstick, for logging after the fact.
 
@@ -148,7 +233,7 @@ def count_gpu(sdfg):
     return n_gpu, n_dev
 
 
-def offload_device_resident(sdfg, block_size=None, force_inline=False):
+def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False):
     """Schedule + storage assignment for device-resident offload. In place.
 
     `force_inline` is OFF by default and must be turned on PER KERNEL, because it is not generally
@@ -156,6 +241,13 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False):
     (the flux-difference family), which is exactly the kind of thing `InlineSDFG.can_be_applied`'s
     refusal was protecting against.  It is enabled for `mfc_dace_fdiff_src_*`, where the resulting
     kernel is verified bit-identical and 1.57x faster, and for nothing else.
+
+    `split_siblings` is OFF by default for the same reason: it is a STRUCTURAL rewrite whose failure
+    mode is a silently wrong or silently slow kernel.  It is a no-op on any SDFG whose device Maps do
+    not hold sibling Maps -- which is every kernel in the shipped MFC set, since those TUs are
+    hand-written in the union form -- so turning it on cannot move them; it exists for the TUs the
+    extractor emits from the source's own sibling form.  Turn it on per kernel, with that kernel's
+    differential.
     """
     # 0a. Mapify every level, then inline the loop-body NestedSDFGs the
     #     frontend introduces: MapCollapse cannot fuse across the nested-SDFG
@@ -166,12 +258,22 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False):
     sutils.inline_sdfgs(sdfg, permissive=True)
     if force_inline:
         _force_inline(sdfg)
-
     # 0b. Collapse perfectly-nested map chains into single maps: scheduling the
     #     outermost of i(l(k(j))) as a GPU map would put sys_size (=5) threads on
     #     the device and run the N^3 spatial loops serially per thread.
     from dace.transformation.dataflow import MapCollapse
     sdfg.apply_transformations_repeated(MapCollapse, validate=False)
+
+    # 0b'. Split sibling Maps -- AFTER the collapse above, and that order is load-bearing.
+    #      The split decides whether two children are INDEPENDENT by resolving what each one writes,
+    #      and that walk only finds writes directly in a child's own scope.  Run before the collapse,
+    #      each arm is still an uncollapsed chain (`_loop_it_4` whose body is `_loop_it_5`), so
+    #      neither child appears to write anything, the conservative independence check refuses, and
+    #      the split silently does nothing -- measured, and it is why the first wiring of this
+    #      pass changed no kernel.  After the collapse each arm IS one Map holding its tasklets.
+    if split_siblings:
+        _split_siblings(sdfg)
+
     # 0c. Reorder the collapsed map's dims: PIN the innermost (memory-fastest)
     #     dim last -- the block's threads span it, so it must stay the coalesced
     #     access dim -- and sort the rest ASCENDING (symbolic = large last).

@@ -149,7 +149,8 @@ def optimize(sdfg: SDFG,
              verify_inputs: Optional[Dict[str, Any]] = None,
              gpu: bool = False,
              gpu_block_size=None,
-             force_inline: bool = False) -> SDFG:
+             force_inline: bool = False,
+             split_siblings: bool = False) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
 
     :param sdfg: the SDFG to optimize (mutated in place).
@@ -164,6 +165,11 @@ def optimize(sdfg: SDFG,
     :param gpu_block_size: the CUDA block size to pin, if ``gpu``.
     :param force_inline: force the nested-SDFG inlining that ``InlineSDFG.can_be_applied`` declines.
                 NOT generally sound -- enabled per kernel, paid for by that kernel's differential.
+    :param split_siblings: clone the enclosing Map per child when a Map's body holds SIBLING Maps, so
+                each stencil arm's chain can collapse on its own.  Recovers a measured 372x (2.0
+                ms/launch vs 5.40 us) on the source's natural one-loop-per-arm form.  A no-op unless
+                that form is present, so it cannot move a kernel written in the union form. NOT
+                generally sound -- enabled per kernel, paid for by that kernel's differential.
     :param verify_inputs: call arguments to check numerics with once the pipeline is done. The
                           pre-optimization SDFG is snapshotted and both are run on these inputs,
                           requiring bit-identical results (:func:`verify_numerics`). Costs a
@@ -218,7 +224,8 @@ def optimize(sdfg: SDFG,
         # and the storage.  Running it earlier would hand it maps that are about to be fused.
         from dace_fortran.offload import offload_device_resident
         sdfg, n_gpu, n_dev = offload_device_resident(sdfg, block_size=gpu_block_size,
-                                                     force_inline=force_inline)
+                                                     force_inline=force_inline,
+                                                     split_siblings=split_siblings)
         print(f"[dace_fortran.optimize] gpu offload: {n_gpu} device map(s), {n_dev} device array(s)")
 
     if validate:
