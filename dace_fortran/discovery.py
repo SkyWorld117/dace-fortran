@@ -215,7 +215,7 @@ def _difference_position(stmt: str, access: str = ACCESS) -> Optional[int]:
     return d
 
 
-def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX"), access: str = ACCESS) -> Optional[Shape]:
+def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX", "COPY"), access: str = ACCESS) -> Optional[Shape]:
     """The shape of one loop body, or ``None`` when it does not fit the signature.
 
     ``None`` is a REPORTED outcome, not a fallback: a caller must be able to say "this nest is not
@@ -226,15 +226,24 @@ def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX"), access: str = ACCESS
         m = re.match(r'\s*do\s+([a-z])\s*=\s*(.+?)\s*,\s*(.+?)\s*$', ln)
         if m:
             loops.append((m.group(1), m.group(2).strip(), m.group(3).strip()))
-    # The THREE spatial loops.  A fourth loop (the equation rows) often sits inside every one of
-    # them and is not part of the shape -- the rows are unrolled in the generated kernel.
-    if len(loops) < 3:
-        return None
-    loops = loops[:3]
-
     stmts = [st for st in _join(body) if access + '(' in st and '=' in st]
     if not stmts:
         return None
+
+    # A PURE COPY has no arithmetic, and that changes the loop rule below: MFC's `s_periodic` is
+    #     do i = 1, sys_size                  <- the equation rows
+    #       do j = 1, buff_size
+    #         q_prim_vf(i)%sf(-j, k, l) = q_prim_vf(i)%sf(m - (j - 1), k, l)
+    # -- TWO loops, not three, because a copy has no stencil to sweep and no transverse window.
+    # MEASURED: s_periodic reported 0 shapes until this, and every reason was structural.
+    _rhs_all = ' '.join(st.split('=', 1)[1] if '=' in st else '' for st in stmts)
+    is_copy = not re.search(r'[+*/-]', _rhs_all)
+
+    # The THREE spatial loops.  A fourth loop (the equation rows) often sits inside every one of
+    # them and is not part of the shape -- the rows are unrolled in the generated kernel.
+    if len(loops) < (2 if is_copy else 3):
+        return None
+    loops = loops[:2 if is_copy else 3]
     st = stmts[0]
     # The write's subscript tuple.  Match AFTER `%sf(`: an array NAME carries its own parentheses
     # (`foo(2)%vf(i)%sf`), so a `name(...)` pattern captures the `(2)` and sees a single subscript.
@@ -267,7 +276,7 @@ def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX"), access: str = ACCESS
     # scaling.
     is_flux = (bool(re.search(r'\binv_ds\b', whole)) and not is_avg and not is_grad
                and bool(re.search(re.escape(access) + r'\s*\([^)]*-\s*1\b', whole)))
-    op = 'AVG' if is_avg else ('GRAD' if is_grad else ('FLUX' if is_flux else '?'))
+    op = 'COPY' if is_copy else ('AVG' if is_avg else ('GRAD' if is_grad else ('FLUX' if is_flux else '?')))
     if op not in ops and op != '?':
         op = '?'
     return Shape(op, dim, tuple(l[0] for l in loops))
