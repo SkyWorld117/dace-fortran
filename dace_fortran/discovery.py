@@ -120,6 +120,37 @@ def blocks(text: str, collapse: Optional[int] = None) -> List[Tuple[int, List[st
     return out
 
 
+def anchorless_blocks(text: str) -> List[Tuple[int, List[str]]]:
+    """Outermost ``do``-nests, for a routine that carries no parallel-loop anchor.
+
+    A FALLBACK, not the default, and that distinction is deliberate: for every family that HAS the
+    macro, the macro is the better anchor -- it is semantic, it brackets the nest, and it carries
+    ``collapse``.  Using the weaker signal by default would silently re-found every family by it.
+
+    Why it is needed at all: MFC's ``s_periodic`` is CALLED from inside ``m_boundary_common``'s
+    per-cell loop rather than containing a ``$:GPU_PARALLEL_LOOP`` of its own, so ``blocks()`` returns
+    nothing, ``discover()`` finds no nests, and the routine reports ZERO SHAPES however good the shape
+    vocabulary is.  MEASURED: adding a ``COPY`` op to ``canonical`` did not change
+    ``--routine s_periodic`` from 0 shapes for exactly this reason.
+    """
+    lines = text.split('\n')
+    out, i = [], 0
+    while i < len(lines):
+        if re.match(r'\s*do\b', lines[i]):
+            body = nest_body(lines, i)
+            # REPORT `i`, NOT `i + 1`, so this COMPOSES with `extract.nest`.  `blocks()` reports the
+            # 1-BASED line of the ANCHOR and collects from the line AFTER it -- so `nest(text, line)`
+            # resumes at 0-based `line`.  Here the `do` IS the anchor, so the number that makes
+            # `nest()` start at it is `i`.  MEASURED: reporting `i + 1` gave a body starting at the
+            # INNER `do`, which cost each nest its outermost loop (`lb_lens=[1, 1]` for a 2-loop
+            # copy) and made the emit route skip all three shapes silently.
+            out.append((i, body))
+            i += max(1, len(body))          # past this nest, so an inner `do` is not re-reported
+            continue
+        i += 1
+    return out
+
+
 def nest_body(lines: List[str], start: int) -> List[str]:
     """The lines of the nest beginning at ``start``, INCLUDING its closing ``end do``s.
 
@@ -236,8 +267,21 @@ def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX", "COPY"), access: str 
     #         q_prim_vf(i)%sf(-j, k, l) = q_prim_vf(i)%sf(m - (j - 1), k, l)
     # -- TWO loops, not three, because a copy has no stencil to sweep and no transverse window.
     # MEASURED: s_periodic reported 0 shapes until this, and every reason was structural.
-    _rhs_all = ' '.join(st.split('=', 1)[1] if '=' in st else '' for st in stmts)
-    is_copy = not re.search(r'[+*/-]', _rhs_all)
+    # A copy's right-hand side is ONE ACCESS and nothing else.  Testing "no operators anywhere" is
+    # WRONG, and measured wrong: MFC's `s_periodic` is
+    #     q_prim_vf(i)%sf(-j, k, l) = q_prim_vf(i)%sf(m - (j - 1), k, l)
+    # -- whose right-hand side contains `-`, in its INDEX.  The operator is in the subscript, not in
+    # the arithmetic, so the test has to look at the whole shape of the RHS: an access with its
+    # subscript list, optionally wrapped, and nothing else.
+    # The WHOLE access, BASE INCLUDED -- `q_prim_vf(i)%sf(...)`, not just the `%sf(...)` tail.  An
+    # anchored pattern over the tail alone never matches, because the string STARTS with the base.
+    # (Measured: the first version of this returned False for the very copy it was written for.)
+    _chain = (r'[A-Za-z_]\w*(?:\([^()]*\))?'
+              r'(?:%\w+(?:\([^()]*\))?)*' + re.escape(access) +
+              r'\s*\([^()]*(?:\([^()]*\)[^()]*)*\)')
+    _bare = re.compile(r'^[\s&]*' + _chain + r'[\s&]*$')
+    is_copy = bool(stmts) and all(
+        _bare.match(st.split('=', 1)[1]) for st in stmts if '=' in st)
 
     # The THREE spatial loops.  A fourth loop (the equation rows) often sits inside every one of
     # them and is not part of the shape -- the rows are unrolled in the generated kernel.
@@ -288,7 +332,13 @@ def discover(text: str, routine: Optional[str] = None,
     if routine:
         text = scope_to_routine(text, routine)
     found: Dict[Shape, List[int]] = {}
-    for ln, body in blocks(text):
+    blks = blocks(text)
+    if not blks:
+        # See `anchorless_blocks`: a routine with no anchor yields no blocks and therefore no
+        # shapes, whatever the vocabulary can name.  The fallback is used ONLY when the anchor
+        # found nothing, so no family that has the macro changes behaviour.
+        blks = anchorless_blocks(text)
+    for ln, body in blks:
         shape = canonical(body, access=access)
         if shape is None:
             continue
