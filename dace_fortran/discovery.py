@@ -215,7 +215,7 @@ def _difference_position(stmt: str, access: str = ACCESS) -> Optional[int]:
     return d
 
 
-def canonical(body: List[str], ops=("AVG", "GRAD"), access: str = ACCESS) -> Optional[Shape]:
+def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX"), access: str = ACCESS) -> Optional[Shape]:
     """The shape of one loop body, or ``None`` when it does not fit the signature.
 
     ``None`` is a REPORTED outcome, not a fallback: a caller must be able to say "this nest is not
@@ -240,13 +240,34 @@ def canonical(body: List[str], ops=("AVG", "GRAD"), access: str = ACCESS) -> Opt
     # (`foo(2)%vf(i)%sf`), so a `name(...)` pattern captures the `(2)` and sees a single subscript.
     write = re.search(re.escape(access) + r'\s*\(([^)]*)\)\s*=', st)
     rhs = st[write.end():] if write else st
-    dim = _difference_position(rhs, access)
-
     # The operation is a property of the WHOLE body (see the module docstring).
     whole = ' '.join(stmts)
+    dim = _difference_position(rhs, access)
+    if dim is None:
+        # THE READS MAY BE HOISTED INTO TEMPORARIES.  Measured on MFC's
+        # `s_compute_advection_source_term`: `flux_face1 = flux_n(1)%vf(j)%sf(k_loop - 1, ...)` sits
+        # two statements BEFORE the write, whose right-hand side is then
+        # `inv_ds*(flux_face1 - flux_face2)` and contains no access at all.  Scanning only the RHS
+        # finds nothing, the shape comes out `dim = None`, and with no axis letter `arms_of`
+        # classifies every arm `both/neither` -- so nothing is ever paired and the group is refused.
+        # A hoisted read is no less a read, so the whole body is the right scope.
+        dim = _difference_position(whole, access)
     is_avg = bool(re.search(r'25\.e-2|25\.d-2|0\.25', whole))
     is_grad = bool(re.search(r'/\s*\(', whole)) and not is_avg
-    op = 'AVG' if is_avg else ('GRAD' if is_grad else '?')
+    # A ONE-SIDED FLUX DIFFERENCE: `inv_ds*(f(k-1) - f(k))`, both reads on the same access.  It is
+    # neither AVG (a four-term face average) nor GRAD (a difference divided by a SPACING difference):
+    # it scales a face difference by a reciprocal.  Added for MFC's `s_compute_advection_source_term`,
+    # whose nests previously came back `?` -- and a `?` shape has NO axis letter, so `arms_of`
+    # classified every arm `both/neither`, nothing was ever paired, and the whole group was blocked
+    # with "could not pair the arms by the direction their stencil reaches".  MEASURED before this:
+    # 6 shapes discovered, 6 blocked, 0 emitted.
+    #
+    # `inv_ds` alone does not name it -- the advection term uses it too -- so the body must also READ
+    # one access at an index and at its neighbour.  That is what makes it a DIFFERENCE and not a
+    # scaling.
+    is_flux = (bool(re.search(r'\binv_ds\b', whole)) and not is_avg and not is_grad
+               and bool(re.search(re.escape(access) + r'\s*\([^)]*-\s*1\b', whole)))
+    op = 'AVG' if is_avg else ('GRAD' if is_grad else ('FLUX' if is_flux else '?'))
     if op not in ops and op != '?':
         op = '?'
     return Shape(op, dim, tuple(l[0] for l in loops))
