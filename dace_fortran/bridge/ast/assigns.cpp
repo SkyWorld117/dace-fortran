@@ -63,7 +63,13 @@ std::string buildIndexExpr(mlir::Value v, int d) {
   // treats these as transparent; mirror it here.)
   {
     auto cn = def->getName().getStringRef();
-    if ((cn == "arith.extsi" || cn == "arith.extui" || cn == "arith.trunci") && def->getNumOperands() == 1)
+    // ``arith.index_cast`` belongs with the width casts: it is equally transparent in an index
+    // context, and it is the one `IndexCastOp` the pass itself introduces when a subscript's type does
+    // not match the arithmetic it is folded into.  MEASURED: without this an index of the form
+    // ``index_cast(i) * 15`` renders as ``(? * 15)`` -- the cast is not peeled, so its operand never
+    // resolves, and the memlet carries a `?` that no amount of fixing the OPERATOR removes.
+    if ((cn == "arith.extsi" || cn == "arith.extui" || cn == "arith.trunci" || cn == "arith.index_cast")
+        && def->getNumOperands() == 1)
       return buildIndexExpr(def->getOperand(0), d + 1);
   }
 

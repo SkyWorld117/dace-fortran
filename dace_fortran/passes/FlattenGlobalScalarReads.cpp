@@ -130,6 +130,15 @@ struct Candidate {
   /// only other) case.
   hlfir::DesignateOp elemDg;
   llvm::SmallVector<int64_t, 4> outerShape;
+  /// RECORD-MAJOR: the entity is a static array of records whose fields all share the member's type,
+  /// so ONE 1-D companion holds the whole record array and the member is selected by index
+  /// arithmetic -- `arr(i)%x` -> `arr_cm(i * numFields + <x's ordinal>)`.  That is Fortran's layout
+  /// exactly, so a caller passes one base pointer instead of gathering fifteen strided views.  MFC's
+  /// own comment on `eos_coefficients` says the record exists to avoid those descriptors in the
+  /// Riemann kernels, so the per-member form costs precisely what MFC designed against.
+  unsigned memberIndex = 0;
+  unsigned numFields = 0;
+  bool recordMajor = false;
 };
 
 struct FlattenGlobalScalarReadsPass
@@ -205,10 +214,28 @@ struct FlattenGlobalScalarReadsPass
       if (!outerShape.empty() && !elemDg) return;   // array global must be read via an element select
 
       llvm::StringRef const member = d.getComponent()->getValue();
-      std::string const newSym = (llvm::Twine(sym) + "_" + member).str();
       auto refTy = mlir::dyn_cast<fir::ReferenceType>(d.getResult().getType());
       if (!refTy) return;
       std::string const dtype = scalarDtypeName(refTy.getEleTy());
+
+      // One companion can hold the whole record array only when every field has the member's type --
+      // MFC's `eos_coefficients` is fifteen `real(wp)` fields and qualifies.  Anything else keeps the
+      // per-member form, which is the conservative answer rather than an error.  Restricted to a 1-D
+      // record array because the flattened extent and the index arithmetic are written for that case.
+      unsigned memberIndex = 0;
+      unsigned numFields = 0;
+      bool recordMajor = false;
+      if (outerShape.size() == 1) {
+        if (auto rec = mlir::dyn_cast<fir::RecordType>(recTy)) {
+          memberIndex = rec.getFieldIndex(member);
+          numFields = rec.getNumFields();
+          recordMajor = true;
+          for (auto const& f : rec.getTypeList())
+            if (f.second != refTy.getEleTy()) recordMajor = false;
+        }
+      }
+      std::string const newSym = recordMajor ? (llvm::Twine(sym) + "_cm").str()
+                                             : (llvm::Twine(sym) + "_" + member).str();
 
       bool ok = !dtype.empty() && !writtenGlobals.contains(sym) && !takenNames.contains(newSym);
       for (mlir::Operation* user : d.getResult().getUsers())
@@ -217,8 +244,12 @@ struct FlattenGlobalScalarReadsPass
         rejected.insert(newSym);
         return;
       }
-      candidates.push_back(Candidate{d, sym.str(), mod.str(), entity.str(), member.str(), dtype,
-                                     refTy.getEleTy(), elemDg, outerShape});
+      Candidate cand{d, sym.str(), mod.str(), entity.str(), member.str(), dtype,
+                     refTy.getEleTy(), elemDg, outerShape};
+      cand.memberIndex = memberIndex;
+      cand.numFields = numFields;
+      cand.recordMajor = recordMajor;
+      candidates.push_back(cand);
     });
 
     mlir::Builder b(&getContext());
@@ -226,15 +257,20 @@ struct FlattenGlobalScalarReadsPass
     llvm::StringSet<> emitted;
     unsigned rewritten = 0;
     for (Candidate& c : candidates) {
-      std::string const newSym = c.symbol + "_" + c.member;
+      std::string const newSym = c.recordMajor ? (c.symbol + "_cm") : (c.symbol + "_" + c.member);
       if (rejected.contains(newSym)) continue;
       // THE COMPANION'S TYPE IS THE MEMBER'S OWN, EXTENDED BY THE RECORD ARRAY'S SHAPE.  For a
       // scalar struct global that is just the scalar; for a module-level array of records it is a
       // 1-D array of the scalar, indexed by the SAME record index the element select used -- so
       // `arr(i)%x` becomes `arr_x(i)` and the access is one level shallower, not a different shape.
       mlir::Type const compTy = c.scalarTy;
+      llvm::SmallVector<int64_t, 4> compShape;
+      if (c.recordMajor)
+        compShape.push_back(static_cast<int64_t>(c.numFields) * c.outerShape.front());
+      else
+        compShape.append(c.outerShape.begin(), c.outerShape.end());
       mlir::Type const companionTy =
-          c.outerShape.empty() ? compTy : mlir::Type(fir::SequenceType::get(c.outerShape, compTy));
+          compShape.empty() ? compTy : mlir::Type(fir::SequenceType::get(compShape, compTy));
       if (emitted.insert(newSym).second) {
         mlir::OpBuilder gb(&getContext());
         gb.setInsertionPointToEnd(module.getBody());
@@ -250,8 +286,14 @@ struct FlattenGlobalScalarReadsPass
         // Say so when the companion is an ARRAY.  A consumer that materialises the flat array needs
         // the record extent, and a consumer that does not can ignore the key -- which is why it is
         // additive rather than a change to the existing entry shape.
-        if (!c.outerShape.empty())
-          entry.push_back(b.getNamedAttr("outer_shape", b.getI64ArrayAttr(c.outerShape)));
+        if (!compShape.empty())
+          entry.push_back(b.getNamedAttr("outer_shape", b.getI64ArrayAttr(compShape)));
+        // A consumer MUST read these: record-major means one flattened array whose member is an index,
+        // not a symbol per member.  Assuming the per-member shape would size the argument wrongly.
+        if (c.recordMajor) {
+          entry.push_back(b.getNamedAttr("record_major", b.getUnitAttr()));
+          entry.push_back(b.getNamedAttr("field_count", b.getI64IntegerAttr(c.numFields)));
+        }
         table.push_back(b.getDictionaryAttr(entry));
       }
       mlir::OpBuilder rb(c.designate);
@@ -259,18 +301,40 @@ struct FlattenGlobalScalarReadsPass
       auto refTy = fir::ReferenceType::get(companionTy);
       auto addr = rb.create<fir::AddrOfOp>(loc, refTy, mlir::SymbolRefAttr::get(&getContext(), newSym));
       mlir::Value shape;
-      if (!c.outerShape.empty()) {
+      if (!compShape.empty()) {
         llvm::SmallVector<mlir::Value, 4> dims;
-        for (int64_t d : c.outerShape)
+        for (int64_t d : compShape)
           dims.push_back(rb.create<mlir::arith::ConstantIndexOp>(loc, d));
         shape = rb.create<fir::ShapeOp>(loc, dims).getResult();
       }
       auto decl = rb.create<hlfir::DeclareOp>(loc, addr.getResult(), newSym, shape);
       mlir::Value repl = decl.getResult(0);
       if (c.elemDg) {
-        // `arr(i)%x` -> `arr_x(i)`: keep the element select, drop the component.
+        // `arr(i)%x` -> `arr_x(i)`: keep the element select, drop the component.  Record-major folds
+        // the member's ordinal in ARITHMETICALLY -- `arr_cm(i * numFields + <ordinal>)` -- rather than
+        // as a leading dimension, because a shape-carried ordinate is what the bridge mis-bounds.
+        llvm::SmallVector<mlir::Value, 4> idx;
+        if (c.recordMajor) {
+          mlir::Value acc = rb.create<mlir::arith::ConstantIndexOp>(
+              loc, static_cast<int64_t>(c.memberIndex));
+          mlir::Value const nfields = rb.create<mlir::arith::ConstantIndexOp>(
+              loc, static_cast<int64_t>(c.numFields));
+          for (mlir::Value v : c.elemDg.getIndices()) {
+            // The element select's index is NOT necessarily `index`-typed (the verifier rejected
+            // `arith.muli` on a mixed pair), so normalise it before scaling.
+            mlir::Value const vi = v.getType().isIndex()
+                                       ? v
+                                       : rb.create<mlir::arith::IndexCastOp>(loc, rb.getIndexType(), v);
+            auto scaled = rb.create<mlir::arith::MulIOp>(loc, vi, nfields);
+            acc = rb.create<mlir::arith::AddIOp>(loc, scaled, acc);
+          }
+          idx.push_back(acc);
+        } else {
+          for (mlir::Value v : c.elemDg.getIndices())
+            idx.push_back(v);
+        }
         repl = rb.create<hlfir::DesignateOp>(loc, fir::ReferenceType::get(compTy), decl.getResult(0),
-                                             c.elemDg.getIndices());
+                                             idx);
       }
       c.designate.getResult().replaceAllUsesWith(repl);
       c.designate.erase();
