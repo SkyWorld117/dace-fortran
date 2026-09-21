@@ -253,13 +253,21 @@ def module(name: str,
            wp: int = 8) -> str:
     """A complete TU: a module holding one kernel subroutine.
 
-    ``dummies`` is ``(name, rank)`` per array argument -- the rank comes from the caller because it is
-    a property of the data being ported, and a hand-written emitter that assumed rank 3 declared the
-    one 1-D array as 3-D until someone special-cased its NAME.
+    ``dummies`` is ``(name, rank)`` or ``(name, rank, intent)`` per array argument -- the rank comes
+    from the caller because it is a property of the data being ported, and a hand-written emitter that
+    assumed rank 3 declared the one 1-D array as 3-D until someone special-cased its NAME.
+
+    The optional third element is the INTENT, defaulting to ``inout`` so an existing 2-tuple caller is
+    unaffected.  It is worth carrying rather than forcing ``inout`` everywhere: an input declared
+    ``inout`` is not a compile error and dace infers read/write from the memlets, so nothing catches
+    it -- but the Fortran-level contract then stops matching the kernel's, which is the drift this
+    file exists to keep out.
     """
-    decl = "\n".join(f"    real({wp}), intent(inout) :: {n}({', '.join('0:' for _ in range(r))})"
-                     for n, r in dummies)
-    sig = [n for n, _ in dummies] + list(scalars)
+    norm = [(d[0], d[1], d[2] if len(d) > 2 else "inout") for d in dummies]
+    decl = "\n".join(
+        f"    real({wp}), intent({i}) :: {n}({', '.join('0:' for _ in range(r))})"
+        for n, r, i in norm)
+    sig = [n for n, _, _ in norm] + list(scalars)
     scal = ", ".join(scalars)
     return f"""module {name}
   implicit none
