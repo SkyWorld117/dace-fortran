@@ -269,12 +269,29 @@ def module(name: str,
         for n, r, i in norm)
     sig = [n for n, _, _ in norm] + list(scalars)
     scal = ", ".join(scalars)
+    # WRAP THE SIGNATURE, and it is not cosmetic: gfortran's free-form limit is 132 columns and
+    # nvfortran's is longer, so a unit that bakes fine can fail to COMPILE in the gate --
+    # MEASURED, verbatim: `Error: Line truncated at (1) [-Werror=line-truncation]` on a signature the
+    # bake had accepted.  Two more scalars were enough to cross it.  Free-form continuations (`&` at
+    # the end of the line being left, and at the start of the next) keep it inside the limit wherever
+    # the unit is compiled.
+    _sig = []
+    _cur = f"  subroutine {kernel}("
+    for _i, _n in enumerate(sig):
+        _piece = _n if _i == len(sig) - 1 else _n + ","
+        if len(_cur) + 1 + len(_piece) + (1 if _i == len(sig) - 1 else 0) <= 100:
+            _cur = _cur + " " + _piece
+        else:
+            _sig.append(_cur + " &")
+            _cur = "      & " + _piece
+    _sig.append(_cur + ")")
+    _sigline = "\n".join(_sig)
     return f"""module {name}
   implicit none
   integer, parameter :: wp = {wp}
 contains
   !> {doc}
-  subroutine {kernel}({', '.join(sig)})
+{_sigline}
     implicit none
 {decl}
     integer, intent(in) :: {scal}
