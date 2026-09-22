@@ -58,8 +58,20 @@ def scope_to_routine(text: str, routine: str) -> str:
     what a hand-maintained table hides.
     """
     lines = text.split('\n')
-    b = next(i for i, l in enumerate(lines) if re.search(rf'\bsubroutine\s+{routine}\b', l, re.I))
-    e = next(i for i, l in enumerate(lines) if i > b and re.match(r'\s*end subroutine', l, re.I))
+    # A ROUTINE THAT IS NOT HERE IS AN ANSWER, NOT A TRACEBACK.  Both of these were bare `next(...)`
+    # calls, so a caller who named the wrong file -- easy, since a routine's home is not derivable
+    # from its name -- got `StopIteration` with no mention of the routine it was looking for.
+    # MEASURED: that is how `s_periodic` (which lives in `m_boundary_primitives.fpp`, not
+    # `m_boundary_common.fpp`) failed the first time it was asked for by name.
+    b = next((i for i, l in enumerate(lines)
+              if re.search(rf'\bsubroutine\s+{routine}\b', l, re.I)), None)
+    if b is None:
+        raise ValueError(f"no `subroutine {routine}` in the text ({len(lines)} lines); "
+                         f"a routine's source file is not derivable from its name")
+    e = next((i for i, l in enumerate(lines)
+              if i > b and re.match(r'\s*end subroutine', l, re.I)), None)
+    if e is None:
+        raise ValueError(f"`subroutine {routine}` at line {b + 1} has no `end subroutine`")
     return '\n'.join(lines[b:e + 1])
 
 
