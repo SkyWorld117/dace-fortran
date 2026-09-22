@@ -250,7 +250,19 @@ def module(name: str,
            nest_vars: Sequence[str],
            nest_bounds: Sequence[Bounds],
            doc: str = "",
-           wp: int = 8) -> str:
+           wp: int = 8,
+           locals: Sequence[str] = ()) -> str:
+    """... ``locals`` declares INTERMEDIATE scalars the body uses.
+
+    The source hoists reads into temporaries -- MFC's flux difference is
+    ``flux_face1 = f(..j-1..); flux_face2 = f(..j..); rh = inv_ds*(flux_face1 -
+    flux_face2)`` -- and while the declarations above cover the dummies, the
+    scalars and the loop variables, nothing declared THOSE.  MEASURED: the emitted
+    unit referenced `inv_ds`, `flux_face1` and `flux_face2` with no declaration,
+    i.e. it was not merely a different form from the committed unit, it was
+    INVALID FORTRAN.  A generated unit that cannot compile is worse than one that
+    compiles and is wrong, because no gate here would have said so.
+    """
     """A complete TU: a module holding one kernel subroutine.
 
     ``dummies`` is ``(name, rank)`` or ``(name, rank, intent)`` per array argument -- the rank comes
@@ -286,6 +298,7 @@ def module(name: str,
             _cur = "      & " + _piece
     _sig.append(_cur + ")")
     _sigline = "\n".join(_sig)
+    locals_ = f"    real({wp}) :: {', '.join(locals)}" if locals else ""
     return f"""module {name}
   implicit none
   integer, parameter :: wp = {wp}
@@ -296,6 +309,7 @@ contains
 {decl}
     integer, intent(in) :: {scal}
     integer :: {', '.join(nest_vars)}
+{locals_}
 
 {nest(nest_vars, nest_bounds, body)}
   end subroutine {kernel}
