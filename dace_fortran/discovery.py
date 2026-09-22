@@ -302,8 +302,27 @@ def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX", "COPY"), access: str 
     is_copy = bool(stmts) and all(
         _bare.match(st.split('=', 1)[1]) for st in stmts if '=' in st)
 
-    # The THREE spatial loops.  A fourth loop (the equation rows) often sits inside every one of
-    # them and is not part of the shape -- the rows are unrolled in the generated kernel.
+    # AT LEAST the spatial loops.  A fourth loop (the equation rows) is not part of the shape -- the
+    # rows are unrolled in the generated kernel -- and the first version of this KEPT THE FIRST THREE,
+    # on the assumption that the row loop sits INNERMOST.  MEASURED on MFC's x-direction flux nest:
+    #
+    #     do j = 1, sys_size        <- the row loop, OUTERMOST
+    #       do q_loop = 0, p
+    #         do l_loop = 0, n
+    #           do k_loop = 0, m    <- the SWEPT axis, and `loops[:3]` DROPPED it
+    #
+    # so `Shape.loops` did not contain the axis the difference is on, `_axis_letter` found nothing,
+    # `arms_of` classified every arm `both/neither`, and the group was refused with "could not pair the
+    # arms by the direction their stencil reaches".  Its own neighbouring nest classified `1 down` --
+    # same shape, same direction -- which is what identified this as a truncation and not a pairing
+    # fault.
+    #
+    # THE TRUNCATION STAYS, and removing it was TRIED AND REVERTED: keeping all four loops fixed this
+    # family (the pair shapes went `0 down-arm` -> `2 down-arm` and the units stopped being empty) and
+    # BROKE `visc_avg` -- `AVG:dx2`/`AVG:dz2` stopped emitting at all, and the gate dropped from six
+    # GATE verdicts to two.  `Shape.loops` feeds `_axis_index`/`_axis_letter` for every family, so the
+    # fix belongs in `arms_of`, which does not need the mapping: it can look at each `%sf(...)`
+    # subscript and ask whether the variable being shifted is a loop of the nest.
     if len(loops) < (2 if is_copy else 3):
         return None
     loops = loops[:2 if is_copy else 3]
