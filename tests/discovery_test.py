@@ -119,3 +119,37 @@ def test_the_depth_is_read_from_the_directive():
     assert len(discovery.blocks(four)) == 1                       # accepted by default
     assert len(discovery.blocks(four, collapse=3)) == 0           # and still filterable
     assert len(discovery.blocks(four, collapse=4)) == 1
+
+
+def test_multi_character_loop_variables_are_LOOPS():
+    """`do k_loop = ...` is a loop, and a single-letter class silently says it is not.
+
+    MFC's x-direction flux nest spells its loops `j`, `q_loop`, `l_loop`, `k_loop` while the SAME
+    construct in y/z uses `q`, `l`, `k`.  `canonical` matched loops with `([a-z])`, so it matched ONE
+    of the four, hit its `len(loops) < 3` guard, and returned `None` for the whole nest.
+
+    The consequence was not a wrong shape but a MISSING one: with no FLUX shape there is no axis
+    letter, so the arm classifier reports `both/neither` for every arm and the group is refused with
+    "could not pair the arms by the direction their stencil reaches" -- a message that names the
+    symptom and points nowhere near the class.  MEASURED: the x direction emitted 0 units, and all
+    three directions emit after widening the class to `[a-z_]\\w*`.
+    """
+    body = [
+        "do j = 1, sys_size",
+        "  do q_loop = 0, p",
+        "    do l_loop = 0, n",
+        "      do k_loop = 0, m",
+        "        inv_ds = 1._wp/dx(k_loop)",
+        "        flux_face1 = flux_n(1)%vf(j)%sf(k_loop - 1, l_loop, q_loop)",
+        "        flux_face2 = flux_n(1)%vf(j)%sf(k_loop, l_loop, q_loop)",
+        "        rhs_vf(j)%sf(k_loop, l_loop, q_loop) = inv_ds*(flux_face1 - flux_face2)",
+        "      end do",
+        "    end do",
+        "  end do",
+        "end do",
+    ]
+    shape = discovery.canonical(body)
+    assert shape is not None, "a nest with multi-character loop variables is still not a shape"
+    assert shape.op == "FLUX", shape
+    assert shape.dim == 0, f"the difference is on subscript 0 (`k_loop - 1`), got {shape.dim}"
+    assert "k_loop" in shape.loops or "q_loop" in shape.loops, shape.loops

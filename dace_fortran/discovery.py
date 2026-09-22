@@ -266,7 +266,14 @@ def canonical(body: List[str], ops=("AVG", "GRAD", "FLUX", "COPY"), access: str 
     """
     loops = []
     for ln in body:
-        m = re.match(r'\s*do\s+([a-z])\s*=\s*(.+?)\s*,\s*(.+?)\s*$', ln)
+        # `[a-z_]\w*` AND NOT `[a-z]`: MFC spells the x-direction flux loop `k_loop` while the SAME
+        # construct in y/z uses `k`.  A single-letter class matched ONE of the four loops, the
+        # `len(loops) < 3` guard fired, and `canonical` returned None -- so the x nest was never a
+        # FLUX shape, `arms_of` had no axis letter, and the whole direction was refused.
+        # MEASURED: same construct, same routine, `canonical(x nest) = None` against
+        # `canonical(y nest) = Shape(op='FLUX', dim=1, ...)` with IDENTICAL loop and statement
+        # counts -- the only difference was the lettering.
+        m = re.match(r'\s*do\s+([a-z_]\w*)\s*=\s*(.+?)\s*,\s*(.+?)\s*$', ln)
         if m:
             loops.append((m.group(1), m.group(2).strip(), m.group(3).strip()))
     stmts = [st for st in _join(body) if access + '(' in st and '=' in st]
