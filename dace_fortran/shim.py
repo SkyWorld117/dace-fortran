@@ -89,7 +89,11 @@ def sync_span(lines: Sequence[str], i: int) -> Tuple[int, int] | None:
 
 def route_launches(text: str, *, call: str, use_line: str, comment: Sequence[str] = (),
                    ) -> Tuple[str, List[str]]:
-    """Ensure every kernel launch is followed by exactly one ordering call.  Idempotent.
+    """Ensure every kernel launch is PRECEDED by exactly one ordering call.  Idempotent.
+
+    NOT "followed by": the launch reads ``state->gpu_context->streams[0]`` as its own trailing
+    argument at the call, so an ordering call placed after it misses that launch and only takes
+    effect on the next one.  See ``_pass_launches`` for the generated-code evidence.
 
     :param call: the ordering routine, e.g. ``"dace_order"``.
     :param use_line: the whole import line, e.g. ``"  use m_dace_order, only: dace_order"``.
@@ -128,6 +132,28 @@ def route_launches(text: str, *, call: str, use_line: str, comment: Sequence[str
 
 def _pass_launches(lines: List[str], call: str, comment: Sequence[str],
                    rewrites: List[str]) -> List[str]:
+    """Put the ordering call BEFORE each launch, not after it.
+
+    THE SIDE MATTERS, AND IT IS DECIDABLE FROM THE GENERATED CODE.  DaCe's launch reads the stream
+    as its own trailing argument, evaluated at the call::
+
+        cudaLaunchKernel((void*)…_map_0_1_17, dim3(…), dim3(32,1,1), …_args, 0,
+                         __state->gpu_context->streams[0]);
+
+    and ``__dace_gpu_set_all_streams`` writes exactly that field.  A setter invoked AFTER the launch
+    has therefore already missed it: the call handed the previous ``streams[0]`` to
+    ``cudaLaunchKernel``, which is the stream DaCe created with ``cudaStreamNonBlocking`` -- i.e.
+    explicitly NOT ordered against the legacy default stream the surrounding OpenACC loops use.  The
+    setter then takes effect on the NEXT launch, so the first launch of each direction stays
+    unordered.  This pass used to emit the call after the launch, which is that bug.
+
+    Idempotent, and idempotent specifically FOR THIS PLACEMENT: an existing call in front of the
+    launch is left exactly as it is, but only when its TAG matches -- a call belonging to a
+    different launch is not this launch's ordering, and treating it as one would silently leave this
+    one unordered.  A call the OLD placement left downstream, or a sync sitting there, is consumed
+    so the rewrite converges rather than duplicating.
+    """
+    tag_re = rf"\s*call\s+{re.escape(call)}\s*\([^,]+,\s*'([^']+)'\s*\)"
     out, i = [], 0
     while i < len(lines):
         m = LAUNCH.match(lines[i])
@@ -136,33 +162,50 @@ def _pass_launches(lines: List[str], call: str, comment: Sequence[str],
             i += 1
             continue
         last = statement_end(lines, i)
-        out.extend(lines[i:last + 1])
-        i = last + 1
         state, tag = m.group(2), tag_of(m.group(1))
-        j = skip_blanks(lines, i)
-        if j < len(lines) and re.match(rf'\s*call\s+{re.escape(call)}\s*\(', lines[j]):
-            # Already routed.  CORRECT it if the state expression is wrong -- a state that is an
-            # array must be passed with its subscript, and a transformer that merely skipped would
-            # leave that mistake in place forever.
-            want = f"    call {call}({state}, '{tag}')"
-            if lines[j].strip() != want.strip():
-                out.append(want)
-                rewrites.append(f"corrected {call}({tag}) -> {state}")
-            else:
-                out.append(lines[j])
-            i = j + 1
-            continue
-        if j < len(lines):
-            span = sync_span(lines, j)
-            if span is not None:
-                out.extend(comment)
-                out.append(f"    call {call}({state}, '{tag}')")
-                i = span[1] + 1
-                rewrites.append(f"replaced sync after {m.group(1)} -> {call}({tag})")
+        want = f"    call {call}({state}, '{tag}')"
+        # Already ordered FOR THIS TAG: an existing call may sit after blank lines and a comment
+        # block, so look backward past both rather than at the immediately preceding line.
+        b = i - 1
+        while b >= 0 and (not lines[b].strip() or lines[b].strip().startswith('!')):
+            b -= 1
+        if b >= 0:
+            prev = re.match(tag_re, lines[b])
+            if prev and prev.group(1) == tag:
+                # Already routed FOR THIS TAG.  CORRECT it if the state expression is wrong: an
+                # array-valued state is one library per direction and must carry its subscript
+                # (`state_sweeps(1)`, not `state_sweeps`), so a transformer that merely skipped would
+                # leave that mistake in place forever.  The line is already in `out`, possibly
+                # shifted by earlier insertions, so find it by scanning back rather than by index.
+                if lines[b].strip() != want.strip():
+                    for idx in range(len(out) - 1, -1, -1):
+                        if re.match(tag_re, out[idx]):
+                            out[idx] = want
+                            rewrites.append(f"corrected {call}({tag}) -> {state}")
+                            break
+                out.append(lines[i])
+                i += 1
                 continue
+        # Consume what the old placement left DOWNSTREAM of this launch, so a shim normalised by
+        # the previous version converges here instead of gaining a second call.
+        tail = last
+        j = skip_blanks(lines, last + 1)
+        if j < len(lines):
+            if re.match(rf'\s*call\s+{re.escape(call)}\s*\(', lines[j]):
+                tail = j
+                # It is being moved, but say so when its state expression was wrong -- the same
+                # mistake the already-routed branch corrects, seen from the other side.
+                if lines[j].strip() != want.strip():
+                    rewrites.append(f"corrected {call}({tag}) -> {state}")
+            else:
+                span = sync_span(lines, j)
+                if span is not None:
+                    tail = span[1]
         out.extend(comment)
-        out.append(f"    call {call}({state}, '{tag}')")
-        rewrites.append(f"inserted {call}({tag}) after {m.group(1)}")
+        out.append(want)
+        out.extend(lines[i:last + 1])
+        rewrites.append(f"inserted {call}({tag}) before {m.group(1)}")
+        i = tail + 1
     return out
 
 
