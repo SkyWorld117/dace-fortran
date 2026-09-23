@@ -472,5 +472,76 @@ def main(argv=None) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# deviceptr / present  -- the SILENT failure mode
+# ---------------------------------------------------------------------------
+#
+# A DaCe AOT library hands back device addresses, so a Fortran shim views them with
+# ``c_f_pointer`` and names them in the loop with ``deviceptr(...)``.  ``deviceptr`` tells the
+# compiler "this is already a device address, do NOT consult the present table for it" -- and
+# that is only half the story, because the loop still WRITES a host array.  If that written
+# array is not ``present``, the write does not reach the device: the run continues, the numbers
+# are wrong, and nothing reports an error.  It is silent in the worst way -- the host copy even
+# looks plausible afterwards.
+#
+# Measured, on the MFC port: a shim that copied a staging buffer D2H, transposed it in a serial
+# host loop, then pushed it back with ``!$acc update device`` cost 108 round trips per run
+# (553 MB at 64^3, 32.1 GB at 256^3) and gave back the whole advantage of the ported kernels --
+# which were 1.9x cheaper than the stock loops.  The fix moved the transpose onto the device and
+# relies on ``present(Re_avg_rsx_vf)``, whose precondition is that the host code declared it with
+# ``$:GPU_DECLARE(create=...)``.  Nothing checked that.  This does.
+
+
+def deviceptr_writes_without_present(source, targets, defines: Iterable[str] = DEFAULT_CPP_DEFINES):
+    """Acc loops that read through ``deviceptr`` but write an array without ``present``.
+
+    :param source: the Fortran source text.
+    :param targets: the array names to check, **lower-cased**.  The caller names what it cares
+        about, because deciding in general which identifier in a loop body is a module array
+        (rather than a local or a dummy) needs scope information this pass does not have --
+        naming it is cheap and exact.
+    :returns: ``[(line, target, directive_head), ...]``, empty when clean.
+
+    The body of a directive is taken to run from the line after it to the next ``!$acc`` line
+    (its own ``end``), which is where an OpenACC loop nest's statements live.  An assignment is
+    recognised by the target appearing at the start of a statement followed by ``(`` -- so
+    ``re_avg_rsx_vf(p, q, r, i) = ...`` is a write and ``x = re_avg_rsx_vf(...)`` is not.
+    """
+    lines = source.splitlines()
+    want = {t.lower() for t in targets}
+    violations = []
+    for logical in acc_directives(source):
+        # `_head` stops at the first clause, so it yields "parallel" for `parallel loop
+        # collapse(...)` -- testing it for "loop" skips EVERY directive.  Match on the whole
+        # directive text instead.  (This is the positive control's job: without it the check
+        # reported 0 violations both with and without `present`, which looks like success.)
+        if "loop" not in logical.text.lower():
+            continue
+        clauses = {}
+        for name, entities in _clauses(logical):
+            clauses.setdefault(name, []).extend(entities)
+        if "deviceptr" not in clauses:
+            continue
+        present = {base.lower() for base, _ref, _off in clauses.get("present", [])}
+        start = (logical.line or 0)
+        end = len(lines)
+        for i in range(start, len(lines)):
+            if _ACC_SENTINEL_RE.match(lines[i]):
+                end = i
+                break
+        written = set()
+        for i in range(start, end):
+            stmt = _strip_comment(lines[i]).strip().lower()
+            if not stmt:
+                continue
+            for t in want:
+                # a write, not a read: the name leads a statement and is subscripted
+                if stmt.startswith(t) and stmt[len(t):len(t) + 1] in ("(", ","):
+                    written.add(t)
+        for t in sorted(written - present):
+            violations.append((start, t, _head(logical.text).strip()))
+    return violations
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
