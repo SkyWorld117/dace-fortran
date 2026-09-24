@@ -62,3 +62,68 @@ def test_cpp_defines_reach_the_source():
     src = "#ifdef KEEP\nkept\n#endif\n#ifdef DROP\ndropped\n#endif\n"
     out = extract.cpp(src, defines=["KEEP"])
     assert "kept" in out and "dropped" not in out
+
+
+# ---------------------------------------------------------------------------------------------------
+# The branch a nest sits in.  A source may hold TWO nests of one shape with DIFFERENT arithmetic, one
+# per arm of a branch pair, and which one is live is not a choice the emitter gets to make.
+# ---------------------------------------------------------------------------------------------------
+
+BRANCHED = """subroutine s
+  if (mode /= dual_pass) then
+    !$acc parallel loop
+    do j = 1, n
+      x = flux(j - 1) - flux(j)
+    end do
+  else
+    !$acc parallel loop
+    do j = 1, n
+      x = one_face(j)
+    end do
+  end if
+end subroutine
+"""
+
+
+def test_a_nest_in_the_if_arm_reports_that_guard():
+    assert extract.branch_of(BRANCHED, 4) == "mode /= dual_pass"
+
+
+def test_a_nest_in_the_ELSE_arm_reports_the_NEGATED_guard():
+    """Scanning back for the nearest `if (...) then` alone returns the SAME text for an `if` arm and
+    its `else` arm -- MEASURED on a real source, where both x-direction flux nests reported
+    `hypo_nc_mode /= hypo_nc_mode_dual_pass`.  A caller selecting "the nest inside guard G" then keeps
+    BOTH, emits two different arithmetic forms under one library name, and the second silently
+    overwrites the first on the way to the bake."""
+    assert extract.branch_of(BRANCHED, 9) == "!.(mode /= dual_pass)"
+    assert extract.branch_of(BRANCHED, 4) != extract.branch_of(BRANCHED, 9)
+
+
+def test_a_nest_in_no_branch_returns_the_empty_string():
+    """The empty string is the "not in a branch" answer, which is what makes a guard filter able to say
+    'this shape is not covered by the guard' instead of silently dropping it."""
+    assert extract.branch_of(BRANCHED, 1) == ""            # the `subroutine` line, above the `if`
+    assert extract.branch_of("subroutine s\n  do j = 1, n\n  end do\nend subroutine\n", 2) == ""
+
+
+def test_every_arm_of_an_else_if_chain_gets_a_DISTINCT_answer():
+    """THE COLLISION THIS CLOSES, and the shape of the answer.
+
+    With only the nearest `if` negated, the `else if` arm and the plain `else` arm BOTH answered
+    `!.(a)` -- so a caller selecting "the nests inside guard `!.(a)`" kept two arms that compute
+    different things, which is exactly what the `else` negation was added to stop, one level in.
+
+    The convention the function settles on: an arm answers the negation of the NEAREST enclosing
+    condition, conjoined with its own when it is an `else if`.  That makes the `else` arm `!.(b)`
+    rather than the full `!.(a) && !.(b)` -- incomplete as a predicate, and the right thing for what
+    this is FOR, which is telling arms apart.  DISTINCTNESS is therefore the property asserted, not
+    the three literal strings; a future change that made them distinctive in another way would still
+    satisfy it, and one that re-introduced the collision could not."""
+    src = ("subroutine s\n"
+           "  if (a) then\n    x = 1\n"
+           "  else if (b) then\n    y = 2\n"
+           "  else\n    z = 3\n"
+           "  end if\nend subroutine\n")
+    arms = [extract.branch_of(src, n) for n in (2, 4, 6)]
+    assert arms == ["a", "!.(a) && (b)", "!.(b)"]
+    assert len(set(arms)) == 3

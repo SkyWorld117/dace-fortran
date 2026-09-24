@@ -96,3 +96,110 @@ def test_module_declares_the_rank_the_caller_gives():
     # the nest is present and closed
     assert src.count("do c = 0, n") == 1
     assert re.search(r"end do\s*\n\s*end subroutine", src)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Analysing a shape's nests.  These came from a porting project's emitter, where each one had already
+# cost a measured defect; they are here because none of them is knowledge about THAT project.
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_the_difference_axis_is_looked_up_by_DIM_not_hardcoded_innermost():
+    """The house convention is outermost = LAST storage dimension, so position `dim` is `loops[-1-dim]`.
+
+    Getting this wrong guards the difference on the wrong loop for 4 of 6 shapes and NOTHING RAISES:
+    the bounds are read off the wrong axis, so the union is taken over the wrong axis and the emitted
+    nest writes the wrong cells.  An emitter with the bug reported "6 shape(s) emitted, 0 blocked" the
+    whole time."""
+    assert tu.axis_index(tu.Shape("AVG", 0, ("l", "k", "j"))) == 2      # innermost
+    assert tu.axis_letter(tu.Shape("AVG", 0, ("l", "k", "j"))) == "j"
+    assert tu.axis_index(tu.Shape("GRAD", 2, ("j", "l", "k"))) == 0     # outermost
+    assert tu.axis_letter(tu.Shape("GRAD", 2, ("j", "l", "k"))) == "j"
+
+
+def test_an_undetermined_dim_is_treated_as_zero_rather_than_refused():
+    assert tu.axis_index(tu.Shape("AVG", None, ("l", "k", "j"))) == 2
+
+
+def test_a_shape_with_no_loops_RAISES_instead_of_returning_minus_one():
+    """`-1` is a valid Python index, so `bounds[axis_index(shape)]` read the LAST bound silently.  That
+    is the same silent-wrong-answer shape as the hardcoded innermost loop, one step further out."""
+    empty = tu.Shape("AVG", 0, ())
+    with pytest.raises(ValueError, match="no loops"):
+        tu.axis_index(empty)
+    assert tu.axis_letter(empty) is None             # the letter is still just an absent answer
+
+
+def test_nest_bounds_sees_a_loop_variable_longer_than_one_letter():
+    """`[a-z]` was too narrow and it was found four separate times in one emitter: a nest spelling its
+    loops `k_loop`/`l_loop` yielded NO loops, and the caller then emitted a unit with no `do` at all
+    whose body referenced `j`/`k`/`l` undeclared."""
+    body = "do i = 0, n\n  do k_loop = a + 1, b - 1\n    x = 1\n  end do\nend do"
+    assert tu.nest_bounds(body) == [("i", "0", "n"), ("k_loop", "a + 1", "b - 1")]
+
+
+def test_nest_bounds_returns_nothing_for_a_body_with_no_do():
+    assert tu.nest_bounds("x = y + 1") == []
+
+
+def test_two_units_differing_only_in_NAME_and_LINE_are_the_same_shape():
+    """One library per SHAPE serves every loop of that shape, so the check that two pairs of a shape
+    agree must not be defeated by the rename it is checking for."""
+    a = tu.module("avg_d0_l189_mod", "avg_d0_l189_mod_kernel", dummies=[("a1", 3)], scalars=["n"],
+                  body="do c = 1, n\n  a1(c, 1, 1) = 1\nend do",
+                  nest_vars=["c"], nest_bounds=[("1", "n")], doc="extracted from 189/204")
+    b = tu.module("visc_avg_d0_mod", "visc_avg_d0_mod_kernel", dummies=[("a1", 3)], scalars=["n"],
+                  body="do c = 1, n\n  a1(c, 1, 1) = 1\nend do",
+                  nest_vars=["c"], nest_bounds=[("1", "n")], doc="extracted from 189/204")
+    assert tu.shape_signature(a) == tu.shape_signature(b)
+    assert a != b                                     # they really do differ as text
+
+
+def test_a_shape_signature_notices_a_changed_assignment():
+    """The falsifying control: if only names were normalised, this would compare equal too."""
+    a = tu.module("u_mod", "u_mod_kernel", dummies=[("a1", 3)], scalars=["n"],
+                  body="do c = 1, n\n  a1(c, 1, 1) = 1\nend do",
+                  nest_vars=["c"], nest_bounds=[("1", "n")])
+    b = tu.module("u_mod", "u_mod_kernel", dummies=[("a1", 3)], scalars=["n"],
+                  body="do c = 1, n\n  a1(c, 1, 1) = 2\nend do",
+                  nest_vars=["c"], nest_bounds=[("1", "n")])
+    assert tu.shape_signature(a) != tu.shape_signature(b)
+
+
+def test_a_shape_signature_ignores_the_wrap_point_the_renamed_length_moves():
+    """`module` breaks the argument list at 100 columns, so a longer NAME moves the `&`.  MEASURED
+    before this normalisation: two identical units reported a mismatch at
+    `& b_lo, b_hi, c_lo, ...` against `& b_hi, c_lo, c_hi, ...`."""
+    long_args = [f"a{i}" for i in range(14)]
+    long = tu.module("a_very_long_unit_name_here_mod", "k", dummies=[("a1", 3)],
+                     scalars=long_args, body="do c = 1, n\n  a1(c, 1, 1) = 1\nend do",
+                     nest_vars=["c"], nest_bounds=[("1", "n")])
+    short = tu.module("s_mod", "k", dummies=[("a1", 3)], scalars=long_args,
+                      body="do c = 1, n\n  a1(c, 1, 1) = 1\nend do",
+                      nest_vars=["c"], nest_bounds=[("1", "n")])
+    assert long != short                              # the wrap really did move
+    assert tu.shape_signature(long) == tu.shape_signature(short)
+
+
+def test_aliases_binds_the_three_assignments_a_source_writes_on_ONE_line():
+    """A line-anchored regex matches none of `is1 = ix; is2 = iy; is3 = iz`, so the map comes out empty
+    and a pair that DOES run over the same cells is refused for a reason that is no longer true.
+
+    The result is `alias_map`'s CANONICAL map, so BOTH sides of each assignment appear, each resolved
+    to its representative.  Asserting only the three left-hand names would pass on a map that had lost
+    `iy`'s own entry -- which is the side the bounds actually spell."""
+    m = tu.aliases_of("  is1_viscous = ix; is2_viscous = iy; is3_viscous = iz\n  x = 1\n  y = x + 1\n")
+    assert m["is1_viscous"] == m["ix"] == "ix"
+    assert m["is2_viscous"] == m["iy"] == "iy"
+    assert m["is3_viscous"] == m["iz"] == "iz"
+
+
+def test_an_expression_on_the_right_is_not_an_alias():
+    """An alias that is not a pure rename is not an alias, and neither is a self-assignment."""
+    assert tu.aliases_of("a = b + 1\nc = c\nd = -e\n") == {}
+
+
+def test_aliases_is_empty_for_a_routine_with_no_pure_renames():
+    """The falsifying control for the test above: the map comes from a SCAN, so an empty answer has to
+    be reachable rather than being what a broken scan always returns."""
+    assert tu.aliases_of("subroutine s\n  x = 1\nend subroutine\n") == {}

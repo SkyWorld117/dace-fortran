@@ -32,6 +32,7 @@ checkable -- a difference that used to be invisible is now one function's contra
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -106,3 +107,40 @@ def routine(text: str, name: str) -> str:
 def from_file(path, defines: Sequence[str] = (), **kw) -> str:
     """Read a source file and preprocess it.  Convenience for the common two-step."""
     return cpp(Path(path).read_text(), defines=defines, **kw)
+
+
+def branch_of(scoped: str, line: int) -> str:
+    """The branch a 0-based ``line`` sits in: the nearest PRECEDING ``if (...) then``, as text.
+
+    Returns ``""`` when the line is in no ``if`` at all.
+
+    AN ``else`` ARM IS THE NEGATION OF ITS ``if``, AND RETURNING THE SAME TEXT FOR BOTH IS THE BUG
+    THIS GUARDS.  Scanning back for the nearest ``if (...) then`` alone gives an ``if`` arm and its
+    ``else`` arm the SAME string -- MEASURED on a source whose x-direction nest appears once in
+    ``if (hypo_nc_mode /= hypo_nc_mode_dual_pass)`` and once in the ``else``.  A caller that selects
+    "the nest inside guard G" then keeps BOTH, emits two DIFFERENT arithmetic forms under one library
+    name, and the second silently overwrites the first on the way to the bake.
+
+    So an ``else`` arm is returned negated, and a caller naming the positive guard selects the positive
+    arm and only that one.
+
+    AN ``else if`` ARM CARRIES ITS OWN CONDITION TOO, and returning only the negated outer guard makes
+    it INDISTINGUISHABLE FROM THE PLAIN ``else`` -- both would answer ``!.(a)`` in
+    ``if (a) ... else if (b) ... else ...``, which is the same collision one level in.  So an ``else
+    if`` arm answers ``!.(a) && (b)``: the negation of the guard it is the alternative to, conjoined
+    with its own.
+    """
+    lines = scoped.split("\n")
+    for i in range(min(line, len(lines)) - 1, -1, -1):
+        if re.match(r"\s*else\b", lines[i], re.I):
+            m_ei = re.match(r"\s*else\s+if\s*\((.*)\)\s*then", lines[i], re.I)
+            for j in range(i - 1, -1, -1):
+                m = re.match(r"\s*(?:else\s+)?if\s*\((.*)\)\s*then", lines[j], re.I)
+                if m:
+                    outer = "!.(" + m.group(1).strip() + ")"
+                    return f"{outer} && ({m_ei.group(1).strip()})" if m_ei else outer
+            return "!(else)"
+        m = re.match(r"\s*if\s*\((.*)\)\s*then", lines[i], re.I)
+        if m:
+            return m.group(1).strip()
+    return ""

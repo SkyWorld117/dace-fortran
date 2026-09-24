@@ -315,3 +315,120 @@ contains
   end subroutine {kernel}
 end module {name}
 """
+
+
+# ---------------------------------------------------------------------------------------------------
+# Analysing a shape's nests: which nest loop carries the difference, what its bounds are, whether two
+# emitted units are the same arithmetic, and which source names are aliases of each other.
+#
+# These are properties of FORTRAN and of `Shape`, not of any one code being ported, which is why they
+# live here.  What is deliberately absent is anything that knows what an ACCESS MEANS: the helpers
+# below that read `%sf(...)` take the access idiom as an argument instead of assuming it, and the
+# substitution that turns an access into a DUMMY stays with the caller -- see the module docstring.
+# ---------------------------------------------------------------------------------------------------
+
+
+def axis_index(shape: Shape) -> int:
+    """The NEST position (0 = outermost) whose loop indexes storage position ``shape.dim``.
+
+    The house convention, which :mod:`dace_fortran.discovery` documents where it builds ``loops``, is
+    outermost = LAST storage dimension, innermost = first, so position ``dim`` in a subscript tuple is
+    ``loops[-1 - dim]``.
+
+    THIS IS THE BUG THIS FUNCTION EXISTS TO NOT HAVE.  An emitter that used ``shape.loops[-1]`` and a
+    hardcoded axis -- the INNERMOST loop -- guards the difference on the wrong loop for four of six
+    shapes, and nothing raises: the bounds are read off the wrong axis, so the union is taken over the
+    wrong axis and the emitted nest writes the wrong cells.  It reported "6 shape(s) emitted, 0
+    blocked" the whole time, which is why a success counter is not evidence.
+
+    A SHAPE WITH NO LOOPS RAISES, and it used to return ``-1``.  ``-1`` is a VALID Python index, so a
+    caller doing ``bounds[axis_index(shape)]`` silently read the LAST bound instead of failing -- the
+    same silent-wrong-answer shape as the hardcoded innermost loop above, one step further out.  There
+    is no axis to name, so it raises.
+    """
+    if not shape.loops:
+        raise ValueError(f"shape {shape.op}:{shape.dim} has no loops, so it has no difference axis")
+    d = shape.dim if shape.dim is not None else 0
+    return len(shape.loops) - 1 - d
+
+
+def axis_letter(shape: Shape) -> Optional[str]:
+    """The loop variable of the difference axis -- :func:`axis_index`'s letter, or ``None``.
+
+    ``None`` is a real answer and not an error: ``Shape.loops`` may be shorter than the nest, so a
+    shape whose difference rides a loop the canonicaliser dropped has no letter here.  Callers must
+    handle it rather than index blindly -- an emitter that assumed a letter classified every arm of
+    such a shape as neither up nor down and refused the whole group.
+    """
+    return shape.loops[axis_index(shape)] if shape.loops else None
+
+
+def nest_bounds(body: str) -> List[Tuple[str, str, str]]:
+    """``(var, lo, hi)`` per ``do`` header in ``body``, outermost first -- the union's inputs.
+
+    ONE LETTER CLASS IS A BUG, and it was found four separate times in this path.  The loop variable
+    is ``[a-z_]\\w*`` and not ``[a-z]``: a nest that spells its loops ``k_loop``/``l_loop`` yields NO
+    loops under the narrow class, and the caller then emits a unit with no ``do`` statements at all
+    whose body references ``j``/``k``/``l`` undeclared.
+
+    WIDENING IT IS NOT FREE, and that is the other half.  This decides how a shape is RENDERED, and it
+    is shared by every family already validated: MEASURED, widening it changed two pairs' emitted text
+    so they no longer agreed and the same-shape guard refused the emission -- for a family verified
+    bit-identical an hour earlier.  A change in shared rendering code has to arrive with the family it
+    is for.
+    """
+    out: List[Tuple[str, str, str]] = []
+    for ln in body.split("\n"):
+        m = re.match(r"\s*do\s+([a-z_]\w*)\s*=\s*(.+?)\s*,\s*(.+?)\s*$", ln)
+        if m:
+            out.append((m.group(1), m.group(2).strip(), m.group(3).strip()))
+    return out
+
+
+def shape_signature(unit_src: str) -> str:
+    """The unit's ARITHMETIC identity: everything a caller does NOT supply.
+
+    One library per SHAPE serves every loop of that shape, each with its own ranges -- that is how one
+    ``AVG dim0`` unit serves both stencils of that shape.  So the loop RANGES are arguments and are
+    not part of the kernel, and comparing raw text would call a shape a mismatch for being used the
+    way it is designed to be used.
+
+    THREE THINGS HAVE TO BE NORMALISED AWAY and the third is not obvious: the doc line carries a
+    source LINE NUMBER; the unit's own NAME differs between a per-pair and a per-shape naming; and the
+    SIGNATURE's wrap point moves with that name's LENGTH, because :func:`module` breaks the argument
+    list at 100 columns.  MEASURED: without the last one, two identical units reported a mismatch at
+    ``& b_lo, b_hi, c_lo, ...`` against ``& b_hi, c_lo, c_hi, ...`` -- a pure formatting artefact of
+    the rename being checked for.
+    """
+    src = "\n".join(l for l in unit_src.split("\n") if not l.strip().startswith("!>"))
+    src = re.sub(r"&\s*\n\s*&?", " ", src)            # fold free-form continuations before comparing
+    src = re.sub(r"\b\w+_mod_kernel\b", "KERNEL", src)
+    src = re.sub(r"\b\w+_mod\b", "UNIT", src)
+    keep: List[str] = []
+    for ln in src.split("\n"):
+        s = " ".join(ln.split())
+        m = re.match(r"do\s+(\w+)\s*=", s)
+        keep.append(f"do {m.group(1)}" if m else s)
+    return "\n".join(keep)
+
+
+def aliases_of(scoped: str) -> Dict[str, str]:
+    """Simple ``a = b`` equalities in a routine, as the map :func:`check_nest_pair` takes.
+
+    WHY THIS IS EXTRACTED RATHER THAN ASSUMED.  ``is1_viscous = ix; is2_viscous = iy`` at the top of a
+    routine means two arms whose transverse bounds read ``is2_viscous%beg`` and ``iy%beg`` run over
+    exactly the same cells -- and no reading of the bounds alone can know that.  Without the map such a
+    pair is refused as "not the same nest", which is safe but wrong.
+
+    ``;``-SEPARATED, and that is not a detail: sources write all three assignments on ONE line, so a
+    line-anchored ``^\\s*(\\w+)\\s*=\\s*(\\w+)\\s*$`` matches none of them and the map comes out empty
+    for a reason that is no longer true.  Only assignments of one bare name to another count -- an
+    alias that is not a pure rename is not an alias.
+    """
+    pairs = []
+    for ln in scoped.split("\n"):
+        for part in ln.split(";"):
+            m = re.match(r"\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*$", part)
+            if m and m.group(1) != m.group(2):
+                pairs.append((m.group(1), m.group(2)))
+    return alias_map(pairs)
