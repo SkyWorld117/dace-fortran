@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from dace_fortran.acc_residency import classify, extract_acc_residency, write_acc_residency_sidecar
+from dace_fortran.acc_residency import (check_deviceptr_files, classify,
+                                        deviceptr_writes_without_present,
+                                        extract_acc_residency,
+                                        write_acc_residency_sidecar)
 
 REPO = Path(__file__).resolve().parents[1]
 VELOCITY = REPO / "tests" / "icon" / "atmosphere" / "velocity_advection_acc.f90"
@@ -235,6 +238,109 @@ def test_cli(tmp_path):
         check=True,
         cwd=REPO)
     assert json.loads(out.read_text())["args"]["b_copyin"]["clause"] == "COPYIN"
+
+
+# ---------------------------------------------------------------------------
+# deviceptr / present -- the SILENT write
+# ---------------------------------------------------------------------------
+#
+# These are the positive controls for the check.  It is worth stating why they are not optional:
+# the check's own author shipped a first version that tested `_head(text)` for "loop", and `_head`
+# stops at the first clause, so it yields "parallel" -- the guard skipped EVERY directive and the
+# check reported 0 violations BOTH with and without `present(...)`.  A clean-looking zero.  Only a
+# fixture that is supposed to FAIL separates "correct" from "never ran", so `test_deviceptr_*`
+# below come in pairs.
+
+DEVP_BODY = """
+  call c_f_pointer(d_src, src, [4*4*4*2])
+  !$acc parallel loop collapse(4) deviceptr(src)%(present)s
+  do i = 1, 2
+    do r = 0, 3
+      do q = 0, 3
+        do p = 0, 3
+          out(p, q, r, i) = src(p + 1)
+        end do
+      end do
+    end do
+  end do
+  !$acc end parallel loop
+end subroutine
+"""
+
+
+def _devp(present: str = " present(out)"):
+    return ("subroutine view_me(d_src, out)\n"
+            "  real(c_double) :: out(4, 4, 4, 2)\n"
+            + DEVP_BODY % {"present": present})
+
+
+def test_deviceptr_with_present_is_clean():
+    assert deviceptr_writes_without_present(_devp(), {"out"}) == []
+
+
+def test_deviceptr_without_present_is_caught():
+    """The control that makes the clean case mean something."""
+    v = deviceptr_writes_without_present(_devp(""), {"out"})
+    assert len(v) == 1
+    line, target, head = v[0]
+    assert target == "out"
+    assert line > 0
+
+
+def test_deviceptr_read_only_is_not_a_write():
+    """`x = src(...)` reads through deviceptr; only the written array needs `present`."""
+    src = """
+  !$acc parallel loop deviceptr(src) present(out)
+  do i = 1, 4
+    out(i) = src(i)
+  end do
+  !$acc end parallel loop
+end subroutine
+"""
+    assert deviceptr_writes_without_present(src, {"__nope__"}) == []
+
+
+def test_check_deviceptr_files_unreadable_is_a_violation(tmp_path):
+    """An unchecked file must NOT report what a clean file reports.
+
+    Skipping an unreadable path would make a typo'd path, a bad glob or a missing checkout
+    indistinguishable from a clean tree -- which is the failure mode the check exists to catch.
+    """
+    n, out = check_deviceptr_files([tmp_path / "absent.fpp"], {"out"})
+    assert n == 1
+    assert len(out) == 1 and "unreadable" in out[0] and "not a clean one" in out[0]
+
+
+def test_check_deviceptr_files_walks_every_path(tmp_path):
+    clean = tmp_path / "clean.fpp"
+    clean.write_text(_devp())
+    dirty = tmp_path / "dirty.fpp"
+    dirty.write_text(_devp(""))
+    n, out = check_deviceptr_files([clean, dirty], {"out"})
+    assert n == 2
+    assert len(out) == 1 and "dirty.fpp" in out[0]
+
+
+def test_deviceptr_cli_agrees_with_the_function(tmp_path):
+    """The CLI is what a consumer's gate calls, so it is the exit code that must be right."""
+    clean = tmp_path / "clean.fpp"
+    clean.write_text(_devp())
+    dirty = tmp_path / "dirty.fpp"
+    dirty.write_text(_devp(""))
+
+    def run(p):
+        return subprocess.run(
+            [sys.executable, "-m", "dace_fortran.acc_residency",
+             "--check-deviceptr", "out", str(p)],
+            capture_output=True, text=True, cwd=REPO).returncode
+
+    assert run(clean) == 0
+    assert run(dirty) == 1, "a violating site must not exit 0"
+    # ...and the reverse control: the CLEAN file is not merely "not 1"
+    assert "every deviceptr loop declares present" in subprocess.run(
+        [sys.executable, "-m", "dace_fortran.acc_residency",
+         "--check-deviceptr", "out", str(clean)],
+        capture_output=True, text=True, cwd=REPO).stdout
 
 
 @pytest.mark.skipif(not VELOCITY.is_file(), reason="ACC-annotated velocity twin not present")

@@ -234,6 +234,8 @@ dace_fortran.register_external("foo", dace_fortran.ExternalSignature(
 
 Real-codebase recipes (ICON from source, Quantum ESPRESSO `exx`): `docs/ICON_INTEGRATION.md`, `docs/CODEBASE_HELPERS.md`, the external-call policy above (§4); worked examples under `tests/external_call/`, `tests/icon/full/`, `tests/qe/`.
 
+Calling a generated library from a Fortran **shim** (device addresses, `deviceptr`/`present`, and the silent write that check exists to catch): `docs/SHIM_RULES.md`.
+
 ## Build-system integration
 
 Three integration paths run the source-text preprocess passes in place so your existing compiler builds the result:
@@ -351,7 +353,8 @@ autotools/                 dace_fortran.m4 + dace_fortran.mk
 scripts/                   ICON build/configure helpers, pre-commit guards,
                            generated-kernel static analysis
 docs/                      CODEBASE_HELPERS (flang on a real codebase),
-                           ICON_INTEGRATION (full ICON CPU recipe)
+                           ICON_INTEGRATION (full ICON CPU recipe),
+                           SHIM_RULES (deviceptr/present rules for a Fortran shim)
 tests/                     test corpora (see Testing)
 ```
 

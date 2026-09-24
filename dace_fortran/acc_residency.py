@@ -434,8 +434,10 @@ def write_acc_residency_sidecar(source_path,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m dace_fortran.acc_residency",
                                      description="Extract per-argument OpenACC data residency for a Fortran routine.")
-    parser.add_argument("source", type=Path, help="Fortran source, ACC directives intact.")
-    parser.add_argument("--routine", required=True, help="Target routine name.")
+    parser.add_argument("source", type=Path, nargs="*",
+                        help="Fortran source(s), ACC directives intact.  One file in extract "
+                        "mode; every file to walk in --check-deviceptr mode.")
+    parser.add_argument("--routine", help="Target routine name (extract mode, required).")
     parser.add_argument("--define",
                         action="append",
                         default=[],
@@ -444,11 +446,36 @@ def main(argv=None) -> int:
     parser.add_argument("--out", type=Path, help="Write the sidecar JSON here (default: stdout).")
     parser.add_argument("--out-dir", type=Path, help="Write <routine>.acc_residency.json into this directory.")
     parser.add_argument("--table", action="store_true", help="Also print a human-readable table on stderr.")
+    parser.add_argument("--check-deviceptr", action="append", default=[], metavar="NAME",
+                        help="Check mode: require `present(NAME)` on every array a deviceptr loop "
+                        "writes.  Repeatable; naming the arrays is exact and cheap, because "
+                        "deciding in general which identifier in a loop body is a module array "
+                        "needs scope information this pass does not have.  Every positional file "
+                        "is walked.  Exit 1 if any site is unguarded.")
     ns = parser.parse_args(argv)
 
     defines = DEFAULT_CPP_DEFINES | set(ns.define)
+
+    if ns.check_deviceptr:
+        if not ns.source:
+            print("error: --check-deviceptr needs at least one file to walk", file=sys.stderr)
+            return 2
+        names = sorted({n.lower() for n in ns.check_deviceptr})
+        n_files, violations = check_deviceptr_files(ns.source, names, defines)
+        for line in violations:
+            print(line)
+        if violations:
+            print(f"{len(violations)} silent-write site(s) in {n_files} file(s) -- NOT a pass",
+                  file=sys.stderr)
+            return 1
+        print(f"{n_files} file(s): every deviceptr loop declares present for what it writes")
+        return 0
+
+    if len(ns.source) != 1 or not ns.routine:
+        print("error: extract mode needs exactly one source and --routine", file=sys.stderr)
+        return 2
     try:
-        payload = extract_acc_residency(ns.source, ns.routine, defines)
+        payload = extract_acc_residency(ns.source[0], ns.routine, defines)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -541,6 +568,41 @@ def deviceptr_writes_without_present(source, targets, defines: Iterable[str] = D
         for t in sorted(written - present):
             violations.append((start, t, _head(logical.text).strip()))
     return violations
+
+
+def check_deviceptr_files(paths, targets, defines: Iterable[str] = DEFAULT_CPP_DEFINES):
+    """Run :func:`deviceptr_writes_without_present` over many files.
+
+    This exists so a CONSUMER does not have to hand-roll the driver.  The recipe
+    this check was written for shipped one first, and a driver is a place to get
+    the file walk, the target set or the exit code wrong -- none of which is the
+    property being checked.  Keeping it here also gives the failure text and the
+    exit code one definition, next to the analysis they report on.
+
+    :param paths: iterable of ``pathlib.Path`` (or ``str``) Fortran sources.
+    :param targets: array names to require ``present`` for, **lower-cased**.
+    :param defines: cpp macros assumed defined when selecting ``#if`` arms.
+    :returns: ``(n_files, [str, ...])`` -- the number of files read, and one
+        printable line per violation (empty when clean).
+
+    A file that cannot be read is a VIOLATION, not a skip.  The caller is asking
+    "is every site guarded?", and an unreadable file cannot answer that -- while
+    silently skipping it would report exactly what a clean tree reports.
+    """
+    want = {t.lower() for t in targets}
+    paths = [Path(p) for p in paths]
+    out = []
+    for p in paths:
+        try:
+            text = p.read_text(errors="surrogateescape")
+        except OSError as exc:
+            out.append(f"VIOLATION {p}: unreadable ({exc}) -- an unchecked file is not a clean one")
+            continue
+        for line, target, head in deviceptr_writes_without_present(text, want, defines):
+            out.append(f"VIOLATION {p}:{line}: `{head}` reads via deviceptr but writes "
+                       f"`{target}` with no `present({target})` -- the write will not reach "
+                       f"the device")
+    return len(paths), out
 
 
 if __name__ == "__main__":
