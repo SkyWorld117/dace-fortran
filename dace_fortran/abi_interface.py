@@ -41,6 +41,7 @@ __all__ = [
     "BY_VALUE_TYPE",
     "UntypedArgument",
     "UnsupportedKind",
+    "by_name",
     "by_value_type",
     "declaration",
     "declarations",
@@ -134,3 +135,14 @@ def declarations(abi: Dict[str, Any], *, indent: str = "      ") -> List[str]:
     library = abi.get("name", "")
     args: Sequence[Dict[str, Any]] = abi.get("args", [])
     return [declaration(a, indent=indent, library=library) for a in args]
+
+
+def by_name(abi: Dict[str, Any], *, indent: str = "      ") -> Dict[str, str]:
+    """``{argument name: its declaration line}`` -- for a caller that emits them one at a time.
+
+    The consumers this was written for build their interface blocks in an f-string, interpolating a
+    declaration per name in the order they choose; a name-keyed view lets them keep that shape
+    instead of restructuring around a list.
+    """
+    library = abi.get("name", "")
+    return {a["name"]: declaration(a, indent=indent, library=library) for a in abi.get("args", [])}
