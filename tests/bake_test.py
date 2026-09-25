@@ -151,3 +151,36 @@ def test_bake_split_returns_the_two_dicts_the_optimize_API_takes(sdfg):
     syms, conts = bake.bake_split(sdfg, values=({"nVar": 3},), keep_runtime=("jlb",))
     assert syms["nVar"] == 3 and "jlb" not in syms
     assert conts == {}
+
+
+
+def test_a_SCALAR_CONTAINER_the_kernel_reads_stays_runtime(sdfg):
+    """The primitive that cost a full re-bake, and the ONLY of the five that a unit test can pin.
+
+    A scalar container is read through a memlet whose SUBSET is `0`, so its name appears NOWHERE in
+    the index arithmetic: `jb` is `mlt(data='jb', subset='0')`, not `Q(j + jb, ...)`.  A rule that
+    looks only at map bounds and subsets therefore folds it to zero -- and MEASURED on a real port,
+    that turned the family's loop bounds into zeros, the subsets went NEGATIVE, and the build failed
+    with `Memlet subset negative out-of-bounds` and `StorageType.GPU_Global but accessed on host`.
+    It failed LOUDLY there; the silent version of the same mistake is a kernel reading a neighbouring
+    cell, which every differential gate would then read equally wrong.
+
+    THE OTHER FOUR PRIMITIVES ARE NOT UNIT-TESTABLE AND ARE NOT FAKED HERE.  A `SymExpr` bound, a CFG
+    branch condition and a control-flow code block all need a graph that DaCe's public API will not
+    build in a test -- MEASURED: `add_map(..., {"i": "0:min(jlb, p)"})` keeps every symbol as one that
+    HAS `free_symbols`, so a test written around it passes against the broken rule too, and a
+    standalone `LoopRegion` never reaches the SDFG it is meant to belong to.  Those are covered where
+    they can be: end to end, by the consumer's bake, which is what found the defect.
+    """
+    sdfg.add_symbol("p", dace.int32)
+    sdfg.add_scalar("jb", dace.int32)
+    sdfg.add_array("A", [4], dace.float64)
+    st = sdfg.add_state()
+    m, mx = st.add_map("m", {"i": "0:p"})
+    a, jb, w = st.add_access("A"), st.add_access("jb"), st.add_access("A")
+    t = st.add_tasklet("c", {"_i", "_j"}, {"_o"}, "_o = _i + _j")
+    st.add_memlet_path(a, m, t, dst_conn="_i", memlet=dace.Memlet("A[i]"))
+    st.add_memlet_path(jb, m, t, dst_conn="_j", memlet=dace.Memlet("jb[0]"))   # a READ of the container
+    st.add_memlet_path(t, mx, w, src_conn="_o", memlet=dace.Memlet("A[i]"))
+    assert "jb" in bake.graph_runtime_syms(sdfg)
+    assert "jb" not in bake.bake_scalars(sdfg)
