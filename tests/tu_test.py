@@ -203,3 +203,69 @@ def test_aliases_is_empty_for_a_routine_with_no_pure_renames():
     """The falsifying control for the test above: the map comes from a SCAN, so an empty answer has to
     be reachable rather than being what a broken scan always returns."""
     assert tu.aliases_of("subroutine s\n  x = 1\nend subroutine\n") == {}
+
+
+# ---------------------------------------------------------------------------------------------------
+# The mechanical half: turning the source's own accesses into dummies, and reading a copy's
+# subscripts.  Both take the ACCESS IDIOM as a parameter -- it is a property of the code being
+# ported, and assuming one project's spelling is the one thing this module must not do.
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_dummies_binds_every_component_access_and_keeps_the_subscripts():
+    dummies, subst = tu.dummies(["oa(c, b, a) = qa%vf(i)%sf(c, b, a)"])
+    assert [d for d, _, _ in dummies] == ["a1", "a2"]
+    assert subst["qa%vf(i)"] == "a1" and subst["oa"] == "a2"
+    # the SUBSCRIPTS stay verbatim -- rewriting them is where arithmetic gets composed by accident
+    assert dummies[0][1] == 3 and dummies[1][1] == 3
+
+
+def test_dummies_also_binds_a_PLAIN_module_array():
+    """The component idiom is not the only way Fortran reads memory.  MEASURED: a shape that divides by
+    a coordinate spacing carried as a module array reached the compiler undeclared -- `Function 'y_cc'
+    at (1) has no IMPLICIT type` -- because the component pattern never saw it."""
+    dummies, subst = tu.dummies(["oa(c, b, a) = qa%sf(c, b, a) / y_cc(b)"])
+    assert "y_cc" in subst and dummies[2][1] == 1
+
+
+def test_dummies_does_not_bind_the_INNER_part_of_a_component_chain():
+    """`q%vf(i)%sf(...)` contains `q%vf(i)`, which the plain-array pattern matches on its own; binding
+    it too gives the SAME array two dummies of different ranks, and the two units then disagree about
+    which is which (`Rank mismatch in argument 'a5'`)."""
+    _, subst = tu.dummies(["oa(c, b, a) = q%vf(i)%sf(c, b, a)"])
+    assert set(subst) == {"q%vf(i)", "oa"}
+
+
+def test_dummies_skips_intrinsics_and_keywords():
+    _, subst = tu.dummies(["oa(c, b, a) = max(size(qa%sf(c, b, a), 1), 2)"])
+    assert "max" not in subst and "size" not in subst
+
+
+def test_the_access_idiom_is_a_PARAMETER():
+    """Asserted with a spelling that is NOT the default: if the idiom were baked in, this would find
+    nothing and return an empty binding -- which is exactly the silent failure mode."""
+    dummies, subst = tu.dummies(["oa(c) = qa%field(c)"], access="%field")
+    assert subst["qa"] == "a1" and len(dummies) == 2
+    # ... and with the default, the COMPONENT access is missed while the PLAIN one is still found --
+    # which is the two passes behaving independently, and the reason this shows up as a missing
+    # substitution rather than as an empty result.
+    _, default = tu.dummies(["oa(c) = qa%field(c)"])
+    assert "qa" not in default and default["oa"] == "a1"
+
+
+def test_subscripts_splits_on_the_MATCHING_paren_not_the_first_comma():
+    """A naive `split(',')` cuts `m - (j - 1)` in half, and the cut expression parses as a DIFFERENT
+    affine function rather than failing."""
+    s = "qa%sf(m - (j - 1), k, l) = qb%sf(m - (j - 1), k, l)"
+    assert tu.subscripts(s, 1) == ("m - (j - 1)", "m - (j - 1)")
+    assert tu.subscripts(s, 2) == ("k", "k")
+    assert tu.subscripts(s, 3) == ("l", "l")
+
+
+def test_subscripts_refuses_what_it_cannot_read_rather_than_returning_a_fragment():
+    with pytest.raises(tu.NotAnAccess, match="not an assignment"):
+        tu.subscripts("qa%sf(1, 2, 3)", 1)
+    with pytest.raises(tu.NotAnAccess, match="no `%sf\\(` access"):
+        tu.subscripts("oa(1, 2, 3) = qb(1, 2, 3)", 1)
+    with pytest.raises(tu.NotAnAccess, match="wanted 4"):
+        tu.subscripts("qa%sf(1, 2, 3) = qb%sf(1, 2, 3)", 4)

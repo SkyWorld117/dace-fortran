@@ -34,7 +34,12 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from dace_fortran import discovery
 from dace_fortran.discovery import Shape
+# `from dace_fortran.extract import nest as _extract_nest` and not a plain `nest`: this module has its
+# own `nest` (the union-nest emitter), and a caller reading `nest(...)` in `arms_of` would have to
+# work out which one it got.
+from dace_fortran.extract import nest as _extract_nest
 
 Bounds = Tuple[str, str]
 
@@ -432,3 +437,172 @@ def aliases_of(scoped: str) -> Dict[str, str]:
             if m and m.group(1) != m.group(2):
                 pairs.append((m.group(1), m.group(2)))
     return alias_map(pairs)
+
+
+#: The component an array's storage is read through -- `%sf` in the code these were written against.
+#: IT IS A PARAMETER AND NOT A CONSTANT because it is a property of the CODE BEING PORTED: a project
+#: whose derived types spell the field differently gets the same machinery, and the one thing this
+#: module must not do is assume one project's spelling.
+ACCESS_DEFAULT = "%sf"
+
+
+class NotAnAccess(ValueError):
+    """The text is not an assignment through the access idiom, or its subscripts do not balance."""
+
+
+def subscripts(stmt: str, pos: int, access: str = ACCESS_DEFAULT) -> Tuple[str, str]:
+    """``(dst, src)`` -- the ``pos``-th subscript (1-based) of each side of a copy statement.
+
+    Paren-aware splitting, because the expressions carry parentheses of their own (`m - (j - 1)`) and
+    a naive `split(',')` would cut one in half -- and the cut expression would parse as a DIFFERENT
+    affine function rather than failing.
+    """
+    if "=" not in stmt:
+        raise NotAnAccess(f"not an assignment: {stmt!r}")
+    open_at = access + "("
+    lhs, rhs = stmt.split("=", 1)
+
+    def subs_of(side: str) -> str:
+        i = side.find(open_at)
+        if i < 0:
+            raise NotAnAccess(f"no `{open_at}` access in {side!r}")
+        depth, start = 1, i + len(open_at)
+        for j in range(start, len(side)):
+            if side[j] == "(":
+                depth += 1
+            elif side[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    body = side[start:j]
+                    break
+        else:
+            raise NotAnAccess(f"unbalanced parentheses in {side!r}")
+        parts, depth, cur = [], 0, ""
+        for ch in body:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if ch == "," and depth == 0:
+                parts.append(cur.strip())
+                cur = ""
+            else:
+                cur += ch
+        parts.append(cur.strip())
+        if len(parts) < pos:
+            raise NotAnAccess(f"access has {len(parts)} subscript(s), wanted {pos}: {side!r}")
+        return parts[pos - 1]
+
+    return subs_of(lhs), subs_of(rhs)
+
+
+# Names that look like a subscripted access and are not data.  Small on purpose: an emitter that
+# guessed would silently declare a function as an array, which fails at link time in a way that is
+# harder to read than a compile error.
+_NOT_DATA = {
+    "real", "mod", "min", "max", "abs", "sqrt", "exp", "log", "sin", "cos", "tan", "int", "nint",
+    "if", "do", "end", "then", "write", "read", "open", "close", "size", "sum", "allocated",
+    "present", "trim", "reshape", "matmul", "sign", "dim", "epsilon", "huge", "tiny", "null",
+}
+
+
+def dummies(stmts: Sequence[str], access: str = ACCESS_DEFAULT):
+    """``([(dummy, rank, base)], {base: dummy})`` per distinct array ACCESS in ``stmts``.
+
+    Deliberately the weakest thing that can work, and it is worth saying what it is NOT: it does not
+    know that one gradient array is the level-2 x-gradient of the LEFT state, nor that an index is
+    momentum row 0.  Those names are what makes an emitted unit CALLABLE, and they are a binding
+    record -- a separate concern, and `dace_fortran.tu_bindings` is the module for it.
+
+    What this does establish is the property a compile-and-compare gate is about: the emitted nest is
+    FORTRAN THAT COMPILES, built from the source's own statements with no arithmetic composed
+    anywhere.  A substitution that guessed at meaning would be worse than none.
+    """
+    seen: Dict[str, str] = {}
+    out: List[Tuple[str, int, str]] = []
+
+    def add(base: str, rank: int) -> None:
+        if base not in seen:
+            seen[base] = f"a{len(seen) + 1}"
+            out.append((seen[base], rank, base))
+
+    comp = re.compile(r"([A-Za-z_]\w*(?:\([^)]*\))?(?:%\w+(?:\([^)]*\))?)*)"
+                      + re.escape(access) + r"\s*\(([^)]*)\)")
+    for st in stmts:
+        for m in comp.finditer(st):
+            add(m.group(1), len(m.group(2).split(",")))
+    # ... AND THE PLAIN ARRAYS.  The component idiom is not the only way Fortran reads memory: a
+    # shape may divide by a coordinate spacing that is a MODULE ARRAY, which the pattern above never
+    # sees and which therefore reaches the compiler undeclared -- "Function 'y_cc' at (1) has no
+    # IMPLICIT type", i.e. a unit that does not compile, which is exactly what this is for.
+    # Intrinsics and keywords are excluded by name; anything else with a subscript is data.
+    for st in stmts:
+        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", st):
+            name = m.group(1)
+            if name.lower() in _NOT_DATA:
+                continue
+            # ... but NOT the inner part of a `%`-chain: the component pass above already owns it,
+            # and adding it gives the SAME array two dummies of different ranks, so the two units then
+            # disagree about which is which (`Rank mismatch in argument 'a5'`).  A `%` before the name
+            # or after its closing paren means the component pass owns it.
+            if st[m.start() - 1:m.start()] == "%":
+                continue
+            depth, j = 0, m.end() - 1
+            while j < len(st):
+                if st[j] == "(":
+                    depth += 1
+                elif st[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if st[j + 1:j + 2] == "%":
+                continue
+            add(name, st[m.end():j].count(",") + 1)
+    return out, seen
+
+
+def arms_of(text: str, lines: Sequence[int], shape: Shape,
+            access: str = ACCESS_DEFAULT) -> List[dict]:
+    """Split a shape's nests into arms by the direction their difference points.
+
+    The arms of a stencil pair differ in ONE way: which way the stencil reads.  The L arm writes where
+    its reads reach DOWN (`c - 1`), the R arm where they reach UP (`c + 1`).  Reading that off the body
+    is the only sound way to pair them -- pairing by adjacency would mis-pair a family whose nests are
+    not stored L,R,L,R.
+
+    AXIS-FREE, AND THAT IS THE FIX RATHER THAN A SIMPLIFICATION.  This used to derive the difference
+    axis from the shape and look ONLY at that subscript position -- and `Shape.loops` can be SHORTER
+    than the nest, so a shape whose swept axis is the fourth loop has no letter, both flags stay
+    False, and every arm of it is classified `both/neither`: the group is refused.
+    MEASURED: `FLUX dim0: 2 nest(s) -> 0 down-arm, 0 up-arm` while its neighbouring nest of the same
+    shape and direction classified `1 down`.  A flux difference reads `f(k-1)` and `f(k)` -- one DOWN
+    and no UP -- so `0/0` could only mean the lookup found nothing.
+
+    So it asks the question directly: for each access, is the variable being shifted a LOOP OF THIS
+    NEST?  No shape mapping, no subscript position, and it reads `k_loop` and `k` alike.  ANCHORED to
+    the loop variables rather than a bare `[a-z]\\s*-\\s*1`, which matches identifiers and unrelated
+    expressions -- it found `d - 1` and `g + 1` inside array NAMES and reported every arm as "both".
+    """
+    out = []
+    for ln in lines:
+        body = _extract_nest(text, ln)
+        stmts = discovery.statements(body.split("\n"))
+        shift = discovery._difference_position(" ".join(stmts))
+        # WIDE on purpose, and NOT via `nest_bounds`: that one uses a single-letter class because it
+        # decides how a shape is RENDERED and it is shared by every family already validated.  This
+        # use is a CLASSIFICATION, so it can be as permissive as the source needs.
+        loopvars = {m.group(1) for ln in body.split("\n")
+                    for m in [re.match(r"\s*do\s+([a-z_]\w*)\s*=", ln)] if m}
+        minus = plus = False
+        for m in re.finditer(re.escape(access) + r"\s*\(([^)]*)\)", " ".join(stmts)):
+            for sub in (x.strip() for x in m.group(1).split(",")):
+                for v in loopvars:
+                    if re.search(rf"\b{re.escape(v)}\s*-\s*1\b", sub):
+                        minus = True
+                    if re.search(rf"\b{re.escape(v)}\s*\+\s*1\b", sub):
+                        plus = True
+        out.append({"line": ln, "body": body, "stmts": stmts, "dim": shift,
+                    "reaches": "down" if minus and not plus else ("up" if plus and not minus
+                                                                   else "both/neither")})
+    return out
