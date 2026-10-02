@@ -30,6 +30,12 @@ _LAZY = {
     "MULTI_FILE_PIPELINE": "dace_fortran.hlfir_to_sdfg",
     "preprocess_fortran_source": "dace_fortran.preprocess",
     "merge_used_modules": "dace_fortran.preprocess",
+    # Anti-vacuous extraction guards (python-only): refuse an empty-but-passing SDFG, an
+    # unresolved external CALL the build dropped, or an externalised call that hides arithmetic.
+    "assert_nonvacuous": "dace_fortran.vacuity",
+    "VacuityError": "dace_fortran.vacuity",
+    "compute_nodes": "dace_fortran.vacuity",
+    "external_call_names": "dace_fortran.vacuity",
     # fparser-based single-TU inliner (opt-in alternative to the regex merge_used_modules splicer).
     "inline_to_single_tu": "dace_fortran.fparser_inliner",
     "inline_to_ast": "dace_fortran.fparser_inliner",
