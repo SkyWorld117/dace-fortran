@@ -36,6 +36,17 @@
 //     anyway and the downstream chain dies in the AST builder's
 //     character handler.
 //
+//     It also erases write-only character-typed ``hlfir.assign`` stores
+//     (``errmsg = 'mp_wsm6_run OK'``) -- stores whose destination is never read
+//     afterwards.  Such a store has no numerical content but otherwise survives
+//     to ``buildAssignNode``, which reads the literal global
+//     (``_QQclX<hex>``) as a scalar operand and emits a broken tasklet
+//     (``KeyError '_QQclX<hex>'`` / ``SyntaxError: invalid decimal literal``).
+//     A store whose destination IS read (a local substring write read by a
+//     SELECT CASE, a character FUNCTION result read by the caller) is left
+//     alone: the destination-type test alone cannot tell them apart -- the
+//     errmsg dummy and the substring write share the exact type pair.
+//
 // Safety:
 //     - Pure deletion + result replacement; never synthesises an
 //       abort or a return.  Matches the bridge's existing
@@ -58,6 +69,7 @@
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Config/llvm-config.h"
@@ -184,6 +196,60 @@ mlir::Value makeReplacement(mlir::OpBuilder& builder, mlir::Location loc, mlir::
   return {};
 }
 
+/// Whether ``ty`` is a Fortran character value in storage position: a
+/// ``!fir.boxchar<1>`` dummy (character(len=*) intent(out)) or a reference /
+/// heap / pointer to a ``!fir.char<len,kind>`` (a literal-pool global or a
+/// local buffer).  Peels the pointer wrapper first so both spellings match.
+bool isCharacterValued(mlir::Type ty) {
+  ty = fir::unwrapRefType(ty);
+  return mlir::isa<fir::CharacterType, fir::BoxCharType>(ty);
+}
+
+/// Follow an assignment destination down its addressing chain
+/// (``hlfir.designate`` subscripts / sections, ``fir.convert`` casts) to the
+/// entity being written, recording every intermediate value in ``chain`` so a
+/// later use can be told apart from the store's own addressing path.
+mlir::Value assignedBase(mlir::Value dst, llvm::SmallPtrSetImpl<mlir::Value>& chain) {
+  chain.insert(dst);
+  for (int hop = 0; hop < 16; ++hop) {
+    if (auto designate = dst.getDefiningOp<hlfir::DesignateOp>()) {
+      dst = designate.getBase();
+    } else if (auto conv = dst.getDefiningOp<fir::ConvertOp>()) {
+      dst = conv.getValue();
+    } else {
+      break;
+    }
+    chain.insert(dst);
+  }
+  return dst;
+}
+
+/// Whether the destination memory of ``assign`` is READ anywhere besides this
+/// store.  ``hlfir.assign %src to %dst`` writes operand 1 (the destination);
+/// operand 0 is a read.  A use of the base entity is the store itself when it
+/// is this assign's own destination operand, and is addressing-only when its
+/// owner is a designate / convert whose result lies on the destination chain.
+/// Any other use (a load, an ``as_expr``, a ``fir.emboxchar`` return, a read
+/// designate, another assignment reading it as source, a call argument, ...)
+/// makes it a read.
+///
+/// This is the measured separator between the two shapes the destination-type
+/// test alone conflates: the ``errmsg`` dummy store and the ``cwhat(i:i) = ...``
+/// substring store are BOTH ``assign <char ref> to <boxchar>`` -- identical on
+/// types -- but the substring's base (``cwhat``) is read by the surrounding
+/// SELECT CASE while the write-only error dummy is not.
+bool destinationIsRead(hlfir::AssignOp assign) {
+  llvm::SmallPtrSet<mlir::Value, 8> chain;
+  mlir::Value const base = assignedBase(assign.getOperand(1), chain);
+  for (mlir::OpOperand& use : base.getUses()) {
+    mlir::Operation* const owner = use.getOwner();
+    if (owner == assign.getOperation() && use.getOperandNumber() == 1) continue;  // the store itself
+    if (owner->getNumResults() == 1 && chain.count(owner->getResult(0))) continue;  // addressing
+    return true;
+  }
+  return false;
+}
+
 #if LLVM_VERSION_MAJOR >= 22
 /// Value of ``pred`` when both operands compare equal, matching the LLVM 21 call path.
 bool cmpCharEqualResult(mlir::arith::CmpIPredicate pred) {
@@ -233,7 +299,8 @@ struct StripCharacterRuntimePass
   llvm::StringRef getArgument() const final { return "hlfir-strip-character-runtime"; }
   llvm::StringRef getDescription() const final {
     return "Delete fir.call ops to flang's _FortranACharacter* runtime "
-           "(string compare / Trim / Adjust / ...) -- the bridge's "
+           "(string compare / Trim / Adjust / ...) and WRITE-ONLY "
+           "character-typed hlfir.assign stores -- the bridge's "
            "numerical-equivalence contract does not model character data.";
   }
 
@@ -274,6 +341,46 @@ struct StripCharacterRuntimePass
     for (auto call : toErase) call->erase();
 
     LLVM_DEBUG(llvm::dbgs() << "StripCharacterRuntime: erased " << toErase.size() << " _FortranACharacter* call(s)\n");
+
+    // Erase character-typed ``hlfir.assign`` stores that are WRITE-ONLY error
+    // plumbing (``errmsg = 'mp_wsm6_run OK'``).  The destination dummy lowers to
+    // ``!fir.boxchar<1>`` and the RHS to a ``!fir.ref<!fir.char<1,N>>`` pointing
+    // at flang's literal-pool global (``_QQclX<hex>``).  Left alone, the store
+    // reaches ``buildAssignNode``, which treats the literal as a scalar LOAD and
+    // emits ``_out = _in__QQclX<hex>`` -- an access node for a global that is
+    // never registered as an SDFG array (``KeyError '_QQclX6B204F4B'``), or,
+    // when the name is longer, a tasklet whose RHS is the mangled name's byte
+    // tail (``_out = 204F4B`` -> ``SyntaxError: invalid decimal literal``).
+    // Error-message plumbing carries no arithmetic, so the documented behaviour
+    // is to DROP it outright -- never to synthesise a broken tasklet.
+    //
+    // The erasure is restricted to stores whose destination is NOT READ
+    // afterwards (``destinationIsRead``).  Erasing on the destination TYPE alone
+    // also removed live character data the surrounding code still reads, and
+    // which the bridge handled before this pass learned about assigns:
+    //   * ``cwhat(i:i) = capital(what(i:i))`` -- a local substring write whose
+    //     base is read by the following SELECT CASE (same assign type pair as
+    //     the errmsg dummy: ``<char ref> to <boxchar>``); and
+    //   * ``capital = upper(k:k)`` -- a character FUNCTION result the caller
+    //     reads through ``fir.emboxchar`` on return.
+    // Removing those erased a value out of the dataflow and later surfaced as
+    // ``KeyError '__al_0'`` in ``builder/emit_tasklet.py``.  The condition is
+    // re-evaluated to a fixpoint: dropping a write-only store can orphan the
+    // store that fed it (``errmsg = buf`` dropped, then the now-dead
+    // ``buf = 'scratch'``), and the newly-dead store must go too.
+    size_t erasedAssigns = 0;
+    for (bool changed = true; changed;) {
+      changed = false;
+      llvm::SmallVector<hlfir::AssignOp, 8> charAssigns;
+      module.walk([&](hlfir::AssignOp assign) {
+        if (isCharacterValued(assign.getOperand(1).getType()) && !destinationIsRead(assign))
+          charAssigns.push_back(assign);
+      });
+      for (auto assign : charAssigns) assign->erase();
+      erasedAssigns += charAssigns.size();
+      changed = !charAssigns.empty();
+    }
+    LLVM_DEBUG(llvm::dbgs() << "StripCharacterRuntime: erased " << erasedAssigns << " write-only character hlfir.assign store(s)\n");
 
 #if LLVM_VERSION_MAJOR >= 22
     stripCmpChar(module, selection);
