@@ -150,7 +150,8 @@ def optimize(sdfg: SDFG,
              gpu: bool = False,
              gpu_block_size=None,
              force_inline: bool = False,
-             split_siblings: bool = False) -> SDFG:
+             split_siblings: bool = False,
+             permissive_ltm: bool = False) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
 
     :param sdfg: the SDFG to optimize (mutated in place).
@@ -170,6 +171,13 @@ def optimize(sdfg: SDFG,
                 ms/launch vs 5.40 us) on the source's natural one-loop-per-arm form.  A no-op unless
                 that form is present, so it cannot move a kernel written in the union form. NOT
                 generally sound -- enabled per kernel, paid for by that kernel's differential.
+    :param permissive_ltm: allow the PERMISSIVE ``LoopToMap`` escalation when the conservative
+                per-iteration affine-write check refuses every loop.  NOT generally sound and the
+                failure is SILENT: on the fused acoustic-substep window it restructured ~24 nests and
+                diverged wildly from stock, while conservative-only is byte-identical
+                (W9-localise).  Enabled per kernel, paid for by that kernel's bit-exact differential.
+                Off, a kernel the conservative check refuses fails loudly rather than being silently
+                restructured (see :mod:`dace_fortran.offload`).
     :param verify_inputs: call arguments to check numerics with once the pipeline is done. The
                           pre-optimization SDFG is snapshotted and both are run on these inputs,
                           requiring bit-identical results (:func:`verify_numerics`). Costs a
@@ -225,7 +233,8 @@ def optimize(sdfg: SDFG,
         from dace_fortran.offload import offload_device_resident
         sdfg, n_gpu, n_dev = offload_device_resident(sdfg, block_size=gpu_block_size,
                                                      force_inline=force_inline,
-                                                     split_siblings=split_siblings)
+                                                     split_siblings=split_siblings,
+                                                     permissive_ltm=permissive_ltm)
         print(f"[dace_fortran.optimize] gpu offload: {n_gpu} device map(s), {n_dev} device array(s)")
 
     if validate:

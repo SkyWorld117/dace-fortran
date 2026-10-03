@@ -24,25 +24,46 @@ from dace.sdfg import nodes
 from dace.sdfg.state import SDFGState
 
 
-def _mapify(sdfg):
+def _mapify(sdfg, permissive_ltm=False):
     """LoopToMap + MapCollapse at this level, then recurse into nested SDFGs.
 
     dp.optimize's LoopToMap runs on the top-level SDFG only: for the pack
     kernel it mapped just the outer loop while the spatial nest stayed
     control-flow inside a NestedSDFG - inlining that yields a serial tasklet
     and a GPU grid of nvar threads.  Mapping every level before inlining is
-    what lets the collapse produce one full-domain map."""
+    what lets the collapse produce one full-domain map.
+
+    ``permissive_ltm`` gates the PERMISSIVE ``LoopToMap`` escalation and is OFF by default, turned on
+    per kernel exactly like ``force_inline`` and ``split_siblings``.  The conservative check is
+    sufficient for every kernel whose loop bodies carry a per-iteration affine write (``a*i+b``,
+    ``|a| >= 1``); the escalation exists only for bodies that check refuses (MFC's scatter writes,
+    and a loop body living entirely inside a NestedSDFG whose connector memlet is the loop UNION).
+
+    IT IS NOT SOUND IN GENERAL, AND THE FAILURE IS SILENT.  Measured (W9-localise, 2026-10-03): on
+    the fused acoustic-substep window the conservative ``LoopToMap`` fires ZERO times while the
+    permissive escalation restructures ~24 nests (52 -> 28 maps), and the resulting dataflow is not
+    arithmetically equivalent to the stock sequence -- running it reproduces the shipped GPU
+    kernel's wild divergence (``t_2``/``ph`` maxrel ~ 2).  With only this escalation disabled the
+    window is byte-identical to stock (``wrfout_d01`` md5 ``b18a9d02c0cfa8c72ee41f1bf52fe445``).
+    The escalation had no per-kernel bit-exact differential behind it; per the pass's own contract
+    it must have one, and defaulting to conservative-only is the safe half of that contract.
+
+    So: conservative only by default.  A kernel whose loops the conservative check refuses keeps
+    those loops as control flow and, if it then has no map to schedule, ``offload_device_resident``
+    FAILS LOUDLY (see the ``n_gpu == 0`` guard) -- loud failure beats a silently restructured, wrong
+    kernel.  A caller that has a differential for one kernel opts in with ``permissive_ltm=True``."""
     from dace.transformation.interstate.loop_to_map import LoopToMap
     from dace.transformation.dataflow import MapCollapse
 
     def _apply_ltm(sdfg):
-        """LoopToMap, escalating to permissive when the conservative checks
-        refuse.  The main refusal for MFC's kernels: a loop body that lives
-        entirely inside a NestedSDFG carries a loop-UNION subset on the
-        connector memlet, so the per-iteration affine write check sees no
-        iterator and refuses.  MFC's scatter writes (r = ...; buf(r) = ...)
-        are per-iteration-unique by construction; unsoundness would be caught
-        by the mandatory per-kernel bit-exact differential downstream."""
+        """LoopToMap, escalating to permissive only when the caller opted in.
+
+        The main refusal for MFC's kernels: a loop body that lives entirely inside a NestedSDFG
+        carries a loop-UNION subset on the connector memlet, so the per-iteration affine write check
+        sees no iterator and refuses.  MFC's scatter writes (r = ...; buf(r) = ...) are
+        per-iteration-unique by construction; but that is a claim about MFC, and the W9 window
+        (which is not a scatter kernel) is the measured counterexample, so the escalation is opt-in
+        and must be paid for by a per-kernel bit-exact differential downstream."""
         from dace.sdfg import nodes as _nodes
 
         def _maps(s):
@@ -51,7 +72,7 @@ def _mapify(sdfg):
 
         before = _maps(sdfg)
         sdfg.apply_transformations_repeated(LoopToMap, validate=False)
-        if _maps(sdfg) == before:
+        if _maps(sdfg) == before and permissive_ltm:
             sdfg.apply_transformations_repeated(LoopToMap, validate=False,
                                                 permissive=True)
 
@@ -59,7 +80,7 @@ def _mapify(sdfg):
     for state in sdfg.all_states():
         for node in list(state.nodes()):
             if isinstance(node, nodes.NestedSDFG):
-                _mapify(node.sdfg)
+                _mapify(node.sdfg, permissive_ltm=permissive_ltm)
     sdfg.apply_transformations_repeated(MapCollapse, validate=False)
 
 
@@ -233,7 +254,8 @@ def count_gpu(sdfg):
     return n_gpu, n_dev
 
 
-def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False):
+def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False,
+                            permissive_ltm=False):
     """Schedule + storage assignment for device-resident offload. In place.
 
     `force_inline` is OFF by default and must be turned on PER KERNEL, because it is not generally
@@ -248,12 +270,21 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     hand-written in the union form -- so turning it on cannot move them; it exists for the TUs the
     extractor emits from the source's own sibling form.  Turn it on per kernel, with that kernel's
     differential.
+
+    `permissive_ltm` is OFF by default and turned on PER KERNEL, for the same reason as the other two:
+    the permissive `LoopToMap` escalation is a STRUCTURAL rewrite with no conservative soundness
+    check behind it (see `_mapify`).  Measured (W9-localise): on the fused acoustic-substep window it
+    silently restructured ~24 nests and produced a kernel that diverges wildly from stock, while
+    conservative-only is byte-identical.  With it off, a kernel whose loops the conservative check
+    refuses stays correct (loops left as control flow) and, if it has no map left to schedule, fails
+    loudly at the `n_gpu == 0` guard below.  A caller with a per-kernel bit-exact differential may
+    opt in.
     """
     # 0a. Mapify every level, then inline the loop-body NestedSDFGs the
     #     frontend introduces: MapCollapse cannot fuse across the nested-SDFG
     #     boundary, and without fusion the GPU map would cover only the outer
     #     loop (sys_size/nvar threads) with the N^3 loops serial per thread.
-    _mapify(sdfg)
+    _mapify(sdfg, permissive_ltm=permissive_ltm)
     from dace.sdfg import utils as sutils
     sutils.inline_sdfgs(sdfg, permissive=True)
     if force_inline:
@@ -363,5 +394,14 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     n_gpu = sum(1 for st in sdfg.all_states() for nd in st.nodes()
                 if isinstance(nd, nodes.MapEntry) and nd.schedule == dace.dtypes.ScheduleType.GPU_Device)
     if n_gpu == 0:
-        raise RuntimeError("offload_device_resident: no top-level map found to schedule")
+        # Loud failure, deliberately: the alternative is the silent restructure the permissive
+        # LoopToMap escalation used to do (see `_mapify`).  When the conservative check refused every
+        # loop, the body may actually be mappable -- but proving that needs the permissive path and
+        # a per-kernel bit-exact differential, so it is the caller's explicit choice, not ours.
+        hint = ("" if permissive_ltm else
+                "; the conservative LoopToMap mapped nothing and the permissive escalation is OFF "
+                "-- if this kernel's loop bodies are refused by the conservative affine-write check, "
+                "opt in per kernel with permissive_ltm=True AND pay for it with that kernel's "
+                "bit-exact differential")
+        raise RuntimeError("offload_device_resident: no top-level map found to schedule" + hint)
     return sdfg, n_gpu, n_dev
