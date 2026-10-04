@@ -52,6 +52,7 @@ from dace_fortran.builder.descriptors import (
     add_descriptors,
     auto_declare_synth,
     dt,
+    emit_declare_scalar,
     emit_declare_transient,
     sdfg_name,
 )
@@ -1909,6 +1910,7 @@ class SDFGBuilder:
         "break": emit_break,
         "return": emit_return,
         "declare_transient": emit_declare_transient,
+        "declare_scalar": emit_declare_scalar,
         "symbol_init": emit_symbol_init,
     }
 

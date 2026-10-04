@@ -29,6 +29,11 @@ std::vector<ASTNode> buildReductionAssignNodes(hlfir::AssignOp assign, mlir::Ope
 std::vector<ASTNode> buildSectionReduceAssign(hlfir::AssignOp assign, hlfir::DesignateOp src, std::string_view pyOp,
                                               std::string_view identity);
 
+/// ``target = MAXLOC/MINLOC(src(lo:hi), 1)`` over a dynamically-bounded section -> explicit counted loop with a
+/// running extremum + position (index-returning analogue of buildSectionReduceAssign).  Empty vector = not covered
+/// (multi-dim section, mask=, back=.true., dim != 1), so the caller falls back to the libcall path.
+std::vector<ASTNode> buildSectionLocAssign(hlfir::AssignOp assign, mlir::Operation* locOp, bool isMax);
+
 std::vector<ASTNode> buildSectionScalarAssign(hlfir::AssignOp assign, hlfir::DesignateOp dst);
 
 std::vector<ASTNode> buildSectionToSectionAssign(hlfir::AssignOp assign, mlir::Value dst);

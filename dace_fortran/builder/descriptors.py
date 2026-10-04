@@ -42,7 +42,7 @@ _MEMBER_REF_EXPR = re.compile(r"[A-Za-z_]\w*(?:\s*%\s*[A-Za-z_]\w*)+(?:\[[^\]]*\
 #: heuristic), which drops their store and no-ops the loop.  Not Fortran-derived
 #: flat member names (those never start with ``__``), so excluding them narrows
 #: the alias heuristic to its real domain rather than special-casing.
-_SYNTH_SCALAR_PREFIXES = ("__sc_", "__al_", "__brk_", "__brkc_")
+_SYNTH_SCALAR_PREFIXES = ("__sc_", "__al_", "__brk_", "__brkc_", "__loc_")
 
 
 def _is_synth_scalar(name: str) -> bool:
@@ -1167,6 +1167,30 @@ def declare_synth_array(builder, name: str, shape, dtype: str, ctx):
         if sym_name not in ctx.sdfg.symbols:
             ctx.sdfg.add_symbol(sym_name, dace.int64)
         builder.offset_values[sym_name] = 1
+
+
+def emit_declare_scalar(builder, ctx, n, region):
+    """Handler for ASTNode kind=\"declare_scalar\".
+
+    Mints a true ``dace.data.Scalar`` transient (``n.expr`` = dtype string)
+    and registers it in BOTH ``ctx.sdfg`` and the real ``builder.scalars``
+    dict.  ``emit_tasklet`` classifies scalar tokens from ``builder.scalars``
+    (using single ``_in_<name>`` connectors and ``subset='0'`` memlets), so a
+    bridge-synthesised accumulator that must live across tasklets within a
+    loop -- the index-returning reduction's running extremum/position -- has
+    to land there, not in ``builder.arrays`` (a ``declare_transient`` scalar
+    goes to ``builder.arrays`` only and would be mis-classified as an array).
+    No-op if the name already exists.
+    """
+    name = n.target
+    if name in builder.scalars or name in builder.symbols:
+        return
+    dtype = n.expr or "int32"
+    v = SimpleNamespace(fortran_name=name, intent='', dtype=dtype, rank=0,
+                        is_dynamic=False, role='scalar', shape_symbols=[], lower_bounds=[])
+    builder.scalars[name] = v
+    if name not in ctx.sdfg.arrays:
+        ctx.sdfg.add_scalar(name, dtype=dt(dtype), transient=True)
 
 
 def emit_declare_transient(builder, ctx, n, region):

@@ -254,6 +254,34 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
             continue;
           }
         }
+        // Index-returning reductions (``MAXLOC``/``MINLOC``) as a direct RHS inside a do-while body.
+        // The structured dispatch routes these through buildSectionLocAssign (dynamic section) or the
+        // ArgMin/ArgMax libcall; this walker must do the same, else they strand as ``?`` and the
+        // enclosing emit_tasklet aborts (Grell-Freitas ``ktopdby(i)=maxloc(dby(:),1)`` sits in a
+        // goto-formed do-while body).
+        {
+          mlir::Value peeled = src;
+          while (auto* pdef = peeled.getDefiningOp())
+            if (auto cv = mlir::dyn_cast<fir::ConvertOp>(pdef)) {
+              peeled = cv.getValue();
+              continue;
+            } else {
+              break;
+            }
+          if (auto* psd = peeled.getDefiningOp()) {
+            auto nm = psd->getName().getStringRef();
+            if (nm == "hlfir.minloc" || nm == "hlfir.maxloc") {
+              bool const isMax = (nm == "hlfir.maxloc");
+              auto locBuilt = buildSectionLocAssign(assign, psd, isMax);
+              if (!locBuilt.empty()) {
+                for (auto& n : locBuilt) out.push_back(std::move(n));
+                continue;
+              }
+              out.push_back(buildLibCallNode(assign, psd, isMax ? "argmax" : "argmin"));
+              continue;
+            }
+          }
+        }
       }
       if (dst_is_array && src_is_array) {
         out.push_back(buildCopyNode(assign));
@@ -2929,6 +2957,18 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
                     break;
                   }
                 }
+              }
+            }
+            // Dynamic-section MINLOC/MAXLOC: the ArgMin/ArgMax libcall cannot express an array-element read as a
+            // section bound (illegal memlet grammar) nor expand a symbolic extent (``argminmax.py`` does
+            // ``int(shape[dim])``). Lower to an explicit counted loop, mirroring the SUM/MAXVAL section reducer.
+            // Not covered -> empty vector -> the libcall path below runs unchanged.
+            if (e.op == "hlfir.minloc" || e.op == "hlfir.maxloc") {
+              auto locBuilt = buildSectionLocAssign(assign, sd, e.op == "hlfir.maxloc");
+              if (!locBuilt.empty()) {
+                for (auto& n : locBuilt) nodes.push_back(std::move(n));
+                libMatched = true;
+                break;
               }
             }
             // Libcall-over-elemental fix-up: when a libcall operand is an inline hlfir.elemental (e.g. transpose(1.0 -

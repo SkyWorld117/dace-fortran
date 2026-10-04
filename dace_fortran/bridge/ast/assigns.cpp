@@ -1950,4 +1950,243 @@ std::vector<ASTNode> buildSectionReduceAssign(hlfir::AssignOp assign, hlfir::Des
   return {init, current};
 }
 
+/// ``target = MAXLOC(src(lo:hi), dim)`` / ``MINLOC`` where ``src`` is a
+/// dynamically-bounded SECTION designate.  DaCe's ArgMax/ArgMin library
+/// nodes (a) need an array name + subset memlet, which cannot express an
+/// array-element read as a bound (``heo_cup[(i-1), 1:(kbmax[i]+2)]`` is not
+/// legal memlet grammar), and (b) cannot expand a symbolic-extent input
+/// (``argminmax.py`` does ``int(shape[dim])``).  The value reductions
+/// (SUM/MAXVAL/...) have a section lowering -- ``buildSectionReduceAssign`` --
+/// that loops explicitly over symbolic bounds with iterator-only memlets; the
+/// index-returning reductions had no analogue.  This is that analogue.
+///
+/// SCOPE (what this covers, and what it deliberately does NOT):
+///   * exactly ONE triplet dim over a rank-1 section result (the shape WRF's
+///     GF uses: ``maxloc(heo_cup(i, start:kbmax(i)+2), 1)``);
+///   * ``dim`` absent or constant 1 (the reduced dim); any other ``dim``
+///     returns {} so the caller falls back to the existing libcall path;
+///   * ``mask=`` absent, and ``back=`` absent or constant .false. (the
+///     default; first-occurrence semantics).  A mask or ``back=.true.``
+///     returns {} -- not covered here.
+/// Everything else returns an empty vector and the previous (libcall)
+/// lowering runs unchanged, so this is a strict extension.
+///
+/// Semantics: emit scalars ``ext`` (running extremum, element dtype),
+/// ``idx`` (running 1-based position within the section, 0 until seen),
+/// ``cnt`` (per-iteration position counter) and ``take`` (update flag), then
+/// a counted loop ``ar_0 = lo, hi``:
+///     take = 1 if (idx == 0) or (src > ext) else 0
+///     idx  = cnt if take else idx
+///     ext  = src if take else ext
+///     cnt  = cnt + 1
+/// followed by ``target = idx``.  The strict ``>`` keeps the FIRST maximum
+/// (Fortran's default BACK=.false.); the ``idx == 0`` term makes the first
+/// element always win (so a section of all -inf still yields index 1) and
+/// leaves ``idx`` at 0 for an empty section, matching Fortran's
+/// zero-size-result-is-zero rule.  The four sibling assigns are ordered by
+/// the existing WAR/WAW serialiser, so ``take``/``idx`` read the PREVIOUS
+/// iteration's ``ext``.
+std::vector<ASTNode> buildSectionLocAssign(hlfir::AssignOp assign, mlir::Operation* locOp, bool isMax) {
+  mlir::Value arrayVal, dimVal, maskVal, backVal;
+  if (auto o = mlir::dyn_cast<hlfir::MaxlocOp>(locOp)) {
+    arrayVal = o.getArray();
+    dimVal = o.getDim();
+    maskVal = o.getMask();
+    backVal = o.getBack();
+  } else if (auto o = mlir::dyn_cast<hlfir::MinlocOp>(locOp)) {
+    arrayVal = o.getArray();
+    dimVal = o.getDim();
+    maskVal = o.getMask();
+    backVal = o.getBack();
+  } else {
+    return {};
+  }
+  if (maskVal) return {};  // mask= not covered
+  if (dimVal) {
+    auto c = traceConstInt(dimVal);
+    if (!c || *c != 1) return {};  // only the sole (rank-1) dim
+  }
+  if (backVal) {
+    auto c = traceConstInt(backVal);
+    if (!c || *c != 0) return {};  // only back=.false.
+  }
+  while (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(arrayVal.getDefiningOp()))
+    arrayVal = cv.getValue();
+  auto src = mlir::dyn_cast_or_null<hlfir::DesignateOp>(arrayVal.getDefiningOp());
+  if (!src) return {};
+
+  auto triplets = src.getIsTriplet();
+  if (triplets.empty()) return {};
+  auto srcIndices = src.getIndices();
+
+  struct DimSpec {
+    bool isTriplet = false;
+    mlir::Value lo, hi, stride;
+    mlir::Value index;
+  };
+  std::vector<DimSpec> dims;
+  unsigned cursor = 0;
+  for (bool const t : triplets) {
+    DimSpec d;
+    d.isTriplet = t;
+    if (t) {
+      if (cursor + 3 > srcIndices.size()) return {};
+      d.lo = srcIndices[cursor++];
+      d.hi = srcIndices[cursor++];
+      d.stride = srcIndices[cursor++];
+    } else {
+      if (cursor + 1 > srcIndices.size()) return {};
+      d.index = srcIndices[cursor++];
+    }
+    dims.push_back(d);
+  }
+  unsigned sectionRank = 0;
+  for (auto& d : dims)
+    if (d.isTriplet) sectionRank++;
+  if (sectionRank != 1) return {};  // 1-D section only (covers the 2-D ``a(i, lo:hi)`` shape too)
+  // Only unit forward stride: a reverse/strided section needs the position/index relation reversed (not covered).
+  for (auto& d : dims) {
+    if (!d.isTriplet) continue;
+    auto s = traceConstInt(d.stride);
+    if (!s || *s != 1) return {};
+  }
+
+  // Resolve the loop bounds; a ``?`` means the bridge cannot render them, so
+  // let the libcall path produce its (loud) error instead of emitting ``?``.
+  std::string loopLo, loopHi;
+  for (auto& d : dims) {
+    if (!d.isTriplet) continue;
+    loopLo = buildIndexExpr(d.lo, 0);
+    loopHi = buildIndexExpr(d.hi, 0);
+  }
+  if (loopLo.empty() || loopHi.empty() || loopLo == "?" || loopHi == "?") return {};
+
+  // Element dtype (for the extremum accumulator's identity/type).
+  mlir::Type elemTy;
+  {
+    mlir::Type rty = src.getResult().getType();
+    if (auto box = mlir::dyn_cast<fir::BoxType>(rty)) rty = box.getEleTy();
+    if (auto seq = mlir::dyn_cast<fir::SequenceType>(rty)) elemTy = seq.getEleTy();
+  }
+  std::string const dtype = exprDtypeString(elemTy);
+
+  std::string const srcName = traceToDecl(src.getMemref());
+  if (srcName.empty()) return {};
+
+  // Target (``k22(i)``): element designate (array) or a bare scalar.
+  auto dst = assign.getOperand(1);
+  std::string tgtName;
+  hlfir::DesignateOp tgtDg;
+  if (auto* dd = dst.getDefiningOp()) tgtDg = mlir::dyn_cast<hlfir::DesignateOp>(dd);
+  if (tgtDg)
+    tgtName = traceToDecl(tgtDg.getMemref());
+  else
+    tgtName = traceToDecl(dst);
+  if (tgtName.empty()) return {};
+
+  AccessInfo tgtWrite;
+  tgtWrite.array_name = tgtName;
+  tgtWrite.is_write = true;
+  if (tgtDg) {
+    for (auto idx : tgtDg.getIndices()) {
+      auto nm = resolveIndex(idx);
+      tgtWrite.index_vars.push_back(nm.empty() ? "?" : nm);
+      tgtWrite.index_exprs.push_back(buildIndexExpr(idx, 0));
+    }
+  }
+  bool const tgtIsArray = !tgtWrite.index_vars.empty();
+
+  // Source read: iterator for the triplet dim, threaded original indices for
+  // the rest -- identical to buildSectionReduceAssign.
+  AccessInfo srcRead;
+  srcRead.array_name = srcName;
+  srcRead.is_read = true;
+  unsigned sectionIdx = 0;
+  for (auto& d : dims) {
+    if (d.isTriplet) {
+      srcRead.index_vars.push_back("ar_0");
+      srcRead.index_exprs.push_back("ar_0");
+      sectionIdx++;
+    } else {
+      auto nm = resolveIndex(d.index);
+      srcRead.index_vars.push_back(nm.empty() ? "?" : nm);
+      srcRead.index_exprs.push_back(buildIndexExpr(d.index, 0));
+    }
+  }
+
+  unsigned const id = (unsigned)kSynthTransientCounter++;
+  std::string const ext = "__loc_ext_" + std::to_string(id);
+  std::string const idxv = "__loc_idx_" + std::to_string(id);
+  std::string const cnt = "__loc_cnt_" + std::to_string(id);
+  std::string const take = "__loc_take_" + std::to_string(id);
+
+  std::vector<ASTNode> out;
+  auto declScalar = [&](const std::string& nm, const std::string& ty) {
+    ASTNode d;
+    d.kind = "declare_scalar";
+    d.target = nm;
+    d.expr = ty;
+    out.push_back(std::move(d));
+  };
+  declScalar(ext, dtype);
+  declScalar(idxv, "int32");
+  declScalar(cnt, "int32");
+  declScalar(take, "int32");
+
+  auto scalarInit = [&](const std::string& nm, const std::string& v) {
+    ASTNode a;
+    a.kind = "assign";
+    a.target = nm;
+    a.expr = v;
+    out.push_back(std::move(a));
+  };
+  scalarInit(idxv, "0");
+  scalarInit(ext, "0");
+  scalarInit(cnt, "1");
+
+  // Loop body (innermost nodes first; wrapped below).
+  ASTNode takeA;
+  takeA.kind = "assign";
+  takeA.target = take;
+  takeA.expr = "1 if ((" + idxv + " == 0) or (" + srcName + (isMax ? " > " : " < ") + ext + ")) else 0";
+  takeA.accesses.push_back(srcRead);
+
+  ASTNode idxA;
+  idxA.kind = "assign";
+  idxA.target = idxv;
+  idxA.expr = cnt + " if " + take + " else " + idxv;
+
+  ASTNode extA;
+  extA.kind = "assign";
+  extA.target = ext;
+  extA.expr = srcName + " if " + take + " else " + ext;
+  extA.accesses.push_back(srcRead);
+
+  ASTNode cntA;
+  cntA.kind = "assign";
+  cntA.target = cnt;
+  cntA.expr = cnt + " + 1";
+
+  ASTNode body;
+  body.kind = "loop";
+  body.loop_iter = "ar_0";
+  body.loop_lower_expr = loopLo;
+  body.loop_bound = loopHi;
+  body.children.push_back(std::move(takeA));
+  body.children.push_back(std::move(idxA));
+  body.children.push_back(std::move(extA));
+  body.children.push_back(std::move(cntA));
+  out.push_back(std::move(body));
+
+  ASTNode fin;
+  fin.kind = "assign";
+  fin.target = tgtName;
+  fin.target_is_array = tgtIsArray;
+  fin.expr = idxv;
+  fin.accesses.push_back(tgtWrite);
+  out.push_back(std::move(fin));
+
+  return out;
+}
+
 }  // namespace hlfir_bridge

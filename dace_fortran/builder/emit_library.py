@@ -202,6 +202,40 @@ def emit_libcall(builder, ctx, n, region):
     from dace_fortran.intrinsics import libnode_spec
     import dace.dtypes as dtypes
 
+    # Symbol target: the bridge promotes a local that drives a downstream array index to an SDFG
+    # *symbol* (closed-form memlet indices).  A symbol has no descriptor for a library node to
+    # write, so land the node in a fresh 1-element backing transient and assign the symbol from it
+    # afterwards -- the same pattern ``query_target``/``bind_query_symbol`` use for MPI query
+    # results (``k800 = minloc(abs(sec_deriv), 1)`` with ``k_inv_layers(i, k800)`` downstream).
+    if n.target not in ctx.sdfg.arrays and n.target in ctx.sdfg.symbols:
+        from types import SimpleNamespace
+        spec0 = libnode_spec(n.callee)
+        backing = f"__{n.target}_lib_{builder.nid()}"
+        if spec0 is not None and spec0.node_cls in ("ArgMin", "ArgMax", "CountLibraryNode"):
+            dtype = dtypes.int32  # Fortran MINLOC/MAXLOC/COUNT return default INTEGER
+        else:
+            dtype = ctx.sdfg.symbols[n.target]
+        if backing not in ctx.sdfg.arrays:
+            ctx.sdfg.add_array(backing, [1], dtype, transient=True)
+        sub = SimpleNamespace(
+            kind=getattr(n, 'kind', 'libcall'),
+            callee=n.callee,
+            target=backing,
+            target_is_array=False,
+            call_args=list(getattr(n, 'call_args', None) or []),
+            call_arg_subsets=list(getattr(n, 'call_arg_subsets', None) or []),
+            accesses=[],
+            reduce_axes=list(getattr(n, 'reduce_axes', None) or []),
+            options=dict(getattr(n, 'options', None) or {}),
+        )
+        emit_libcall(builder, ctx, sub, region)
+        ctx.flush(builder, region)
+        ctx.ensure(region)
+        nxt = region.add_state(f"post_lib_{n.target}_{builder.nid()}")
+        region.add_edge(ctx.cur, nxt, InterstateEdge(assignments={n.target: f"{backing}[0]"}))
+        ctx.cur = nxt
+        return
+
     state = ctx.flush_and_ensure(builder, region)
 
     # hlfir.matmul_transpose (C = MATMUL(TRANSPOSE(A), B)) -> MatMul(transA=True); transpose
