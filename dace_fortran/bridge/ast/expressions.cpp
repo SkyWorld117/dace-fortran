@@ -325,19 +325,33 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
     return raw;
   }
 
-  // Assumed-shape alias contribution: the callee's view-offset is 1
-  // (Fortran default for assumed-shape) but the resolved outer
-  // array's offset is the caller's lb.  Add ``(lb_outer - 1)`` so
-  // the memlet form gives the right element after specialise.
+  // Assumed-shape alias contribution.  The inlined callee's own view has a
+  // LOWER BOUND of its own: 1 for a bare assumed-shape dummy (the Fortran
+  // default), but something else for a callee dummy that declares an explicit
+  // bound (``dimension(0:1000)``, or ``dimension(0:)``, both of which stay
+  // boxes through ``hlfir-inline-all``).  The resolved outer array's offset is
+  // the CALLER's lb, so the callee iter ``i`` must be rebased by
+  // ``(lb_outer - lb_callee)`` for the final memlet
+  // ``(i + lb_outer - lb_callee) - offset_outer`` to collapse to
+  // ``i - lb_callee`` -- the callee view's storage offset.  Using the literal
+  // ``1`` here read one element low whenever the callee dummy declared a lower
+  // bound other than 1 (measured: ``tab(5)`` inside an inlined helper whose
+  // ``tab`` is ``dimension(0:1000)`` lowered to ``tab[4]``; the same access
+  // written inline -- where the callee/outer distinction does not arise --
+  // lowered correctly).
   auto declOp = mlir::dyn_cast<hlfir::DeclareOp>(defOp);
   if (!declOp) return raw;
   auto outer = asAssumedShapeAlias(declOp);
   if (!outer) return raw;
-  auto lbs = declareLowerBounds(outer);
-  if (dim >= lbs.size()) return raw;
-  auto const& lb = lbs[dim];
-  if (!lb) return raw;
-  int64_t const adjust = *lb - 1;
+  auto outerLbs = declareLowerBounds(outer);
+  if (dim >= outerLbs.size()) return raw;
+  auto const& outerLb = outerLbs[dim];
+  if (!outerLb) return raw;
+  // The callee (inlined alias) view's lower bound, per dim; Fortran default 1
+  // when the declare carries no per-dim bound (bare assumed-shape).
+  auto calleeLbs = declareLowerBounds(declOp);
+  int64_t const lbCallee = (dim < calleeLbs.size() && calleeLbs[dim]) ? *calleeLbs[dim] : 1;
+  int64_t const adjust = *outerLb - lbCallee;
   if (adjust == 0) return raw;
   if (adjust > 0) return "(" + raw + " + " + std::to_string(adjust) + ")";
   return "(" + raw + " - " + std::to_string(-adjust) + ")";
