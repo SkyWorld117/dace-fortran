@@ -88,3 +88,23 @@ def test_minloc_back_recognised(tmp_path):
     nodes = _find_lib_nodes(sdfg, "ArgMin")
     assert len(nodes) == 1
     assert nodes[0].back is True
+
+
+def test_maxloc_as_expression_operand_lifted(tmp_path):
+    """``idx = MAXLOC(arr, 1) + 1`` -> the nested MAXLOC is lifted to a
+    scalar temp by ``hlfir-lift-reduction-operands``, then emitted as a
+    top-level ArgMax libcall; the consuming ``+ 1`` reads a scalar load.
+
+    Without the lift ``buildExpr`` strands ``?`` and the tasklet body
+    ``(_ + 1)`` cannot be parsed (WRF Grell-Freitas ``k22(i) =
+    MAXLOC(heo_cup(i, start:kbmax+2), 1) + start - 1``)."""
+    sdfg = _build("maxloc_expr_operand_probe.f90", "maxloc_expr_operand", tmp_path)
+    nodes = _find_lib_nodes(sdfg, "ArgMax")
+    assert len(nodes) == 1, f"expected one ArgMax lib node, got {len(nodes)}"
+
+
+def test_minloc_as_expression_operand_lifted(tmp_path):
+    """``idx = MINLOC(arr, 1) - 1`` -> nested MINLOC lifted to ArgMin."""
+    sdfg = _build("minloc_expr_operand_probe.f90", "minloc_expr_operand", tmp_path)
+    nodes = _find_lib_nodes(sdfg, "ArgMin")
+    assert len(nodes) == 1, f"expected one ArgMin lib node, got {len(nodes)}"

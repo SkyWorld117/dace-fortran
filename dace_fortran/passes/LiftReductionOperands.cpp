@@ -77,9 +77,20 @@ namespace {
 /// ``buildExpr`` cannot render inline.  ``hlfir.count`` is excluded  --
 /// the dispatcher routes it through ``CountLibraryNode`` which handles
 /// inline use via the libcall emit path.
+///
+/// ``hlfir.minloc`` / ``hlfir.maxloc`` are included: like the value
+/// reductions they map to a scalar (or index-vector) result that
+/// ``buildExpr`` has no handler for, and the dispatcher's
+/// ``kLibTable`` (``hlfir.minloc`` -> argmin, ``hlfir.maxloc`` ->
+/// argmax) already renders the top-level form.  Without the lift,
+/// ``k22(i) = MAXLOC(slice, 1) + start_k22 - 1`` strands a ``?`` in
+/// the tasklet body.  The lift turns it into ``_QQred_lift_N =
+/// MAXLOC(slice, 1)`` (a top-level assign the ArgMin/ArgMax libcall
+/// path consumes) plus a scalar load in the consuming expression.
 bool isReductionOp(mlir::Operation* op) {
   if (!op) return false;
-  return mlir::isa<hlfir::SumOp, hlfir::ProductOp, hlfir::MinvalOp, hlfir::MaxvalOp, hlfir::AnyOp, hlfir::AllOp>(op);
+  return mlir::isa<hlfir::SumOp, hlfir::ProductOp, hlfir::MinvalOp, hlfir::MaxvalOp, hlfir::AnyOp, hlfir::AllOp,
+                   hlfir::MinlocOp, hlfir::MaxlocOp>(op);
 }
 
 /// True iff ``op`` is one of the dense-linalg intrinsics that the
