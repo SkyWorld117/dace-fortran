@@ -104,12 +104,28 @@ def external_call_names(sdfg) -> Set[str]:
 # ---------------------------------------------------------------------------------------------
 # Source inspection (a heuristic scanner -- see limits in assert_nonvacuous)
 # ---------------------------------------------------------------------------------------------
+# The ``(?!\s*end\b)`` guard is load-bearing: the loose return-type prefix ``(?:[\w()*,:\s]+\s+)?``
+# would otherwise swallow the leading ``end`` of ``end subroutine foo`` and read the END line as a
+# *definition* of ``foo`` -- incrementing depth instead of closing it, so a named-END source nests
+# forever.  (``endif``/``enddo`` are already rejected: ``end`` is not a word boundary inside them.)
+# The lookahead is anchored at ``^`` (not after ``\s*``) on purpose: a trailing ``\s*`` would
+# backtrack and let the guard slide past the ``end`` token, defeating it.
 _PROC_DEF = re.compile(
-    r"^\s*(?:(?:pure|impure|elemental|recursive|module|non_recursive)\s+)*"
+    r"^(?!\s*end\b)\s*(?:(?:pure|impure|elemental|recursive|module|non_recursive)\s+)*"
     r"(?:[\w()*,:\s]+\s+)?(subroutine|function)\s+([A-Za-z_]\w*)",
     re.IGNORECASE,
 )
-_PROC_END = re.compile(r"^\s*end\s*(subroutine|function)?\s*$", re.IGNORECASE)
+# An END statement closes a program unit.  The name after the keyword is OPTIONAL Fortran
+# (``END SUBROUTINE foo`` == ``END SUBROUTINE``); before this fix the regex required the
+# keyword and name to be ABSENT (``^\s*end\s*(subroutine|function)?\s*$``), so a source that
+# writes every procedure's name on its END -- as the WRF/WPS slices do -- never closed a level
+# and ``defined_procedures`` returned only the first (outermost) name.  A bare ``END`` still
+# matches.  ``END DO`` / ``END IF`` / ``END WHERE`` do NOT: the alternation requires one of the
+# program-unit keywords, and those loop/construct ends are not in it.
+_PROC_END = re.compile(
+    r"^\s*end\s*(?:(?:subroutine|function|module|program|block(?:\s+data)?)\b\s*(?:\w+)?)?\s*$",
+    re.IGNORECASE,
+)
 _CALL_SITE = re.compile(r"\bcall\s+([A-Za-z_]\w*)", re.IGNORECASE)
 _COMMENT = re.compile(r"!.*$")
 _STRING = re.compile(r"'[^']*'|\"[^\"]*\"")
