@@ -33,6 +33,35 @@ end subroutine
     np.testing.assert_allclose(out, [np.sinh(0.7), np.cosh(0.7), np.tanh(0.7)], rtol=1e-12)
 
 
+def test_gamma_log_gamma(tmp_path: Path):
+    """gamma / log_gamma -- flang lowers GAMMA to ``fir.call @tgamma[f]`` and
+    LOG_GAMMA to ``lgamma[f]``; the bridge maps both kinds onto ``tgamma`` /
+    ``lgamma``, which C++ codegen rewrites to ``dace::math::tgamma`` /
+    ``dace::math::lgamma`` (float overloads)."""
+    import math
+    src = """
+subroutine probe(x, out8, out4)
+  real(8), intent(in)  :: x
+  real(8), intent(out) :: out8(2)
+  real(4), intent(out) :: out4(2)
+  real(4) :: x4
+  x4 = real(x, 4)
+  out8(1) = gamma(x)
+  out8(2) = log_gamma(x)
+  out4(1) = gamma(x4)
+  out4(2) = log_gamma(x4)
+end subroutine
+"""
+    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    v = 0.7
+    out8 = np.zeros(2, dtype=np.float64)
+    out4 = np.zeros(2, dtype=np.float32)
+    sdfg(x=v, out8=out8, out4=out4)
+    np.testing.assert_allclose(out8, [math.gamma(v), math.lgamma(v)], rtol=1e-12)
+    # real(4) goes through the float overloads; allow single-precision slack.
+    np.testing.assert_allclose(out4, [math.gamma(v), math.lgamma(v)], rtol=1e-5)
+
+
 def test_inverse_trig(tmp_path: Path):
     """asin / acos / atan / atan2."""
     src = """

@@ -1019,11 +1019,27 @@ def _stage_cond_scalar(builder, ctx, region, pre, sym, cond, cond_accesses):
                         shape_symbols=[],
                         lower_bounds=[]))
     pre = _anchor_views_referenced_in_expr(builder, cond, region, pre, ctx.sdfg)
+    synth = SimpleNamespace(kind='assign', target=sym, expr=cond, target_is_array=False, accesses=cond_accesses)
+    # Inline indirect index in the condition (``IF (zu(kbcon(i)) ...)``):
+    # mint the ``<arr>_at<gid>`` symbol(s) and materialise them on interstate
+    # edges BEFORE the condition tasklet, exactly like the assign path above
+    # (``emit_assign``).  Without this the condition tasklet's memlet subset
+    # carries a nested ``kbcon[...]`` bracket and DaCe's memlet-subset parser
+    # raises ``ValueError: too many values to unpack``.
+    indirect_syms = collect_indirect(builder, [synth])
+    if indirect_syms:
+        materialize_indirect_view_sources(builder, pre, indirect_syms)
+        for expr, isym in indirect_syms.items():
+            rhs = expr if '[' not in expr else _strip_dace_casts(indirect_to_dace(builder, expr, ctx.iter_map, indirect_syms))
+            if isym not in ctx.sdfg.symbols:
+                ctx.sdfg.add_symbol(isym, dace.int64)
+            st = region.add_state(f"sym_{isym}_{builder.nid()}")
+            region.add_edge(pre, st, InterstateEdge(assignments={isym: rhs}))
+            pre = st
     nxt = region.add_state(f"pre_{sym}")
     region.add_edge(pre, nxt, InterstateEdge())
     ctx.cur = nxt
-    synth = SimpleNamespace(kind='assign', target=sym, expr=cond, target_is_array=False, accesses=cond_accesses)
-    emit_tasklet(builder, nxt, synth, builder.nid(), ctx.iter_map)
+    emit_tasklet(builder, nxt, synth, builder.nid(), ctx.iter_map, indirect_syms or None)
     return nxt, sym
 
 

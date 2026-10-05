@@ -194,11 +194,32 @@ struct LiftReductionOperandsPass
 
     // Two-pass: collect first, mutate after  --  modifying the IR
     // mid-walk would invalidate iterators.
-    struct Job {
-      hlfir::AssignOp consumer;
-      mlir::Operation* redOp;
+    //
+    // The func to place the lifted temp in is derived from the reduction op
+    // itself (``getParentOfType<FuncOp>``); the consumer op is not needed.
+    llvm::SmallVector<mlir::Operation*, 16> jobs;
+    // A reduction reached from more than one consumer (e.g. an assign RHS
+    // and a loop bound) must be lifted once only.
+    llvm::SmallPtrSet<mlir::Operation*, 16> targeted;
+
+    auto addJob = [&](mlir::Operation* redOp) {
+      if (targeted.insert(redOp).second) jobs.push_back(redOp);
     };
-    llvm::SmallVector<Job, 16> jobs;
+
+    // Collect every liftable op feeding ``v``.  If ``v`` is itself the
+    // liftable op, add it directly; otherwise walk its feeders.
+    llvm::SmallVector<mlir::Operation*, 4> nested;
+    auto addFromValue = [&](mlir::Value v) {
+      auto* def = v ? v.getDefiningOp() : nullptr;
+      if (!def) return;
+      if (isLiftableOp(def)) {
+        addJob(def);
+        return;
+      }
+      nested.clear();
+      collectNestedLiftable(def, nested);
+      for (auto* r : nested) addJob(r);
+    };
 
     getOperation().walk([&](hlfir::AssignOp assign) {
       auto rhs = assign.getRhs();
@@ -206,12 +227,32 @@ struct LiftReductionOperandsPass
       if (!rhsOp) return;
       // If the RHS itself is a liftable op, the dispatcher already
       // handles it  --  leave alone.  Only lift NESTED ones.
-      llvm::SmallVector<mlir::Operation*, 4> nested;
-      collectNestedLiftable(rhsOp, nested);
-      for (auto* r : nested) jobs.push_back({assign, r});
+      llvm::SmallVector<mlir::Operation*, 4> localNested;
+      collectNestedLiftable(rhsOp, localNested);
+      for (auto* r : localNested) addJob(r);
     });
 
-    for (auto& job : jobs) lift(job.consumer, job.redOp, liftCounter);
+    // Reductions/linalg ops that feed a ``fir.do_loop`` bound/step/iter-arg
+    // or a scalar ``fir.store`` are NOT an ``hlfir.assign`` RHS, so the walk
+    // above misses them.  The bridge's ``buildIndexExpr`` / scalar-store
+    // expression renderer has no way to render an inline reduction either
+    // (a tasklet/index expression cannot hold a reduction), so they strand a
+    // ``?`` and the SDFG fails to build.  Lift them to a top-level temp
+    // assign exactly like the RHS case; the dispatcher's reduce/loc
+    // machinery then materialises them, and the loop bound / store reads a
+    // plain scalar load.
+    getOperation().walk([&](mlir::Operation* op) {
+      if (auto dl = mlir::dyn_cast<fir::DoLoopOp>(op)) {
+        addFromValue(dl.getLowerBound());
+        addFromValue(dl.getUpperBound());
+        addFromValue(dl.getStep());
+        for (auto a : dl.getIterOperands()) addFromValue(a);
+      } else if (auto st = mlir::dyn_cast<fir::StoreOp>(op)) {
+        addFromValue(st.getValue());
+      }
+    });
+
+    for (auto* redOp : jobs) lift(redOp, liftCounter);
   }
 
   /// Materialise a temp local for the liftable op's result, emit
@@ -221,9 +262,9 @@ struct LiftReductionOperandsPass
   /// results (``hlfir.matmul`` / ``transpose`` / dim-reduction)
   /// get a ``fir.alloca !fir.array<NxT>`` + ``hlfir.declare`` and
   /// uses are rewritten to the declare's box result.
-  void lift(hlfir::AssignOp consumer, mlir::Operation* redOp,
+  void lift(mlir::Operation* redOp,
             llvm::DenseMap<mlir::func::FuncOp, unsigned>& liftCounter) {
-    auto func = consumer->getParentOfType<mlir::func::FuncOp>();
+    auto func = redOp->getParentOfType<mlir::func::FuncOp>();
     if (!func) return;
     if (redOp->getNumResults() != 1) return;
     auto resTy = redOp->getResult(0).getType();
@@ -311,7 +352,7 @@ struct LiftReductionOperandsPass
         }
       }
       if (needsMaterialise) {
-        liftArrayResult(consumer, redOp, liftCounter, arrayRank, arrayEltTy);
+        liftArrayResult(redOp, liftCounter, arrayRank, arrayEltTy);
         return;
       }
       // A linalg result fed STRAIGHT into a bare arith op (no elemental, no
@@ -383,10 +424,10 @@ struct LiftReductionOperandsPass
   /// when the operand came from a normal Fortran-source array
   /// declaration -- so no per-consumer rewrite is needed beyond
   /// ``replaceAllUsesExcept``.
-  static void liftArrayResult(hlfir::AssignOp consumer, mlir::Operation* redOp,
+  static void liftArrayResult(mlir::Operation* redOp,
                               llvm::DenseMap<mlir::func::FuncOp, unsigned>& liftCounter, int64_t rank,
                               mlir::Type eltTy) {
-    auto func = consumer->getParentOfType<mlir::func::FuncOp>();
+    auto func = redOp->getParentOfType<mlir::func::FuncOp>();
     if (!func || rank <= 0 || !eltTy) return;
 
     unsigned const gid = liftCounter[func]++;

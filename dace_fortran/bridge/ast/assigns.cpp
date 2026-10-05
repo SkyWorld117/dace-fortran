@@ -1506,6 +1506,40 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
   }
   inner.accesses.push_back(std::move(wa));
 
+  // Also collect read accesses on the scalar RHS.  ``inner.expr`` is the
+  // rendered RHS string (e.g. ``c0t3d``), and Python ``emit_tasklet``
+  // rewrites every array-name occurrence to ``_in_<name>_<N>`` and creates
+  // one in-connector + memlet PER ``AccessInfo`` in ``inner.accesses``.
+  // Without read AccessInfos here the connector references in the rewritten
+  // code become dangling  --  DaCe's free-symbol analysis then treats the
+  // unbound ``_in_<name>_<N>`` token as an undefined symbol and SDFG
+  // construction fails with ``unresolved free symbol(s)``.  The RHS is a
+  // SCALAR expression (e.g. ``chem_pw = c0t3d(i,j)*dz*trash*zuo(i,j)``) whose
+  // array reads are element designates at fixed indices, so this mirrors the
+  // ``collectScalarRhsReads`` walker in ``buildSectionScalarAssign``.
+  std::function<void(mlir::Value, int)> collectScalarRhsReads = [&](mlir::Value v, int depth) {
+    if (depth > 40) return;
+    auto* op = v.getDefiningOp();
+    if (!op) return;
+    if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(op)) {
+      AccessInfo ra;
+      ra.array_name = traceToDecl(dg.getMemref());
+      ra.is_read = true;
+      unsigned di = 0;
+      for (auto idx : dg.getIndices()) {
+        auto n = resolveIndex(idx);
+        ra.index_vars.push_back(n.empty() ? "?" : n);
+        ra.index_exprs.push_back(buildDesignateIndexExpr(dg, di, idx, 0));
+        ++di;
+        collectScalarRhsReads(idx, depth + 1);
+      }
+      inner.accesses.push_back(std::move(ra));
+      return;
+    }
+    for (auto operand : op->getOperands()) collectScalarRhsReads(operand, depth + 1);
+  };
+  collectScalarRhsReads(assign.getOperand(0), 0);
+
   ASTNode current = inner;
   for (int i = (int)rank - 1; i >= 0; --i) {
     ASTNode wrap;

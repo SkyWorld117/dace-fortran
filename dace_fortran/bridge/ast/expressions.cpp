@@ -1231,6 +1231,31 @@ std::string buildExpr(mlir::Value val, int d) {
           {"clogf", "log"},
           {"csqrtf", "sqrt"},
           {"cabsf", "abs"},
+          // Fortran GAMMA / LOG_GAMMA.  ``GAMMA`` lowers to the C99
+          // runtime ``tgamma[f]`` (Flang emits ``fir.call @tgammaf``
+          // on the f32 path); ``LOG_GAMMA`` lowers to ``lgamma[f]``.
+          // The legacy BSD spelling ``gamma`` is accepted too.  All
+          // map onto the bare ``tgamma`` / ``lgamma`` identifiers,
+          // which DaCe's tasklet codegen rewrites to
+          // ``dace::math::tgamma`` / ``dace::math::lgamma`` (float
+          // overloads, so a real(4) argument is not computed in
+          // double and narrowed).
+          {"tgamma", "tgamma"},
+          {"tgammaf", "tgamma"},
+          {"gamma", "tgamma"},
+          {"gammaf", "tgamma"},
+          {"lgamma", "lgamma"},
+          {"lgammaf", "lgamma"},
+          {"log_gamma", "lgamma"},
+          {"log_gammaf", "lgamma"},
+          // Flang's runtime-library spellings of the same intrinsics
+          // (the ``_FortranA<Name>{4,8}`` convention), in case the
+          // math-to-runtime lowering picks the libm shim instead of
+          // the C99 name.
+          {"_FortranAGamma4", "tgamma"},
+          {"_FortranAGamma8", "tgamma"},
+          {"_FortranALogGamma4", "lgamma"},
+          {"_FortranALogGamma8", "lgamma"},
           // AINT / ANINT  --  same-kind real return, value-only round/trunc.
           {"llvm.trunc.f64", "trunc"},
           {"llvm.trunc.f32", "trunc"},
