@@ -1144,7 +1144,8 @@ def declare_synth_array(builder, name: str, shape, dtype: str, ctx):
     strides = _fortran_strides(dims) if len(dims) > 1 else None
     # Length-1 synthesised transient -> Scalar (same rule as the
     # outer add_descriptors path).  Better DaCe-pass compatibility.
-    if len(dims) == 1 and dims[0] == 1:
+    is_scalar_desc = len(dims) == 1 and dims[0] == 1
+    if is_scalar_desc:
         ctx.sdfg.add_scalar(name, dtype=dt(dtype), transient=True)
     else:
         ctx.sdfg.add_array(name, shape=dims, dtype=dt(dtype), transient=True, strides=strides)
@@ -1157,6 +1158,10 @@ def declare_synth_array(builder, name: str, shape, dtype: str, ctx):
         rank=len(shape),
         is_dynamic=False,
         role='array',
+        # Marks the descriptor as a true SDFG ``Scalar`` (not an Array) so the
+        # tasklet emitters read it as ``_in_<name>`` instead of an indexed array
+        # occurrence (see emit_tasklet._is_len1_synth_scalar).
+        is_synth_scalar=is_scalar_desc,
         shape_symbols=[str(s) for s in shape],
         lower_bounds=['1'] * len(shape),
     )

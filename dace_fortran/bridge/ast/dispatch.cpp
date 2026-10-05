@@ -1832,6 +1832,32 @@ static void materialiseCondReductions(mlir::Value condVal, std::vector<ASTNode>&
     for (auto operand : op->getOperands())
       if (auto* od = operand.getDefiningOp())
         if (seen.insert(od).second) worklist.push_back(od);
+
+    // A condition value can be the result of a structured IF: ``lift-cf-to-scf`` folds a loop's early-exit flag
+    // into an ``scf.if`` yield (``if (k <= last) then (compute; flag = .not. exit) else flag = 0``), and
+    // ``buildExpr`` inlines the yield operands as a Python ternary.  An ``scf.if`` RESULT is not an operand of
+    // the op, so the operand walk above never descends into its regions and a reduction nested in a yield operand
+    // (``if (dby(k) < dbythresh * MAXVAL(dby)) exit``) strands as ``?``.  Descend into every region's
+    // ``scf.yield`` operands, mirroring buildExpr's scf.if / scf.index_switch inlining.  The reduce lib-node the
+    // materialiser emits runs before the branch -- the reduction source is the loop-invariant array the guarded
+    // expression reads, so hoisting it out of the (side-effect-carrying) arm is value-preserving.
+    auto descendYieldOperands = [&](mlir::Region& region) {
+      if (region.empty()) return;
+      for (auto& inner : region.front()) {
+        auto y = mlir::dyn_cast<mlir::scf::YieldOp>(inner);
+        if (!y) continue;
+        for (auto ov : y.getOperands())
+          if (auto* od = ov.getDefiningOp())
+            if (seen.insert(od).second) worklist.push_back(od);
+      }
+    };
+    if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
+      descendYieldOperands(ifOp.getThenRegion());
+      descendYieldOperands(ifOp.getElseRegion());
+    } else if (auto swOp = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(op)) {
+      for (auto& cr : swOp.getCaseRegions()) descendYieldOperands(cr);
+      descendYieldOperands(swOp.getDefaultRegion());
+    }
   }
 }
 

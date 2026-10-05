@@ -236,3 +236,49 @@ def test_runtime_extent_section_materialises(tmp_path):
     out = np.zeros(n, dtype=np.float64)
     sdfg(n=np.int32(n), mm=np.int32(mm), arr=arr, out=out)
     assert out.tolist() == [1.0, 0.0, 1.0]
+
+
+# A do-loop early exit (``go to``) whose EXIT CONDITION carries a reduction.
+# lift-cf-to-scf folds the loop into an scf.while whose break flag is the
+# SECOND RESULT of an scf.if (``if (k <= last) then (compute; flag = .not. exit)
+# else flag = 0``).  The reduction is therefore only reachable by descending
+# into the scf.if's region yields -- NOT by walking operands (an scf.if's
+# results are not its operands).  This is the Grell-Freitas ``rates_up_pdf``
+# shape: ``if (dby(k) < dbythresh*MAXVAL(dby)) ... go to 412``.
+_EXIT_MAXVAL_SOURCE = """
+MODULE m
+  USE iso_fortran_env, ONLY: real64
+CONTAINS
+  SUBROUTINE exit_maxval(n, dby, dthresh, out)
+    INTEGER, INTENT(IN) :: n
+    REAL(real64), INTENT(IN) :: dby(n)
+    REAL(real64), INTENT(IN) :: dthresh
+    INTEGER, INTENT(OUT) :: out
+    INTEGER :: k
+    out = n
+    DO k = 1, n
+      IF (dby(k) < dthresh * MAXVAL(dby)) THEN
+        out = k - 1
+        GO TO 412
+      END IF
+    END DO
+412 CONTINUE
+  END SUBROUTINE exit_maxval
+END MODULE m
+"""
+
+
+def test_maxval_in_do_loop_exit_condition(tmp_path):
+    """MAXVAL nested in a do-loop EXIT condition (goto -> scf.if-mediated
+    scf.while break) materialises into a Reduce lib-node; the break continuation
+    reads the scalar and carries no ``?``; numerics match the Fortran exit."""
+    sdfg = _build(_EXIT_MAXVAL_SOURCE, tmp_path, "exit_maxval")
+    assert _reduce_nodes(sdfg), "exit-condition MAXVAL did not become a Reduce lib-node"
+    for value in _all_conditions(sdfg):
+        assert "?" not in value, f"exit-condition reduction left a ?-placeholder: {value!r}"
+    n = 5
+    dby = np.array([5.0, 4.0, 3.0, 2.0, 1.0], dtype=np.float64)  # max 5, thresh .5 -> first dby<2.5 is k=4
+    out = np.zeros(1, dtype=np.int32)  # scalar INTENT(OUT) is a length-1 array on the signature
+    sdfg(n=np.int32(n), dby=dby, dthresh=np.float64(0.5), out=out)
+    assert int(out[0]) == 3
+

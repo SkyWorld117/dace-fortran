@@ -36,6 +36,23 @@ def _is_len1_scalar_view(builder, nm: str) -> bool:
         and list(a.shape_symbols) == ['1']
 
 
+def _is_len1_synth_scalar(builder, nm: str) -> bool:
+    """True when ``nm`` is a length-1 transient minted by
+    ``descriptors.declare_synth_array`` (``__reduce_cond_N``, ``__allany_cond_N``, ...).
+
+    The helper registers such a name in ``builder.arrays`` (so lib nodes find it)
+    but creates a true SDFG ``Scalar`` for it (length-1 -> Scalar rule).  A tasklet
+    that reads it -- e.g. the array-dependent do-while break continuation
+    ``__brkc_N`` reading a condition-materialised ``__reduce_cond_N`` -- must
+    therefore wire it as ``_in_<nm>`` / ``<nm>[0]``; the array-occurrence branch
+    would emit an unwired ``_in_<nm>_0`` connector and strand the name as a free
+    symbol (a Scalar has no element to index).  ``is_synth_scalar`` is set at
+    declaration time, so genuine length-1 Arrays (intent-out / complex dummies)
+    are untouched."""
+    a = builder.arrays.get(nm)
+    return a is not None and getattr(a, 'is_synth_scalar', False)
+
+
 def _view_link_spec(builder, state, target: str):
     """Resolve ``(src, src_subset, view_subset)`` for a View ``target``'s source
     linking memlet, or ``None`` if not a View.  Normalises all three View flavours
@@ -189,6 +206,9 @@ def emit_tasklet(builder, state, assign_node, idx: int, iter_map: dict, indirect
     _len1_views = {nm for nm in r_arr if _is_len1_scalar_view(builder, nm)}
     r_arr -= _len1_views
     r_scl |= _len1_views
+    _synth_scl = {nm for nm in r_arr if _is_len1_synth_scalar(builder, nm)}
+    r_arr -= _synth_scl
+    r_scl |= _synth_scl
     target = assign_node.target
 
     # Index arrays (e.g. edge_idx) move onto the interstate edge as symbols, not connectors.
@@ -411,7 +431,8 @@ def emit_scalar_assign(builder, state, target: str, value: str):
     # ``nm != target`` was wrong: ``i = i + 1`` needs a read edge on target itself.
     reads = [
         nm for nm in sorted(tokens, key=len, reverse=True) if nm in builder.scalars
-        or _is_len1_scalar_view(builder, nm) or resolve_object_member(builder, nm) in builder.scalars
+        or _is_len1_scalar_view(builder, nm) or _is_len1_synth_scalar(builder, nm)
+        or resolve_object_member(builder, nm) in builder.scalars
     ]
 
     code = value
@@ -490,6 +511,7 @@ def emit_complex_component_assign(builder, state, node, idx: int, iter_map: dict
     r_scl = tokens & set(builder.scalars)
     r_scl -= r_arr
     _len1_views = {nm for nm in r_arr if _is_len1_scalar_view(builder, nm)}
+    _len1_views |= {nm for nm in r_arr if _is_len1_synth_scalar(builder, nm)}
     r_arr -= _len1_views
     r_scl |= _len1_views
     r_arr.discard(name)
