@@ -74,3 +74,55 @@ def test_section_assign_numerical(tmp_path: Path, a, b, expected):
     sdfg(res=res, a=a, b=b)
     assert res.tolist() == expected, \
         f"res({a}:{b}) = 42 -> {res.tolist()}, expected {expected}"
+
+
+# A goto-formed loop lowers (lift-cf-to-scf) to ``scf.while``; the section assign lands in the
+# BEFORE region and is dispatched by ``walkSCFBeforeRegion``.  Without the section routing there,
+# ``buildAssignNode`` sees the raw ``hlfir.designate`` and ``expandDesignateChain`` expands the
+# innermost triplet ``(lo=-1,hi=m(i),stride=-1)`` as separate dims -- a rank-4 memlet on the rank-2
+# array ``res`` (Grell-Freitas ``hcot(i,1:start_level(i))=hkb(i)`` / ``cdd(i,1:jmin(i))=...``).
+_SECWHILE_SRC = """
+subroutine secwhile(res, m, n, k)
+  implicit none
+  integer, intent(in) :: n, k, m(n)
+  real(8), intent(inout) :: res(n, k)
+  integer :: i
+  i = 1
+10 continue
+  if (i > n) goto 30
+  if (m(i) > 0) res(i, 1:m(i)) = 3.0d0
+  i = i + 1
+  goto 10
+30 continue
+end subroutine
+"""
+
+
+def _find(node, kind, out):
+    if getattr(node, "kind", None) == kind:
+        out.append(node)
+    for c in getattr(node, "children", []) or []:
+        _find(c, kind, out)
+    return out
+
+
+def test_section_assign_in_while_before_region(tmp_path: Path):
+    """Section assign inside an ``scf.while`` body routes through ``buildSectionScalarAssign``.
+
+    Regression for the Grell-Freitas rank-4-memlet bug: the ``res(i,1:m(i))`` write must lower to a
+    rank-2 section loop (``as_0`` over ``1..m[i]`` with the scalar ``i`` dim), not a rank-4 memlet.
+    """
+    b = build_sdfg(_SECWHILE_SRC, tmp_path, name="secwhile")
+    whiles: list = []
+    for n in b.ast:
+        _find(n, "while", whiles)
+    assert len(whiles) == 1, f"expected one while node, got {[n.kind for n in b.ast]}"
+    loops = _find(whiles[0], "loop", [])
+    assert len(loops) == 1, f"expected one section loop under the while, got {len(loops)}"
+    assert loops[0].loop_iter == "as_0"
+    assert loops[0].loop_bound == "m[i]"
+    # Builds without an unresolved-offset failure (the rank-4 shape fabricated offset_*_d2/d3).
+    sdfg = b.build()
+    from dace_fortran.pipelines import optimize
+
+    optimize(sdfg, gpu=False, validate=False)

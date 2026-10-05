@@ -295,6 +295,21 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
           for (auto& sn : secNodes) out.push_back(std::move(sn));
         else
           out.push_back(buildMemsetNode(assign));
+      } else if (dst_is_array && !src_is_array) {
+        // Section-on-the-LHS scalar assign inside a do-while BEFORE region (``hcot(i,1:start_level(i)) = hkb(i)`` in
+        // Grell-Freitas). The structured assign dispatcher routes these through ``buildSectionScalarAssign`` (see the
+        // same guard below); this walker previously sent them straight to ``buildAssignNode``, whose LHS path calls
+        // ``expandDesignateChain`` on the raw section designate -- that walker expands the triplet ``(lo,hi,stride)``
+        // operands 1:1, yielding a rank-4 memlet on the rank-2 array and fabricating never-registered
+        // ``offset_<arr>_d2/d3`` symbols. Route to the section lowering instead. Strictly gated: with no section
+        // designate on the LHS the behaviour is byte-for-byte the old ``buildAssignNode`` fallback.
+        std::vector<ASTNode> secNodes;
+        if (auto sec = asSectionDesignate(dst)) secNodes = buildSectionScalarAssign(assign, sec);
+        if (!secNodes.empty()) {
+          for (auto& sn : secNodes) out.push_back(std::move(sn));
+        } else {
+          out.push_back(buildAssignNode(assign));
+        }
       } else {
         out.push_back(buildAssignNode(assign));
       }
