@@ -19,6 +19,8 @@ CPU-scheduled, so a device kernel needs the schedule/storage assignment below on
 sound (applied library-wide it made a real kernel produce NaN), so it is enabled per kernel and
 paid for by that kernel's differential gate.
 """
+import re
+
 import dace
 from dace.sdfg import nodes
 from dace.sdfg.state import SDFGState
@@ -376,7 +378,31 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     _seq_nested(sdfg)
 
     # 2. Device-resident storage for real arrays; scalars stay host.
+    #
+    # Then DEMOTE whatever the validator refuses, using it as the oracle.  Promoting every array to
+    # GPU_Global is wrong whenever an array is also touched by HOST code, and there is more than one
+    # way to be host-touched:
+    #
+    #   InvalidSDFGInterstateEdgeError: ... "kpbl" (StorageType.GPU_Global) in host code interstate
+    #       edge          -- a loop bound / branch condition (`do k = kpbl(i,j), kte`)
+    #   InvalidSDFGEdgeError: ... "brcr" is stored as StorageType.GPU_Global but accessed on host
+    #       (at state if_3) -- a scalar read in a host tasklet or a dynamic map range
+    #
+    # Hand-copying the validator's notion of "host" would be a second implementation of a rule that
+    # already exists, and the two would drift.  So ask it: promote everything, validate, and demote
+    # the container it names, until it is satisfied.  Correct by construction, and it terminates --
+    # each round removes one container from GPU_Global, and the set is finite.
+    #
+    # The cost is real and deliberate: a demoted array is host-resident, so DaCe inserts the
+    # host<->device movement at each use.  MEASURED on ysu_prod, because the obvious guess is wrong:
+    # all 83 demotions are the "accessed on host" kind, on 2-D (i,j) arrays (kpbl, brcr, hpbl, ...)
+    # read as scalars -- host-scheduled tasklets the lowering did not mapify -- and NOT the
+    # data-dependent loop bounds the interstate-edge arm exists for.  Rewriting the slice's
+    # `do k = kpbl(i,j), kte` as a masked static range moves the count by zero (83 -> 83).  So this
+    # demotion is the price of partial mapification in the lowering; the fix lives there, not in
+    # the slice.
     n_dev = 0
+    promoted = []
     for name, arr in sdfg.arrays.items():
         if arr.transient:
             continue
@@ -388,7 +414,30 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
             is_len1 = False
         if not is_len1:
             arr.storage = dace.dtypes.StorageType.GPU_Global
+            promoted.append(name)
             n_dev += 1
+
+    from dace.sdfg.validation import InvalidSDFGEdgeError, InvalidSDFGInterstateEdgeError
+    demoted = []
+    for _ in range(len(promoted) + 1):
+        try:
+            sdfg.validate()
+            break
+        except (InvalidSDFGEdgeError, InvalidSDFGInterstateEdgeError) as err:
+            # `.message`, never `str(err)`: the exception's __str__ can itself raise (it indexes
+            # a state's edges by a region id), so formatting is not a safe way to read a message.
+            msg = getattr(err, "message", "") or ""
+            m = re.search(r'data container "([^"]+)"|Data container "([^"]+)"', msg)
+            culprit = (m.group(1) or m.group(2)) if m else None
+            if culprit is None or culprit not in sdfg.arrays or culprit in demoted:
+                raise
+            sdfg.arrays[culprit].storage = dace.dtypes.StorageType.Default
+            demoted.append(culprit)
+            n_dev -= 1
+    else:
+        raise RuntimeError("offload: could not reach a valid graph by demoting containers")
+    if demoted:
+        print(f"[dace_fortran.offload] demoted {len(demoted)} array(s) to host storage: {demoted}")
 
     # 3. Scheduling validation: at least one GPU map, all GPU maps have device arrays.
     n_gpu = sum(1 for st in sdfg.all_states() for nd in st.nodes()
