@@ -214,6 +214,17 @@ def optimize(sdfg: SDFG,
     sdfg.simplify(validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)
 
+    # BEFORE loop2map: LoopToMap refuses any nest that writes a size-1 container, because its
+    # write-injectivity test can never match the subset "0" a scalar produces (verified on ysu_prod:
+    # 2833 of 2947 refusals).  Give each nest its own copy of the scalars it writes and reads --
+    # which the check then ignores entirely, since a container touched only inside one loop is not
+    # in `other_access_nodes`.  Only scalars whose value is provably dead on entry are split; see
+    # the module docstring for the liveness condition and why it is checked rather than assumed.
+    from dace_fortran.loop_scalar_fission import fission_loop_local_scalars
+    _fissioned = fission_loop_local_scalars(sdfg)
+    if _fissioned:
+        print(f"[dace_fortran.optimize] loop-local scalar fission: {len(_fissioned)} container(s)")
+
     sdfg.apply_transformations_repeated(LoopToMap, validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)
     # FullMapFusion: MapFusionVertical + MapFusionHorizontal run together to a fixed point, not just
