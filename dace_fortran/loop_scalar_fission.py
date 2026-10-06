@@ -202,6 +202,35 @@ def _touched_edges(sdfg: SDFG, name: str) -> List[ControlFlowRegion]:
     return hit
 
 
+_NAME_CACHE: Dict[str, frozenset] = {}
+
+
+def _names_in(cb) -> frozenset:
+    """Every identifier a CodeBlock actually names.
+
+    AST, not substring.  A substring test reads the ``t`` in ``int32(...)`` as the scalar ``t``:
+    measured on a two-line kernel, the loop condition ``... int32(...)`` made ``_mentions`` return
+    True and refused the very scalar the pass exists for.  It failed CLOSED, so it was never a
+    miscompile -- just a pass that quietly did nothing on short names.
+    """
+    src = getattr(cb, "as_string", "")
+    hit = _NAME_CACHE.get(src)
+    if hit is not None:
+        return hit
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return frozenset()
+    found = frozenset(
+        n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+    ) | frozenset(
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    )
+    _NAME_CACHE[src] = found
+    return found
+
+
 def _mentions(block, name: str) -> bool:
     """Whether a control-flow block's own condition/loop statements name ``name``.
 
@@ -211,11 +240,11 @@ def _mentions(block, name: str) -> bool:
     and cannot be treated as loop-local.
     """
     if isinstance(block, ConditionalBlock):
-        return any(c is not None and name in c.as_string for c, _ in block.branches)
+        return any(c is not None and name in _names_in(c) for c, _ in block.branches)
     if isinstance(block, LoopRegion):
         for attr in ("loop_condition", "init_statement", "update_statement"):
             v = getattr(block, attr, None)
-            if v is not None and name in getattr(v, "as_string", ""):
+            if v is not None and name in _names_in(v):
                 return True
     return False
 
