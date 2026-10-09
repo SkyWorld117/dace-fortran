@@ -233,6 +233,33 @@ std::string lowerIsPresent(mlir::Value operand) {
 ///      ``i`` needs ``(lb_outer - 1)`` added so the final memlet
 ///      ``(i + lb_outer - 1) - offset_outer_d0`` collapses to
 ///      ``i - 1`` after specialise (correct for the callee's view).
+mlir::Value declaredLowerBound(hlfir::DeclareOp decl, unsigned dim) {
+  mlir::Value const shape = decl.getShape();
+  if (!shape) return {};
+  if (auto shapeShift = shape.getDefiningOp<fir::ShapeShiftOp>()) {
+    auto origins = shapeShift.getOrigins();  // a fresh vector per call
+    return dim < origins.size() ? origins[dim] : mlir::Value{};
+  }
+  if (auto shift = shape.getDefiningOp<fir::ShiftOp>()) {
+    auto origins = shift.getOrigins();
+    return dim < origins.size() ? origins[dim] : mlir::Value{};
+  }
+  return {};
+}
+
+std::string fortranIndexAt(const std::string& pos, mlir::Value lb, int depth) {
+  if (!lb) return pos;
+  if (auto c = traceConstInt(lb)) {
+    int64_t const adjust = *c - 1;
+    if (adjust > 0) return "(" + pos + " + " + std::to_string(adjust) + ")";
+    if (adjust < 0) return "(" + pos + " - " + std::to_string(-adjust) + ")";
+    return pos;
+  }
+  std::string const lbExpr = buildIndexExpr(lb, depth + 1);
+  if (lbExpr.empty() || lbExpr == "?") return "?";
+  return "(" + pos + " + " + lbExpr + " - 1)";
+}
+
 std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::Value idx, int depth) {
   std::string raw = buildIndexExpr(idx, depth);
   auto memref = dg.getMemref();
@@ -324,9 +351,10 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
     return raw;
   }
 
-  // Assumed-shape alias contribution: the callee's view-offset is 1
-  // (Fortran default for assumed-shape) but the resolved outer
-  // array's offset is the caller's lb.  Add ``(lb_outer - 1)`` so
+  // Inlined-callee alias contribution: the callee's subscripts are
+  // relative to its dummy's lower bound (1 by default for assumed
+  // shape; ``a(0:n)`` / ``a(0:)`` declare their own), the resolved outer
+  // array's offset is the caller's lb.  Add ``(lb_outer - lb_inner)`` so
   // the memlet form gives the right element after specialise.
   auto declOp = mlir::dyn_cast<hlfir::DeclareOp>(defOp);
   if (!declOp) return raw;
@@ -336,7 +364,16 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
   if (dim >= lbs.size()) return raw;
   auto const& lb = lbs[dim];
   if (!lb) return raw;
-  int64_t const adjust = *lb - 1;
+  int64_t adjust = *lb - 1;
+  if (mlir::Value const innerLb = declaredLowerBound(declOp, dim)) {
+    auto innerC = traceConstInt(innerLb);
+    if (!innerC) {
+      std::string const innerExpr = buildIndexExpr(innerLb, depth + 1);
+      if (innerExpr.empty() || innerExpr == "?") return "?";
+      return "(" + raw + " + " + std::to_string(*lb) + " - " + innerExpr + ")";
+    }
+    adjust = *lb - *innerC;
+  }
   if (adjust == 0) return raw;
   if (adjust > 0) return "(" + raw + " + " + std::to_string(adjust) + ")";
   return "(" + raw + " - " + std::to_string(-adjust) + ")";
