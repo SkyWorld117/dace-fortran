@@ -581,7 +581,7 @@ std::string allocAliasName(const std::string& fortran, unsigned site) {
   return fortran + "_alloc" + std::to_string(site);
 }
 
-static std::vector<std::string> resolveLowerBounds(hlfir::DeclareOp decl) {
+static std::vector<std::string> resolveLowerBounds(hlfir::DeclareOp decl, std::vector<ValueSymbol>* valueSyms) {
   std::vector<std::string> lbs;
 
   // ``hlfir-flatten-structs`` lb_hint: authoritative per-dim lower
@@ -610,12 +610,30 @@ static std::vector<std::string> resolveLowerBounds(hlfir::DeclareOp decl) {
   // an assumed-shape / pointer dummy declared with explicit local
   // bounds (``a(10:,20:)``) -- ``si.lbs`` holds them for both forms.
   for (auto lb : si.lbs) {
-    if (auto c = traceConstInt(lb))
+    if (auto c = traceConstInt(lb)) {
       lbs.push_back(std::to_string(*c));
-    else {
-      auto n = traceToDecl(lb);
-      lbs.push_back(n.empty() ? "?" : n);
+      continue;
     }
+    // A bound read from an array element (``a(lo(1):, ...)``, or a module record array's ``idx(1)%beg`` once lifted):
+    // ``traceToDecl`` would collapse it to the bare array name, which is no value.  Fortran evaluates a declared
+    // bound once at entry, like an automatic-array extent, so it becomes the same value-symbol the extents use,
+    // seeded from the element read.
+    if (auto el = constIndexedElementLoad(lb)) {
+      std::string const sym = posSymbolName(el->first, el->second);
+      std::string index;
+      for (auto i : el->second) index += (index.empty() ? "" : ",") + std::to_string(i);
+      if (valueSyms) valueSyms->push_back({sym, el->first, index});
+      lbs.push_back(sym);
+      continue;
+    }
+    if (auto ae = arrayElementExtent(lb)) {
+      std::string const sym = valueSymbolName(ae->first, ae->second);
+      if (valueSyms) valueSyms->push_back({sym, ae->first, ae->second});
+      lbs.push_back(sym);
+      continue;
+    }
+    auto n = traceToDecl(lb);
+    lbs.push_back(n.empty() ? "?" : n);
   }
   return lbs;
 }
@@ -2619,7 +2637,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
     }
 
     v.shape_symbols = resolveShapeSyms(op, value_symbols);
-    v.lower_bounds = resolveLowerBounds(op);
+    v.lower_bounds = resolveLowerBounds(op, value_symbols);
 
     // SequenceType-extent fallback: a declare with no ``fir.shape``
     // operand (e.g. one synthesised by ``hlfir-flatten-structs`` for
