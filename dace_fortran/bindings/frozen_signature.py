@@ -351,7 +351,8 @@ def refreeze(sdfg: SDFG) -> FrozenSignature:
     dropped_buffers = [
         a.sdfg_name
         for a in frozen.args
-        if a.kind not in _MAY_SHRINK and a.sdfg_name not in frozen.module_symbol_origins
+        if a.kind not in _MAY_SHRINK
+        and a.sdfg_name not in frozen.module_symbol_origins
         and a.sdfg_name not in live_arglist
     ]
     if dropped_buffers:
