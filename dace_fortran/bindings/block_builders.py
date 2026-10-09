@@ -214,7 +214,7 @@ def _dace_call_order(frozen: FrozenSignature, dace_arglist: Sequence[str]) -> li
     return [*frozen.args, *_free_sym_names(frozen)]
 
 
-def _module_arg_aliasable(a: FrozenArg) -> bool:
+def _module_arg_aliasable(a: FrozenArg, module_allocatables_are_targets: bool = True) -> bool:
     """True when an orphan module-global array can be zero-copy aliased via a
     ``pointer, contiguous`` local and ``X => X__mod`` instead of a deep copy.
 
@@ -222,6 +222,9 @@ def _module_arg_aliasable(a: FrozenArg) -> bool:
     is deferred (allocatable/pointer) and already allocated by the caller, and
     the kernel does not allocate the array.
     Read-only or inout intent is allowed; out-only still falls back to copy.
+    An ALLOCATABLE module array can only be a pointer target with the TARGET
+    attribute, so it is copied when the caller's modules lack it
+    (``module_allocatables_are_targets=False``); a POINTER one needs none.
     """
     from dace_fortran.bindings.frozen_signature import FrozenArg
 
@@ -232,6 +235,8 @@ def _module_arg_aliasable(a: FrozenArg) -> bool:
     if a.global_alloc_inside:
         return False
     if not (a.module_origin_allocatable or a.module_origin_pointer):
+        return False
+    if not a.module_origin_pointer and not module_allocatables_are_targets:
         return False
     return a.intent != "out"
 
@@ -318,7 +323,11 @@ def _optional_absent_scratch(sdfg_name: str) -> str:
 
 
 def build_wrapper_head(
-    frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, enum_maps: dict | None = None
+    frozen: FrozenSignature,
+    iface: OriginalInterface,
+    plan: FlattenPlan,
+    enum_maps: dict | None = None,
+    module_allocatables_are_targets: bool = True,
 ) -> str:
     """Render the <entry>_dace subroutine header + declaration section
     (template: templates/wrapper_head.f90.in). Walks plan.entries: aliasable
@@ -422,7 +431,7 @@ def build_wrapper_head(
     for a, _mod, _member in _orphan_module_args(frozen, iface, plan):
         ftype = fortran_c_type(a.dtype)
         spec = "(" + ", ".join(":" for _ in range(a.rank)) + ")" if a.rank > 0 else ""
-        if _module_arg_aliasable(a):
+        if _module_arg_aliasable(a, module_allocatables_are_targets):
             scratch_lines.append(f"    {ftype}, pointer, contiguous :: {a.sdfg_name}{spec}")
         elif a.rank > 0:
             scratch_lines.append(f"    {ftype}, allocatable, target :: {a.sdfg_name}{spec}")
@@ -530,7 +539,11 @@ def partition_symbol_blocks(sym_lines: list[str], buffer_names: Collection[str])
 
 
 def build_wrapper_body(
-    frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, enum_maps: dict | None = None
+    frozen: FrozenSignature,
+    iface: OriginalInterface,
+    plan: FlattenPlan,
+    enum_maps: dict | None = None,
+    module_allocatables_are_targets: bool = True,
 ) -> str:
     """Render the between-declaration-and-SDFG-call block: for each FlattenEntry
     either alias it (zero-copy) or allocate + copy in, then populate SDFG free
@@ -640,13 +653,12 @@ def build_wrapper_body(
         for oa, _mod, _member in orphans:
             alias = _module_value_expr(oa.sdfg_name, synth_members)
             alloc_inside = oa.global_alloc_inside
-            is_alloc = oa.module_origin_allocatable
             is_ptr = oa.module_origin_pointer
             # A DEFERRED-storage host global may be unallocated on entry (kernel
             # only reads it on a path the caller need not take); its SDFG extents
             # are its own size symbols, so an explicit allocate would be circular.
             # Guard with allocated/associated; fall back to a degenerate buffer.
-            deferred = (is_alloc or is_ptr) and not alloc_inside and oa.rank > 0
+            deferred = _module_arg_may_be_unallocated(oa)
             if alloc_inside:
                 # Kernel ALLOCATEs this global itself: host alias holds no data on
                 # entry (reading it is UB); write-back assigns it on exit.
@@ -656,7 +668,7 @@ def build_wrapper_body(
                 body.append(f"    ! {oa.sdfg_name}: kernel-allocated, no copy-in (host alias unallocated on entry)")
             elif deferred:
                 degen = ", ".join("1" for _ in range(oa.rank))
-                aliasable = _module_arg_aliasable(oa)
+                aliasable = _module_arg_aliasable(oa, module_allocatables_are_targets)
                 body.append(f"    if ({_present(alias, is_ptr)}) then")
                 if aliasable:
                     body.append(f"      {oa.sdfg_name} => {alias}")
@@ -771,6 +783,7 @@ def build_wrapper_tail(
     dace_arglist: tuple = (),
     enum_maps: dict | None = None,
     init_symbols: Sequence[str] | None = None,
+    module_allocatables_are_targets: bool = True,
 ) -> str:
     """Render the wrapper tail: init-count bump + call dace_program_<entry> +
     copy-back for every non-aliased writeable entry, then deallocate + close.
@@ -850,12 +863,17 @@ def build_wrapper_tail(
     for oa, _mod, _member in _orphan_module_args(frozen, iface, plan):
         if not oa.is_written:
             continue
-        if _module_arg_aliasable(oa):
+        if _module_arg_aliasable(oa, module_allocatables_are_targets):
             continue
         alias = _module_symbol_alias(oa.sdfg_name)
         actual = name_override.get(oa.sdfg_name, oa.sdfg_name)
         rhs = f"{actual}(1)" if tuple(oa.shape) == ("1",) else actual
-        module_writeback_lines.append(f"    {alias} = {rhs}")
+        writeback = f"{alias} = {rhs}"
+        if _module_arg_may_be_unallocated(oa):
+            # Left unallocated by the caller, the array was replaced by a degenerate buffer: there is nothing to
+            # write back, and the assignment would allocate it.
+            writeback = f"if ({_present(alias, oa.module_origin_pointer)}) {writeback}"
+        module_writeback_lines.append(f"    {writeback}")
 
     # AoS-struct components: pack the SoA buffer back into the host struct only if
     # WRITTEN, always deallocate the buffer allocated in the body's copy-in.
@@ -1261,6 +1279,12 @@ def _zero_literal(dtype: str) -> str:
     """Neutral fill literal for dtype -- .false. for LOGICAL (bare 0 warns as an
     INTEGER->LOGICAL extension), 0 otherwise (Fortran promotes it to real/complex)."""
     return ".false." if dtype in LOGICAL_DTYPES else "0"
+
+
+def _module_arg_may_be_unallocated(a: FrozenArg) -> bool:
+    """A deferred (allocatable/pointer) module array the kernel does not allocate itself: the caller may leave it
+    unallocated, and the binding then passes a degenerate buffer in its place."""
+    return (a.module_origin_allocatable or a.module_origin_pointer) and not a.global_alloc_inside and a.rank > 0
 
 
 def _present(expr: str, is_pointer: bool) -> str:
