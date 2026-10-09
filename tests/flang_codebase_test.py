@@ -17,6 +17,7 @@ from dace_fortran.flang_codebase import (
     LIBRARY_STUBS,
     extract_make_compile_args,
     mpi_stub_source,
+    openacc_stub_source,
     patch_mpi_sizeof,
     prepare_flang_translation_unit,
 )
@@ -44,7 +45,7 @@ _VELOCITY_REF = _VELOCITY_BAK if _VELOCITY_BAK.is_file() else _VELOCITY_SRC
 def test_library_stubs_registry_keys():
     """Every built-in library stub name should resolve to a
     :class:`LibraryStub` with ``source`` and ``flags`` callables."""
-    assert set(LIBRARY_STUBS) >= {"mpi", "netcdf"}
+    assert set(LIBRARY_STUBS) >= {"mpi", "netcdf", "openacc"}
     for stub in LIBRARY_STUBS.values():
         assert callable(stub.source)
         assert callable(stub.flags)
@@ -64,6 +65,41 @@ def test_mpi_stub_source_and_flags():
     inc_flag = LIBRARY_STUBS["mpi"].flags()[0]
     assert inc_flag.startswith("-I")
     assert (Path(inc_flag[2:]) / "mpif-config.h").is_file()
+
+
+def test_openacc_stub_lets_flang_compile_openacc_api_calls(tmp_path: Path):
+    """Code built with an OpenACC compiler uses its ``openacc`` module, which flang does not ship; with the stub
+    prepended, a routine querying devices and presence compiles to HLFIR."""
+    entry = """
+module m
+  use openacc
+  implicit none
+contains
+  subroutine setup(rank, a)
+    integer, intent(in) :: rank
+    real(8), intent(inout) :: a(:)
+    integer(acc_device_kind) :: devtype
+    integer :: n
+    devtype = acc_get_device_type()
+    n = acc_get_num_devices(devtype)
+    if (n > 0) call acc_set_device_num(mod(rank, n), devtype)
+    if (.not. acc_is_present(a)) call acc_copyin(a)
+  end subroutine setup
+end module m
+"""
+    tu = prepare_flang_translation_unit(entry, library_stubs=["openacc"])
+    assert tu.flags == []
+    src = tmp_path / "tu.f90"
+    src.write_text(tu.source)
+    subprocess.run(
+        [flang_binary(), "-fc1", "-emit-hlfir", str(src), "-o", str(tmp_path / "tu.hlfir")],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "acc_get_num_devices" in (tmp_path / "tu.hlfir").read_text()
+    assert openacc_stub_source() in tu.source
 
 
 def test_patch_mpi_sizeof_substitutes_static_byte_count():
@@ -174,6 +210,7 @@ def test_lazy_import_surface():
     assert callable(dace_fortran.extract_make_compile_args)
     assert callable(dace_fortran.vendor_netcdf_fortran)
     assert callable(dace_fortran.mpi_stub_source)
+    assert callable(dace_fortran.openacc_stub_source)
     assert "mpi" in dace_fortran.LIBRARY_STUBS
     assert "mpi_sizeof" in dace_fortran.FLANG_BUG_PATCHES
 

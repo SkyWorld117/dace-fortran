@@ -117,6 +117,122 @@ def mpi_stub_source() -> str:
     return _MPI_STUB_SOURCE
 
 
+# MODULE openacc: the OpenACC runtime API (OpenACC 3.3, section 3.2) for code built
+# with an OpenACC compiler, whose ``openacc`` module flang does not ship.  Kinds,
+# device-type constants and the routines' Fortran interfaces; the data routines
+# take any variable (``type(*), dimension(..)``).  Values of the device-type
+# constants are implementation-defined; these are NVIDIA HPC SDK's.
+_OPENACC_STUB_SOURCE = """\
+! Stub ``MODULE openacc`` for the flang frontend: the OpenACC runtime API's
+! kinds, device-type constants and interfaces.  Runtime symbols are resolved at
+! link time against the OpenACC runtime -- this module only has to satisfy the
+! flang semantic checker.
+MODULE openacc
+  IMPLICIT NONE
+  INTEGER, PARAMETER :: openacc_version = 202211
+  INTEGER, PARAMETER :: acc_device_kind = 4
+  INTEGER, PARAMETER :: acc_device_property_kind = 4
+  INTEGER, PARAMETER :: acc_handle_kind = 4
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_none = 0
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_default = 1
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_host = 2
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_not_host = 3
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_nvidia = 4
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_radeon = 8
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_current = -1
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_noval = -1
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_sync = -2
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_default = -3
+  INTERFACE
+    INTEGER FUNCTION acc_get_num_devices(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_get_num_devices
+    SUBROUTINE acc_set_device_type(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_set_device_type
+    INTEGER(acc_device_kind) FUNCTION acc_get_device_type()
+      IMPORT :: acc_device_kind
+    END FUNCTION acc_get_device_type
+    SUBROUTINE acc_set_device_num(dev_num, dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER, VALUE :: dev_num
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_set_device_num
+    INTEGER FUNCTION acc_get_device_num(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_get_device_num
+    SUBROUTINE acc_init(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_init
+    SUBROUTINE acc_shutdown(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_shutdown
+    LOGICAL FUNCTION acc_async_test(wait_arg)
+      INTEGER, VALUE :: wait_arg
+    END FUNCTION acc_async_test
+    LOGICAL FUNCTION acc_async_test_all()
+    END FUNCTION acc_async_test_all
+    SUBROUTINE acc_wait(wait_arg)
+      INTEGER, VALUE :: wait_arg
+    END SUBROUTINE acc_wait
+    SUBROUTINE acc_wait_all()
+    END SUBROUTINE acc_wait_all
+    LOGICAL FUNCTION acc_on_device(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_on_device
+    LOGICAL FUNCTION acc_is_present(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END FUNCTION acc_is_present
+    SUBROUTINE acc_copyin(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_copyin
+    SUBROUTINE acc_create(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_create
+    SUBROUTINE acc_copyout(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_copyout
+    SUBROUTINE acc_delete(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_delete
+    SUBROUTINE acc_update_device(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_update_device
+    SUBROUTINE acc_update_self(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_update_self
+    SUBROUTINE acc_map_data(data_arg, data_dev, bytes)
+      USE, INTRINSIC :: iso_c_binding, ONLY: c_ptr, c_size_t
+      TYPE(*), DIMENSION(..) :: data_arg
+      TYPE(c_ptr), VALUE :: data_dev
+      INTEGER(c_size_t), VALUE :: bytes
+    END SUBROUTINE acc_map_data
+    SUBROUTINE acc_unmap_data(data_arg)
+      TYPE(*), DIMENSION(..) :: data_arg
+    END SUBROUTINE acc_unmap_data
+  END INTERFACE
+END MODULE openacc
+"""
+
+
+def openacc_stub_source() -> str:
+    """Fortran source for ``MODULE openacc``, the OpenACC runtime API; needs no ``-I`` flags."""
+    return _OPENACC_STUB_SOURCE
+
+
 # Not vendored (4 MB, updates yearly): fetched from upstream on first use
 # and cached, same layout as the bridge's own build (~/.cache/dace-fortran).
 _NETCDF_FORTRAN_URL = "https://github.com/Unidata/netcdf-fortran/archive/refs/tags/v{version}.tar.gz"
@@ -217,6 +333,7 @@ def _netcdf_flags(cache_dir: Path | None = None, **_: Any) -> list[str]:
 LIBRARY_STUBS: dict[str, LibraryStub] = {
     "mpi": LibraryStub(name="mpi", source=lambda **_: mpi_stub_source(), flags=_mpi_flags),
     "netcdf": LibraryStub(name="netcdf", source=_netcdf_source, flags=_netcdf_flags),
+    "openacc": LibraryStub(name="openacc", source=lambda **_: openacc_stub_source(), flags=lambda **_: []),
 }
 
 # ---------------------------------------------------------------------------
@@ -365,7 +482,7 @@ def prepare_flang_translation_unit(
     :param search_dirs: directories scanned by
         :func:`merge_used_modules` for sibling modules.
     :param library_stubs: names of upstream-library stubs to opt into;
-        keys of :data:`LIBRARY_STUBS` (``'mpi'``, ``'netcdf'``).
+        keys of :data:`LIBRARY_STUBS` (``'mpi'``, ``'netcdf'``, ``'openacc'``).
     :param patches: names of flang-21 text patches to apply; keys of
         :data:`FLANG_BUG_PATCHES`.  Default is the single safe one
         (``'mpi_sizeof'``) -- only matches the literal call pattern
