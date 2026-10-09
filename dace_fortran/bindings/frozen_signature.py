@@ -322,10 +322,7 @@ def drop_unread_module_inputs(sdfg: SDFG) -> list[str]:
     unread = [
         name
         for name in frozen.module_symbol_origins
-        if name in sdfg.arrays
-        and not sdfg.arrays[name].transient
-        and name not in accessed
-        and name not in referenced
+        if name in sdfg.arrays and not sdfg.arrays[name].transient and name not in accessed and name not in referenced
     ]
     for name in unread:
         sdfg.remove_data(name, validate=False)
