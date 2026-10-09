@@ -148,7 +148,8 @@ class SyntheticGlobal:
         the bridge derives from the synthetic global's mangled symbol).
     module: Fortran module the host struct lives in (``USE``d by the binding).
     entity: the host struct's Fortran name inside ``module``.
-    member: the scalar component read off ``entity``.
+    member: the scalar component read off ``entity``; a ``%``-joined path
+        for a member of a nested record (``a%b`` for ``entity%a%b``).
     dtype: SDFG element dtype of the member.
     """
 
@@ -162,7 +163,7 @@ class SyntheticGlobal:
     def sdfg_name(self) -> str:
         """Name the lifted scalar carries on the SDFG.  Composed from the side
         table, never decoded from ``symbol``."""
-        return f"{self.entity}_{self.member}"
+        return f"{self.entity}_{self.member.replace('%', '_')}"
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""

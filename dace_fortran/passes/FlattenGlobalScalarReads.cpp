@@ -3,6 +3,13 @@
 //                                    module-global struct into reads of a
 //                                    synthetic per-member global, and record
 //                                    the provenance in the flatten plan.
+//
+// The member may sit in a nested record (``entity%a%b`` lifts to
+// ``entity_a_b``).  A module-global array of records with a static shape is
+// handled the same way per element: ``entity(i)%member`` reads element ``i``
+// of a synthetic global array ``entity_member`` of the array's shape and
+// bounds, which the bindings fill from ``entity%member`` (the component over
+// every element).
 // ============================================================================
 
 #include <string>
@@ -90,14 +97,36 @@ bool isPlainComponentDesignate(hlfir::DesignateOp d) {
          !d.getShape() && d.getTypeparams().empty() && !d.getComplexPart().has_value() && d->getNumResults() == 1;
 }
 
+/// For ``entity(i, ...)%member``: the element designate ``entity(i, ...)`` (scalar subscripts only) the component
+/// designate reads from; null when the component is taken off something else.
+hlfir::DesignateOp elementDesignateOf(hlfir::DesignateOp component) {
+  auto elem = component.getMemref().getDefiningOp<hlfir::DesignateOp>();
+  if (!elem || elem.getComponent().has_value() || elem.getIndices().empty() || !elem.getSubstring().empty() ||
+      elem.getComplexPart().has_value() || !elem.getTypeparams().empty())
+    return {};
+  for (bool const triplet : elem.getIsTriplet())
+    if (triplet) return {};
+  return elem;
+}
+
 struct Candidate {
+  /// The leaf component designate, then the record components above it up to the root (``entity%a%b``: ``%b``, ``%a``).
+  llvm::SmallVector<hlfir::DesignateOp, 2> chain;
   hlfir::DesignateOp designate;
+  /// ``entity(i, ...)`` when ``entity`` is an array of records, else null.
+  hlfir::DesignateOp element;
+  /// The host array's declare (its shape operand gives the synthetic array's bounds); null for a scalar record.
+  hlfir::DeclareOp hostDecl;
   std::string symbol;
   std::string module;
   std::string entity;
   std::string member;
   std::string dtype;
   mlir::Type scalarTy;
+  /// Type of the synthetic global: ``scalarTy``, or an array of it in the host array's shape.
+  mlir::Type globalTy;
+  /// Name of the synthetic global.
+  std::string newSym;
 };
 
 struct FlattenGlobalScalarReadsPass
@@ -108,11 +137,12 @@ struct FlattenGlobalScalarReadsPass
   llvm::StringRef getArgument() const final { return "hlfir-flatten-global-scalar-reads"; }
   llvm::StringRef getDescription() const final {
     return "Rewrite a never-written scalar component read of a module-scope "
-           "fir.global record (``mod%entity%member``) into a read of a "
-           "synthetic bodiless ``fir.global`` carrying that member alone, and "
-           "record {symbol, module, entity, member, dtype} in the "
-           "hlfir.flatten_plan side table so the bindings emitter can assign "
-           "``symbol = entity%member`` at the call boundary.";
+           "fir.global record (``mod%entity%member``, or ``entity(i)%member`` "
+           "of a static array of records) into a read of a synthetic bodiless "
+           "``fir.global`` carrying that member alone (an array of it for an "
+           "array of records), and record {symbol, module, entity, member, "
+           "dtype} in the hlfir.flatten_plan side table so the bindings "
+           "emitter can assign ``symbol = entity%member`` at the call boundary.";
   }
 
   void runOnOperation() override {
@@ -139,17 +169,41 @@ struct FlattenGlobalScalarReadsPass
     llvm::StringSet<> rejected;
     module.walk([&](hlfir::DesignateOp d) {
       if (!isPlainComponentDesignate(d)) return;
-      llvm::StringRef const sym = traceToGlobalSym(d.getMemref());
+      // Walk up a nested record path ``entity%a%b`` to the component taken off the root.
+      llvm::SmallVector<hlfir::DesignateOp, 2> chain{d};
+      while (auto up = chain.back().getMemref().getDefiningOp<hlfir::DesignateOp>()) {
+        if (!isPlainComponentDesignate(up)) break;
+        chain.push_back(up);
+      }
+      hlfir::DesignateOp element = elementDesignateOf(chain.back());
+      llvm::StringRef const sym = traceToGlobalSym(element ? element.getMemref() : chain.back().getMemref());
       if (sym.empty()) return;
       llvm::StringRef mod;
       llvm::StringRef entity;
       if (!splitModuleScopeSymbol(sym, mod, entity)) return;
       auto g = module.lookupSymbol<fir::GlobalOp>(sym);
       if (!g || (g.getConstant().has_value() && *g.getConstant())) return;
-      if (!mlir::isa<fir::RecordType>(g.getType())) return;
+      // A scalar record, or an array of records with a static shape read element-wise through its declare.
+      auto hostSeq = mlir::dyn_cast<fir::SequenceType>(g.getType());
+      hlfir::DeclareOp hostDecl;
+      if (element) {
+        hostDecl = element.getMemref().getDefiningOp<hlfir::DeclareOp>();
+        if (!hostSeq || hostSeq.hasDynamicExtents() || !hostDecl || !hostDecl.getShape() ||
+            !mlir::isa<fir::RecordType>(hostSeq.getEleTy()))
+          return;
+      } else if (!mlir::isa<fir::RecordType>(g.getType())) {
+        return;
+      }
 
-      llvm::StringRef const member = d.getComponent()->getValue();
-      std::string const newSym = (llvm::Twine(sym) + "_" + member).str();
+      // ``a%b`` for the table (the bindings read ``entity%a%b``), ``a_b`` for the synthetic symbol.
+      std::string member;
+      std::string symbolSuffix;
+      for (hlfir::DesignateOp step : llvm::reverse(chain)) {
+        llvm::StringRef const name = step.getComponent()->getValue();
+        member += (member.empty() ? "" : "%") + name.str();
+        symbolSuffix += (symbolSuffix.empty() ? "" : "_") + name.str();
+      }
+      std::string const newSym = (llvm::Twine(sym) + "_" + symbolSuffix).str();
       auto refTy = mlir::dyn_cast<fir::ReferenceType>(d.getResult().getType());
       if (!refTy) return;
       std::string const dtype = dtypeName(refTy.getEleTy());
@@ -161,7 +215,10 @@ struct FlattenGlobalScalarReadsPass
         rejected.insert(newSym);
         return;
       }
-      candidates.push_back(Candidate{d, sym.str(), mod.str(), entity.str(), member.str(), dtype, refTy.getEleTy()});
+      mlir::Type const scalarTy = refTy.getEleTy();
+      mlir::Type const globalTy = element ? fir::SequenceType::get(hostSeq.getShape(), scalarTy) : scalarTy;
+      candidates.push_back(Candidate{chain, d, element, hostDecl, sym.str(), mod.str(), entity.str(), member, dtype,
+                                     scalarTy, globalTy, newSym});
     });
 
     mlir::Builder b(&getContext());
@@ -169,12 +226,12 @@ struct FlattenGlobalScalarReadsPass
     llvm::StringSet<> emitted;
     unsigned rewritten = 0;
     for (Candidate& c : candidates) {
-      std::string const newSym = c.symbol + "_" + c.member;
+      std::string const& newSym = c.newSym;
       if (rejected.contains(newSym)) continue;
       if (emitted.insert(newSym).second) {
         mlir::OpBuilder gb(&getContext());
         gb.setInsertionPointToEnd(module.getBody());
-        gb.create<fir::GlobalOp>(c.designate.getLoc(), llvm::StringRef(newSym), c.scalarTy,
+        gb.create<fir::GlobalOp>(c.designate.getLoc(), llvm::StringRef(newSym), c.globalTy,
                                  llvm::ArrayRef<mlir::NamedAttribute>{});
         table.push_back(b.getDictionaryAttr({
             b.getNamedAttr("symbol", b.getStringAttr(newSym)),
@@ -186,11 +243,22 @@ struct FlattenGlobalScalarReadsPass
       }
       mlir::OpBuilder rb(c.designate);
       mlir::Location const loc = c.designate.getLoc();
-      auto refTy = fir::ReferenceType::get(c.scalarTy);
-      auto addr = rb.create<fir::AddrOfOp>(loc, refTy, mlir::SymbolRefAttr::get(&getContext(), newSym));
-      auto decl = rb.create<hlfir::DeclareOp>(loc, addr.getResult(), newSym, /*shape=*/mlir::Value{});
-      c.designate.getResult().replaceAllUsesWith(decl.getResult(0));
-      c.designate.erase();
+      auto addr = rb.create<fir::AddrOfOp>(loc, fir::ReferenceType::get(c.globalTy),
+                                           mlir::SymbolRefAttr::get(&getContext(), newSym));
+      mlir::Value const shape = c.element ? c.hostDecl.getShape() : mlir::Value{};
+      auto decl = rb.create<hlfir::DeclareOp>(loc, addr.getResult(), newSym, shape);
+      mlir::Value replacement = decl.getResult(0);
+      if (c.element) {
+        // ``entity(i, ...)%member`` -> ``entity_member(i, ...)``, subscripted like the host array.
+        replacement =
+            rb.create<hlfir::DesignateOp>(loc, fir::ReferenceType::get(c.scalarTy), replacement, c.element.getIndices())
+                .getResult();
+      }
+      c.designate.getResult().replaceAllUsesWith(replacement);
+      // The leaf, then every component above it and the element designate that no other read still uses.
+      for (hlfir::DesignateOp step : c.chain)
+        if (step->use_empty()) step.erase();
+      if (c.element && c.element->use_empty()) c.element.erase();
       ++rewritten;
     }
 

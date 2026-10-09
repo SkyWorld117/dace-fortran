@@ -281,6 +281,80 @@ end module kern
     np.testing.assert_array_equal(out, np.full(4, 3.0))
 
 
+def test_module_level_array_of_records_scalar_members(tmp_path):
+    """``co(i) % a`` with ``co`` a static module array of records (an EOS-coefficient table): each scalar member
+    reads as an element of a per-member array ``co_a`` / ``co_b`` with ``co``'s shape and lower bound."""
+    import numpy as np
+
+    src = """
+module coefs
+  type :: coef
+    real(8) :: a, b
+  end type
+  type(coef) :: co(0:3)
+end module coefs
+
+module m
+contains
+  subroutine k(n, x, y)
+    use coefs, only: co
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(n)
+    real(8), intent(out) :: y(n)
+    integer :: i
+    do i = 1, n
+      y(i) = co(mod(i, 4)) % a * x(i) + co(0) % b
+    end do
+  end subroutine
+end module m
+"""
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="k", entry="m::k").build()
+    assert tuple(int(s) for s in sdfg.arrays["co_a"].shape) == (4,)
+    a = np.array([1.0, 2.0, 3.0, 4.0])
+    b = np.array([0.5, 0.0, 0.0, 0.0])
+    x = np.arange(1, 7, dtype=np.float64)
+    y = np.zeros(6)
+    sdfg(n=np.int32(6), x=x, y=y, co_a=a, co_b=b)
+    np.testing.assert_allclose(y, a[np.arange(1, 7) % 4] * x + 0.5)
+
+
+def test_module_level_nested_record_scalar_members_as_loop_bounds(tmp_path):
+    """``DO i = idx % cont % beg, idx % cont % end`` with ``idx`` a module record of records: each scalar leaf lifts
+    to its own symbol ``idx_cont_beg`` / ``idx_cont_end``."""
+    import numpy as np
+
+    src = """
+module eqns
+  type :: bounds_info
+    integer :: beg, end
+  end type
+  type :: eqn_indices
+    type(bounds_info) :: cont, species
+  end type
+  type(eqn_indices) :: idx
+end module eqns
+
+module m
+contains
+  subroutine k(x, out)
+    use eqns, only: idx
+    real(8), intent(in) :: x(8)
+    real(8), intent(out) :: out
+    integer :: i
+    out = 0
+    do i = idx % cont % beg, idx % cont % end
+      out = out + x(i)
+    end do
+  end subroutine
+end module m
+"""
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="k", entry="m::k").build()
+    x = np.arange(1, 9, dtype=np.float64)
+    out = np.zeros(1)
+    sdfg(x=x, out=out, idx_cont_beg=np.int32(2), idx_cont_end=np.int32(5))
+    assert out[0] == 2 + 3 + 4 + 5
+
+
 def test_member_array_element_as_extent(tmp_path):
     """``ALLOCATE(w(smap % lb(1) : smap % ub(1)))`` with ``smap`` a module record (QE ``fft_type_init``'s sticks
     map): the extent reads elements of the members ``smap_lb`` / ``smap_ub``, not of the record ``smap``."""
