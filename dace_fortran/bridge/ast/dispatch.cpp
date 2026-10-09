@@ -311,6 +311,9 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
       a.target = target;
       a.expr = expr;
       a.target_is_array = false;
+      // buildExpr renders an array-element read by its parent name and leaves the subscript to the memlet, so a
+      // scalar store (the start or trip count of a lifted DO, ``l = ib(3)%beg``) carries its element reads.
+      if (fir::isa_trivial(st.getValue().getType())) collectReadAccesses(st.getValue(), a.accesses, 0);
       out.push_back(std::move(a));
       continue;
     }
@@ -3225,12 +3228,13 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
       a.target = target;
       a.expr = expr;
       a.target_is_array = false;
-      // Collects the stored value's array-element reads for a value-by-reference associate store
-      // (RewriteSequenceAssociation/ExpandVectorSubscriptGather synthesise a __assoc_scalar alloca + fir.store reaching
-      // here). buildExpr renders an array-ELEMENT read as the bare parent name by design; without these reads the
-      // element leaks as a bare pointer (QE paw_newdxx Gate H). Scoped to __assoc_scalar targets so it doesn't perturb
-      // other stores (e.g. prhoc_d's pointer-rebind).
-      if (target.find("assoc_scalar") != std::string::npos) collectReadAccesses(st.getValue(), a.accesses, 0);
+      // Collects the stored value's array-element reads: buildExpr renders an array-ELEMENT read as the bare parent
+      // name by design, so without these reads the element leaks as a bare pointer -- a value-by-reference associate
+      // store (RewriteSequenceAssociation/ExpandVectorSubscriptGather synthesise a __assoc_scalar alloca + fir.store
+      // reaching here; QE paw_newdxx Gate H) or any other scalar store, such as the start or trip count of a lifted
+      // DO (``l = ib(3)%beg``).  A box store (prhoc_d's pointer-rebind) is no scalar read and keeps none.
+      if (target.find("assoc_scalar") != std::string::npos || fir::isa_trivial(st.getValue().getType()))
+        collectReadAccesses(st.getValue(), a.accesses, 0);
       nodes.push_back(std::move(a));
       continue;
     }
