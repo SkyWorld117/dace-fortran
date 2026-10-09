@@ -385,6 +385,37 @@ end module
     np.testing.assert_allclose(out, (A @ B) @ C)
 
 
+def test_dot_product_of_operands_with_symbolically_different_lengths(tmp_path):
+    """``dot_product(w, t**3)`` with ``w`` an allocatable module array (length ``w_d0``) and ``t`` sized by a module
+    variable ``nb``: the operands conform at runtime, so the Dot node reads both over the first one's length."""
+    src = """
+module wmod
+  implicit none
+  real(8), allocatable :: w(:)
+  integer :: nb = 3
+end module wmod
+
+module m
+contains
+  subroutine k(x, out)
+    use wmod
+    implicit none
+    real(8), intent(in) :: x(nb)
+    real(8), intent(out) :: out
+    real(8) :: t(nb)
+    t = x
+    out = dot_product(w, t**3)
+  end subroutine k
+end module m
+"""
+    sdfg = build_sdfg(src, tmp_path, name="k", entry="m::k").build()
+    w = np.array([1.0, 2.0, 3.0])
+    x = np.array([1.0, 2.0, 0.5])
+    out = np.zeros(1)
+    sdfg(x=x, out=out, w=w, nb=np.int32(3), w_d0=3)
+    np.testing.assert_allclose(out[0], np.dot(w, x**3))
+
+
 def test_inline_dot_product_of_matmul(tmp_path):
     """``out = DOT_PRODUCT(MATMUL(a, v), w)`` -- scalar-result library op whose first operand is a matmul."""
     src = """
