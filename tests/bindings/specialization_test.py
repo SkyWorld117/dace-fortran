@@ -146,7 +146,8 @@ def test_a_specialised_binding_runs_its_values_and_declines_others(tmp_path):
     before = get_frozen_signature(sdfg)
     values = {"nv": 3, "scaled": 1, "factor": 2.0}
     assert set(values) <= specializable(before, iface, plan)
-    specialize(sdfg, symbols={"nv": 3}, scalars={"scaled": 1, "factor": 2.0})
+    symbols = {s: v for s, v in values.items() if s in before.free_symbols}
+    specialize(sdfg, symbols=symbols, scalars={s: v for s, v in values.items() if s not in symbols})
     refreeze(sdfg)
     taken = {a.sdfg_name for a in get_frozen_signature(sdfg).args} | set(get_frozen_signature(sdfg).free_symbols)
     assert not set(values) & taken
@@ -170,6 +171,6 @@ def test_a_specialised_binding_runs_its_values_and_declines_others(tmp_path):
     # Without the flag, a mismatch stops naming the value; the guard reads the module variables themselves, which the
     # specialised SDFG no longer takes.
     text = next((tmp_path / "lib").glob("*_bindings.f90")).read_text()
-    assert "if (nv /= 3) dace_mismatch = 'nv'" in text and "error stop" in text
+    assert "if (nv__mod /= 3) dace_mismatch = 'nv'" in text and "error stop" in text
     assert "if (scaled__mod .neqv. .true.) dace_mismatch = 'scaled'" in text
     assert "if (factor__mod /= 2.0_c_double) dace_mismatch = 'factor'" in text
