@@ -735,7 +735,7 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
       {"math.sin", "sin"},     {"math.cos", "cos"},     {"math.tan", "tan"},   {"math.asin", "asin"},
       {"math.acos", "acos"},   {"math.atan", "atan"},   {"math.sinh", "sinh"}, {"math.cosh", "cosh"},
       {"math.tanh", "tanh"},   {"math.floor", "floor"}, {"math.ceil", "ceil"}, {"math.round", "round"},
-      {"math.trunc", "trunc"},
+      {"math.trunc", "trunc"}, {"math.asinh", "asinh"}, {"math.acosh", "acosh"}, {"math.atanh", "atanh"},
   };
   auto unm = def->getName().getStringRef();
   if (auto it = unary_intrinsics.find(unm); it != unary_intrinsics.end() && def->getNumOperands() == 1)
