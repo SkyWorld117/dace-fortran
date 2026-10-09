@@ -1482,12 +1482,14 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
   inner.target_is_array = true;
   inner.expr = buildExpr(assign.getOperand(0), 0);
 
+  // The loops run over 1-based positions; the write takes each dim's declared lower bound (``qv(0:n, -2:k)``).
+  bool const bounded = mlir::cast<mlir::OpResult>(dst).getResultNumber() == 0;
   AccessInfo wa;
   wa.array_name = inner.target;
   wa.is_write = true;
   for (unsigned i = 0; i < rank; ++i) {
     wa.index_vars.push_back(iter_names[i]);
-    wa.index_exprs.push_back(iter_names[i]);
+    wa.index_exprs.push_back(bounded ? fortranIndexAt(iter_names[i], declaredLowerBound(decl, i), 0) : iter_names[i]);
   }
   inner.accesses.push_back(std::move(wa));
 
