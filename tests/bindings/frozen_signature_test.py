@@ -6,6 +6,8 @@ from pathlib import Path
 
 import dace
 import pytest
+from dace.properties import CodeBlock
+from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 
 from dace_fortran.bindings import (
     FrozenArg,
@@ -196,8 +198,9 @@ def test_drop_unread_module_inputs_keeps_the_callers_buffers():
     sdfg = dace.SDFG("compute")
     sdfg.add_symbol("n", dace.int64)
     sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
-    for name in ("g", "h"):
-        sdfg.add_array(name, shape=(1,), dtype=dace.float64, transient=False)
+    for name, dtype in (("c", dace.int32), ("g", dace.float64), ("h", dace.float64)):
+        sdfg.add_array(name, shape=(1,), dtype=dtype, transient=False)
+    # A map reads g; a branch condition reads c; nothing reads h.
     state = sdfg.add_state()
     state.add_mapped_tasklet(
         "scale",
@@ -207,21 +210,31 @@ def test_drop_unread_module_inputs_keeps_the_callers_buffers():
         {"_a": dace.Memlet("a[i]")},
         external_edges=True,
     )
-    module = {"g": ModuleOrigin("params", "g"), "h": ModuleOrigin("params", "h")}
+    branch = ConditionalBlock("if_c")
+    sdfg.add_node(branch)
+    sdfg.add_edge(state, branch, dace.InterstateEdge())
+    body = ControlFlowRegion("then", sdfg=sdfg)
+    body.add_state("noop", is_start_block=True)
+    branch.add_branch(CodeBlock("c[0] > 0"), body)
     sdfg._frozen_signature = FrozenSignature(
         entry="compute",
         mangled="_QPcompute",
         args=tuple(
-            FrozenArg(fortran_name=n, sdfg_name=n, kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=s)
-            for n, s in (("a", ("n",)), ("g", ("1",)), ("h", ("1",)))
+            FrozenArg(fortran_name=n, sdfg_name=n, kind=FrozenArgKind.ARRAY, dtype=t, rank=1, shape=s)
+            for n, t, s in (
+                ("a", "float64", ("n",)),
+                ("c", "int32", ("1",)),
+                ("g", "float64", ("1",)),
+                ("h", "float64", ("1",)),
+            )
         ),
         free_symbols=("n",),
-        module_symbol_origins=module,
+        module_symbol_origins={name: ModuleOrigin("params", name) for name in ("c", "g", "h")},
     )
 
-    # h is read nowhere: gone, and with it the binding's copy; g is read, a is the caller's.
+    # h is gone, and with it the binding's copy; g and c are read, a is the caller's.
     assert drop_unread_module_inputs(sdfg) == ["h"]
-    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a", "g"]
+    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a", "c", "g"]
 
 
 # ----- OpenACC residency ---------------------------------------------------------
