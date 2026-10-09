@@ -983,6 +983,44 @@ def build_finalize(iface: OriginalInterface) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Free-form Fortran's line limit.  gfortran accepts longer lines only with ``-ffree-line-length-none`` and nvfortran
+#: not at all, while the binding's ``use ..., only:`` lists and C-interface argument lists grow with the SDFG.
+FORTRAN_LINE_LIMIT = 132
+
+
+def _last_comma_outside_strings(line: str, end: int) -> int | None:
+    """Index of the last ``,`` before ``end`` that is outside a string literal and before an inline comment."""
+    quote = None
+    last = None
+    for i, ch in enumerate(line[:end]):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "!":
+            break
+        elif ch == ",":
+            last = i
+    return last
+
+
+def fold_long_lines(src: str, limit: int = FORTRAN_LINE_LIMIT) -> str:
+    """Continue every line longer than ``limit`` with ``&`` after a comma outside string literals (Fortran allows a
+    continuation between any two tokens).  A line with no such comma is left as it is."""
+    out: list[str] = []
+    for line in src.split("\n"):
+        continuation = " " * (len(line) - len(line.lstrip()) + 4)
+        while len(line) > limit:
+            cut = _last_comma_outside_strings(line, limit - 2)
+            if cut is None:
+                break
+            out.append(line[: cut + 1] + " &")
+            line = continuation + line[cut + 1 :].lstrip()
+        out.append(line)
+    return "\n".join(out)
+
+
 def assemble_module(
     iface: OriginalInterface, frozen: FrozenSignature, blocks: dict, plan: FlattenPlan | None = None
 ) -> str:
@@ -1016,8 +1054,9 @@ def assemble_module(
         wrapper_body=wrapper_body,
         finalize_body=blocks["finalize"],
     )
-    # gfortran rejects identifiers over 63 chars; rename any such name uniquely.
-    return _shorten_long_idents(module_src)
+    # gfortran rejects identifiers over 63 chars; rename any such name uniquely.  Then keep every line within the
+    # standard's limit.
+    return fold_long_lines(_shorten_long_idents(module_src))
 
 
 # ---------------------------------------------------------------------------
