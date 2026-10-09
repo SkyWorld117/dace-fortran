@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Collection, Container, Sequence
+from collections.abc import Collection, Container, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -1126,21 +1126,19 @@ def assemble_module(
     blocks: dict,
     plan: FlattenPlan | None = None,
     acc_residency: AccTransferPlan | None = None,
-    guarded: FrozenSignature | None = None,
+    extra_sources: Mapping[str, ModuleOrigin] | None = None,
 ) -> str:
     """Stitch the rendered blocks into the complete Fortran module
     (template: templates/module.f90.in).
 
-    ``guarded``: the signature the symbols of a specialisation guard come from, whose module sources are imported
-    alongside ``frozen``'s (the specialised SDFG no longer takes them)."""
+    ``extra_sources``: module variables of symbols the SDFG no longer takes but the wrapper still reads (those of a
+    specialisation guard), imported alongside ``frozen``'s."""
     use_lines = [f"  use {mod}, only: {', '.join(syms)}" for mod, syms in sorted(iface.used_modules.items())]
     if acc_residency is not None and acc_residency.deviceptr:
         use_lines.append("  use openacc, only: acc_deviceptr")
     # Module-sourced free symbols: import each member under a <sym>__mod alias so
     # it doesn't clash with the wrapper's own local <sym>. Group by module.
-    sources = effective_module_sources(frozen, iface, plan)
-    if guarded is not None:
-        sources = {**effective_module_sources(guarded, iface, plan), **sources}
+    sources = {**(extra_sources or {}), **effective_module_sources(frozen, iface, plan)}
     by_mod: dict = {}
     for sym, (mod, member) in sorted(sources.items()):
         by_mod.setdefault(mod, []).append(f"{_module_symbol_alias(sym)} => {member}")
