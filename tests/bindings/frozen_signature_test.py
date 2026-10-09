@@ -161,8 +161,29 @@ def test_refreeze_refuses_dropped_array():
         free_symbols=("n",),
     )
 
-    with pytest.raises(SignatureDriftError, match="only scalars and free symbols may shrink"):
+    with pytest.raises(SignatureDriftError, match="only scalars, free symbols and module variables may shrink"):
         refreeze(sdfg)
+
+
+def test_refreeze_drops_a_module_variable_the_kernel_no_longer_reads():
+    # A module scalar crosses as a one-element array; once specialised to a constant the kernel no longer takes it,
+    # and the binding stops reading it from the module -- it was never a buffer of the caller's.
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
+
+    sdfg._frozen_signature = FrozenSignature(
+        entry="compute",
+        mangled="_QPcompute",
+        args=(
+            FrozenArg(fortran_name="a", sdfg_name="a", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("n",)),
+            FrozenArg(fortran_name="g", sdfg_name="g", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("1",)),
+        ),
+        free_symbols=("n",),
+        module_symbol_origins={"g": ModuleOrigin("params", "g")},
+    )
+
+    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a"]
 
 
 # ----- OpenACC residency ---------------------------------------------------------

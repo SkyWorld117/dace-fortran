@@ -317,9 +317,11 @@ def refreeze(sdfg: SDFG) -> FrozenSignature:
     * array (and MPI communicator) args must match the original snapshot exactly -- names,
       order, dtypes.  The caller's buffers are the ABI, so one going missing means the
       wrapper would stop passing memory the kernel still expects, or vice versa;
-    * scalar args and the free-symbol set may SHRINK, which is what specialization does:
-      folding a value to a constant deletes its argument, and the binding simply derives
-      and passes fewer. A scalar the kernel no longer reads costs the caller nothing;
+    * scalar args, the free-symbol set and the args the binding reads from a module may
+      SHRINK, which is what specialization does: folding a value to a constant deletes its
+      argument, and the binding simply derives and passes fewer. A scalar the kernel no
+      longer reads costs the caller nothing, and a module variable is no buffer of the
+      caller's (a module scalar crosses as a one-element array, ABI-preserved);
     * anything NEW is refused, symbol or scalar -- the binding has no value derivation
       for an argument that was not in the Fortran interface.
 
@@ -347,18 +349,21 @@ def refreeze(sdfg: SDFG) -> FrozenSignature:
         )
 
     dropped_buffers = [
-        a.sdfg_name for a in frozen.args if a.kind not in _MAY_SHRINK and a.sdfg_name not in live_arglist
+        a.sdfg_name
+        for a in frozen.args
+        if a.kind not in _MAY_SHRINK and a.sdfg_name not in frozen.module_symbol_origins
+        and a.sdfg_name not in live_arglist
     ]
     if dropped_buffers:
         raise SignatureDriftError(
             f"refreeze on {frozen.entry!r}: optimization removed "
-            f"args {dropped_buffers}; only scalars and free symbols may shrink"
+            f"args {dropped_buffers}; only scalars, free symbols and module variables may shrink"
         )
 
     def _survives(a: FrozenArg) -> bool:
         # Anything gone from both the arglist and the free symbols was folded to a constant:
-        # drop it so the regenerated binding stops deriving and passing it.  Only scalars and
-        # symbols reach here -- the rest are refused above.
+        # drop it so the regenerated binding stops deriving and passing it.  Only scalars,
+        # symbols and module variables reach here -- the rest are refused above.
         return a.sdfg_name in live_arglist or a.sdfg_name in live_fs
 
     def _relocate(a: FrozenArg) -> FrozenArg:
