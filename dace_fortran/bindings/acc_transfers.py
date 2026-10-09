@@ -54,6 +54,15 @@ Scalar dummies are exempt from all of it.  They reach the SDFG by value
 to get wrong -- and ICON's own directives rarely name them, which is why
 the extractor reports ``velocity_tendencies``' six scalars as
 ``unclassified``.  Array/pointer dummies get no such pass.
+
+The third lane is a caller that keeps everything the kernel touches on the
+device -- dummies, the module arrays the kernel reads, the members of its
+arrays of records -- and an SDFG whose arrays are GPU storage
+(:func:`plan_device_resident_caller`).  Nothing is staged through the host:
+a dummy is handed over inside ``HOST_DATA USE_DEVICE``; a module array is
+passed as the device address of the caller's own copy (``acc_deviceptr``, which
+unlike ``c_loc`` needs no ``TARGET`` attribute on the module variable); the
+packed companion of an array of records is packed on the device.
 """
 
 from __future__ import annotations
@@ -187,16 +196,25 @@ class AccTransferPlan:
     copyin: tuple[str, ...] = ()
     copyout: tuple[str, ...] = ()
     copy: tuple[str, ...] = ()
+    #: Module-origin arrays the SDFG takes from the caller's device copy: the actual argument is the device address
+    #: ``acc_deviceptr`` reports for the module variable, and the wrapper neither copies the array in nor back.
+    deviceptr: tuple[str, ...] = ()
+    #: Packed companions of arrays of records (``aos_alloc`` recipes) that are packed and unpacked on the device,
+    #: between the caller's device-resident members and a device copy of the companion.  Also in ``use_device``.
+    device_pack: tuple[str, ...] = ()
+    #: Wrapper locals that need a device copy only for their address: the one-element scratch an absent member's
+    #: alias is bound to, which ``USE_DEVICE`` then looks up although the SDFG never reads it.
+    create: tuple[str, ...] = ()
 
     @property
     def active(self) -> bool:
         """True iff the wrapper needs any OpenACC directive at all."""
-        return bool(self.update_host or self.update_device or self.use_device or self.data_region)
+        return bool(self.update_host or self.update_device or self.use_device or self.data_region or self.deviceptr)
 
     @property
     def data_region(self) -> tuple[tuple[str, str], ...]:
         """``(clause, name)`` pairs for the ``!$ACC DATA`` region, in emission order."""
-        groups = (("COPYIN", self.copyin), ("COPY", self.copy), ("COPYOUT", self.copyout))
+        groups = (("COPYIN", self.copyin), ("COPY", self.copy), ("COPYOUT", self.copyout), ("CREATE", self.create))
         return tuple((clause, name) for clause, names in groups for name in names)
 
 
@@ -400,9 +418,89 @@ def plan_frozen_transfers(frozen: FrozenSignature) -> AccTransferPlan:
     )
 
 
+def _host_buffer_clause(arg) -> str:
+    """Data-region clause for a wrapper-side host buffer a GPU-storage SDFG reads or writes: the direction follows the
+    argument's intent, as :attr:`FrozenArg.acc_data_clause` does for an offloaded dummy."""
+    intent = arg.intent.lower()
+    if intent == "in" and not arg.is_written:
+        return "copyin"
+    if intent == "out":
+        return "copyout"
+    return "copy"
+
+
+def plan_device_resident_caller(sdfg: dace.SDFG, frozen: FrozenSignature, iface, plan) -> AccTransferPlan:
+    """Plan the device-resident direction: the caller keeps its arrays on the device, the SDFG's are GPU storage.
+
+    Every array argument whose SDFG storage is on the device is handed over without a host copy:
+
+    * a dummy, or the alias of a record member: its device address, through ``HOST_DATA USE_DEVICE``;
+    * a module-origin array: the device address of the caller's module variable, through ``acc_deviceptr``
+      (``deviceptr``);
+    * the packed companion of an array of records: packed on the device (``device_pack``);
+    * a buffer the wrapper itself fills on the host (a deep copy of a record member, the image of a module
+      array of records, a lifted member read): staged through a ``DATA`` region, by intent;
+    * the alias of a member that may be absent: as any alias, plus a device copy of the scratch the absent
+      member's alias is bound to (``create``).
+
+    Arrays left in host storage (the length-1 images of module scalars) are copied as on the CPU.  ``iface`` and
+    ``plan`` are the binding's :class:`OriginalInterface` and :class:`FlattenPlan`, which say which SDFG argument
+    is which of the above.
+    """
+    from dace_fortran.bindings.block_builders import (
+        _aos_module_args,
+        _orphan_module_args,
+        _presence_scratch_name,
+        _recipe_presence_guard,
+        live_entries,
+    )
+
+    # A lifted member read (``entity%member`` of a module record, or ``entity(:)%member`` of a module array of
+    # records) is a wrapper-side copy of a component, not a module array the caller holds on the device.
+    synthetic = {s.sdfg_name for s in plan.synthetic_globals}
+    orphan = {a.sdfg_name for a, _mod, _member in _orphan_module_args(frozen, iface, plan)} - synthetic
+    aos_image = {a.sdfg_name for a in _aos_module_args(frozen)} | synthetic
+    recipes = {flat: entry.recipe for entry in live_entries(frozen, plan) for flat in entry.recipe.flat_names}
+    use_device, deviceptr, device_pack, create = [], [], [], []
+    by_clause = {"copyin": [], "copyout": [], "copy": []}
+    storage = {}
+    for arg in frozen.args:
+        if arg.kind is not FrozenArgKind.ARRAY:
+            continue
+        name = arg.sdfg_name
+        desc = sdfg.arrays.get(name)  # a frozen array arg is one SDFG container, under its own name
+        if desc is None or desc.storage not in _GPU_STORAGE:
+            storage[name] = HOST
+            continue
+        storage[name] = DEVICE
+        recipe = recipes.get(name)
+        if name in orphan:
+            deviceptr.append(name)
+            continue
+        if recipe is not None and recipe.aos_alloc:
+            device_pack.append(name)
+        elif name in aos_image or (recipe is not None and not recipe.aliasable):
+            by_clause[_host_buffer_clause(arg)].append(name)
+        elif recipe is not None and _recipe_presence_guard(iface, recipe):
+            scratch = _presence_scratch_name(recipe.scratch_dtype)
+            if scratch not in create:
+                create.append(scratch)
+        use_device.append(name)
+    return AccTransferPlan(
+        use_device=tuple(use_device),
+        deviceptr=tuple(deviceptr),
+        device_pack=tuple(device_pack),
+        copyin=tuple(by_clause["copyin"]),
+        copyout=tuple(by_clause["copyout"]),
+        copy=tuple(by_clause["copy"]),
+        create=tuple(create),
+        storage=storage,
+    )
+
+
 #: OpenMP ``target enter data`` / ``target exit data`` map types per data-region clause.
-_OMP_ENTER_MAP = {"COPYIN": "to", "COPY": "to", "COPYOUT": "alloc"}
-_OMP_EXIT_MAP = {"COPYIN": "release", "COPY": "from", "COPYOUT": "from"}
+_OMP_ENTER_MAP = {"COPYIN": "to", "COPY": "to", "COPYOUT": "alloc", "CREATE": "alloc"}
+_OMP_EXIT_MAP = {"COPYIN": "release", "COPY": "from", "COPYOUT": "from", "CREATE": "release"}
 
 
 def render_data_open(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:

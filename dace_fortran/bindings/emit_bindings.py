@@ -57,7 +57,10 @@ def emit_bindings(
     wrapper stage ICON's device-resident arguments itself: ``UPDATE HOST
     ASYNC(1)`` before the copy-in, ``UPDATE DEVICE ASYNC(1)`` + ``WAIT(1)``
     after the copy-out, ``HOST_DATA USE_DEVICE`` around the SDFG invocation
-    (see :func:`block_builders.splice_acc_staging`).  ``None`` (the default)
+    (see :func:`block_builders.splice_acc_staging`).  A plan from
+    :func:`plan_device_resident_caller` instead hands a GPU-storage SDFG the caller's own device copies: module
+    arrays through ``acc_deviceptr`` (no host copy), the companions of arrays of records packed on the device.
+    ``None`` (the default)
     falls back to the standalone direction: if ``frozen`` records arguments an
     offload pass moved to the device, the wrapper gets an ``!$ACC DATA`` region
     staging the host caller's buffers up; if it records none, the emitted module
@@ -82,10 +85,20 @@ def emit_bindings(
         "c_interface": build_c_interface(frozen, iface, dace_arglist, init_symbols),
         "handle_state": build_handle_state(iface),
         "wrapper_head": build_wrapper_head(
-            frozen, iface, plan, enum_maps=enum_maps, module_allocatables_are_targets=module_allocatables_are_targets
+            frozen,
+            iface,
+            plan,
+            enum_maps=enum_maps,
+            module_allocatables_are_targets=module_allocatables_are_targets,
+            acc_residency=acc_residency,
         ),
         "wrapper_body": build_wrapper_body(
-            frozen, iface, plan, enum_maps=enum_maps, module_allocatables_are_targets=module_allocatables_are_targets
+            frozen,
+            iface,
+            plan,
+            enum_maps=enum_maps,
+            module_allocatables_are_targets=module_allocatables_are_targets,
+            acc_residency=acc_residency,
         ),
         "wrapper_tail": build_wrapper_tail(
             frozen,
@@ -95,9 +108,10 @@ def emit_bindings(
             enum_maps=enum_maps,
             init_symbols=init_symbols,
             module_allocatables_are_targets=module_allocatables_are_targets,
+            acc_residency=acc_residency,
         ),
         "finalize": build_finalize(iface),
     }
     blocks = splice_acc_staging(blocks, iface.entry, acc_residency, directive)
-    out_file.write_text(assemble_module(iface, frozen, blocks, plan))
+    out_file.write_text(assemble_module(iface, frozen, blocks, plan, acc_residency))
     return out_file
