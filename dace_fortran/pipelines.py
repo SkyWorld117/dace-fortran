@@ -145,6 +145,26 @@ def verify_numerics(reference: SDFG, optimized: SDFG, inputs: dict[str, Any]) ->
         raise AssertionError("optimize() changed the numerics (must be bit-exact):\n  " + "\n  ".join(mismatched))
 
 
+def specialize(sdfg: SDFG, *, symbols: dict[str, Const] | None = None, scalars: dict[str, Const] | None = None) -> None:
+    """Bake free symbols and scalar data containers to constants (each batched into one recursive walk), and drop the
+    scalar inputs nothing reads any more.
+
+    ``specialize_scalars`` folds every read of a scalar into the code that reads it but keeps the container: a
+    non-transient one would stay in the signature, an input the specialised SDFG ignores.
+    """
+    if symbols:
+        specialize_symbols(sdfg, symbols)
+    if not scalars:
+        return
+    specialize_scalars(sdfg, scalars)
+    accessed = {n.data for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.AccessNode)}
+    referenced = set().union(*(sd.used_symbols(all_symbols=True) for sd in sdfg.all_sdfgs_recursive()))
+    for name in scalars:
+        desc = sdfg.arrays.get(name)
+        if desc is not None and not desc.transient and name not in accessed and name not in referenced:
+            sdfg.remove_data(name, validate=False)
+
+
 def optimize(
     sdfg: SDFG,
     *,
@@ -171,10 +191,7 @@ def optimize(
     """
     reference = copy.deepcopy(sdfg) if verify_inputs is not None else None
 
-    if symbols:
-        specialize_symbols(sdfg, symbols)
-    if scalars:
-        specialize_scalars(sdfg, scalars)
+    specialize(sdfg, symbols=symbols, scalars=scalars)
 
     ConvertLengthOneArraysToScalars(preserve_abi=True).apply_pass(sdfg, {})
 

@@ -9,7 +9,6 @@ import ctypes
 from pathlib import Path
 
 import numpy as np
-from dace.sdfg.utils import specialize_scalars, specialize_symbols
 
 from dace_fortran.bindings.build_fortran_library import build_fortran_library
 from dace_fortran.bindings.flatten_plan import FlattenPlan
@@ -21,6 +20,7 @@ from dace_fortran.bindings.specialization import (
     recorded_invariants,
     specializable,
 )
+from dace_fortran.pipelines import specialize
 from tests._util import build_sdfg
 
 _N = 6
@@ -137,7 +137,8 @@ def test_a_general_binding_records_the_values_of_every_call(tmp_path):
     first, second = (call.splitlines() for call in record.read_text().split("\n\n")[:2])
     assert "nv 3" in first and "nv 4" in second and "scaled 1" in first
     # Reals keep every bit, logicals read 0 or 1, and only what never changed is invariant.
-    assert recorded_invariants(record) == {"scaled": 1, "factor": 0.1}
+    invariant = recorded_invariants(record)
+    assert invariant["scaled"] == 1 and invariant["factor"] == 0.1 and "nv" not in invariant
 
 
 def test_a_specialised_binding_runs_its_values_and_declines_others(tmp_path):
@@ -145,8 +146,7 @@ def test_a_specialised_binding_runs_its_values_and_declines_others(tmp_path):
     before = get_frozen_signature(sdfg)
     values = {"nv": 3, "scaled": 1, "factor": 2.0}
     assert set(values) <= specializable(before, iface, plan)
-    specialize_symbols(sdfg, {"nv": 3})
-    specialize_scalars(sdfg, {"scaled": 1, "factor": 2.0})
+    specialize(sdfg, symbols={"nv": 3}, scalars={"scaled": 1, "factor": 2.0})
     refreeze(sdfg)
     taken = {a.sdfg_name for a in get_frozen_signature(sdfg).args} | set(get_frozen_signature(sdfg).free_symbols)
     assert not set(values) & taken
