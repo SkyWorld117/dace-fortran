@@ -41,6 +41,7 @@ NOTE on nanobind bindings:
 from __future__ import annotations
 
 import ast
+import builtins
 import gc
 import weakref
 from collections.abc import Callable, Sequence
@@ -424,10 +425,20 @@ MULTI_FILE_PIPELINE = (
 # Fortran physics-variable names, so renaming them would break
 # user-side bindings interfaces that key on the original name.
 #
+# Python's builtins are in scope as well when sympy parses a string: an
+# identifier naming a builtin callable (``iter``, ``max``, ``len``, ``type``,
+# ...) evaluates to that function instead of a ``Symbol``, and ``iter + 1``
+# (a lifted DO's counter update) fails with ``unsupported operand type(s)``.
+# Flang lower-cases every identifier, so only the lower-case builtins can
+# collide.
+#
 # The bridge renames any matching Fortran identifier to ``program_<name>``
 # at the SDFG layer; the binding emitter restores the original name on
 # the Python wrapper.
-RESERVED_DACE_NAMES = frozenset({"test", "doctest", "im", "re", "ln", "limit"})
+_PYTHON_BUILTIN_CALLABLES = frozenset(
+    name for name, value in vars(builtins).items() if callable(value) and name.islower() and not name.startswith("_")
+)
+RESERVED_DACE_NAMES = frozenset({"test", "doctest", "im", "re", "ln", "limit"}) | _PYTHON_BUILTIN_CALLABLES
 
 DACE_NAME_PREFIX = "program_"
 

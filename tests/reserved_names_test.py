@@ -3,7 +3,9 @@
 The bridge renames Fortran identifiers matching a sympy module-level
 ``LazyFunction`` attribute (``test``, ``doctest``) to ``program_<name>``; without
 it, any interstate-edge expression mentioning the array crashes sympy with
-``SympifyError: cannot sympify object of type LazyFunction``.
+``SympifyError: cannot sympify object of type LazyFunction``.  Identifiers naming
+a Python builtin callable (``iter``, ``max``, ...) are renamed for the same reason:
+sympy's parser evaluates them to the builtin instead of a symbol.
 """
 
 from pathlib import Path
@@ -172,3 +174,61 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_python_builtin_name_as_loop_counter_survives_simplify(tmp_path: Path):
+    """A counted DO with an EXIT whose counter is called ``iter`` is lifted to a loop that updates the counter on an
+    interstate edge; ``simplify`` parses that expression, which fails on the builtin unless the name is renamed."""
+    src = """
+subroutine main(n, maxit, c, w)
+  implicit none
+  integer, intent(in) :: n, maxit
+  real(8), intent(in) :: c(n)
+  real(8), intent(inout) :: w(n)
+  real(8) :: x, dx
+  integer :: j, iter
+  do j = 1, n
+    x = c(j) + 1.0d0
+    do iter = 1, maxit
+      dx = -(x*x - c(j))/(2.0d0*x)
+      x = x + dx
+      if (abs(dx) < 1.0d-12*x) exit
+    end do
+    w(j) = x
+  end do
+end subroutine main
+"""
+    sdfg = _build(src, tmp_path)
+    assert "iter" not in sdfg.arrays and "iter" not in sdfg.symbols
+    sdfg.simplify()
+    c = np.linspace(1.0, 4.0, 8).copy()
+    w = np.zeros(8)
+    sdfg(n=8, maxit=50, c=c, w=w)
+    np.testing.assert_allclose(w, np.sqrt(c), rtol=1e-12)
+
+
+def test_python_builtin_name_as_dummy_argument(tmp_path: Path):
+    """A dummy called ``input`` is ``program_input`` on the SDFG and stays ``input`` for the binding.  (A name the
+    bridge renders as an intrinsic, ``max``, is refused by the bridge itself.)"""
+    src = """
+subroutine main(d, input)
+  double precision, intent(inout) :: d(2)
+  integer, intent(in) :: input(2)
+  d(1) = input(1)
+  d(2) = input(2) + d(2)
+end subroutine main
+"""
+    from tests._util import build_sdfg as _bs
+
+    sdfg_dir = tmp_path / "sdfg"
+    sdfg_dir.mkdir(parents=True, exist_ok=True)
+    builder = _bs(src, sdfg_dir, name="main")
+    sdfg = builder.build()
+    assert "program_input" in sdfg.arrays and "input" not in sdfg.arrays
+    sdfg.simplify()
+    d = np.array([0.0, 0.5])
+    sdfg(d=d, program_input=np.array([3, 4], dtype=np.int32))
+    assert d.tolist() == [3.0, 4.5]
+    frozen = sdfg._frozen_signature
+    arg = next(a for a in frozen.args if a.sdfg_name == "program_input")
+    assert arg.fortran_name == "input"

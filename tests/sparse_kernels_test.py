@@ -40,7 +40,7 @@ END SUBROUTINE gather_kernel
     idx = np.array([3, 1, 4, 1, 5], dtype=np.int32, order="F")
     out = np.zeros(n, dtype=np.float64, order="F")
 
-    sdfg(input=inp, idx=idx, output=out, n=n)
+    sdfg(program_input=inp, idx=idx, output=out, n=n)  # ``input`` is a Python builtin, renamed on the SDFG
 
     np.testing.assert_array_equal(out, inp[idx - 1])
 
@@ -69,7 +69,7 @@ END SUBROUTINE scatter_kernel
     idx = np.array([3, 1, 4, 5, 2], dtype=np.int32, order="F")
     out = np.zeros(n, dtype=np.float64, order="F")
 
-    sdfg(input=inp, idx=idx, output=out, n=n)
+    sdfg(program_input=inp, idx=idx, output=out, n=n)  # ``input`` is a Python builtin, renamed on the SDFG
 
     expected = np.zeros(n, dtype=np.float64)
     for i in range(n):
