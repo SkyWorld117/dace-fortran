@@ -38,6 +38,7 @@ void registerAllBridgePasses() {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createSplitAoRDummiesPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createEliminateDoubleBufferTogglePass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createDefaultIntentPass(); });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createRestoreCountedLoopsPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createVerifyNoUnresolvedCallsPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createFoldElementAliasesPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createFoldCopyInOutPass(); });

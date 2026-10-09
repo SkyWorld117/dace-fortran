@@ -137,6 +137,10 @@ DEFAULT_PIPELINE = (
     # single-block ``scf.if`` so every callee is single-block and inlines
     # cleanly; the trailing lift-cf-to-scf handles whatever inlining exposes.
     "lift-cf-to-scf,"
+    # A DO with a CYCLE (or any branch out of structured control flow in its body) is lowered unstructured and
+    # lifted to a trip-counted scf.while; restore the counted fir.do_loop so the loop and everything nested in it
+    # can become maps.
+    "hlfir-restore-counted-loops,"
     # Delete every ``CALL errore(...)`` / ``CALL finish(...)`` site
     # BEFORE the inliner runs.  These helpers are universally
     # ``IF (ierr <= 0) RETURN`` + ``WRITE`` + ``STOP 1`` -- their error
@@ -331,6 +335,7 @@ DEFAULT_PIPELINE = (
     "hlfir-default-intent,"
     # Lift cf.br / cf.cond_br loops into scf.while so extract_ast can walk them.
     "lift-cf-to-scf,"
+    "hlfir-restore-counted-loops,"
     # Classify ``fir.global`` ops as INPUT vs MUTABLE based on whether
     # the IR writes them.  INPUT globals (no in-IR writes -- the caller
     # mutates them from OUTSIDE via the bindings layer) have their
@@ -387,6 +392,7 @@ MULTI_FILE_PIPELINE = (
     # ``WP-2`` fix; the LU numerical correctness test passes
     # element-wise against the gfortran reference after this lands.
     "lift-cf-to-scf,"
+    "hlfir-restore-counted-loops,"
     "hlfir-inline-all,"
     "hlfir-fold-element-aliases,"
     "symbol-dce,"

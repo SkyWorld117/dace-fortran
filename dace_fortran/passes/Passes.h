@@ -27,6 +27,7 @@ std::unique_ptr<mlir::Pass> createFlattenGlobalScalarReadsPass();
 std::unique_ptr<mlir::Pass> createSplitAoRDummiesPass();
 std::unique_ptr<mlir::Pass> createEliminateDoubleBufferTogglePass();
 std::unique_ptr<mlir::Pass> createDefaultIntentPass();
+std::unique_ptr<mlir::Pass> createRestoreCountedLoopsPass();
 std::unique_ptr<mlir::Pass> createVerifyNoUnresolvedCallsPass();
 std::unique_ptr<mlir::Pass> createFoldElementAliasesPass();
 std::unique_ptr<mlir::Pass> createFoldCopyInOutPass();
