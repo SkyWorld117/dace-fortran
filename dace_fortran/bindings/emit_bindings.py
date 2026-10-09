@@ -24,6 +24,7 @@ from dace_fortran.bindings.block_builders import (
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.fortran_interface import OriginalInterface
 from dace_fortran.bindings.frozen_signature import FrozenSignature
+from dace_fortran.bindings.specialization import Specialization, build_specialization_guard, render_symbol_record
 
 
 def emit_bindings(
@@ -37,6 +38,8 @@ def emit_bindings(
     init_symbols: tuple[str, ...] | None = None,
     directive: Directive = Directive.OPENACC,
     module_allocatables_are_targets: bool = True,
+    specialization: Specialization | None = None,
+    record_symbols_to: str | Path | None = None,
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -72,6 +75,11 @@ def emit_bindings(
     ``module_allocatables_are_targets=False`` is for a caller whose modules are compiled as they are, without the
     TARGET attribute :func:`build_fortran_library` patches into their deferred arrays: the binding then copies an
     allocatable module array in and out instead of aliasing it, which pointer association would not allow.
+
+    ``specialization`` (optional): the SDFG was specialised to these integer values; the wrapper checks them before
+    it does any work and declines the call otherwise (:mod:`dace_fortran.bindings.specialization`).
+    ``record_symbols_to`` (optional): a file the wrapper appends the integer symbols of every call to, the input of
+    :func:`dace_fortran.bindings.specialization.recorded_invariants`.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -91,6 +99,7 @@ def emit_bindings(
             enum_maps=enum_maps,
             module_allocatables_are_targets=module_allocatables_are_targets,
             acc_residency=acc_residency,
+            declinable=specialization is not None,
         ),
         "wrapper_body": build_wrapper_body(
             frozen,
@@ -113,5 +122,13 @@ def emit_bindings(
         "finalize": build_finalize(iface),
     }
     blocks = splice_acc_staging(blocks, iface.entry, acc_residency, directive)
-    out_file.write_text(assemble_module(iface, frozen, blocks, plan, acc_residency))
+    if specialization is not None:
+        guard = build_specialization_guard(specialization, iface, plan)
+        blocks["wrapper_body"] = "\n".join([*guard, "", blocks["wrapper_body"]])
+    if record_symbols_to is not None:
+        blocks["wrapper_body"] = "\n".join(
+            [blocks["wrapper_body"], "", *render_symbol_record(frozen, record_symbols_to)]
+        )
+    guarded = specialization.frozen if specialization is not None else None
+    out_file.write_text(assemble_module(iface, frozen, blocks, plan, acc_residency, guarded=guarded))
     return out_file
