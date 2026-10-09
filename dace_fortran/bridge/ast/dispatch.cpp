@@ -1694,10 +1694,10 @@ static void recognizeIoCall(fir::CallOp call, llvm::StringRef c, IoState& s, std
 
 // Block walker.
 
-/// An ALL/ANY reduction used directly as an IF condition is materialised into a boolean-scalar transient via
-/// AllNode/AnyNode (a reduce ASTNode) so the branch reads a scalar instead of a malformed multi-dim memlet from
-/// inlining the section. Pushes declare_transient+reduce, returns the scalar's name; empty for non-bare ALL/ANY (e.g.
-/// .NOT. ALL(...)).
+/// An ALL/ANY reduction used directly as an IF condition, or stored to a scalar, is materialised into a boolean-scalar
+/// transient via AllNode/AnyNode (a reduce ASTNode) so the reader sees a scalar instead of a malformed multi-dim memlet
+/// from inlining the section. Pushes declare_transient+reduce, returns the scalar's name; empty for non-bare ALL/ANY
+/// (e.g. .NOT. ALL(...)).
 static std::string tryMaterialiseAllAnyCond(mlir::Value condVal, std::vector<ASTNode>& nodes) {
   mlir::Value v = condVal;
   for (int i = 0; i < 8 && v; ++i) {
@@ -3217,7 +3217,10 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
             ref->print(os);
             if (!fftw3CalleeTag(s).empty()) continue;
           }
-      auto expr = buildExpr(st.getValue(), 0);
+      // ``x = ANY(mask)`` / ``ALL(mask)``, e.g. an actual argument ``any(i == idx)`` stored into its association
+      // scalar: reduce the mask like an IF condition does, then read the boolean scalar.
+      std::string const allanyScalar = tryMaterialiseAllAnyCond(st.getValue(), nodes);
+      auto expr = allanyScalar.empty() ? buildExpr(st.getValue(), 0) : allanyScalar;
       // Drops stores with unresolvable RHS -- see note in walkSCFBeforeRegion's fir.store handler.
       if (expr == "?") continue;
       ASTNode a;
@@ -3225,12 +3228,21 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
       a.target = target;
       a.expr = expr;
       a.target_is_array = false;
-      // Collects the stored value's array-element reads for a value-by-reference associate store
-      // (RewriteSequenceAssociation/ExpandVectorSubscriptGather synthesise a __assoc_scalar alloca + fir.store reaching
-      // here). buildExpr renders an array-ELEMENT read as the bare parent name by design; without these reads the
-      // element leaks as a bare pointer (QE paw_newdxx Gate H). Scoped to __assoc_scalar targets so it doesn't perturb
-      // other stores (e.g. prhoc_d's pointer-rebind).
-      if (target.find("assoc_scalar") != std::string::npos) collectReadAccesses(st.getValue(), a.accesses, 0);
+      if (!allanyScalar.empty()) {
+        AccessInfo read;
+        read.array_name = allanyScalar;
+        read.is_read = true;
+        read.index_vars.emplace_back("1");
+        read.index_exprs.emplace_back("1");
+        a.accesses.push_back(std::move(read));
+      } else if (target.find("assoc_scalar") != std::string::npos) {
+        // Collects the stored value's array-element reads for a value-by-reference associate store
+        // (RewriteSequenceAssociation/ExpandVectorSubscriptGather synthesise a __assoc_scalar alloca + fir.store
+        // reaching here). buildExpr renders an array-ELEMENT read as the bare parent name by design; without these
+        // reads the element leaks as a bare pointer (QE paw_newdxx Gate H). Scoped to __assoc_scalar targets so it
+        // doesn't perturb other stores (e.g. prhoc_d's pointer-rebind).
+        collectReadAccesses(st.getValue(), a.accesses, 0);
+      }
       nodes.push_back(std::move(a));
       continue;
     }
