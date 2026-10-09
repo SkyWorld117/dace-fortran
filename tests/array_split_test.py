@@ -1,8 +1,8 @@
 """Splitting an array along a dimension every access subscripts with a constant: ``a[k, ...]`` becomes the arrays
 ``a_k[...]``, and anything else leaves the SDFG as it was."""
 
-import numpy as np
 import dace
+import numpy as np
 from dace.properties import CodeBlock
 from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 

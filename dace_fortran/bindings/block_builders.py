@@ -1371,10 +1371,11 @@ def _aos_module_args(frozen: FrozenSignature) -> list:
 
 
 def _unsourced_array_args(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan) -> list:
-    """Array SDFG args with NO host source: not a dummy, flatten companion, module
+    """Array SDFG args with NO host source: not a dummy, flatten companion (or one element of a split one), module
     global, or AoS component -- data buffers of ABSENT inlined-callee optionals
     (QE's becphi_r). Need a shape-degenerate zero-filled local or c_loc() fails to compile."""
     declared = {f for entry in plan.entries for f in entry.recipe.flat_names}
+    declared |= {a.sdfg_name for a in frozen.args if a.element_of}
     declared |= {a.sdfg_name for a, _m, _mem in _orphan_module_args(frozen, iface, plan)}
     declared |= {a.sdfg_name for a in _aos_module_args(frozen)}
     declared |= {a.name for a in iface.args}
