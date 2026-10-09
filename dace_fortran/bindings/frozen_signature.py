@@ -314,15 +314,16 @@ def drop_unread_module_inputs(sdfg: SDFG) -> list[str]:
     that read them, most are dead weight the binding would still copy in on every call.  Only module variables go:
     the caller's own buffers are the ABI.  Re-snapshot with :func:`refreeze` afterwards.
     """
+    from dace_fortran.pipelines import read_data
+
     frozen = get_frozen_signature(sdfg)
     if frozen is None:
         return []
-    accessed = {n.data for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.AccessNode)}
-    referenced = set().union(*(sd.used_symbols(all_symbols=True) for sd in sdfg.all_sdfgs_recursive()))
+    read = read_data(sdfg)
     unread = [
         name
         for name in frozen.module_symbol_origins
-        if name in sdfg.arrays and not sdfg.arrays[name].transient and name not in accessed and name not in referenced
+        if name in sdfg.arrays and not sdfg.arrays[name].transient and name not in read
     ]
     for name in unread:
         sdfg.remove_data(name, validate=False)

@@ -145,6 +145,19 @@ def verify_numerics(reference: SDFG, optimized: SDFG, inputs: dict[str, Any]) ->
         raise AssertionError("optimize() changed the numerics (must be bit-exact):\n  " + "\n  ".join(mismatched))
 
 
+def read_data(sdfg: SDFG) -> set[str]:
+    """The data containers of ``sdfg`` something reads: an access node anywhere (nested SDFGs reach the outer
+    containers through access nodes), an interstate edge, or a loop or branch condition."""
+    from dace.sdfg.state import AbstractControlFlowRegion
+
+    read = {n.data for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.AccessNode)}
+    read |= {m.data for e in sdfg.all_interstate_edges() for m in e.data.get_read_memlets(sdfg.arrays)}
+    for block in sdfg.all_control_flow_blocks():
+        if isinstance(block, AbstractControlFlowRegion):
+            read |= {m.data for m in block.get_meta_read_memlets()}
+    return read
+
+
 def specialize(sdfg: SDFG, *, symbols: dict[str, Const] | None = None, scalars: dict[str, Const] | None = None) -> None:
     """Bake free symbols and scalar data containers to constants (each batched into one recursive walk), and drop the
     scalar inputs nothing reads any more.
@@ -157,11 +170,10 @@ def specialize(sdfg: SDFG, *, symbols: dict[str, Const] | None = None, scalars: 
     if not scalars:
         return
     specialize_scalars(sdfg, scalars)
-    accessed = {n.data for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.AccessNode)}
-    referenced = set().union(*(sd.used_symbols(all_symbols=True) for sd in sdfg.all_sdfgs_recursive()))
+    read = read_data(sdfg)
     for name in scalars:
         desc = sdfg.arrays.get(name)
-        if desc is not None and not desc.transient and name not in accessed and name not in referenced:
+        if desc is not None and not desc.transient and name not in read:
             sdfg.remove_data(name, validate=False)
 
 
