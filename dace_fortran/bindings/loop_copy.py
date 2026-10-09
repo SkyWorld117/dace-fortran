@@ -9,6 +9,8 @@ alias), ``render_copy_in_loop`` (allocate + forward do-loop copy),
 return ``List[str]`` of lines pre-indented to wrapper-body level.
 """
 
+from collections.abc import Mapping
+
 from dace_fortran.bindings.flatten_plan import (
     FlattenRecipe,
     strip_index_args,
@@ -210,13 +212,12 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_pack_in called on non-aos_alloc recipe")
     flat = recipe.flat_names[0]
-    caps, lbs = recipe.cap_symbols, recipe.lb_symbols
-    n_extent = recipe.shape_exprs[0] if recipe.shape_exprs else "size(" + outer_expr + ")"
+    caps = recipe.cap_symbols
+    n_extent = _aos_alloc_count(recipe, outer_expr)
     member_at_i = _aos_alloc_member_at_i(recipe)
     present = _aos_alloc_presence(recipe, member_at_i)
     dims = range(1, len(caps) + 1)
     live = ", ".join(f"1:size({member_at_i}, {k})" for k in dims)
-    differs = "error stop 'elements of " + outer_expr + " differ in their lower bounds'"
     if device:
         buffer_idx, member_idx = aos_pack_subscripts(recipe)
         padded = " .or. ".join(f"size({member_at_i}, {k}) < {cap}" for k, cap in zip(dims, caps, strict=True))
@@ -252,6 +253,26 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
         ]
     return [
         f"    ! ----- AoS pack-in: {outer_expr} -> {flat} (cap = {', '.join(caps)}){' on the device' if device else ''} -----",
+        *_aos_alloc_bounds(recipe, outer_expr),
+        *fill,
+    ]
+
+
+def _aos_alloc_count(recipe: FlattenRecipe, outer_expr: str) -> str:
+    """The number of elements of an aos_alloc recipe's array of records."""
+    return recipe.shape_exprs[0] if recipe.shape_exprs else "size(" + outer_expr + ")"
+
+
+def _aos_alloc_bounds(recipe: FlattenRecipe, outer_expr: str) -> list[str]:
+    """Assign the recipe's lower-bound symbols the members' common lower bounds and its cap symbols their largest
+    extents, over the present elements."""
+    caps, lbs = recipe.cap_symbols, recipe.lb_symbols
+    n_extent = _aos_alloc_count(recipe, outer_expr)
+    member_at_i = _aos_alloc_member_at_i(recipe)
+    present = _aos_alloc_presence(recipe, member_at_i)
+    dims = range(1, len(caps) + 1)
+    differs = "error stop 'elements of " + outer_expr + " differ in their lower bounds'"
+    return [
         *(f"    {cap} = 0" for cap in caps),
         *(f"    {lb} = 1" for lb in lbs),
         # The buffer takes the lower bounds of the first present non-empty element (an empty one has lbound 1 in a
@@ -277,8 +298,48 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
         "    end do",
         # Empty-batch sentinel: keep every cap >= 1 so the buffer is non-degenerate.
         *(f"    if ({cap} == 0) {cap} = 1" for cap in caps),
-        *fill,
     ]
+
+
+def render_aos_alloc_members(
+    recipe: FlattenRecipe, outer_expr: str, elements: Mapping[int, str], declined_flag: str | None = None
+) -> list[str]:
+    """Hand the SDFG the members of an array of records one by one instead of packed: ``elements`` maps a 0-based
+    element index to the SDFG array it split into (:func:`dace_fortran.array_split.split_array`), which becomes a
+    pointer to that element's member.  The SDFG addresses every member with the recipe's caps and lower bounds, so
+    each must be present, contiguous and exactly that shape; otherwise the wrapper declines the call through
+    ``declined_flag`` (when the wrapper has one and the caller passes it) or stops."""
+    if not recipe.aos_alloc:
+        raise ValueError("render_aos_alloc_members called on non-aos_alloc recipe")
+    member_at_i = _aos_alloc_member_at_i(recipe)
+    present = _aos_alloc_presence(recipe, member_at_i)
+    dims = range(1, len(recipe.cap_symbols) + 1)
+    conforming = " .and. ".join(
+        [f"is_contiguous({member_at_i})"]
+        + [f"size({member_at_i}, {k}) == {cap}" for k, cap in zip(dims, recipe.cap_symbols, strict=True)]
+        + [f"lbound({member_at_i}, {k}) == {lb}" for k, lb in zip(dims, recipe.lb_symbols, strict=True)]
+    )
+    refuse = []
+    if declined_flag:
+        refuse += [f"if (present({declined_flag})) then", f"  {declined_flag} = .true.", "  return", "end if"]
+    refuse.append(f"error stop 'an element of {outer_expr} is absent or not of the shape its siblings share'")
+    lines = [
+        f"    ! ----- Members of {outer_expr}, one array per element, aliased in place -----",
+        *_aos_alloc_bounds(recipe, outer_expr),
+    ]
+    for index, name in sorted(elements.items()):
+        # Presence first: Fortran's .and. does not short-circuit, and an absent member has no shape to query.
+        lines += [
+            f"    i1 = {index + 1}",
+            f"    if (.not. {present}) then",
+            *(f"      {ln}" for ln in refuse),
+            "    end if",
+            f"    if (.not. ({conforming})) then",
+            *(f"      {ln}" for ln in refuse),
+            "    end if",
+            f"    {name} => {member_at_i}",
+        ]
+    return lines
 
 
 def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str, device: bool = False) -> list[str]:

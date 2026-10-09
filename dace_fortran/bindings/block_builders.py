@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from dace_fortran.bindings.acc_transfers import Directive
 from dace_fortran.bindings.flatten_plan import (
+    FlattenEntry,
     FlattenPlan,
     FlattenRecipe,
     strip_index_args,
@@ -32,6 +33,7 @@ from dace_fortran.bindings.loop_copy import (
     aos_pack_extent_locals,
     fortran_scalar_type,
     render_alias_calls,
+    render_aos_alloc_members,
     render_aos_alloc_pack_in,
     render_aos_alloc_pack_out,
     render_aos_alloc_release,
@@ -414,6 +416,16 @@ def build_wrapper_head(
     for dt in sorted(guard_scratch_dtypes):
         flat_ptr_lines.append(f"    {fortran_scalar_type(dt)}, target :: {_presence_scratch_name(dt)}(1)")
 
+    # A split array of records: a pointer per element onto its member, chosen by the element index i1.
+    for entry, elements in split_entries(frozen, plan):
+        r = entry.recipe
+        member_dims = "(" + ", ".join(":" for _ in r.cap_symbols) + ")"
+        flat_ptr_lines += [
+            f"    {fortran_scalar_type(r.scratch_dtype)}, pointer, contiguous :: {name}{member_dims}"
+            for name in elements.values()
+        ]
+        max_loop_rank = max(max_loop_rank, 1)
+
     # A free symbol that's also a frozen arg must use that arg's C type (e.g.
     # int64 extents) -- a hardcoded integer(c_int) local mismatches the bind(c) dummy.
     sym_dtype = {a.sdfg_name: a.dtype for a in frozen.args if a.kind in (FrozenArgKind.SCALAR, FrozenArgKind.SYMBOL)}
@@ -445,10 +457,11 @@ def build_wrapper_head(
     # The pack-in of an aos_alloc recipe assigns every cap / lower-bound symbol; one the SDFG never reads (a member
     # no element access touches, a lower bound no memlet uses) is not a free symbol, so declare it here.
     declared_syms = set(frozen.free_symbols) | outer_dummy_set | flat_names | module_arg_names
+    record_arrays = [*live_entries(frozen, plan), *(entry for entry, _ in split_entries(frozen, plan))]
     pack_only = sorted(
         {
             sym
-            for entry in live_entries(frozen, plan)
+            for entry in record_arrays
             if entry.recipe.aos_alloc
             for sym in (*entry.recipe.cap_symbols, *entry.recipe.lb_symbols)
         }
@@ -601,10 +614,14 @@ def build_wrapper_body(
     enum_maps: dict | None = None,
     module_allocatables_are_targets: bool = True,
     acc_residency: AccTransferPlan | None = None,
+    declinable: bool = False,
 ) -> str:
     """Render the between-declaration-and-SDFG-call block: for each FlattenEntry
     either alias it (zero-copy) or allocate + copy in, then populate SDFG free
-    symbols from size(...) on the outer storage."""
+    symbols from size(...) on the outer storage.
+
+    ``declinable``: an array of records split per element whose members do not all have the shape the SDFG takes is
+    declined through the wrapper's ``dace_declined`` flag rather than stopped on."""
     deviceptr, device_pack = _device_lane(acc_residency)
     outer_dummy_set = {a.name for a in iface.args}
     enum_args = _enum_args(iface, enum_maps or {})
@@ -674,6 +691,9 @@ def build_wrapper_body(
                 copyin.append("    end if")
             else:
                 copyin.extend(lines)
+    for entry, elements in split_entries(frozen, plan):
+        flag = DECLINED_FLAG if declinable else None
+        copyin.extend(render_aos_alloc_members(entry.recipe, entry.outer_expr, elements, flag))
 
     # Symbol population is SPLIT by data dependency: a shape sym from a module
     # global/dummy/constant must be assigned BEFORE the allocates below, while a
@@ -1433,6 +1453,21 @@ def live_entries(frozen: FrozenSignature, plan: FlattenPlan) -> list:
     internal_pack stack canary. Live iff a flat companion is a kernel arg or symbol."""
     live_names = {a.sdfg_name for a in frozen.args}
     return [e for e in plan.entries if any(f in live_names for f in e.recipe.flat_names)]
+
+
+def split_entries(frozen: FrozenSignature, plan: FlattenPlan) -> list[tuple[FlattenEntry, dict[int, str]]]:
+    """Arrays of records whose packed companion split into one argument per element
+    (:func:`dace_fortran.bindings.record_split.split_record_companions`), each with those arguments by element
+    index."""
+    elements: dict[str, dict[int, str]] = {}
+    for a in frozen.args:
+        if a.element_of:
+            elements.setdefault(a.element_of, {})[a.element_index] = a.sdfg_name
+    return [
+        (e, elements[e.recipe.flat_names[0]])
+        for e in plan.entries
+        if e.recipe.aos_alloc and e.recipe.flat_names[0] in elements
+    ]
 
 
 def _guarded_copy_out(lines: list[str], guard: str, recipe: FlattenRecipe) -> list[str]:
