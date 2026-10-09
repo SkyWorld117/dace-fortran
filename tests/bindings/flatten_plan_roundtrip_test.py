@@ -5,6 +5,8 @@ structurally correct hlfir.flatten_plan attribute that the bridge decodes into F
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from dace_fortran.bindings import FlattenPlan
 from dace_fortran.build_bridge import hb
 from tests._util import flang_binary
@@ -160,11 +162,77 @@ end subroutine
     assert r.aos_alloc is True
     assert r.aliasable is False
     assert r.flat_names == ("a_w",)
-    assert r.cap_symbol == "cap_a_w"
+    assert r.cap_symbols == ("cap_a_w",)
+    assert r.lb_symbols == ("lb_a_w",)
+    assert r.member_pointer is False
     assert r.rank == 2
     assert r.shape_exprs == ("size(a, dim=1)", "cap_a_w")
     assert r.read_exprs == ("a($i1)%w($i2)",)
     assert r.scratch_dtype == "float64"
+
+
+def test_aos_pointer_rank3_dummy_emits_aos_alloc_recipe(tmp_path: Path):
+    """Phase 5c-B with a POINTER rank-3 member and a runtime outer extent: one cap and one lower-bound symbol
+    per member dim, rank = outer_rank + 3, presence by ``associated``."""
+    plan = _plan_from_fortran(
+        """
+module fields_mod
+  implicit none
+  type, public :: field_t
+    real(8), pointer :: sf(:, :, :) => null()
+  end type
+  integer :: nf = 2
+end module
+
+subroutine kernel(q, n)
+  use fields_mod
+  implicit none
+  type(field_t), intent(inout) :: q(nf)
+  integer, intent(in) :: n
+  integer :: i, j
+  do i = 1, nf
+    do j = 0, n
+      q(i)%sf(j, 0, 0) = q(i)%sf(j, 0, 0) * 2.0d0
+    end do
+  end do
+end subroutine
+""",
+        tmp_path,
+    )
+    assert len(plan.entries) == 1
+    r = plan.entries[0].recipe
+    assert r.aos_alloc is True
+    assert r.member_pointer is True
+    assert r.flat_names == ("q_sf",)
+    assert r.rank == 4
+    assert r.read_exprs == ("q($i1)%sf($i2, $i3, $i4)",)
+    assert r.cap_symbols == ("cap_q_sf_d0", "cap_q_sf_d1", "cap_q_sf_d2")
+    assert r.lb_symbols == ("lb_q_sf_d0", "lb_q_sf_d1", "lb_q_sf_d2")
+    assert r.shape_exprs == ("size(q, dim=1)", "cap_q_sf_d0", "cap_q_sf_d1", "cap_q_sf_d2")
+
+
+def test_aos_pointer_member_on_rank2_dummy_fails_loudly(tmp_path: Path, capfd):
+    """The padded pack/unpack handles a rank-1 array of records only: a rank-2 one is rejected, not miscompiled."""
+    with pytest.raises(RuntimeError):
+        _plan_from_fortran(
+            """
+module fields_mod
+  implicit none
+  type, public :: field_t
+    real(8), pointer :: sf(:) => null()
+  end type
+end module
+
+subroutine kernel(q)
+  use fields_mod
+  implicit none
+  type(field_t), intent(inout) :: q(2, 2)
+  q(1, 2)%sf(1) = q(2, 1)%sf(1)
+end subroutine
+""",
+            tmp_path,
+        )
+    assert "rank 2" in capfd.readouterr().err
 
 
 def test_mixed_aos_alloc_and_plain_member_split_into_two_entries(tmp_path: Path):
@@ -206,7 +274,7 @@ end subroutine
     assert len(plain_entries) == 1
     aos = aos_entries[0].recipe
     assert aos.flat_names == ("a_w",)
-    assert aos.cap_symbol == "cap_a_w"
+    assert aos.cap_symbols == ("cap_a_w",)
     plain = plain_entries[0].recipe
     assert plain.flat_names == ("a_tag",)
     assert "tag" in plain.read_exprs[0]

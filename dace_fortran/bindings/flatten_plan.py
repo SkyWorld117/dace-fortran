@@ -37,34 +37,46 @@ class FlattenRecipe:
         flats.  Empty when outer is read-only, the recipe is aliased,
         or aos_alloc (bespoke pack-out code instead).
     rank: number of loop indices used; 0 for scalar unpacks.  For
-        aos_alloc this is outer_rank + 1.
+        aos_alloc this is outer_rank + the member's rank.
     shape_exprs: per-rank extent expr, length == rank (typically
-        ``size(<outer>, dim=1)``, ...).  For aos_alloc the inner dim
-        is the cap symbol verbatim, not a size() call.
+        ``size(<outer>, dim=1)``, ...).  For aos_alloc the member dims
+        are the cap symbols verbatim, not size() calls.
     aliasable: True iff pure element identity + matching storage
         layout -- emitter skips allocate/copy, aliases via
         c_f_pointer.  Mutually exclusive with aos_alloc.
     scratch_dtype: SDFG element dtype for flat scratch buffers; all
         flats of one recipe share a dtype.
-    aos_alloc: Phase 5c-B (AoS + allocatable/pointer array member at
-        the SDFG boundary).  True switches to the padding-to-max
-        pack/unpack path::
+    aos_alloc: Phase 5c-B (AoS + allocatable/pointer array member of
+        rank R at the SDFG boundary).  True switches to the
+        padding-to-max pack/unpack path, per member dim k::
 
-            cap = max_i(merge(size(A(i)%w), 0, allocated(A(i)%w)))
-            allocate(A_w(N, cap)); A_w = 0
-            do i = 1, N; if (allocated(A(i)%w)) A_w(i, 1:size(A(i)%w)) = A(i)%w
+            lb_k = lbound(A(i)%w, k) of the first present element (all must agree)
+            cap_k = max_i(merge(size(A(i)%w, k), 0, present(A(i)%w)))
+            allocate(A_w(N, cap_1, ..., cap_R)); A_w = 0
+            do i = 1, N; if (present) A_w(i, 1:size(A(i)%w, 1), ...) = A(i)%w
             <SDFG call>
-            do i = 1, N; if (allocated(A(i)%w)) A(i)%w = A_w(i, 1:size(A(i)%w))   ! intent(out)/(inout)
+            do i = 1, N; if (present) A(i)%w = A_w(i, 1:size(A(i)%w, 1), ...)   ! intent(out)/(inout)
             deallocate(A_w)
 
-        Companion buffer is always ``A_<member>(N, cap)``, one flat
-        per recipe (complex-split doesn't combine with aos_alloc).
-        Mixed structs (one allocatable + one plain member) split
-        across two recipes: aos_alloc=True for the allocatable one,
-        aliasable=True for the rest.
-    cap_symbol: SDFG runtime symbol carrying the cap.  Empty unless
-        aos_alloc=True, else ``cap_<base>_<member>``.
-        ``_build_symbol_assigns`` skips it (pack-in computes it directly).
+        where present is ``allocated`` or, for a pointer member,
+        ``associated``.  Companion buffer is always
+        ``A_<member>(N, cap...)``, one flat per recipe (complex-split
+        doesn't combine with aos_alloc).  Mixed structs (one
+        allocatable + one plain member) split across two recipes:
+        aos_alloc=True for the allocatable one, aliasable=True for the
+        rest.  The copies assume no two packed elements share storage
+        (pointer members of one or several dummies): pack-out writes
+        them back in order, so the last one would win.
+    cap_symbols: per member dim, the SDFG runtime symbol carrying the
+        padded extent (``cap_<base>_<member>`` for a rank-1 member,
+        ``cap_<base>_<member>_d<k>`` with a 0-based k otherwise).  Empty
+        unless aos_alloc.
+    lb_symbols: per member dim, the SDFG runtime symbol carrying the
+        lower bound the elements share (``lb_...``, named like the caps).
+        ``_build_symbol_assigns`` skips caps and lower bounds (pack-in
+        computes them directly).
+    member_pointer: the aos_alloc member is a POINTER (presence is
+        ``associated``), not an ALLOCATABLE (``allocated``).
     """
 
     flat_names: tuple[str, ...]
@@ -75,7 +87,9 @@ class FlattenRecipe:
     aliasable: bool = False
     scratch_dtype: str = "float64"
     aos_alloc: bool = False
-    cap_symbol: str = ""
+    cap_symbols: tuple[str, ...] = field(default_factory=tuple)
+    lb_symbols: tuple[str, ...] = field(default_factory=tuple)
+    member_pointer: bool = False
 
     # ----- JSON I/O ---------------------------------------------------
 
@@ -85,6 +99,8 @@ class FlattenRecipe:
         d["flat_names"] = list(self.flat_names)
         d["read_exprs"] = list(self.read_exprs)
         d["shape_exprs"] = list(self.shape_exprs)
+        d["cap_symbols"] = list(self.cap_symbols)
+        d["lb_symbols"] = list(self.lb_symbols)
         return d
 
     @classmethod
@@ -94,6 +110,8 @@ class FlattenRecipe:
         d["flat_names"] = tuple(d.get("flat_names", []))
         d["read_exprs"] = tuple(d.get("read_exprs", []))
         d["shape_exprs"] = tuple(d.get("shape_exprs", []))
+        d["cap_symbols"] = tuple(d.get("cap_symbols", []))
+        d["lb_symbols"] = tuple(d.get("lb_symbols", []))
         return cls(**d)
 
 

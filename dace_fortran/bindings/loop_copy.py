@@ -147,52 +147,78 @@ def render_copy_out_loop(recipe: FlattenRecipe, outer_expr: str) -> list[str]:
 # ``FlattenRecipe.aos_alloc`` in ``flatten_plan.py``; this module
 # implements the two emitters that read those fields.
 #
-# Helpers below extract `A($i1)%w` from recipe.read_exprs[0] by splitting
-# on "($i2)" -- safe because the bridge always emits aos_alloc recipes as
-# `<outer>($i1)%<member>($i2)`.  i1 is the iterator build_wrapper_head
-# declares for any non-aliasable rank>=1 recipe.
+# Helpers below extract `A($i1)%w` from recipe.read_exprs[0] by dropping the
+# trailing member subscript list -- safe because the bridge always emits
+# aos_alloc recipes as `<outer>($i1)%<member>($i2, ...)`.  i1 is the iterator
+# build_wrapper_head declares for any non-aliasable rank>=1 recipe.
 
 
 def _aos_alloc_member_at_i(recipe: FlattenRecipe) -> str:
-    """Extract ``<outer>(i1)%<member>`` (no inner index) from an
-    aos_alloc recipe's ``read_exprs[0]``, for allocated()/size() queries
-    in the pack-in/pack-out emitters."""
-    template = recipe.read_exprs[0]  # "A($i1)%w($i2)"
-    base = template.split("($i2)")[0] if "($i2)" in template else template.rsplit("(", 1)[0]
-    return base.replace("$i1", "i1")
+    """Extract ``<outer>(i1)%<member>`` (no member subscripts) from an
+    aos_alloc recipe's ``read_exprs[0]``, for presence / size() / lbound()
+    queries in the pack-in/pack-out emitters."""
+    template = recipe.read_exprs[0]  # "A($i1)%w($i2, ...)"
+    return template.rsplit("(", 1)[0].replace("$i1", "i1")
+
+
+def _aos_alloc_presence(recipe: FlattenRecipe, member: str) -> str:
+    """Presence query for one element's member: ``associated`` for a pointer, else ``allocated``."""
+    return f"associated({member})" if recipe.member_pointer else f"allocated({member})"
 
 
 def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str) -> list[str]:
-    """Compute ``cap``, allocate the 2D buffer, pack each allocated row's
-    live region.  ``recipe.aos_alloc`` must be True."""
+    """Take the elements' common lower bounds, compute each member dim's
+    cap, allocate the buffer, pack each present element's live region.
+    ``recipe.aos_alloc`` must be True."""
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_pack_in called on non-aos_alloc recipe")
     flat = recipe.flat_names[0]
-    cap = recipe.cap_symbol
+    caps, lbs = recipe.cap_symbols, recipe.lb_symbols
     n_extent = recipe.shape_exprs[0] if recipe.shape_exprs else "size(" + outer_expr + ")"
     member_at_i = _aos_alloc_member_at_i(recipe)
+    present = _aos_alloc_presence(recipe, member_at_i)
+    dims = range(1, len(caps) + 1)
+    live = ", ".join(f"1:size({member_at_i}, {k})" for k in dims)
+    differs = "error stop 'elements of " + outer_expr + " differ in their lower bounds'"
     return [
-        f"    ! ----- AoS+allocatable pack-in: {outer_expr} -> {flat} (cap = {cap}) -----",
-        f"    {cap} = 0",
+        f"    ! ----- AoS pack-in: {outer_expr} -> {flat} (cap = {', '.join(caps)}) -----",
+        *(f"    {cap} = 0" for cap in caps),
+        *(f"    {lb} = 1" for lb in lbs),
+        # The buffer takes the lower bounds of the first present non-empty element (an empty one has lbound 1 in a
+        # zero-extent dim); every other non-empty element must agree.
         f"    do i1 = 1, {n_extent}",
-        f"      if (allocated({member_at_i})) then",
-        f"        if (size({member_at_i}) > {cap}) {cap} = size({member_at_i})",
+        f"      if ({present}) then",
+        f"        if (size({member_at_i}) > 0) then",
+        *(f"          {lb} = lbound({member_at_i}, {k})" for k, lb in zip(dims, lbs, strict=True)),
+        "          exit",
+        "        end if",
         "      end if",
         "    end do",
-        # Empty-batch sentinel: keep cap >= 1 so the buffer is non-degenerate.
-        f"    if ({cap} == 0) {cap} = 1",
-        f"    allocate({flat}({n_extent}, {cap}))",
+        f"    do i1 = 1, {n_extent}",
+        f"      if ({present}) then",
+        f"        if (size({member_at_i}) > 0) then",
+        *(f"          if (lbound({member_at_i}, {k}) /= {lb}) {differs}" for k, lb in zip(dims, lbs, strict=True)),
+        "        end if",
+        *(
+            f"        if (size({member_at_i}, {k}) > {cap}) {cap} = size({member_at_i}, {k})"
+            for k, cap in zip(dims, caps, strict=True)
+        ),
+        "      end if",
+        "    end do",
+        # Empty-batch sentinel: keep every cap >= 1 so the buffer is non-degenerate.
+        *(f"    if ({cap} == 0) {cap} = 1" for cap in caps),
+        f"    allocate({flat}({n_extent}, {', '.join(caps)}))",
         f"    {flat} = 0",
         f"    do i1 = 1, {n_extent}",
-        f"      if (allocated({member_at_i})) then",
-        f"        {flat}(i1, 1:size({member_at_i})) = {member_at_i}",
+        f"      if ({present}) then",
+        f"        {flat}(i1, {live}) = {member_at_i}",
         "      end if",
         "    end do",
     ]
 
 
 def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str) -> list[str]:
-    """Copy each allocated row's live region back from the buffer, free
+    """Copy each present element's live region back from the buffer, free
     the scratch.  No reallocation -- 5c-B kernels don't change
     per-instance sizes (reserved for 5c-C)."""
     if not recipe.aos_alloc:
@@ -200,11 +226,13 @@ def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str) -> list[st
     flat = recipe.flat_names[0]
     n_extent = recipe.shape_exprs[0] if recipe.shape_exprs else "size(" + outer_expr + ")"
     member_at_i = _aos_alloc_member_at_i(recipe)
+    present = _aos_alloc_presence(recipe, member_at_i)
+    live = ", ".join(f"1:size({member_at_i}, {k})" for k in range(1, len(recipe.cap_symbols) + 1))
     return [
-        f"    ! ----- AoS+allocatable pack-out: {flat} -> {outer_expr} -----",
+        f"    ! ----- AoS pack-out: {flat} -> {outer_expr} -----",
         f"    do i1 = 1, {n_extent}",
-        f"      if (allocated({member_at_i})) then",
-        f"        {member_at_i} = {flat}(i1, 1:size({member_at_i}))",
+        f"      if ({present}) then",
+        f"        {member_at_i} = {flat}(i1, {live})",
         "      end if",
         "    end do",
         f"    deallocate({flat})",

@@ -2011,7 +2011,11 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
     // leaf referenced in a closed-form extent expression
     // (``traceExtentExpr`` resolves these for the descriptor; the
     // leaves must be SDFG symbols for the expression to compile).
-    for (auto ext : classifyShapeOperand(op.getShape()).extents) collectExtentExprScalars(ext, symbolNames);
+    // A runtime lower bound is a size use too: the array's
+    // ``offset_<arr>_d<i>`` symbol aliases it only if it is a symbol.
+    auto shapeInfo = classifyShapeOperand(op.getShape());
+    for (auto ext : shapeInfo.extents) collectExtentExprScalars(ext, symbolNames);
+    for (auto lb : shapeInfo.lbs) collectExtentExprScalars(lb, symbolNames);
   }
   module.walk([&](fir::DoLoopOp lp) {
     auto ub = traceToDecl(lp.getUpperBound());

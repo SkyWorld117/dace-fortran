@@ -16,6 +16,7 @@ from dace_fortran.bindings import (
     OriginalInterface,
     emit_bindings,
 )
+from dace_fortran.bindings.build_fortran_library import compiled_init_symbols
 from dace_fortran.bindings.fortran_interface import build_auto_interface
 from tests._util import build_sdfg
 
@@ -67,7 +68,8 @@ def _build_sdfg_lib(
         iface = build_auto_interface(sdfg._fortran_interface_raw, name)
 
     bindings_path = tmp_path / f"{name}_bindings.f90"
-    emit_bindings(fs, iface, plan, str(bindings_path))
+    # The production path's init contract: ``__dace_init`` takes only the symbols the generated code uses.
+    emit_bindings(fs, iface, plan, str(bindings_path), init_symbols=compiled_init_symbols(so_path, name))
     types_path = tmp_path / f"{name}_types.f90"
     types_path.write_text(types_src)
     driver_path = tmp_path / f"{name}_driver.f90"
@@ -949,6 +951,141 @@ def test_e2e_array_of_jagged_alloc_structs_deepcopy(tmp_path: Path):
     np.testing.assert_allclose(p_sdfg, p_ref, rtol=1e-12, atol=1e-12)
     # Sanity: the live data really was scaled (not a no-op match).
     np.testing.assert_allclose(p_ref, p_init * 2.0, rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# AoS of rank-3 POINTER members with lower bounds -- padded pack/unpack
+# ---------------------------------------------------------------------------
+
+_FLD_TYPES_SRC = """
+module mo_fields
+  use iso_c_binding
+  implicit none
+  type :: field_t
+     real(c_double), pointer :: sf(:, :, :) => null()
+     real(c_double), pointer :: spare(:) => null()
+  end type field_t
+  integer :: nf = 3
+end module mo_fields
+"""
+
+_FLD_KERNEL_SRC = """
+module kern_fld_mod
+contains
+subroutine kern_fld(q_in, q_out, n)
+  use mo_fields
+  use iso_c_binding
+  implicit none
+  type(field_t), intent(in) :: q_in(0:nf - 1)
+  type(field_t), intent(inout) :: q_out(nf)
+  integer, intent(in) :: n
+  integer :: i, j, k, l
+  do l = -1, n
+     do k = -1, n
+        do j = -1, n
+           do i = 1, nf
+              q_out(i)%sf(j, k, l) = 2.0_c_double*q_in(i - 1)%sf(j, k, l) + real(i, c_double)
+           end do
+        end do
+     end do
+  end do
+  call add_first(q_in, q_out)
+end subroutine kern_fld
+
+subroutine add_first(q_vf, q_res)
+  use mo_fields
+  use iso_c_binding
+  implicit none
+  type(field_t), intent(in) :: q_vf(nf)
+  type(field_t), intent(inout) :: q_res(nf)
+  integer :: i, j
+  do i = 1, nf
+     do j = lbound(q_vf(1)%sf, 1), ubound(q_vf(1)%sf, 1)
+        q_res(i)%sf(j, 0, 0) = q_res(i)%sf(j, 0, 0) + q_vf(1)%sf(j, lbound(q_vf(1)%sf, 2), 0)
+     end do
+  end do
+end subroutine add_first
+end module kern_fld_mod
+"""
+
+# Both drivers allocate every q(i)%sf as (-1:n, -1:n, -1:n) from flat buffers of nf*(n+2)**3 values.
+_FLD_DRIVER_TEMPLATE = """
+subroutine {run}(p_in, p_out, n) bind(c, name='{run}')
+  use iso_c_binding
+  use mo_fields, only: field_t, nf
+  use {kernel_module}
+  implicit none
+  integer(c_int), value :: n
+  real(c_double), intent(in) :: p_in(3*(n + 2)**3)
+  real(c_double), intent(inout) :: p_out(3*(n + 2)**3)
+  type(field_t), target :: q_in(3), q_out(3)
+  integer :: i, m
+  m = (n + 2)**3
+  do i = 1, nf
+     allocate(q_in(i)%sf(-1:n, -1:n, -1:n), q_out(i)%sf(-1:n, -1:n, -1:n))
+     q_in(i)%sf = reshape(p_in((i - 1)*m + 1:i*m), [n + 2, n + 2, n + 2])
+     q_out(i)%sf = reshape(p_out((i - 1)*m + 1:i*m), [n + 2, n + 2, n + 2])
+  end do
+  call {call}(q_in, q_out, n)
+  do i = 1, nf
+     p_out((i - 1)*m + 1:i*m) = reshape(q_out(i)%sf, [m])
+     deallocate(q_in(i)%sf, q_out(i)%sf)
+  end do
+{finalize}
+end subroutine {run}
+"""
+
+
+def test_e2e_array_of_pointer_rank3_structs_with_lower_bounds(tmp_path: Path):
+    """``type(field_t){pointer sf(:,:,:)} :: q(nf)`` dummies with ``nf`` a module variable and every ``sf`` at
+    ``(-1:n, -1:n, -1:n)``: the padded companion ``q_sf(nf, cap...)`` keeps the lower bounds, so the kernel's
+    Fortran subscripts, an inlined callee's reads through its own dummy and its ``lbound`` / ``ubound`` loop all
+    hit the right elements, vs gfortran.  ``q_in`` starts at 0 in the kernel and at 1 in the callee, and the
+    never-associated ``spare`` member still gets a companion the pack-in sizes to 1."""
+    sdfg_lib = _build_sdfg_lib(
+        tmp_path,
+        kernel_src=_FLD_TYPES_SRC + _FLD_KERNEL_SRC,
+        types_src=_FLD_TYPES_SRC,
+        name="kern_fld",
+        entry="kern_fld_mod::kern_fld",
+        driver_src=_FLD_DRIVER_TEMPLATE.format(
+            run="run_fld",
+            kernel_module="kern_fld_dace_bindings",
+            call="kern_fld_dace",
+            finalize="  call kern_fld_dace_finalize()",
+        ),
+    )
+    ref_lib = _build_reference_lib(
+        tmp_path,
+        types_src=_FLD_TYPES_SRC,
+        kernel_src=_FLD_KERNEL_SRC,
+        ref_driver_src=_FLD_DRIVER_TEMPLATE.format(
+            run="run_fld_ref", kernel_module="kern_fld_mod, only: kern_fld", call="kern_fld", finalize=""
+        ),
+        name="kern_fld",
+    )
+    argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_int]
+    sdfg_lib.run_fld.argtypes = argtypes
+    ref_lib.run_fld_ref.argtypes = argtypes
+
+    n = 3
+    rng = np.random.default_rng(11)
+    p_in = np.asfortranarray(rng.standard_normal(3 * (n + 2) ** 3))
+    p_out0 = np.asfortranarray(rng.standard_normal(3 * (n + 2) ** 3))
+
+    def run(fn):
+        p_out = p_out0.copy(order="F")
+        fn(
+            p_in.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            p_out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            n,
+        )
+        return p_out
+
+    p_ref = run(ref_lib.run_fld_ref)
+    np.testing.assert_allclose(run(sdfg_lib.run_fld), p_ref, rtol=1e-12, atol=1e-12)
+    # Sanity: the output really changed (not a no-op match).
+    assert not np.allclose(p_ref, p_out0)
 
 
 if __name__ == "__main__":

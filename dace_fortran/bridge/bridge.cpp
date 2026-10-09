@@ -220,21 +220,22 @@ class HLFIRModule {
     auto planDict = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
     if (!planDict) return out;
 
+    // A key a recipe does not carry (``get`` returns null) reads as the default.
     auto asStr = [](mlir::Attribute a) -> std::string {
-      if (auto s = mlir::dyn_cast<mlir::StringAttr>(a)) return s.str();
+      if (auto s = mlir::dyn_cast_or_null<mlir::StringAttr>(a)) return s.str();
       return "";
     };
     auto asInt = [](mlir::Attribute a) -> int64_t {
-      if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(a)) return i.getInt();
+      if (auto i = mlir::dyn_cast_or_null<mlir::IntegerAttr>(a)) return i.getInt();
       return 0;
     };
     auto asBool = [](mlir::Attribute a) -> bool {
-      if (auto b = mlir::dyn_cast<mlir::BoolAttr>(a)) return b.getValue();
+      if (auto b = mlir::dyn_cast_or_null<mlir::BoolAttr>(a)) return b.getValue();
       return false;
     };
     auto asStrList = [&](mlir::Attribute a) -> nb::list {
       nb::list out;
-      if (auto arr = mlir::dyn_cast<mlir::ArrayAttr>(a))
+      if (auto arr = mlir::dyn_cast_or_null<mlir::ArrayAttr>(a))
         for (auto e : arr) out.append(asStr(e));
       return out;
     };
@@ -276,7 +277,9 @@ class HLFIRModule {
         recipeDict["aliasable"] = asBool(recipe.get("aliasable"));
         recipeDict["scratch_dtype"] = asStr(recipe.get("scratch_dtype"));
         recipeDict["aos_alloc"] = asBool(recipe.get("aos_alloc"));
-        recipeDict["cap_symbol"] = asStr(recipe.get("cap_symbol"));
+        recipeDict["cap_symbols"] = asStrList(recipe.get("cap_symbols"));
+        recipeDict["lb_symbols"] = asStrList(recipe.get("lb_symbols"));
+        recipeDict["member_pointer"] = asBool(recipe.get("member_pointer"));
       }
       entryDict["recipe"] = recipeDict;
       entries.append(entryDict);

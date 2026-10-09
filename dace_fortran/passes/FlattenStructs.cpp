@@ -114,15 +114,21 @@
 //   collapsed.
 //
 // 5c-B (true SDFG-boundary)  --  ``intent(inout)`` AoS struct dummy
-//   When the AoS+allocatable struct is the dummy of the SDFG entry
-//   itself, the per-instance sizes are runtime-determined and
-//   generally differ.  ``replaceStructArg`` inserts two block args
-//   per allocatable member:
-//     * ``cap_<base>_<m>`` of type ``ref<index>``  --  runtime cap
-//     * ``<base>_<m>`` of type ``ref<array<N x ?xT>>``  --  2D buffer
-//   It synthesises a declare for each, with ``uniq_name = "cap_..."``
-//   on the cap declare so ``traceToDecl`` resolves the data declare's
-//   inner extent to ``cap_<base>_<m>`` on the SDFG signature.
+//   When the AoS struct is the dummy of the SDFG entry itself and its
+//   member is an allocatable or pointer array of rank R, the
+//   per-instance sizes are runtime-determined and generally differ.
+//   ``replaceStructArg`` inserts 2R + 1 block args per such member:
+//     * ``cap_<base>_<m>[_d<k>]`` of type ``ref<index>``  --  runtime cap
+//       of member dim k (0-based; the suffix only for R > 1)
+//     * ``lb_<base>_<m>[_d<k>]`` of type ``ref<index>``  --  the lower
+//       bound the elements share in member dim k
+//     * ``<base>_<m>`` of type ``ref<array<N x ?... x T>>``  --  the
+//       padded buffer, declared with a ``fir.shape_shift`` over the
+//       AoS's own outer bounds and the member's lower bounds
+//   It synthesises a declare for each scalar named after its symbol so
+//   ``traceToDecl`` resolves the data declare's extents and lower bounds
+//   to ``cap_...`` / ``lb_...`` on the SDFG signature.  The outer rank
+//   must be 1.
 //   ``recordAosAllocEntry`` emits one ``aos_alloc=True`` FlattenEntry
 //   per allocatable member; ``recordStructArgEntry`` takes an
 //   exclude-set so non-allocatable siblings are still covered by a
@@ -130,15 +136,21 @@
 //   per-member aos_alloc entry plus one regular entry).
 //
 // Bindings-side contract for 5c-B (true boundary).  Stamped in the
-// recipe's ``aos_alloc=True`` + ``cap_symbol`` fields and consumed
-// by ``bindings/loop_copy.py``:
-//   1. cap = max_i(merge(size(A(i)%w), 0, allocated(A(i)%w)))
-//   2. allocate(A_w(N, cap)); zero-init.
-//   3. Per i with allocated(A(i)%w): A_w(i, 1:size(A(i)%w)) = A(i)%w.
-//   4. Call SDFG with the buffer + cap symbol.
-//   5. On intent(out)/(inout) and per allocated row: copy back
-//      A(i)%w = A_w(i, 1:size(A(i)%w)).
-//   6. deallocate(A_w).
+// recipe's ``aos_alloc=True`` + ``cap_symbols`` / ``lb_symbols`` /
+// ``member_pointer`` fields and consumed by ``bindings/loop_copy.py``,
+// per member dim k (present = allocated, or associated for a pointer):
+//   1. lb_k = lbound(A(i)%w, k) of the first present element; every
+//      present element must agree (error stop otherwise).
+//   2. cap_k = max_i(merge(size(A(i)%w, k), 0, present(A(i)%w)))
+//   3. allocate(A_w(N, cap_1, ...)); zero-init.
+//   4. Per present i: A_w(i, 1:size(A(i)%w, 1), ...) = A(i)%w.
+//   5. Call SDFG with the buffer + cap and lower-bound symbols.
+//   6. On intent(out)/(inout) and per present element: copy back
+//      A(i)%w = A_w(i, 1:size(A(i)%w, 1), ...).
+//   7. deallocate(A_w).
+// The copies assume no two packed elements share storage (within one
+// dummy or across dummies): pack-out writes the elements back in order,
+// so with aliasing the last one wins.
 // Saved policy: NO runtime ``allocated()`` checks inside the SDFG  --
 // the bindings handle every allocation query.  Mixed allocation
 // states are allowed; unallocated rows stay zero-padded and the
@@ -298,6 +310,23 @@ bool isAllocatableArrayMember(mlir::Type t) {
   auto seq = mlir::dyn_cast<fir::SequenceType>(inner);
   if (!seq) return false;
   return isSimpleScalar(seq.getEleTy());
+}
+
+/// The array type of an allocatable / pointer array member (``box<heap|ptr<array<...>>>``); null otherwise.
+fir::SequenceType allocatableArrayMemberType(mlir::Type t) {
+  if (!isAllocatableArrayMember(t)) return {};
+  mlir::Type inner = mlir::cast<fir::BoxType>(t).getEleTy();
+  if (auto heap = mlir::dyn_cast<fir::HeapType>(inner)) return mlir::cast<fir::SequenceType>(heap.getEleTy());
+  return mlir::cast<fir::SequenceType>(mlir::cast<fir::PointerType>(inner).getEleTy());
+}
+
+/// The SDFG symbol carrying dim ``k`` of an AoS member's padded companion ``flat`` (Phase 5c-B): ``<prefix>_<flat>``
+/// for a rank-1 member, ``<prefix>_<flat>_d<k>`` otherwise.  ``cap`` names the padded extent, ``lb`` the lower bound
+/// the elements share.
+std::string aosMemberSymbol(llvm::StringRef prefix, llvm::StringRef flat, unsigned k, unsigned rank) {
+  std::string s = (prefix + "_" + flat).str();
+  if (rank > 1) s += "_d" + std::to_string(k);
+  return s;
 }
 
 /// Recognise an allocatable-scalar OR pointer-scalar struct member:
@@ -2020,7 +2049,6 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
           b.getNamedAttr("aliasable", b.getBoolAttr(memberAliasable)),
           b.getNamedAttr("scratch_dtype", mkStr(scratchDtype)),
           b.getNamedAttr("aos_alloc", b.getBoolAttr(false)),
-          b.getNamedAttr("cap_symbol", mkStr("")),
       });
 
       // Per-member outer_expr ``<source>%<member>`` so the
@@ -2128,7 +2156,6 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
           b.getNamedAttr("aliasable", b.getBoolAttr(true)),
           b.getNamedAttr("scratch_dtype", mkStr(scratchDtype)),
           b.getNamedAttr("aos_alloc", b.getBoolAttr(false)),
-          b.getNamedAttr("cap_symbol", mkStr("")),
       });
 
       auto entry = b.getDictionaryAttr({
@@ -2145,12 +2172,14 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
   }
 
   /// Phase 5c-B (true SDFG-boundary): emit one FlattenEntry per
-  /// AoS+allocatable member.  The bindings layer pads to max
-  /// per-instance size, populates ``cap_<base>_<member>`` from the
-  /// pack-in loop, and ships a 2D buffer ``<base>_<member>(N, cap)``
-  /// to the SDFG.  The bridge declares the data block-arg with
-  /// type ``ref<array<N x ?xT>>`` so the inner extent surfaces as a
-  /// runtime symbol (``cap_<base>_<member>``) on the SDFG signature.
+  /// AoS member that is an allocatable or pointer array of rank R.  The
+  /// bindings layer pads each member dim to the max per-instance extent,
+  /// populates its ``cap_<base>_<member>[_d<k>]`` and the elements' common
+  /// lower bound ``lb_<base>_<member>[_d<k>]`` from the pack-in loop, and
+  /// ships a buffer ``<base>_<member>(N, cap...)`` to the SDFG.  The bridge
+  /// declares the data block-arg with type ``ref<array<N x ?...xT>>`` so
+  /// the caps and lower bounds surface as runtime symbols on the SDFG
+  /// signature.
   void recordAosAllocEntry(hlfir::DeclareOp argDecl, fir::RecordType rec, llvm::StringRef memName,
                            llvm::StringRef intentStr, llvm::ArrayRef<int64_t> outerShape) {
     auto* ctx = argDecl.getContext();
@@ -2177,12 +2206,13 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
       if (std::string const dt = dtypeName(memberElementType(memTy)); !dt.empty()) scratchDtype = dt;
 
     std::string const flatName = outerName + "_" + memName.str();
-    std::string const capName = "cap_" + flatName;
     auto const outerRank = (unsigned)outerShape.size();
+    auto memberSeq = memTy ? allocatableArrayMemberType(memTy) : fir::SequenceType{};
+    if (!memberSeq) return;
+    unsigned const memberRank = memberSeq.getDimension();
+    bool const memberPointer = mlir::isa<fir::PointerType>(mlir::cast<fir::BoxType>(memTy).getEleTy());
 
-    // read_expr: ``<outer>($i1, ..., $iOR)%<member>($i_OR+1)``.
-    // We always treat the allocatable member as 1-D for now (the
-    // inner extent is the cap symbol  --  runtime-determined).
+    // read_expr: ``<outer>($i1, ..., $iOR)%<member>($i_OR+1, ..., $i_OR+R)``.
     std::string read = outerName;
     read += "(";
     for (unsigned i = 1; i <= outerRank; ++i) {
@@ -2191,23 +2221,34 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
     }
     read += ")%";
     read += memName.str();
-    read += "($i" + std::to_string((int)outerRank + 1) + ")";
+    read += "(";
+    for (unsigned k = 1; k <= memberRank; ++k) {
+      if (k > 1) read += ", ";
+      read += "$i" + std::to_string(outerRank + k);
+    }
+    read += ")";
 
     llvm::SmallVector<mlir::Attribute, 1> const flatNames{mkStr(flatName)};
     llvm::SmallVector<mlir::Attribute, 1> const readExprs{mkStr(read)};
 
-    // shape_exprs: ``size(<outer>, dim=i)`` for each outer dim,
-    // then the cap symbol for the inner.  The bindings layer's
-    // ``_build_symbol_assigns`` skips the cap symbol because the
-    // pack-in code computes it directly.
-    llvm::SmallVector<mlir::Attribute, 2> shapeExprs;
+    // shape_exprs: ``size(<outer>, dim=i)`` for each outer dim, then
+    // the cap symbol of each member dim.  The bindings layer's
+    // ``_build_symbol_assigns`` skips the cap and lower-bound symbols
+    // because the pack-in code computes them directly.
+    llvm::SmallVector<mlir::Attribute, 4> shapeExprs;
     for (unsigned i = 1; i <= outerRank; ++i) {
       std::string const s = "size(" + outerName + ", dim=" + std::to_string((int)i) + ")";
       shapeExprs.push_back(mkStr(s));
     }
-    shapeExprs.push_back(mkStr(capName));
+    llvm::SmallVector<mlir::Attribute, 3> capSymbols;
+    llvm::SmallVector<mlir::Attribute, 3> lbSymbols;
+    for (unsigned k = 0; k < memberRank; ++k) {
+      capSymbols.push_back(mkStr(aosMemberSymbol("cap", flatName, k, memberRank)));
+      lbSymbols.push_back(mkStr(aosMemberSymbol("lb", flatName, k, memberRank)));
+    }
+    shapeExprs.append(capSymbols.begin(), capSymbols.end());
 
-    int64_t const totalRank = (int64_t)outerRank + 1;
+    int64_t const totalRank = (int64_t)(outerRank + memberRank);
 
     auto recipe = b.getDictionaryAttr({
         b.getNamedAttr("flat_names", b.getArrayAttr(flatNames)),
@@ -2218,7 +2259,9 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         b.getNamedAttr("aliasable", b.getBoolAttr(false)),
         b.getNamedAttr("scratch_dtype", mkStr(scratchDtype)),
         b.getNamedAttr("aos_alloc", b.getBoolAttr(true)),
-        b.getNamedAttr("cap_symbol", mkStr(capName)),
+        b.getNamedAttr("cap_symbols", b.getArrayAttr(capSymbols)),
+        b.getNamedAttr("lb_symbols", b.getArrayAttr(lbSymbols)),
+        b.getNamedAttr("member_pointer", b.getBoolAttr(memberPointer)),
     });
 
     auto entry = b.getDictionaryAttr({
@@ -2774,7 +2817,6 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
             pb.getNamedAttr("aliasable", pb.getBoolAttr(false)),
             pb.getNamedAttr("scratch_dtype", mkStr(dtype)),
             pb.getNamedAttr("aos_alloc", pb.getBoolAttr(false)),
-            pb.getNamedAttr("cap_symbol", mkStr("")),
         });
         auto entry = pb.getDictionaryAttr({
             pb.getNamedAttr("outer_expr", mkStr(aorPath + "%" + kv.first.inner)),
@@ -4008,8 +4050,8 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
       llvm::SmallVector<int64_t, 4> jaggedExtents;
       bool outerIsArray = false;
       llvm::SmallVector<int64_t, 4> outerShape;
-      // Members that must take the Phase 5c-B AoS+allocatable
-      // path (cap+data block-arg pair, runtime inner extent).
+      // Members that must take the Phase 5c-B AoS allocatable/pointer
+      // path (cap, lower-bound and data block args per member dim).
       llvm::SmallVector<std::string, 2> aosAllocMembers;
       // Nested branch: when ``rec`` has any member that's itself
       // a record, ``allMembersFlattenable`` returns false and the
@@ -4156,13 +4198,13 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
       // companion (``<base>_<member>``) and the bindings layer
       // marshals it across the call boundary.
       //
-      // Phase 5c-B (true SDFG-boundary): AoS + allocatable
-      // members get the padding-to-max contract.  Each such
-      // member becomes a 2D buffer ``A_<member>(N, cap)`` plus
-      // a runtime cap symbol; the bindings layer computes the
-      // cap by max-ing per-instance ``size()`` values, packs
-      // each allocated row's live region into the buffer, and
-      // unpacks back on intent(out)/(inout).
+      // Phase 5c-B (true SDFG-boundary): AoS + allocatable / pointer
+      // array members get the padding-to-max contract.  Each such
+      // member of rank R becomes a buffer ``A_<member>(N, cap...)``
+      // plus a runtime cap and lower-bound symbol per member dim; the
+      // bindings layer computes each cap by max-ing per-instance
+      // ``size()`` values, packs each present row's live region into
+      // the buffer, and unpacks back on intent(out)/(inout).
       if (outerIsArray) {
         for (auto& pair : rec.getTypeList())
           if (isAllocatableArrayMember(pair.second)) p.aosAllocMembers.push_back(pair.first);
@@ -4209,12 +4251,19 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
       // degenerate buffer that silently truncates the kernel's writes.
       // Fail rather than miscompile; pass the struct as ``intent(inout)``
       // with pre-allocated members instead.
+      if (!p.aosAllocMembers.empty() && p.outerShape.size() != 1) {
+        p.argDecl->emitError(
+            "AoS allocatable/pointer member on a struct dummy of rank " + std::to_string(p.outerShape.size()) +
+            " is unsupported: the padded companion's pack/unpack handles a rank-1 array of records only.");
+        signalPassFailure();
+        continue;
+      }
       if (!p.aosAllocMembers.empty() && intentStr == "out") {
         p.argDecl->emitError(
-            "AoS-allocatable member on an intent(out) struct dummy needs a "
-            "kernel-internal first allocate, which is unsupported: no caller "
-            "data to size the padded companion.  Pass the struct as "
-            "intent(inout) with pre-allocated members.");
+            "AoS allocatable/pointer member on an intent(out) struct dummy "
+            "needs a kernel-internal first allocate / association, which is "
+            "unsupported: no caller data to size the padded companion.  Pass "
+            "the struct as intent(inout) with allocated / associated members.");
         signalPassFailure();
         continue;
       }
@@ -4253,28 +4302,28 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
       auto memName = pair.first;
       auto memTy = pair.second;
 
-      // Phase 5c-B (true SDFG boundary): AoS + allocatable member.
-      // Insert two block args  --  the runtime cap (``index``) then a
-      // 2D data buffer ``ref<array<N x ?xT>>``.  Build a declare
-      // for each, with the cap declare's name = ``cap_<base>_<m>``
-      // so ``traceToDecl`` resolves the inner extent to that
-      // symbol on the SDFG signature.  ``collapseAosAllocReads``
-      // afterwards rewrites every ``fir.load + designate``
-      // chain on the original member box into a direct 2-index
+      // Phase 5c-B (true SDFG boundary): AoS + allocatable / pointer
+      // array member of rank R.  Insert 2R + 1 block args  --  the
+      // runtime cap (``index``) of each member dim, the lower bound the
+      // elements share in each member dim, then the padded data buffer
+      // ``ref<array<N x ?... x T>>``.  Each scalar gets a declare named
+      // after its SDFG symbol (``cap_<base>_<m>[_d<k>]`` /
+      // ``lb_<base>_<m>[_d<k>]``) so ``traceToDecl`` resolves the data
+      // declare's extents and lower bounds to those symbols.  The data
+      // declare carries the member's lower bounds (a ``fir.shape_shift``),
+      // so the Fortran subscripts of ``A(i)%m(j, ...)`` index it unchanged
+      // once ``collapseAosAllocReads`` rewrites every ``fir.load +
+      // designate`` chain on the original member box into a direct
       // designate over the new flat declare.
       if (aosAllocMembers.contains(memName)) {
-        auto box = mlir::cast<fir::BoxType>(memTy);
-        mlir::Type eleTy;
-        if (auto heap = mlir::dyn_cast<fir::HeapType>(box.getEleTy()))
-          eleTy = mlir::cast<fir::SequenceType>(heap.getEleTy()).getEleTy();
-        else if (auto ptr = mlir::dyn_cast<fir::PointerType>(box.getEleTy()))
-          eleTy = mlir::cast<fir::SequenceType>(ptr.getEleTy()).getEleTy();
-        else
-          continue;
+        auto memberSeq = allocatableArrayMemberType(memTy);
+        if (!memberSeq) continue;
+        mlir::Type const eleTy = memberSeq.getEleTy();
+        unsigned const memberRank = memberSeq.getDimension();
 
-        // Pointee shape: outer extents (static) x {?} (cap, runtime).
+        // Pointee shape: outer extents x one runtime extent per member dim.
         llvm::SmallVector<int64_t, 4> exts(outerShape.begin(), outerShape.end());
-        exts.push_back(fir::SequenceType::getUnknownExtent());
+        exts.append(memberRank, fir::SequenceType::getUnknownExtent());
         auto pointee = fir::SequenceType::get(exts, eleTy);
         auto refTy = fir::ReferenceType::get(pointee);
         // HLFIR's variable-form result for an array with any
@@ -4293,45 +4342,65 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         std::string flatName = demangledBase;
         flatName += "_";
         flatName += memName;
-        std::string const capName = "cap_" + flatName;
+        llvm::SmallVector<std::string, 6> symbolNames;
+        for (unsigned k = 0; k < memberRank; ++k)
+          symbolNames.push_back(aosMemberSymbol("cap", flatName, k, memberRank));
+        for (unsigned k = 0; k < memberRank; ++k) symbolNames.push_back(aosMemberSymbol("lb", flatName, k, memberRank));
 
-        // Insert cap arg (block.getArgument as an ``index``
-        // value passed by reference so the bindings layer can
-        // populate it from the wrapper).
-        unsigned const capArgIdx = argIdx + 1 + memberCount;
-        block.insertArgument(capArgIdx, idxRefTy, loc);
-        auto capArg = block.getArgument(capArgIdx);
-        ++memberCount;
-
-        unsigned const dataArgIdx = argIdx + 1 + memberCount;
+        // Insert the scalar args (``index`` values passed by reference so
+        // the bindings layer can populate them from the wrapper), then
+        // the data arg.
+        llvm::SmallVector<mlir::BlockArgument, 6> symbolArgs;
+        for (size_t s = 0; s < symbolNames.size(); ++s) {
+          unsigned const symArgIdx = argIdx + 1 + memberCount++;
+          block.insertArgument(symArgIdx, idxRefTy, loc);
+          symbolArgs.push_back(block.getArgument(symArgIdx));
+        }
+        unsigned const dataArgIdx = argIdx + 1 + memberCount++;
         block.insertArgument(dataArgIdx, refTy, loc);
         auto dataArg = block.getArgument(dataArgIdx);
-        ++memberCount;
 
         mlir::OpBuilder b(&block, std::next(argDecl->getIterator()));
         b.setInsertionPoint(argDecl);
 
-        // Cap declare: scalar ``ref<index>`` with uniq_name
-        // ``cap_<base>_<member>``.  The bridge's
-        // ``traceToDecl`` will resolve the data declare's
-        // shape extent to this name.
-        mlir::NamedAttrList capAttrs;
-        capAttrs.append("uniq_name", mlir::StringAttr::get(ctx, capName));
-        capAttrs.append(declareSegments(b, /*hasShape=*/false));
-        auto capDecl =
-            b.create<hlfir::DeclareOp>(loc, mlir::TypeRange{idxRefTy, idxRefTy}, mlir::ValueRange{capArg}, capAttrs);
+        // One scalar ``ref<index>`` declare per symbol, loaded for the
+        // data declare's shape.
+        llvm::SmallVector<mlir::Value, 6> symbolVals;
+        for (size_t s = 0; s < symbolNames.size(); ++s) {
+          mlir::NamedAttrList symAttrs;
+          symAttrs.append("uniq_name", mlir::StringAttr::get(ctx, symbolNames[s]));
+          symAttrs.append(declareSegments(b, /*hasShape=*/false));
+          auto symDecl = b.create<hlfir::DeclareOp>(loc, mlir::TypeRange{idxRefTy, idxRefTy},
+                                                    mlir::ValueRange{symbolArgs[s]}, symAttrs);
+          symbolVals.push_back(b.create<fir::LoadOp>(loc, symDecl.getResult(0)).getResult());
+        }
 
-        // Load the cap value to use it in the data declare's
-        // shape op.
-        auto capVal = b.create<fir::LoadOp>(loc, capDecl.getResult(0)).getResult();
-
-        // Build the shape op: outer (static) + cap (runtime).
-        llvm::SmallVector<mlir::Value, 4> dims;
-        for (auto e : outerShape)
-          dims.push_back(b.create<mlir::arith::ConstantOp>(loc, idxTy, b.getIndexAttr(e)).getResult());
-        dims.push_back(capVal);
-        auto shapeTy = fir::ShapeType::get(ctx, dims.size());
-        auto shape = b.create<fir::ShapeOp>(loc, shapeTy, dims).getResult();
+        // Shape: (lower bound, extent) per dim.  Outer dims keep the AoS's
+        // own lower bounds; a runtime outer extent is a fresh ``index``
+        // the bindings layer populates (``<flat>_d<i>``, from
+        // ``size(<outer>, dim=i)``), as for the regular companions.
+        auto outerOrigins = classifyShapeOperand(argDecl.getShape()).lbs;
+        llvm::SmallVector<mlir::Value, 8> pairs;
+        for (unsigned d = 0; d < outerShape.size(); ++d) {
+          mlir::Value origin = d < outerOrigins.size() ? outerOrigins[d] : mlir::Value{};
+          if (!origin) origin = b.create<mlir::arith::ConstantOp>(loc, idxTy, b.getIndexAttr(1)).getResult();
+          if (origin.getType() != idxTy) origin = b.create<fir::ConvertOp>(loc, idxTy, origin).getResult();
+          mlir::Value extent;
+          if (outerShape[d] != fir::SequenceType::getUnknownExtent()) {
+            extent = b.create<mlir::arith::ConstantOp>(loc, idxTy, b.getIndexAttr(outerShape[d])).getResult();
+          } else {
+            auto al = b.create<fir::AllocaOp>(loc, idxTy);
+            extent = b.create<fir::LoadOp>(loc, al.getResult()).getResult();
+          }
+          pairs.push_back(origin);
+          pairs.push_back(extent);
+        }
+        for (unsigned k = 0; k < memberRank; ++k) {
+          pairs.push_back(symbolVals[memberRank + k]);  // lower bound
+          pairs.push_back(symbolVals[k]);               // cap
+        }
+        auto shapeTy = fir::ShapeShiftType::get(ctx, pairs.size() / 2);
+        auto shape = b.create<fir::ShapeShiftOp>(loc, shapeTy, pairs).getResult();
 
         mlir::NamedAttrList attrs;
         attrs.append("uniq_name", mlir::StringAttr::get(ctx, flatName));
@@ -4986,33 +5055,74 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
           if (t) return;
         if (parent.getIndices().empty()) return;
 
-        // Collect the outer indices (typically a single
-        // scalar i for a 1-D AoS).
-        llvm::SmallVector<mlir::Value, 4> const outerIdx(parent.getIndices().begin(), parent.getIndices().end());
+        // Collect the outer indices (typically a single scalar i for a 1-D
+        // AoS).  They are relative to the declare the parent designates:
+        // an inlined callee's alias declares bounds of its own (``q_c(nf)``
+        // for a caller's ``q(0:nf-1)``), so rebase them to the flat
+        // companion's.
+        llvm::SmallVector<mlir::Value, 4> outerIdx(parent.getIndices().begin(), parent.getIndices().end());
+        {
+          hlfir::DeclareOp viewDecl;
+          for (mlir::Value v = parent.getMemref(); v && !viewDecl;) {
+            auto* d = v.getDefiningOp();
+            if (auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(d))
+              viewDecl = decl;
+            else if (auto eb = mlir::dyn_cast_or_null<fir::EmboxOp>(d))
+              v = eb.getMemref();
+            else if (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(d))
+              v = cv.getValue();
+            else
+              break;
+          }
+          auto flatDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(flatBase.getDefiningOp());
+          auto viewLbs = viewDecl ? classifyShapeOperand(viewDecl.getShape()).lbs : std::vector<mlir::Value>{};
+          auto flatLbs = flatDecl ? classifyShapeOperand(flatDecl.getShape()).lbs : std::vector<mlir::Value>{};
+          auto constLb = [](mlir::Value lb) { return lb ? traceConstInt(lb) : std::optional<int64_t>(1); };
+          mlir::OpBuilder pb(parent->getContext());
+          pb.setInsertionPointAfter(parent);
+          auto idxTy = pb.getIndexType();
+          auto asIndex = [&](mlir::Value v) {
+            if (!v) return pb.create<mlir::arith::ConstantOp>(parent.getLoc(), idxTy, pb.getIndexAttr(1)).getResult();
+            return v.getType() == idxTy ? v : pb.create<fir::ConvertOp>(parent.getLoc(), idxTy, v).getResult();
+          };
+          for (size_t d = 0; d < outerIdx.size(); ++d) {
+            mlir::Value const from = d < viewLbs.size() ? viewLbs[d] : mlir::Value{};
+            mlir::Value const to = d < flatLbs.size() ? flatLbs[d] : mlir::Value{};
+            auto cf = constLb(from);
+            auto ct = constLb(to);
+            if (from == to || (cf && ct && *cf == *ct)) continue;
+            auto shifted = pb.create<mlir::arith::SubIOp>(parent.getLoc(), asIndex(outerIdx[d]), asIndex(from));
+            outerIdx[d] = pb.create<mlir::arith::AddIOp>(parent.getLoc(), shifted, asIndex(to)).getResult();
+          }
+        }
 
         // For each user of the loaded box: if it's an
-        // element-form designate, rewrite to a direct
-        // 2-index designate over flatBase.
+        // element-form designate, rewrite to a direct designate over
+        // flatBase merging the outer and the member subscripts.
         for (auto* u : load.getResult().getUsers()) {
-          // ``size(A(i)%member)`` lowers to ``fir.box_dims`` on the
-          // loaded per-instance member box.  That box no longer exists
-          // after flattening, so redirect the queried extent to the
-          // packed companion's matching dimension (member dim ``d``
-          // maps to companion dim ``outerRank + d``).  Only the extent
-          // result (#1) feeds loop bounds; lb (#0) / stride (#2), where
-          // used, are the contiguous 1-based defaults of a packed row.
+          // ``size(A(i)%member)`` / ``lbound`` lower to ``fir.box_dims``
+          // on the loaded per-instance member box.  That box no longer
+          // exists after flattening, so redirect the query to the packed
+          // companion's matching dimension (member dim ``d`` maps to
+          // companion dim ``outerRank + d``): its extent (#1) and the
+          // lower bound the elements share (#0).  A stride query (#2) has
+          // no counterpart in the packed buffer: leave the chain alone.
           if (auto bd = mlir::dyn_cast<fir::BoxDimsOp>(u)) {
             auto memberDimC = traceConstInt(bd.getDim());
-            if (!memberDimC) continue;
-            mlir::Value const ext = companionExtent(flatBase, outerIdx.size() + static_cast<unsigned>(*memberDimC));
+            if (!memberDimC || !bd.getResult(2).use_empty()) continue;
+            unsigned const companionDim = outerIdx.size() + static_cast<unsigned>(*memberDimC);
+            mlir::Value const ext = companionExtent(flatBase, companionDim);
             if (!ext) continue;
             mlir::OpBuilder b(bd);
             bd.getResult(1).replaceAllUsesWith(ext);
             auto one = [&]() {
               return b.create<mlir::arith::ConstantOp>(bd.getLoc(), b.getIndexType(), b.getIndexAttr(1)).getResult();
             };
-            if (!bd.getResult(0).use_empty()) bd.getResult(0).replaceAllUsesWith(one());
-            if (!bd.getResult(2).use_empty()) bd.getResult(2).replaceAllUsesWith(one());
+            if (!bd.getResult(0).use_empty()) {
+              auto declOp = mlir::dyn_cast_or_null<hlfir::DeclareOp>(flatBase.getDefiningOp());
+              auto origins = declOp ? classifyShapeOperand(declOp.getShape()).lbs : std::vector<mlir::Value>{};
+              bd.getResult(0).replaceAllUsesWith(companionDim < origins.size() ? origins[companionDim] : one());
+            }
             eraseInner.push_back(bd);
             continue;
           }

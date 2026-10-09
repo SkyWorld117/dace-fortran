@@ -411,6 +411,21 @@ def build_wrapper_head(
         for s in frozen.free_symbols
         if s not in outer_dummy_set and s not in flat_names and s not in module_arg_names
     )
+    # The pack-in of an aos_alloc recipe assigns every cap / lower-bound symbol; one the SDFG never reads (a member
+    # no element access touches, a lower bound no memlet uses) is not a free symbol, so declare it here.
+    declared_syms = set(frozen.free_symbols) | outer_dummy_set | flat_names | module_arg_names
+    pack_only = sorted(
+        {
+            sym
+            for entry in live_entries(frozen, plan)
+            if entry.recipe.aos_alloc
+            for sym in (*entry.recipe.cap_symbols, *entry.recipe.lb_symbols)
+        }
+        - declared_syms
+    )
+    if pack_only:
+        pack_decl = f"    {fortran_c_type('int64')} :: " + ", ".join(pack_only)
+        symbol_decls = (symbol_decls + "\n" + pack_decl) if symbol_decls else pack_decl
     if max_loop_rank:
         iter_decl = "    integer(c_int) :: " + ", ".join(f"i{d + 1}" for d in range(max_loop_rank))
         symbol_decls = (symbol_decls + "\n" + iter_decl) if symbol_decls else iter_decl
@@ -1622,10 +1637,13 @@ def _build_symbol_assigns(
         if a.kind is FrozenArgKind.ARRAY and deferred and not a.global_alloc_inside:
             alias = _module_value_expr(a.sdfg_name, _synth_members)
             module_array_hosts[a.sdfg_name] = (alias, _present(alias, a.module_origin_pointer))
-    # Cap symbols of aos_alloc recipes are populated by pack-in code before the
-    # call -- skip here to avoid a stray TODO or duplicate assignment.
-    aos_cap_syms = {
-        entry.recipe.cap_symbol for entry in plan.entries if entry.recipe.aos_alloc and entry.recipe.cap_symbol
+    # Cap and lower-bound symbols of aos_alloc recipes are populated by pack-in code
+    # before the call -- skip here to avoid a stray TODO or duplicate assignment.
+    aos_pack_syms = {
+        sym
+        for entry in plan.entries
+        if entry.recipe.aos_alloc
+        for sym in (*entry.recipe.cap_symbols, *entry.recipe.lb_symbols)
     }
     # <flat>_d<i> is the i-th extent of the flat companion <flat> -- must take
     # that entry's shape_exprs[i] (substring-scanning mis-binds on a multi-member struct).
@@ -1677,7 +1695,7 @@ def _build_symbol_assigns(
     for sym in frozen.free_symbols:
         if sym in outer_dummy_set:
             continue
-        if sym in aos_cap_syms:
+        if sym in aos_pack_syms:
             continue
         m = _EXTENT_SYM_RE.match(sym)
         if m and not _OFFSET_SYM_RE.match(sym):

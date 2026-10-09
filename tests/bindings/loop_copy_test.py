@@ -169,7 +169,8 @@ def _aos_alloc_recipe() -> FlattenRecipe:
         shape_exprs=("size(a, dim=1)", "cap_a_w"),
         aliasable=False,
         aos_alloc=True,
-        cap_symbol="cap_a_w",
+        cap_symbols=("cap_a_w",),
+        lb_symbols=("lb_a_w",),
     )
 
 
@@ -179,13 +180,16 @@ def test_render_aos_alloc_pack_in_emits_cap_max_loop():
     # Cap = max per-instance size, guarded by allocated() so unalloc'd rows don't poison it.
     assert "cap_a_w = 0" in joined
     assert "if (allocated(a(i1)%w))" in joined
-    assert "if (size(a(i1)%w) > cap_a_w) cap_a_w = size(a(i1)%w)" in joined
+    assert "if (size(a(i1)%w, 1) > cap_a_w) cap_a_w = size(a(i1)%w, 1)" in joined
+    # The buffer takes the first allocated element's lower bound; the others must agree.
+    assert "lb_a_w = lbound(a(i1)%w, 1)" in joined
+    assert "if (lbound(a(i1)%w, 1) /= lb_a_w) error stop" in joined
     # Empty-batch sentinel keeps the buffer non-degenerate.
     assert "if (cap_a_w == 0) cap_a_w = 1" in joined
     # Buffer allocate at (N, cap) shape, zero-init, then per-row copy.
     assert "allocate(a_w(size(a, dim=1), cap_a_w))" in joined
     assert "a_w = 0" in joined
-    assert "a_w(i1, 1:size(a(i1)%w)) = a(i1)%w" in joined
+    assert "a_w(i1, 1:size(a(i1)%w, 1)) = a(i1)%w" in joined
 
 
 def test_render_aos_alloc_pack_out_copies_back_live_region():
@@ -193,8 +197,32 @@ def test_render_aos_alloc_pack_out_copies_back_live_region():
     joined = "\n".join(lines)
     # Per-row copy-back, guarded by allocated() -- unalloc'd rows stay zeroed (bindings policy).
     assert "if (allocated(a(i1)%w))" in joined
-    assert "a(i1)%w = a_w(i1, 1:size(a(i1)%w))" in joined
+    assert "a(i1)%w = a_w(i1, 1:size(a(i1)%w, 1))" in joined
     assert "deallocate(a_w)" in joined
+
+
+def test_render_aos_alloc_pack_for_rank3_pointer_member():
+    """A rank-3 pointer member: presence by associated(), one cap and lower bound per member dim."""
+    r = FlattenRecipe(
+        flat_names=("q_sf",),
+        read_exprs=("q($i1)%sf($i2, $i3, $i4)",),
+        rank=4,
+        shape_exprs=("size(q, dim=1)", "cap_q_sf_d0", "cap_q_sf_d1", "cap_q_sf_d2"),
+        aliasable=False,
+        aos_alloc=True,
+        cap_symbols=("cap_q_sf_d0", "cap_q_sf_d1", "cap_q_sf_d2"),
+        lb_symbols=("lb_q_sf_d0", "lb_q_sf_d1", "lb_q_sf_d2"),
+        member_pointer=True,
+    )
+    pack_in = "\n".join(render_aos_alloc_pack_in(r, outer_expr="q"))
+    assert "if (associated(q(i1)%sf))" in pack_in
+    assert "allocated(" not in pack_in
+    assert "lb_q_sf_d2 = lbound(q(i1)%sf, 3)" in pack_in
+    assert "if (size(q(i1)%sf, 3) > cap_q_sf_d2) cap_q_sf_d2 = size(q(i1)%sf, 3)" in pack_in
+    assert "allocate(q_sf(size(q, dim=1), cap_q_sf_d0, cap_q_sf_d1, cap_q_sf_d2))" in pack_in
+    assert "q_sf(i1, 1:size(q(i1)%sf, 1), 1:size(q(i1)%sf, 2), 1:size(q(i1)%sf, 3)) = q(i1)%sf" in pack_in
+    pack_out = "\n".join(render_aos_alloc_pack_out(r, outer_expr="q"))
+    assert "q(i1)%sf = q_sf(i1, 1:size(q(i1)%sf, 1), 1:size(q(i1)%sf, 2), 1:size(q(i1)%sf, 3))" in pack_out
 
 
 def test_render_aos_alloc_pack_in_raises_on_non_aos_alloc():
