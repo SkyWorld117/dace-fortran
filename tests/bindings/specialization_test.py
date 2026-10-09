@@ -13,9 +13,14 @@ from dace.sdfg.utils import specialize_symbols
 
 from dace_fortran.bindings.build_fortran_library import build_fortran_library
 from dace_fortran.bindings.flatten_plan import FlattenPlan
-from dace_fortran.bindings.fortran_interface import build_auto_interface
-from dace_fortran.bindings.frozen_signature import get_frozen_signature, refreeze
-from dace_fortran.bindings.specialization import Specialization, recorded_invariants, specializable_symbols
+from dace_fortran.bindings.fortran_interface import OriginalInterface, build_auto_interface
+from dace_fortran.bindings.frozen_signature import FrozenSignature, get_frozen_signature, refreeze
+from dace_fortran.bindings.specialization import (
+    Specialization,
+    build_specialization_guard,
+    recorded_invariants,
+    specializable_symbols,
+)
 from tests._util import build_sdfg
 
 _N = 6
@@ -98,6 +103,12 @@ def test_recorded_invariants_keep_the_values_that_never_changed(tmp_path):
     record = tmp_path / "calls.symbols"
     record.write_text("n 3\nm 5\n\nn 3\nm 6\n\n")
     assert recorded_invariants(record) == {"n": 3}
+
+
+def test_a_specialisation_to_no_values_only_clears_the_flag():
+    general = Specialization({}, FrozenSignature(entry="k", mangled="_QPk", args=()))
+    lines = build_specialization_guard(general, OriginalInterface(entry="k", args=()), FlattenPlan(entries=()))
+    assert [ln.strip() for ln in lines[1:]] == ["if (present(dace_declined)) dace_declined = .false."]
 
 
 def test_a_general_binding_records_the_symbols_of_every_call(tmp_path):
