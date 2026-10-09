@@ -29,10 +29,12 @@ from dace_fortran.bindings.fortran_interface import (
 )
 from dace_fortran.bindings.frozen_signature import FrozenArg, FrozenArgKind, FrozenSignature, ModuleOrigin
 from dace_fortran.bindings.loop_copy import (
+    aos_pack_extent_locals,
     fortran_scalar_type,
     render_alias_calls,
     render_aos_alloc_pack_in,
     render_aos_alloc_pack_out,
+    render_aos_alloc_release,
     render_copy_in_loop,
     render_copy_out_loop,
 )
@@ -328,11 +330,16 @@ def build_wrapper_head(
     plan: FlattenPlan,
     enum_maps: dict | None = None,
     module_allocatables_are_targets: bool = True,
+    acc_residency: AccTransferPlan | None = None,
 ) -> str:
     """Render the <entry>_dace subroutine header + declaration section
     (template: templates/wrapper_head.f90.in). Walks plan.entries: aliasable
     recipes -> pointer decl, non-aliasable -> allocatable/target scratch decl.
-    Free symbols not already outer dummies become local integer(c_int) scalars."""
+    Free symbols not already outer dummies become local integer(c_int) scalars.
+
+    ``acc_residency`` (see :func:`emit_bindings`): a module array passed as the caller's device copy needs no local,
+    a companion packed on the device needs the loop indices and the padding flag of its OpenACC pack loops."""
+    deviceptr, device_pack = _device_lane(acc_residency)
     tpl = _load("wrapper_head.f90.in")
     outer_dummy_names = [a.name for a in iface.args]
     outer_dummy_set = set(outer_dummy_names)
@@ -388,6 +395,11 @@ def build_wrapper_head(
                 max_loop_rank = max(max_loop_rank, r.rank)
             for flat in r.flat_names:
                 scratch_lines.append(f"    {ftype}, allocatable, target :: {flat}{shape_dims}")
+            if r.aos_alloc and r.flat_names[0] in device_pack:
+                # The device pack loops run over the member's dims behind the element index.
+                max_loop_rank = max(max_loop_rank, 1 + len(r.cap_symbols))
+                scratch_lines.append(f"    logical :: {r.flat_names[0]}_padded")
+                scratch_lines.append(f"    {fortran_c_type('int64')} :: {', '.join(aos_pack_extent_locals(r))}")
 
     for dt in sorted(guard_scratch_dtypes):
         flat_ptr_lines.append(f"    {fortran_scalar_type(dt)}, target :: {_presence_scratch_name(dt)}(1)")
@@ -444,6 +456,10 @@ def build_wrapper_head(
     # use a pointer local to avoid the deep copy; scalars and non-aliasable arrays
     # keep an allocatable/target scratch.
     for a, _mod, _member in _orphan_module_args(frozen, iface, plan):
+        if a.sdfg_name in deviceptr:
+            # The device address of the caller's copy, null while the caller leaves the array unallocated.
+            scratch_lines.append(f"    type(c_ptr) :: {_device_address_local(a.sdfg_name)}")
+            continue
         ftype = fortran_c_type(a.dtype)
         spec = "(" + ", ".join(":" for _ in range(a.rank)) + ")" if a.rank > 0 else ""
         if _module_arg_aliasable(a, module_allocatables_are_targets):
@@ -559,10 +575,12 @@ def build_wrapper_body(
     plan: FlattenPlan,
     enum_maps: dict | None = None,
     module_allocatables_are_targets: bool = True,
+    acc_residency: AccTransferPlan | None = None,
 ) -> str:
     """Render the between-declaration-and-SDFG-call block: for each FlattenEntry
     either alias it (zero-copy) or allocate + copy in, then populate SDFG free
     symbols from size(...) on the outer storage."""
+    deviceptr, device_pack = _device_lane(acc_residency)
     outer_dummy_set = {a.name for a in iface.args}
     enum_args = _enum_args(iface, enum_maps or {})
     body: list[str] = []
@@ -601,7 +619,7 @@ def build_wrapper_body(
         # stack). Guard the marshal; ABSENT branch gives the flat a degenerate binding.
         guard = _recipe_presence_guard(iface, r)
         if r.aos_alloc:
-            copyin.extend(render_aos_alloc_pack_in(r, entry.outer_expr))
+            copyin.extend(render_aos_alloc_pack_in(r, entry.outer_expr, device=r.flat_names[0] in device_pack))
         elif r.aliasable:
             lines = render_alias_calls(r)
             if guard:
@@ -667,6 +685,18 @@ def build_wrapper_body(
         body.append("    ! ----- Module-global args sourced from use-imports -----")
         for oa, _mod, _member in orphans:
             alias = _module_value_expr(oa.sdfg_name, synth_members)
+            if oa.sdfg_name in deviceptr:
+                # The caller's device copy, passed directly; acc_deviceptr, unlike c_loc, needs no TARGET on the
+                # module variable.  An unallocated array (the kernel reads it only on a path the caller does not
+                # take) has no device copy and must not reach acc_deviceptr at all.
+                local = _device_address_local(oa.sdfg_name)
+                address = f"{local} = transfer(acc_deviceptr({alias}), c_null_ptr)"
+                if _module_arg_may_be_unallocated(oa):
+                    body.append(f"    {local} = c_null_ptr")
+                    body.append(f"    if ({_present(alias, oa.module_origin_pointer)}) {address}")
+                else:
+                    body.append(f"    {address}")
+                continue
             alloc_inside = oa.global_alloc_inside
             is_ptr = oa.module_origin_pointer
             # A DEFERRED-storage host global may be unallocated on entry (kernel
@@ -799,12 +829,14 @@ def build_wrapper_tail(
     enum_maps: dict | None = None,
     init_symbols: Sequence[str] | None = None,
     module_allocatables_are_targets: bool = True,
+    acc_residency: AccTransferPlan | None = None,
 ) -> str:
     """Render the wrapper tail: init-count bump + call dace_program_<entry> +
     copy-back for every non-aliased writeable entry, then deallocate + close.
     Template templates/wrapper_call.f90.in supplies the skeleton; we splice the
     copy-back block in before its end marker."""
     tpl = _load("wrapper_call.f90.in")
+    deviceptr, device_pack = _device_lane(acc_residency)
 
     # Enum dummies pass their SELECT CASE INTEGER scratch, not the outer CHARACTER.
     # Extend name_override so _call_actual picks up the swap.
@@ -837,6 +869,8 @@ def build_wrapper_tail(
         if a.kind is FrozenArgKind.MPI_COMM:
             # The C ``MPI_Comm`` (f2c result), not the integer dummy.
             return _mpi_comm_local(a.sdfg_name)
+        if a.sdfg_name in deviceptr:
+            return _device_address_local(a.sdfg_name)
         if a.kind is FrozenArgKind.ARRAY or a.rank > 0:
             return f"c_loc({actual})"
         return actual
@@ -850,11 +884,12 @@ def build_wrapper_tail(
     for entry in live_entries(frozen, plan):
         r = entry.recipe
         if r.aos_alloc:
+            device = r.flat_names[0] in device_pack
             if entry.writeback_intent in ("out", "inout"):
-                copy_out_lines.extend(render_aos_alloc_pack_out(r, entry.outer_expr))
+                copy_out_lines.extend(render_aos_alloc_pack_out(r, entry.outer_expr, device=device))
             else:
                 # intent(in): no copy-back, but pack-in's scratch still needs releasing.
-                copy_out_lines.append(f"    deallocate({r.flat_names[0]})")
+                copy_out_lines.extend(render_aos_alloc_release(r, device))
             continue
         # Presence guard mirrors copy-in: an ABSENT member's writeback must not
         # touch the member, but its degenerate copy-in scratch still needs releasing.
@@ -876,8 +911,8 @@ def build_wrapper_tail(
     # Aliased arrays already write through the host pointer, so no copy-back is needed.
     module_writeback_lines: list[str] = []
     for oa, _mod, _member in _orphan_module_args(frozen, iface, plan):
-        if not oa.is_written:
-            continue
+        if not oa.is_written or oa.sdfg_name in deviceptr:
+            continue  # the kernel wrote the caller's own (device) copy
         if _module_arg_aliasable(oa, module_allocatables_are_targets):
             continue
         alias = _module_symbol_alias(oa.sdfg_name)
@@ -924,6 +959,19 @@ def build_wrapper_tail(
 # ---------------------------------------------------------------------------
 # OpenACC staging (optional; reuses the acc_transfers renderers)
 # ---------------------------------------------------------------------------
+
+
+def _device_address_local(sdfg_name: str) -> str:
+    """Wrapper local holding the device address of a module array passed as the caller's device copy."""
+    return f"{sdfg_name}__dev"
+
+
+def _device_lane(acc_residency: AccTransferPlan | None) -> tuple[frozenset, frozenset]:
+    """``(deviceptr, device_pack)`` of the plan as sets; empty without a plan (the CPU-only wrapper)."""
+    if acc_residency is None:
+        return frozenset(), frozenset()
+    return frozenset(acc_residency.deviceptr), frozenset(acc_residency.device_pack)
+
 
 #: Indent of a wrapper-body statement in the generated module.
 _ACC_INDENT = "    "
@@ -1055,11 +1103,17 @@ def fold_long_lines(src: str, limit: int = FORTRAN_LINE_LIMIT) -> str:
 
 
 def assemble_module(
-    iface: OriginalInterface, frozen: FrozenSignature, blocks: dict, plan: FlattenPlan | None = None
+    iface: OriginalInterface,
+    frozen: FrozenSignature,
+    blocks: dict,
+    plan: FlattenPlan | None = None,
+    acc_residency: AccTransferPlan | None = None,
 ) -> str:
     """Stitch the rendered blocks into the complete Fortran module
     (template: templates/module.f90.in)."""
     use_lines = [f"  use {mod}, only: {', '.join(syms)}" for mod, syms in sorted(iface.used_modules.items())]
+    if acc_residency is not None and acc_residency.deviceptr:
+        use_lines.append("  use openacc, only: acc_deviceptr")
     # Module-sourced free symbols: import each member under a <sym>__mod alias so
     # it doesn't clash with the wrapper's own local <sym>. Group by module.
     by_mod: dict = {}
@@ -1700,6 +1754,12 @@ def _build_symbol_assigns(
         if a.kind is FrozenArgKind.ARRAY and deferred and not a.global_alloc_inside:
             alias = _module_value_expr(a.sdfg_name, _synth_members)
             module_array_hosts[a.sdfg_name] = (alias, _present(alias, a.module_origin_pointer))
+    # Their extents too, and those of every other module array the kernel does not allocate: the wrapper may pass the
+    # caller's own (device) copy and hold no local to measure.
+    module_array_extents: dict = dict(module_array_hosts)
+    for a in frozen.args:
+        if a.kind is FrozenArgKind.ARRAY and a.sdfg_name in _module_sources and not a.global_alloc_inside:
+            module_array_extents.setdefault(a.sdfg_name, (_module_value_expr(a.sdfg_name, _synth_members), ""))
     # Cap and lower-bound symbols of aos_alloc recipes are populated by pack-in code
     # before the call -- skip here to avoid a stray TODO or duplicate assignment.
     aos_pack_syms = {
@@ -1787,6 +1847,11 @@ def _build_symbol_assigns(
         if off_m and off_m.group(1) in module_array_hosts:
             alias, guard = module_array_hosts[off_m.group(1)]
             out.extend(_guarded_assign(sym, f"lbound({alias}, dim={int(off_m.group(2)) + 1})", guard, absent="1"))
+            continue
+        ext_m = _EXTENT_SYM_RE.match(sym)
+        if ext_m and not off_m and ext_m.group(1) in module_array_extents:
+            alias, guard = module_array_extents[ext_m.group(1)]
+            out.extend(_guarded_assign(sym, f"size({alias}, dim={int(ext_m.group(2)) + 1})", guard, absent="1"))
             continue
         # No flatten-plan size expr: derive directly via lbound/size (covers plain
         # assumed-shape / non-default-lower-bound dummies).
