@@ -24,7 +24,12 @@ from dace_fortran.bindings.block_builders import (
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.fortran_interface import OriginalInterface
 from dace_fortran.bindings.frozen_signature import FrozenSignature
-from dace_fortran.bindings.specialization import Specialization, build_specialization_guard, render_symbol_record
+from dace_fortran.bindings.specialization import (
+    Specialization,
+    build_specialization_guard,
+    guard_module_sources,
+    render_symbol_record,
+)
 
 
 def emit_bindings(
@@ -101,6 +106,6 @@ def emit_bindings(
         blocks["wrapper_body"] = "\n".join(
             [blocks["wrapper_body"], "", *render_symbol_record(frozen, record_symbols_to)]
         )
-    guarded = specialization.frozen if specialization is not None else None
-    out_file.write_text(assemble_module(iface, frozen, blocks, plan, guarded=guarded))
+    extra = guard_module_sources(specialization, iface, plan) if specialization is not None else None
+    out_file.write_text(assemble_module(iface, frozen, blocks, plan, extra_sources=extra))
     return out_file

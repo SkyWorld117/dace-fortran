@@ -24,7 +24,7 @@ from pathlib import Path
 
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.fortran_interface import OriginalInterface
-from dace_fortran.bindings.frozen_signature import FrozenSignature
+from dace_fortran.bindings.frozen_signature import FrozenSignature, ModuleOrigin
 
 _INDENT = "    "
 
@@ -103,6 +103,13 @@ def specializable_symbols(frozen: FrozenSignature, iface: OriginalInterface, pla
     """The free symbols of ``frozen`` a specialisation guard can check: the ones the wrapper computes from its inputs
     alone.  The extents and lower bounds of the record arrays it packs are only known once it has packed them."""
     return set(_guard_assigns(frozen, iface, plan, frozen.free_symbols))
+
+
+def guard_module_sources(spec: Specialization, iface: OriginalInterface, plan: FlattenPlan) -> dict[str, ModuleOrigin]:
+    """The module variables the guard of ``spec`` reads: those of its symbols that come from a module."""
+    from dace_fortran.bindings.block_builders import effective_module_sources
+
+    return {s: o for s, o in effective_module_sources(spec.frozen, iface, plan).items() if s in spec.values}
 
 
 def build_specialization_guard(spec: Specialization, iface: OriginalInterface, plan: FlattenPlan) -> list[str]:
