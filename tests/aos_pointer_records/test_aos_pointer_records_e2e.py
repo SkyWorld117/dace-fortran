@@ -130,6 +130,24 @@ def test_assumed_shape_target_numerical(tmp_path):
         np.testing.assert_allclose(out_sdfg, targets[ix - 1], rtol=1e-12, atol=1e-12, err_msg=f"mismatch for ix={ix}")
 
 
+def test_inlined_callee_reads_through_its_dummy_numerical(tmp_path):
+    """The lifted array is read in an inlined callee through the callee's own dummy (a re-declare of it)."""
+    src_text = (_HERE / "aos_inlined_callee_probe.f90").read_text()
+    sdfg = _sdfg(src_text, tmp_path / "sdfg", "m::run", "run")
+
+    # out = qa - qb; f2py cannot wrap the derived-type dummy of ``kernel``.
+    rng = np.random.default_rng(15)
+    n, k = 5, 4
+    qa0 = np.asfortranarray(rng.standard_normal((n, k)))
+    qb0 = np.asfortranarray(rng.standard_normal((n, k)))
+    qa, qb = qa0.copy(order="F"), qb0.copy(order="F")
+    out = np.zeros((n, k), order="F")
+    sdfg(n=np.int32(n), k=np.int32(k), qa=qa, qb=qb, out=out)
+    np.testing.assert_allclose(out, qa0 - qb0, rtol=1e-12, atol=1e-12)
+    np.testing.assert_array_equal(qa, qa0)
+    np.testing.assert_array_equal(qb, qb0)
+
+
 def test_wp_kind_alias_numerical(tmp_path):
     """``REAL(KIND=wp)`` compiles + runs without pre-resolving ``wp`` -- exercises ``normalize_kind_parameters``."""
     src_path = _HERE / "aos_wp_kind_probe.f90"
@@ -331,6 +349,7 @@ if __name__ == "__main__":
         test_write_through_pointer_numerical,
         test_target_and_alias_stay_coherent_numerical,
         test_assumed_shape_target_numerical,
+        test_inlined_callee_reads_through_its_dummy_numerical,
         test_wp_kind_alias_numerical,
         test_lower_bound_target_numerical,
         test_assumed_shape_lower_bound_target_numerical,

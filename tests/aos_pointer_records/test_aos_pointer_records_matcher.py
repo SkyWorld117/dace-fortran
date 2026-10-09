@@ -134,6 +134,16 @@ def test_unrepresentable_rebinds_declined(tmp_path):
     assert "_QXaos_lift__QMmFoffset_aosEq" not in mod, "offset_aos: lifted"
 
 
+def test_only_local_arrays_lifted(tmp_path):
+    """``run``'s local array is lifted; ``kernel``'s dummy array, whose pointers its caller associated, is not, neither
+    in ``kernel`` itself nor as the re-declare its inlined body leaves in ``run``."""
+    mod = _lifted_module("aos_inlined_callee_probe.f90", tmp_path)
+    assert _has_attr(mod, "hlfir.aos_ptr_records._QMmFrunEq"), "run's local array not recognised"
+    assert "_QXaos_lift__QMmFrunEq" in mod, "run's local array not lifted"
+    assert not _has_attr(mod, "hlfir.aos_ptr_records._QMmFkernelEq"), "kernel's dummy array recognised"
+    assert "_QXaos_lift__QMmFkernelEq" not in mod, "kernel's dummy array lifted"
+
+
 @pytest.mark.parametrize("entry", ["m::part", "m::mixed", "m::offset_aos", "m::late_bound"])
 def test_unrepresentable_rebinds_rejected_by_bridge(entry, tmp_path):
     """A rebind the pass leaves alone reaches the bridge, which rejects the component pointer assignment instead of

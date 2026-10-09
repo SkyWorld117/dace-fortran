@@ -483,12 +483,28 @@ std::optional<InnerShape> innerShapeFromTargetDecl(hlfir::DeclareOp targetDecl) 
   return s;
 }
 
+/// True when the array ``d`` declares is storage of this procedure: a ``fir.alloca``, possibly behind re-declares (an
+/// inlined callee's dummy) and converts.  The pointer components of a dummy argument or a global are associated
+/// outside the procedure: rebinds here need not cover every element, and their absence does not make the accesses
+/// dead, so the gather would read slots no rebind filled.
+bool isLocalStorage(hlfir::DeclareOp d) {
+  mlir::Value v = d.getMemref();
+  while (true) {
+    if (auto outer = v.getDefiningOp<hlfir::DeclareOp>())
+      v = outer.getMemref();
+    else if (auto cv = v.getDefiningOp<fir::ConvertOp>())
+      v = cv.getValue();
+    else
+      return v.getDefiningOp<fir::AllocaOp>() != nullptr;
+  }
+}
+
 std::optional<Candidate> matchCandidate(hlfir::DeclareOp d) {
   auto refTy = mlir::dyn_cast<fir::ReferenceType>(d.getMemref().getType());
   if (!refTy) return std::nullopt;
   auto seqTy = mlir::dyn_cast<fir::SequenceType>(refTy.getEleTy());
   if (!seqTy) return std::nullopt;
-  if (seqTy.getShape().size() != 1) return std::nullopt;
+  if (seqTy.getShape().size() != 1 || !isLocalStorage(d)) return std::nullopt;
   // The concat's outer dim takes the AoS subscripts unchanged and starts at 1, so the AoS must start at 1 too.
   for (auto origin : shapeOrigins(d.getShape()))
     if (constIntThroughConvert(origin) != 1) return std::nullopt;
@@ -1073,7 +1089,9 @@ unsigned rewriteAllAccesses(mlir::OpBuilder& b, Candidate& cand,
 /// ``<aos>_<member>`` symbol those dead designates would surface.  Side-effecting
 /// stores (no results, so trivially ``use_empty``) are skipped -- the copy-in
 /// already erased the rebinds, and sweeping a store would double-free it.
-void eraseDeadAosChain(Candidate& cand) {
+/// Every erased op is added to ``erased``: the forest can hold another
+/// candidate's declare (an inlined callee's re-declare of this array).
+void eraseDeadAosChain(Candidate& cand, llvm::SmallPtrSetImpl<mlir::Operation*>& erased) {
   llvm::SmallPtrSet<mlir::Operation*, 32> seen;
   llvm::SmallVector<mlir::Operation*, 32> forest{cand.aosDecl.getOperation()};
   seen.insert(cand.aosDecl.getOperation());
@@ -1091,6 +1109,7 @@ void eraseDeadAosChain(Candidate& cand) {
     changed = false;
     for (auto*& op : forest)
       if (op && op->getNumResults() > 0 && op->use_empty()) {
+        erased.insert(op);
         op->erase();
         op = nullptr;
         changed = true;
@@ -1230,19 +1249,25 @@ struct LiftAosPointerRecordsPass
       if (auto c = matchCandidate(d)) cands.push_back(*c);
     });
     int allocId = 0;
-    for (auto& c : cands)
-      if (!processCandidate(func, c, allocId)) return false;
+    llvm::SmallPtrSet<mlir::Operation*, 8> erased;
+    for (auto& c : cands) {
+      // A re-declare of an earlier candidate's array has had its accesses rewritten and been swept with it.
+      if (erased.contains(c.aosDecl.getOperation())) continue;
+      if (!processCandidate(func, c, allocId, erased)) return false;
+    }
     return true;
   }
 
-  static bool processCandidate(mlir::func::FuncOp func, Candidate& cand, int& allocId) {
+  static bool processCandidate(mlir::func::FuncOp func, Candidate& cand, int& allocId,
+                               llvm::SmallPtrSetImpl<mlir::Operation*>& erased) {
     llvm::SmallVector<Rebind, 8> rebinds;
     func.walk([&](fir::StoreOp store) {
       if (auto r = matchRebindStore(store, cand)) rebinds.push_back(*r);
     });
     if (rebinds.empty()) {
       // A matched AoS-of-pointer-records with NO rebinds is DEAD exchange
-      // scaffolding: ICON ``recv_sp`` when ``nfields_sp`` folds to 0 (no
+      // scaffolding (only arrays local to the procedure are matched, so their
+      // pointers were never associated): ICON ``recv_sp`` when ``nfields_sp`` folds to 0 (no
       // single-precision fields this config) is allocated but never rebound.
       // After ``hlfir-inline-all`` folds the exchange worker into the caller,
       // its ``recv_sp(k)%p`` reads survive as 0-trip-loop bodies (dead, never
@@ -1268,7 +1293,7 @@ struct LiftAosPointerRecordsPass
         insertAfter = declare.getOperation();
       }
       if (concatByMember.size() == cand.members.size()) rewriteAllAccesses(b, cand, concatByMember);
-      eraseDeadAosChain(cand);
+      eraseDeadAosChain(cand, erased);
       return true;
     }
 
@@ -1422,7 +1447,7 @@ struct LiftAosPointerRecordsPass
       emitCopyLoop(b, term->getLoc(), term, it->second, r.outerIdx, r.targetDecl, rebindShapes[i],
                    /*directionCopyIn=*/false);
     }
-    eraseDeadAosChain(cand);
+    eraseDeadAosChain(cand, erased);
     return true;
   }
 };
