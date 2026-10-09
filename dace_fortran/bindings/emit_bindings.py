@@ -113,6 +113,7 @@ def emit_bindings(
             enum_maps=enum_maps,
             module_allocatables_are_targets=module_allocatables_are_targets,
             acc_residency=acc_residency,
+            declinable=specialization is not None,
         ),
         "wrapper_tail": build_wrapper_tail(
             frozen,

@@ -105,6 +105,10 @@ class FrozenArg:
     # straight through.  Back on the host, ``device_storage`` clears again.
     storage: str = HOST_STORAGE
     device_storage: str = ""
+    # The packed companion of an array of records this argument is one element of (``element_index``, 0-based):
+    # dace_fortran.array_split split the companion, and the binding passes that element's member itself.
+    element_of: str = ""
+    element_index: int = 0
 
     @property
     def acc_data_clause(self) -> str:
