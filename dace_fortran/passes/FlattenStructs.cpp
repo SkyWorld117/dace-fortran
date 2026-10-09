@@ -4282,6 +4282,42 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
   // Struct dummy arguments
   // -------------------------------------------------------------------
 
+  /// ``size(A)`` / ``lbound(A)`` / ``ubound(A)`` of an array-of-records dummy lower to ``fir.box_dims`` on its own
+  /// box, which does not survive the flattening.  Redirect each query on outer dim ``k`` of ``roots`` (the dummy's
+  /// declare results and its inlined aliases): the lower bound is the dummy's own (``argDecl``'s shape, else 1), the
+  /// extent is ``companion``'s dim ``k`` -- the packed companions carry the outer dims first -- from its shape when
+  /// it has one, else a ``fir.box_dims`` on the companion.  A stride query has no counterpart: it is left alone, and
+  /// keeps the dummy alive.
+  static void redirectOuterBoxDims(llvm::ArrayRef<mlir::Value> roots, hlfir::DeclareOp argDecl, mlir::Value companion,
+                                   unsigned outerRank) {
+    auto companionDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(companion.getDefiningOp());
+    if (!companionDecl) return;
+    auto extents = companionDecl.getShape() ? classifyShapeOperand(companionDecl.getShape()).extents
+                                            : std::vector<mlir::Value>{};
+    auto lbs = argDecl.getShape() ? classifyShapeOperand(argDecl.getShape()).lbs : std::vector<mlir::Value>{};
+    llvm::SmallVector<fir::BoxDimsOp, 4> queries;
+    for (mlir::Value root : roots)
+      for (auto* u : root.getUsers())
+        if (auto bd = mlir::dyn_cast<fir::BoxDimsOp>(u)) queries.push_back(bd);
+    for (auto bd : queries) {
+      auto dim = traceConstInt(bd.getDim());
+      if (!dim || *dim < 0 || static_cast<unsigned>(*dim) >= outerRank || !bd.getResult(2).use_empty()) continue;
+      auto const k = static_cast<unsigned>(*dim);
+      if (k >= extents.size() && !mlir::isa<fir::BaseBoxType>(companion.getType())) continue;
+      mlir::OpBuilder b(bd);
+      auto loc = bd.getLoc();
+      auto idx = b.getIndexType();
+      mlir::Value extent = k < extents.size()
+                               ? extents[k]
+                               : b.create<fir::BoxDimsOp>(loc, idx, idx, idx, companion, bd.getDim()).getResult(1);
+      mlir::Value lb = k < lbs.size() && lbs[k] ? lbs[k] : b.create<mlir::arith::ConstantIndexOp>(loc, 1).getResult();
+      if (lb.getType() != idx) lb = b.create<fir::ConvertOp>(loc, idx, lb).getResult();
+      bd.getResult(0).replaceAllUsesWith(lb);
+      bd.getResult(1).replaceAllUsesWith(extent);
+      bd.erase();
+    }
+  }
+
   static void replaceStructArg(mlir::func::FuncOp func, unsigned argIdx, hlfir::DeclareOp argDecl, fir::RecordType rec,
                                bool outerIsArray = false, llvm::ArrayRef<int64_t> outerShape = {},
                                const llvm::StringSet<>& aosAllocMembers = {}) {
@@ -4346,6 +4382,14 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         for (unsigned k = 0; k < memberRank; ++k)
           symbolNames.push_back(aosMemberSymbol("cap", flatName, k, memberRank));
         for (unsigned k = 0; k < memberRank; ++k) symbolNames.push_back(aosMemberSymbol("lb", flatName, k, memberRank));
+        // A runtime outer extent is the companion's own extent symbol ``<flat>_d<i>``, which the bindings layer
+        // populates from ``size(<outer>, dim=i)`` as for the regular companions.
+        llvm::SmallVector<unsigned, 2> runtimeOuterDims;
+        for (unsigned d = 0; d < outerShape.size(); ++d)
+          if (outerShape[d] == fir::SequenceType::getUnknownExtent()) {
+            runtimeOuterDims.push_back(d);
+            symbolNames.push_back(flatName + "_d" + std::to_string(d));
+          }
 
         // Insert the scalar args (``index`` values passed by reference so
         // the bindings layer can populate them from the wrapper), then
@@ -4375,10 +4419,8 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
           symbolVals.push_back(b.create<fir::LoadOp>(loc, symDecl.getResult(0)).getResult());
         }
 
-        // Shape: (lower bound, extent) per dim.  Outer dims keep the AoS's
-        // own lower bounds; a runtime outer extent is a fresh ``index``
-        // the bindings layer populates (``<flat>_d<i>``, from
-        // ``size(<outer>, dim=i)``), as for the regular companions.
+        // Shape: (lower bound, extent) per dim.  Outer dims keep the AoS's own lower bounds; a runtime outer
+        // extent is its ``<flat>_d<i>`` symbol (after the cap and lower-bound symbols).
         auto outerOrigins = classifyShapeOperand(argDecl.getShape()).lbs;
         llvm::SmallVector<mlir::Value, 8> pairs;
         for (unsigned d = 0; d < outerShape.size(); ++d) {
@@ -4386,12 +4428,11 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
           if (!origin) origin = b.create<mlir::arith::ConstantOp>(loc, idxTy, b.getIndexAttr(1)).getResult();
           if (origin.getType() != idxTy) origin = b.create<fir::ConvertOp>(loc, idxTy, origin).getResult();
           mlir::Value extent;
-          if (outerShape[d] != fir::SequenceType::getUnknownExtent()) {
+          auto runtime = llvm::find(runtimeOuterDims, d);
+          if (runtime == runtimeOuterDims.end())
             extent = b.create<mlir::arith::ConstantOp>(loc, idxTy, b.getIndexAttr(outerShape[d])).getResult();
-          } else {
-            auto al = b.create<fir::AllocaOp>(loc, idxTy);
-            extent = b.create<fir::LoadOp>(loc, al.getResult()).getResult();
-          }
+          else
+            extent = symbolVals[(2 * memberRank) + (runtime - runtimeOuterDims.begin())];
           pairs.push_back(origin);
           pairs.push_back(extent);
         }
@@ -4582,6 +4623,17 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         }
       }
       for (auto dg : designates) rewriteDesignate(dg, memberBase, concatMembers);
+      // Size queries on the dummy itself: answered by a companion's outer dims (the first member's, by name, so the
+      // choice is deterministic).
+      llvm::SmallVector<std::string, 4> companionNames;
+      for (auto& kv : aosAllocFlatBase) companionNames.push_back(kv.first().str());
+      for (auto& kv : memberBase) companionNames.push_back(kv.first().str());
+      llvm::sort(companionNames);
+      if (!companionNames.empty()) {
+        auto it = aosAllocFlatBase.find(companionNames.front());
+        mlir::Value companion = it != aosAllocFlatBase.end() ? it->second : memberBase.lookup(companionNames.front());
+        redirectOuterBoxDims(roots, argDecl, companion, static_cast<unsigned>(outerShape.size()));
+      }
       // Drop now-dead inlined alias declares so ``argDecl`` becomes erasable
       // (the alias is the only remaining user keeping the block arg live).
       for (auto adcl : aliasDecls)
