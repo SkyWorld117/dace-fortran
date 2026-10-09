@@ -313,20 +313,10 @@ std::string buildIndexExpr(mlir::Value v, int d) {
     if (resIdx == 2) return "1";  // stride  --  bridge requires contiguous
     auto dimC = traceConstInt(def->getOperand(1));
     // Walk operand 0 back to a declare so we can name the array.
-    mlir::Value arrayVal = def->getOperand(0);
-    for (int hop = 0; hop < limits::kTraceToDeclMax && arrayVal; ++hop) {
-      auto* adef = arrayVal.getDefiningOp();
-      if (!adef) break;
-      if (auto cv = mlir::dyn_cast<fir::ConvertOp>(adef)) {
-        arrayVal = cv.getValue();
-        continue;
-      }
-      if (auto ld = mlir::dyn_cast<fir::LoadOp>(adef)) {
-        arrayVal = ld.getMemref();
-        continue;
-      }
-      break;
-    }
+    BoxDimsSource const src = traceBoxDimsSource(def->getOperand(0));
+    mlir::Value const arrayVal = src.array;
+    fir::ReboxOp const boundsRebox = src.boundsRebox;
+    if (resIdx == 0 && boundsRebox && dimC) return reboxLowerBound(boundsRebox, static_cast<unsigned>(*dimC), d);
     auto arrName = traceToDecl(arrayVal);
     // ``fir.box_dims`` reads the box (#1) result of an
     // ``hlfir.declare``; ``traceToDecl`` keys on the addr result
@@ -422,6 +412,9 @@ std::string buildIndexExpr(mlir::Value v, int d) {
               if (!shapeVal) {
                 if (auto outer = asAssumedShapeAlias(decl)) shapeVal = outer.getShape();
               }
+            } else if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(adef)) {
+              // A section's own shape: the LiftAos gather-buffer slice (see the ``buildExpr`` box_dims handler).
+              shapeVal = dg.getShape();
             }
           }
           if (shapeVal) {

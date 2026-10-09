@@ -2,9 +2,15 @@
 AoS-of-pointer-records pattern emits ``hlfir.aos_ptr_records.<aos_decl>``, ahead of materialisation.
 """
 
+import subprocess
 from pathlib import Path
 
+import pytest
+
 from dace_fortran.build import make_builder
+from dace_fortran.build_bridge import hb
+from dace_fortran.builder import DEFAULT_PIPELINE
+from tests._util import flang_binary, flang_intrinsic_modules_path
 
 _HERE = Path(__file__).resolve().parent
 
@@ -77,6 +83,63 @@ def test_materialisation_handles_two_members(tmp_path):
     assert sum(1 for ln in concat_lines if "hlfir.declare" in ln) >= 2, (
         f"expected 2 concat declares; got: {concat_lines!r}"
     )
+
+
+def _concat_declares(module_str: str) -> list[str]:
+    """The concat ``hlfir.declare`` lines the materialisation emits."""
+    return [ln for ln in module_str.splitlines() if "_QXaos_lift_" in ln and "hlfir.declare" in ln]
+
+
+def test_concat_keeps_member_lower_bounds(tmp_path):
+    """A member whose targets start at (0, -2) gets a concat declared with a ``fir.shape_shift``; a member that starts
+    at 1 keeps the plain ``fir.shape``."""
+    shifted = _concat_declares(_post_pass_module("aos_lower_bound_target_probe.f90", "m::run", tmp_path / "shifted"))
+    assert shifted and all("!fir.shapeshift<3>" in ln for ln in shifted), shifted
+    plain = _concat_declares(_post_pass_module("aos_single_pointer_member_probe.f90", "m::run", tmp_path / "plain"))
+    assert plain and all("!fir.shape<3>" in ln for ln in plain), plain
+
+
+def _lifted_module(probe_name: str, tmp_path) -> str:
+    """The module text right after ``hlfir-lift-aos-pointer-records``: the pipeline up to it, without the bridge."""
+    hlfir = tmp_path / "probe.hlfir"
+    subprocess.check_call(
+        [
+            flang_binary(),
+            "-fc1",
+            "-fintrinsic-modules-path",
+            flang_intrinsic_modules_path(),
+            "-emit-hlfir",
+            str(_HERE / probe_name),
+            "-o",
+            str(hlfir),
+        ],
+        cwd=tmp_path,
+    )
+    mod = hb.HLFIRModule()
+    assert mod.parse_file(str(hlfir))
+    head, lift, _ = DEFAULT_PIPELINE.partition("hlfir-lift-aos-pointer-records")
+    mod.run_passes(head + lift)
+    return mod.dump()
+
+
+def test_unrepresentable_rebinds_declined(tmp_path):
+    """Rebinds one gather temp cannot represent are recognised but not lifted: a member pointing at part of its
+    target, members whose targets start at different lower bounds, and a runtime remap bound computed after another
+    member's rebind.  An array of records starting at 0 is not even recognised."""
+    mod = _lifted_module("aos_unliftable_bounds_probe.f90", tmp_path)
+    for entry in ("part", "mixed", "late_bound"):
+        assert _has_attr(mod, f"hlfir.aos_ptr_records._QMmF{entry}Eq"), f"{entry}: not recognised"
+        assert f"_QXaos_lift__QMmF{entry}Eq" not in mod, f"{entry}: lifted"
+    assert not _has_attr(mod, "hlfir.aos_ptr_records._QMmFoffset_aosEq"), "offset_aos: recognised"
+    assert "_QXaos_lift__QMmFoffset_aosEq" not in mod, "offset_aos: lifted"
+
+
+@pytest.mark.parametrize("entry", ["m::part", "m::mixed", "m::offset_aos", "m::late_bound"])
+def test_unrepresentable_rebinds_rejected_by_bridge(entry, tmp_path):
+    """A rebind the pass leaves alone reaches the bridge, which rejects the component pointer assignment instead of
+    lowering a copy that reads the wrong elements."""
+    with pytest.raises(NotImplementedError, match=r"pointer assignment to the component '\w+' of an array element"):
+        _post_pass_module("aos_unliftable_bounds_probe.f90", entry, tmp_path)
 
 
 def test_allocatable_member_aos_not_matched(tmp_path):

@@ -473,6 +473,32 @@ std::string internPosSymbol(const std::string& array, int64_t one_based_idx) {
   return internPosSymbol(array, std::vector<int64_t>{one_based_idx});
 }
 
+BoxDimsSource traceBoxDimsSource(mlir::Value box) {
+  BoxDimsSource src{box, {}};
+  for (int hop = 0; hop < limits::kTraceToDeclMax && src.array; ++hop) {
+    auto* def = src.array.getDefiningOp();
+    if (!def) break;
+    if (auto cv = mlir::dyn_cast<fir::ConvertOp>(def)) {
+      src.array = cv.getValue();
+    } else if (auto ld = mlir::dyn_cast<fir::LoadOp>(def)) {
+      src.array = ld.getMemref();
+    } else if (auto rb = mlir::dyn_cast<fir::ReboxOp>(def);
+               rb && !rb.getSlice() && (!rb.getShape() || rb.getShape().getDefiningOp<fir::ShiftOp>())) {
+      if (!src.boundsRebox) src.boundsRebox = rb;
+      src.array = rb.getBox();
+    } else {
+      break;
+    }
+  }
+  return src;
+}
+
+std::string reboxLowerBound(fir::ReboxOp rebox, unsigned dim, int d) {
+  auto shift = rebox.getShape() ? rebox.getShape().getDefiningOp<fir::ShiftOp>() : fir::ShiftOp{};
+  if (!shift) return "1";
+  return dim < shift->getNumOperands() ? buildIndexExpr(shift->getOperand(dim), d + 1) : "?";
+}
+
 std::string buildExpr(mlir::Value val, int d) {
   if (d > limits::kBuildExprDepth) return "?";
   // Synthetic scalars minted for scf.if results: every downstream read of
@@ -724,20 +750,9 @@ std::string buildExpr(mlir::Value val, int d) {
     // Walk operand 0 back to the underlying ``hlfir.declare`` so we
     // can read its shape (for explicit-shape) or fall back to the
     // assumed-shape symbol form.
-    mlir::Value arrayVal = def->getOperand(0);
-    for (int hop = 0; hop < limits::kTraceToDeclMax && arrayVal; ++hop) {
-      auto* adef = arrayVal.getDefiningOp();
-      if (!adef) break;
-      if (auto cv = mlir::dyn_cast<fir::ConvertOp>(adef)) {
-        arrayVal = cv.getValue();
-        continue;
-      }
-      if (auto ld = mlir::dyn_cast<fir::LoadOp>(adef)) {
-        arrayVal = ld.getMemref();
-        continue;
-      }
-      break;
-    }
+    BoxDimsSource const src = traceBoxDimsSource(def->getOperand(0));
+    mlir::Value const arrayVal = src.array;
+    fir::ReboxOp const boundsRebox = src.boundsRebox;
     std::string arrName = traceToDecl(arrayVal);
     // ``fir.box_dims`` reads the *box* result (#1) of an
     // ``hlfir.declare``; ``traceToDecl`` keys on the addr result
@@ -768,7 +783,7 @@ std::string buildExpr(mlir::Value val, int d) {
       } else if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(adef)) {
         // A sectioned designate carries the RESULT's per-dim extents on its own
         // ``shape`` operand -- most importantly the LiftAos concat SLICE-BOX
-        // (``concat(idx, 1:d1, 1:d2, ...)`` replacing ``recv_dp(idx)%p``).  That
+        // (``concat(idx, lb1:lb1+d1-1, ...)`` replacing ``recv_dp(idx)%p``).  That
         // slice already dropped the concat's leading N dim, so its dim ``k`` is
         // the concat's dim ``k+1``; ``SIZE`` / ``UBOUND`` on it must read THIS
         // shape (yielding the rebind target's real extent, e.g. ``recv1_dp_d1``
@@ -827,6 +842,7 @@ std::string buildExpr(mlir::Value val, int d) {
     };
 
     // Lower bound (#0):
+    if (resIdx == 0 && boundsRebox) return reboxLowerBound(boundsRebox, dim, d);
     if (resIdx == 0) {
       if (shapeVal) {
         if (auto ss = mlir::dyn_cast<fir::ShapeShiftOp>(shapeVal.getDefiningOp())) {
