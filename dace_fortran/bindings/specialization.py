@@ -107,7 +107,8 @@ def specializable_symbols(frozen: FrozenSignature, iface: OriginalInterface, pla
 
 def build_specialization_guard(spec: Specialization, iface: OriginalInterface, plan: FlattenPlan) -> list[str]:
     """Wrapper lines that compute every symbol of ``spec`` and decline the call (or stop) unless all of them hold the
-    values the SDFG was specialised to.  They go first in the wrapper body."""
+    values the SDFG was specialised to.  They go first in the wrapper body.  Without values, the wrapper of the
+    general SDFG still takes the flag, and never sets it: one caller serves both."""
     from dace_fortran.bindings.block_builders import DECLINED_FLAG
 
     assigns = _guard_assigns(spec.frozen, iface, plan, spec.values)
@@ -117,12 +118,14 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
             f"cannot guard the specialisation of {', '.join(unguardable)}: the wrapper computes "
             "them only after it has allocated or copied its buffers (see specializable_symbols)"
         )
-    width = max(len(s) for s in spec.values)
     lines = [
         f"{_INDENT}! ----- Specialisation guard: the SDFG holds these symbols at the values below -----",
         f"{_INDENT}if (present({DECLINED_FLAG})) {DECLINED_FLAG} = .false.",
-        f"{_INDENT}block",
     ]
+    if not spec.values:
+        return lines
+    width = max(len(s) for s in spec.values)
+    lines.append(f"{_INDENT}block")
     lines += [f"{_INDENT}  integer(c_int64_t) :: {s}" for s in spec.values if assigns[s]]
     lines.append(f"{_INDENT}  character(len={width}) :: dace_mismatch")
     lines.append(f"{_INDENT}  dace_mismatch = ''")
