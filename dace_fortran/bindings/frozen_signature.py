@@ -307,6 +307,31 @@ def _install_sdfg_accessor() -> None:
 _install_sdfg_accessor()
 
 
+def drop_unread_module_inputs(sdfg: SDFG) -> list[str]:
+    """Remove the inputs ``sdfg`` takes from a module variable but no longer reads, and return their names.
+
+    The frontend hands an entry every module variable its code may read; once optimisation has folded the branches
+    that read them, most are dead weight the binding would still copy in on every call.  Only module variables go:
+    the caller's own buffers are the ABI.  Re-snapshot with :func:`refreeze` afterwards.
+    """
+    frozen = get_frozen_signature(sdfg)
+    if frozen is None:
+        return []
+    accessed = {n.data for n, _ in sdfg.all_nodes_recursive() if isinstance(n, dace.nodes.AccessNode)}
+    referenced = set().union(*(sd.used_symbols(all_symbols=True) for sd in sdfg.all_sdfgs_recursive()))
+    unread = [
+        name
+        for name in frozen.module_symbol_origins
+        if name in sdfg.arrays
+        and not sdfg.arrays[name].transient
+        and name not in accessed
+        and name not in referenced
+    ]
+    for name in unread:
+        sdfg.remove_data(name, validate=False)
+    return unread
+
+
 def refreeze(sdfg: SDFG) -> FrozenSignature:
     """Re-snapshot after a DELIBERATE transformation of the built SDFG (e.g. an optimization
     pipeline run between ``build()`` and ``build_fortran_library``), so the bindings regenerate
