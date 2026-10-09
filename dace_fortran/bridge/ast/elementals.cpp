@@ -368,6 +368,15 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
 /// (parent-section scalar dims aren't silently dropped).
 void collectReadAccesses(mlir::Value v, std::vector<AccessInfo>& accesses, int depth) {
   if (depth > 40) return;
+  // A result already lowered to a synthetic scalar (an scf.if or scf.index_switch result whose statement lowering
+  // assigns it) is read as that scalar, as buildExpr renders it -- not through the arms that computed it.
+  if (auto it = kScfValueMap.find(v); it != kScfValueMap.end()) {
+    AccessInfo ra;
+    ra.array_name = it->second;
+    ra.is_read = true;
+    accesses.push_back(std::move(ra));
+    return;
+  }
   auto* op = v.getDefiningOp();
   if (!op) return;
   // ``fir.box_dims`` reads only shape/bounds metadata (already rendered as symbols); recursing into its operand would

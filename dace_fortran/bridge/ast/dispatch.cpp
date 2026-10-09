@@ -115,14 +115,32 @@ static void dispatchScfWhileCall(fir::CallOp call, std::vector<ASTNode>& out);
 // Forward decl: walkSCFBeforeRegion dispatches a NESTED scf.while through the same builder as a top-level one.
 static ASTNode buildWhileNode(mlir::scf::WhileOp whileOp);
 
+// The last op of `block` that `cond` depends on through SSA operands; nullptr when it depends on none (it reads only the
+// region's arguments or values from outside the loop).  The condition's value is fixed where that op runs: a load
+// reads the memory of that point, an scf.if result is what its taken branch yielded.
+static mlir::Operation* lastDependencyInBlock(mlir::Block& block, mlir::Value cond) {
+  mlir::Operation* last = nullptr;
+  llvm::SmallVector<mlir::Value, 8> work{cond};
+  llvm::DenseSet<mlir::Value> seen;
+  while (!work.empty()) {
+    mlir::Value const v = work.pop_back_val();
+    if (!seen.insert(v).second) continue;
+    mlir::Operation* def = v.getDefiningOp();
+    if (!def || def->getBlock() != &block) continue;
+    if (!last || last->isBeforeInBlock(def)) last = def;
+    for (mlir::Value const o : def->getOperands()) work.push_back(o);
+  }
+  return last;
+}
+
 std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
   std::vector<ASTNode> out;
-  // Snapshot scf.condition's break value at body START, before an in-body scf.if mutates it, into __brk_<N>; without it
-  // the break re-evaluates post-mutation values and fires one iteration early (NPB LU ssor convergence check).
+  // Snapshot scf.condition's break value into __brk_<N> right after the last op of the body it depends on, where its
+  // SSA value is computed.  Taken earlier, it reads values the body has not produced yet (an EXIT testing the body's
+  // own update, whose condition is the result of the scf.if around the body); re-evaluated at the guard, it reads
+  // values an in-body scf.if has mutated since and fires one iteration early (NPB LU ssor convergence check).
   static thread_local int kBrkCounter = 0;
   std::string brkSynthName;
-  ASTNode deferredSnap;  // break-condition snapshot deferred past the block's switch chain (see below)
-  bool haveDeferredSnap = false;
   mlir::scf::ConditionOp pendingCondOp;
   for (auto& op : block) {
     if (auto condOp = mlir::dyn_cast<mlir::scf::ConditionOp>(op)) {
@@ -130,57 +148,47 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
       break;
     }
   }
-  if (pendingCondOp) {
+  // Rendered only once every op it depends on has been walked, so an scf.if or scf.index_switch result reads as the
+  // synthetic scalar its statement lowering assigns.
+  auto pushBreakSnapshot = [&]() {
     auto condVal = pendingCondOp.getCondition();
     // Materialises SUM/MINVAL/MAXVAL/PRODUCT in the loop condition into a Reduce lib-node scalar before the
     // break-check; without it a runtime-extent DO WHILE (MAXVAL(a) > 0) falls to inline-unroll which bails to "?".
     materialiseCondReductions(condVal, out);
-    size_t const scMapBefore = kScfValueMap.size();
     auto b = buildBoolExpr(condVal, 0);
-    if (!b.empty() && b != "?") {
-      // An array-element break condition (e.g. rsdnm(i) < tolrsd(i)) can't ride an interstate-edge assignment -- DaCe
-      // strips the subscript to a bare pointer compare (see tests/lu_two_call_convergence_repro_test.py).
-      std::vector<AccessInfo> condAccesses;
-      collectReadAccesses(condVal, condAccesses, 0);
-      int const brkId = kBrkCounter++;
-      // Rendering the condition LAZILY registered a side-effecting index_switch result (kScfValueMap grew): the
-      // switch's materialising chain is emitted by the block walk BELOW, so the snapshot must be deferred to just
-      // before the guard -- pushed here it would read the synth BEFORE the switch assigned it (hpsort GOTO loops).
-      bool const deferSnap = kScfValueMap.size() != scMapBefore;
-      if (condAccesses.empty()) {
-        // Pure scalar/counter condition -- symbol snapshot is exact (no array reads to keep off the interstate edge).
-        brkSynthName = "__brk_" + std::to_string(brkId);
-        ASTNode snap;
-        snap.kind = "assign";
-        snap.target = brkSynthName;
-        snap.expr = b;
-        snap.target_is_array = false;
-        if (deferSnap) {
-          deferredSnap = std::move(snap);
-          haveDeferredSnap = true;
-        } else {
-          out.push_back(std::move(snap));
-        }
-      } else {
-        // Array-dependent break: compute into scalar transient __brkc_<N> via tasklet (array reads keep per-occurrence
-        // connectors/memlets); guard reads the bare scalar name. Scalars-over-len1 rule -- no length-1 array promotion.
-        brkSynthName = "__brkc_" + std::to_string(brkId);
-        ASTNode comp;
-        comp.kind = "assign";
-        comp.target = brkSynthName;
-        comp.expr = b;  // bare names; emit_tasklet wires the subscripts
-        comp.accesses = std::move(condAccesses);
-        comp.target_is_array = false;
-        if (deferSnap) {
-          deferredSnap = std::move(comp);
-          haveDeferredSnap = true;
-        } else {
-          out.push_back(std::move(comp));
-        }
-      }
+    if (b.empty() || b == "?") return;
+    // An array-element break condition (e.g. rsdnm(i) < tolrsd(i)) can't ride an interstate-edge assignment -- DaCe
+    // strips the subscript to a bare pointer compare (see tests/lu_two_call_convergence_repro_test.py).
+    std::vector<AccessInfo> condAccesses;
+    collectReadAccesses(condVal, condAccesses, 0);
+    int const brkId = kBrkCounter++;
+    ASTNode snap;
+    snap.kind = "assign";
+    snap.expr = b;  // bare names; emit_tasklet wires the subscripts
+    snap.target_is_array = false;
+    if (condAccesses.empty()) {
+      // Pure scalar/counter condition -- symbol snapshot is exact (no array reads to keep off the interstate edge).
+      brkSynthName = "__brk_" + std::to_string(brkId);
+    } else {
+      // Array-dependent break: compute into scalar transient __brkc_<N> via tasklet (array reads keep per-occurrence
+      // connectors/memlets); guard reads the bare scalar name. Scalars-over-len1 rule -- no length-1 array promotion.
+      brkSynthName = "__brkc_" + std::to_string(brkId);
+      snap.accesses = std::move(condAccesses);
     }
+    snap.target = brkSynthName;
+    out.push_back(std::move(snap));
+  };
+  mlir::Operation* snapshotAfter = pendingCondOp ? lastDependencyInBlock(block, pendingCondOp.getCondition()) : nullptr;
+  bool snapshotPending = static_cast<bool>(pendingCondOp);
+  if (snapshotPending && !snapshotAfter) {
+    pushBreakSnapshot();
+    snapshotPending = false;
   }
   for (auto& op : block) {
+    if (snapshotPending && snapshotAfter->isBeforeInBlock(&op)) {
+      pushBreakSnapshot();
+      snapshotPending = false;
+    }
     if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
       if (isOptionalPresentSelect(ifOp)) continue;  // dead optional-present marshalling select
       out.push_back(buildScfIfAsConditional(ifOp));
@@ -203,12 +211,6 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
       continue;
     }
     if (auto condOp = mlir::dyn_cast<mlir::scf::ConditionOp>(op)) {
-      // A deferred break-condition snapshot lands HERE -- after the block's ops (incl. the materialising switch
-      // chain for any lazily-registered index_switch result the snapshot reads), before the guard that reads it.
-      if (haveDeferredSnap) {
-        out.push_back(std::move(deferredSnap));
-        haveDeferredSnap = false;
-      }
       // Captures the scf.while's carried results into synth scalars each iteration; a post-loop scf.index_switch reads
       // these to run the fired EXIT's side effect -- without this the exit reason is lost.
       if (auto whileOp = condOp->getParentOfType<mlir::scf::WhileOp>()) {
@@ -222,8 +224,8 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
           out.push_back(std::move(a));
         }
       }
-      // scf.condition(%c): break when %c is false. Uses the pre-body snapshot __brk_<N> (if created) so the check sees
-      // start-of-iteration values, not post-mutation ones.
+      // scf.condition(%c): break when %c is false. Reads the snapshot __brk_<N> (if created), taken where %c is
+      // computed, not values mutated since.
       ASTNode guard;
       guard.kind = "conditional";
       if (!brkSynthName.empty()) {
@@ -402,7 +404,6 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
                                "allowlist via ``kKnownBenign`` if the op is a pure marker.");
     }
   }
-  if (haveDeferredSnap) out.push_back(std::move(deferredSnap));  // safety net; normally pushed at the condition op
   return out;
 }
 
