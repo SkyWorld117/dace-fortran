@@ -1,6 +1,6 @@
-"""Specialising a binding's SDFG to recorded integer values: a general binding records the symbols of each call, the
-SDFG is specialised to the ones that never changed, and the specialised binding runs only for calls that hold those
-values -- any other call is declined, so the caller can run its own code.
+"""Specialising a binding's SDFG to recorded values: a general binding records the integer symbols and scalar inputs
+of each call, the SDFG is specialised to the ones that never changed, and the specialised binding runs only for calls
+that hold those values -- any other call is declined, so the caller can run its own code.
 
 Each test builds its own entry: two SDFG libraries of one entry name loaded into one process would share the first
 one's code."""
@@ -9,7 +9,7 @@ import ctypes
 from pathlib import Path
 
 import numpy as np
-from dace.sdfg.utils import specialize_symbols
+from dace.sdfg.utils import specialize_scalars, specialize_symbols
 
 from dace_fortran.bindings.build_fortran_library import build_fortran_library
 from dace_fortran.bindings.flatten_plan import FlattenPlan
@@ -19,7 +19,7 @@ from dace_fortran.bindings.specialization import (
     Specialization,
     build_specialization_guard,
     recorded_invariants,
-    specializable_symbols,
+    specializable,
 )
 from tests._util import build_sdfg
 
@@ -29,34 +29,43 @@ _SRC = """
 module params_{entry}
   implicit none
   integer :: nv = 3
+  logical :: scaled = .true.
+  real(8) :: factor = 2.0d0
 end module params_{entry}
 
 module kern_{entry}
   implicit none
 contains
   subroutine {entry}(x, y)
-    use params_{entry}, only: nv
+    use params_{entry}, only: nv, scaled, factor
     real(8), intent(in) :: x(:)
     real(8), intent(inout) :: y(:)
     integer :: i
     do i = 1, nv
-      y(i) = 2*x(i)
+      if (scaled) then
+        y(i) = factor*x(i)
+      else
+        y(i) = x(i)
+      end if
     end do
   end subroutine {entry}
 end module kern_{entry}
 """
 
 _SHIM = f"""
-subroutine run_kern(xin, yout, nv_in, declined_out) bind(c, name="run_kern")
+subroutine run_kern(xin, yout, nv_in, scaled_in, factor_in, declined_out) bind(c, name="run_kern")
   use iso_c_binding
-  use params_{{entry}}, only: nv
+  use params_{{entry}}, only: nv, scaled, factor
   use {{entry}}_dace_bindings, only: {{entry}}_dace
   real(c_double), intent(in) :: xin({_N})
   real(c_double), intent(inout) :: yout({_N})
-  integer(c_int), value :: nv_in
+  integer(c_int), value :: nv_in, scaled_in
+  real(c_double), value :: factor_in
   integer(c_int), intent(out) :: declined_out
   logical :: declined
   nv = nv_in
+  scaled = scaled_in /= 0
+  factor = factor_in
   {{call}}
   declined_out = merge(1, 0, declined)
 end subroutine run_kern
@@ -79,7 +88,7 @@ def _build(tmp_path: Path, entry: str):
 
 def _library(tmp_path: Path, sdfg, iface, plan, src: Path, call: str, **binding):
     """Build the library with a shim running ``call``; ``binding`` goes to :func:`build_fortran_library`.  Returns a
-    function that runs the kernel with the module variable set to ``nv`` and gives ``(y, declined)``."""
+    function that runs the kernel with the module variables set as given and returns ``(y, declined)``."""
     shim = tmp_path / "shim.f90"
     shim.write_text(_SHIM.format(entry=iface.entry, call=call.format(entry=iface.entry)))
     lib = build_fortran_library(
@@ -87,13 +96,13 @@ def _library(tmp_path: Path, sdfg, iface, plan, src: Path, call: str, **binding)
     )
     fn = lib.load().run_kern
     fn.restype = None
-    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_void_p]
 
-    def run(nv: int) -> tuple[np.ndarray, bool]:
+    def run(nv: int = 3, scaled: bool = True, factor: float = 2.0) -> tuple[np.ndarray, bool]:
         x = np.arange(1, _N + 1, dtype=np.float64)
         y = np.full(_N, -1.0)
         declined = np.zeros(1, dtype=np.int32)
-        fn(x.ctypes.data, y.ctypes.data, nv, declined.ctypes.data)
+        fn(x.ctypes.data, y.ctypes.data, nv, int(scaled), factor, declined.ctypes.data)
         return y, bool(declined[0])
 
     return run
@@ -101,8 +110,8 @@ def _library(tmp_path: Path, sdfg, iface, plan, src: Path, call: str, **binding)
 
 def test_recorded_invariants_keep_the_values_that_never_changed(tmp_path):
     record = tmp_path / "calls.symbols"
-    record.write_text("n 3\nm 5\n\nn 3\nm 6\n\n")
-    assert recorded_invariants(record) == {"n": 3}
+    record.write_text("n 3\nm 5\nf 2.50000000000000000E+000\n\nn 3\nm 6\nf 2.50000000000000000E+000\n\n")
+    assert recorded_invariants(record) == {"n": 3, "f": 2.5}
 
 
 def test_a_specialisation_to_no_values_only_clears_the_flag():
@@ -111,7 +120,7 @@ def test_a_specialisation_to_no_values_only_clears_the_flag():
     assert [ln.strip() for ln in lines[1:]] == ["if (present(dace_declined)) dace_declined = .false."]
 
 
-def test_a_general_binding_records_the_symbols_of_every_call(tmp_path):
+def test_a_general_binding_records_the_values_of_every_call(tmp_path):
     sdfg, iface, plan, src = _build(tmp_path, "scale_rec")
     record = tmp_path / "scale_rec.symbols"
     run = _library(
@@ -123,20 +132,24 @@ def test_a_general_binding_records_the_symbols_of_every_call(tmp_path):
         "call {entry}_dace(xin, yout)\n  declined = .false.",
         record_symbols_to=record,
     )
-    run(3)
-    run(4)
-    calls = record.read_text().split("\n\n")
-    assert "nv 3" in calls[0].splitlines() and "nv 4" in calls[1].splitlines()
-    assert "nv" not in recorded_invariants(record)
+    run(nv=3, factor=0.1)
+    run(nv=4, factor=0.1)
+    first, second = (call.splitlines() for call in record.read_text().split("\n\n")[:2])
+    assert "nv 3" in first and "nv 4" in second and "scaled 1" in first
+    # Reals keep every bit, logicals read 0 or 1, and only what never changed is invariant.
+    assert recorded_invariants(record) == {"scaled": 1, "factor": 0.1}
 
 
 def test_a_specialised_binding_runs_its_values_and_declines_others(tmp_path):
     sdfg, iface, plan, src = _build(tmp_path, "scale_spec")
     before = get_frozen_signature(sdfg)
-    assert "nv" in specializable_symbols(before, iface, plan)
+    values = {"nv": 3, "scaled": 1, "factor": 2.0}
+    assert set(values) <= specializable(before, iface, plan)
     specialize_symbols(sdfg, {"nv": 3})
+    specialize_scalars(sdfg, {"scaled": 1, "factor": 2.0})
     refreeze(sdfg)
-    assert "nv" not in get_frozen_signature(sdfg).free_symbols
+    taken = {a.sdfg_name for a in get_frozen_signature(sdfg).args} | set(get_frozen_signature(sdfg).free_symbols)
+    assert not set(values) & taken
     run = _library(
         tmp_path,
         sdfg,
@@ -144,17 +157,19 @@ def test_a_specialised_binding_runs_its_values_and_declines_others(tmp_path):
         plan,
         src,
         "call {entry}_dace(xin, yout, dace_declined=declined)",
-        specialization=Specialization({"nv": 3}, before),
+        specialization=Specialization(values, before),
     )
-    y, declined = run(3)
+    y, declined = run()
     assert not declined
     np.testing.assert_array_equal(y, [2, 4, 6, -1, -1, -1])
-    # Another value: the binding declines before touching anything.
-    y, declined = run(4)
-    assert declined
-    np.testing.assert_array_equal(y, -1.0)
-    # Without the flag, a mismatch stops naming the symbol; the guard reads the module variable itself, which the
+    # Any other value: the binding declines before touching anything.
+    for other in ({"nv": 4}, {"scaled": False}, {"factor": 2.5}):
+        y, declined = run(**other)
+        assert declined, other
+        np.testing.assert_array_equal(y, -1.0)
+    # Without the flag, a mismatch stops naming the value; the guard reads the module variables themselves, which the
     # specialised SDFG no longer takes.
     text = next((tmp_path / "lib").glob("*_bindings.f90")).read_text()
     assert "if (nv /= 3) dace_mismatch = 'nv'" in text and "error stop" in text
-    assert "nv__mod => nv" in text
+    assert "if (scaled__mod .neqv. .true.) dace_mismatch = 'scaled'" in text
+    assert "if (factor__mod /= 2.0_c_double) dace_mismatch = 'factor'" in text
