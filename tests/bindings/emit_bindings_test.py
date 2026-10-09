@@ -254,6 +254,20 @@ def _nested_struct(tmp_path: Path) -> str:
 # --------------------------------------------------------------------------
 
 
+def test_fold_long_lines_keeps_lines_within_the_standard_limit():
+    """A long ``use ..., only:`` list is continued after commas outside string literals; the statement is unchanged."""
+    from dace_fortran.bindings.block_builders import FORTRAN_LINE_LIMIT, fold_long_lines
+
+    renames = ", ".join(f"v{i}__mod => v{i}" for i in range(80))
+    src = f"  use m_globals, only: {renames}\n  print *, 'a, b, c'\n"
+    folded = fold_long_lines(src)
+    assert all(len(line) <= FORTRAN_LINE_LIMIT for line in folded.split("\n"))
+    assert folded.split("\n")[0].endswith(", &")
+    assert " ".join(folded.replace("&\n", " ").split()) == " ".join(src.split())
+    # A comma inside a string literal is no place to break, so a short line with one is left alone.
+    assert "  print *, 'a, b, c'" in folded.split("\n")
+
+
 def test_two_real_array_struct_all_aliased(tmp_path: Path):
     """Matching layout on every member -- wrapper must not allocate scratch or emit copy loops, pointer aliasing only."""
     src = _two_real_array_struct(tmp_path)
