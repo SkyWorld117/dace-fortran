@@ -393,9 +393,18 @@ def _emit_libcall(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFl
     effective_in_conns = list(in_conns)
     if has_mask and spec.node_cls in ("ArgMin", "ArgMax"):
         effective_in_conns.append("_mask")
-    for conn, src, sub in zip(effective_in_conns, n.call_args, arg_subsets, strict=False):
-        src_desc = ctx.sdfg.arrays[src]
-        in_memlet = Memlet(f"{src}[{sub}]") if sub else Memlet.from_array(src, src_desc)
+    in_memlets = [
+        Memlet(f"{src}[{sub}]") if sub else Memlet.from_array(src, ctx.sdfg.arrays[src])
+        for src, sub in zip(n.call_args, arg_subsets, strict=False)
+    ]
+    # DOT_PRODUCT needs conforming operands, but their lengths may differ symbolically (an allocatable's descriptor
+    # extent ``w_d0`` vs a temporary sized ``nb`` from the same variable), which Dot rejects: read both whole 1-D
+    # operands over the first one's length.
+    if spec.node_cls == "Dot" and len(in_memlets) == 2 and not any(arg_subsets[:2]):
+        x_shape, y_shape = ctx.sdfg.arrays[n.call_args[0]].shape, ctx.sdfg.arrays[n.call_args[1]].shape
+        if len(x_shape) == len(y_shape) == 1 and x_shape[0] != y_shape[0]:
+            in_memlets[1] = Memlet(f"{n.call_args[1]}[0:{x_shape[0]}]")
+    for conn, src, in_memlet in zip(effective_in_conns, n.call_args, in_memlets, strict=False):
         state.add_edge(acc(builder, state, src), None, node, conn, in_memlet)
 
     # Element-designate dest (res1(1) = dot_product(...)): narrow the output memlet to one
