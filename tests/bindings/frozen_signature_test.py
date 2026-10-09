@@ -12,7 +12,13 @@ from dace_fortran.bindings import (
     FrozenSignature,
     SignatureDriftError,
 )
-from dace_fortran.bindings.frozen_signature import HOST_STORAGE, FrozenArgKind, ModuleOrigin, refreeze
+from dace_fortran.bindings.frozen_signature import (
+    HOST_STORAGE,
+    FrozenArgKind,
+    ModuleOrigin,
+    drop_unread_module_inputs,
+    refreeze,
+)
 
 
 def _demo_signature() -> FrozenSignature:
@@ -184,6 +190,38 @@ def test_refreeze_drops_a_module_variable_the_kernel_no_longer_reads():
     )
 
     assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a"]
+
+
+def test_drop_unread_module_inputs_keeps_the_callers_buffers():
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
+    for name in ("g", "h"):
+        sdfg.add_array(name, shape=(1,), dtype=dace.float64, transient=False)
+    state = sdfg.add_state()
+    state.add_mapped_tasklet(
+        "scale",
+        {"i": "0:n"},
+        {"_g": dace.Memlet("g[0]")},
+        "_a = _g",
+        {"_a": dace.Memlet("a[i]")},
+        external_edges=True,
+    )
+    module = {"g": ModuleOrigin("params", "g"), "h": ModuleOrigin("params", "h")}
+    sdfg._frozen_signature = FrozenSignature(
+        entry="compute",
+        mangled="_QPcompute",
+        args=tuple(
+            FrozenArg(fortran_name=n, sdfg_name=n, kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=s)
+            for n, s in (("a", ("n",)), ("g", ("1",)), ("h", ("1",)))
+        ),
+        free_symbols=("n",),
+        module_symbol_origins=module,
+    )
+
+    # h is read nowhere: gone, and with it the binding's copy; g is read, a is the caller's.
+    assert drop_unread_module_inputs(sdfg) == ["h"]
+    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a", "g"]
 
 
 # ----- OpenACC residency ---------------------------------------------------------
