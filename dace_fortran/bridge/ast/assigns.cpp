@@ -36,6 +36,60 @@ namespace hlfir_bridge {
 // unit's namespace, includes, and file-static state.  It MUST NOT be
 // added to the build's compile list  --  CMakeLists.txt deliberately omits
 // it.  The split is purely for readability.
+
+/// The declare of the variable ``v`` names, or null: through the designates that select a member or an element of it,
+/// and through the declares an inlined callee puts on its dummies -- a dummy declared on the caller's variable is that
+/// variable.
+static hlfir::DeclareOp rootDeclare(mlir::Value v) {
+  hlfir::DeclareOp root;
+  for (int hop = 0; hop < 16 && v; ++hop) {
+    mlir::Operation* def = v.getDefiningOp();
+    if (auto dg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(def)) {
+      v = dg.getMemref();
+    } else if (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(def)) {
+      v = cv.getValue();
+    } else if (auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(def)) {
+      root = decl;
+      v = decl.getMemref();
+    } else {
+      break;
+    }
+  }
+  return root;
+}
+
+/// Whether two declares name the same variable: the same op, or two declares of one module variable (an inlined
+/// callee declares the global again).
+static bool sameVariable(hlfir::DeclareOp a, hlfir::DeclareOp b) {
+  if (a == b) return true;
+  auto globalOf = [](hlfir::DeclareOp d) -> mlir::StringRef {
+    auto addr = mlir::dyn_cast_or_null<fir::AddrOfOp>(d.getMemref().getDefiningOp());
+    return addr ? addr.getSymbol().getRootReference().getValue() : mlir::StringRef();
+  };
+  mlir::StringRef ga = globalOf(a);
+  return !ga.empty() && ga == globalOf(b);
+}
+
+/// Whether the variable ``v`` selects (through designates) is assigned anywhere in its function, whole or through a
+/// member or an element: the LHS of some ``hlfir.assign`` names it.  Such a variable may change after SDFG entry, so
+/// an element or member of it read as an index must not become an entry-time position symbol.
+static bool assignedInItsFunction(mlir::Value v) {
+  hlfir::DeclareOp decl = rootDeclare(v);
+  if (!decl) return false;
+  auto func = decl->getParentOfType<mlir::func::FuncOp>();
+  if (!func) return false;
+  bool assigned = false;
+  func.walk([&](hlfir::AssignOp aop) {
+    hlfir::DeclareOp target = rootDeclare(aop.getLhs());
+    if (target && sameVariable(target, decl)) {
+      assigned = true;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return assigned;
+}
+
 std::string buildIndexExpr(mlir::Value v, int d) {
   if (d > limits::kBuildIndexExprDepth || !v) return "?";
 
@@ -132,9 +186,15 @@ std::string buildIndexExpr(mlir::Value v, int d) {
         // ``g_idx`` scalar transient leaks into the memlet
         // subset and DaCe's parser raises
         // ``unresolved free symbol(s) in SDFG: ['g_idx']``.
+        // A record the kernel assigns (``b = d`` ahead of
+        // ``do j = b % beg, b % end``) is the exception: its
+        // members are read where they are used, like any scalar
+        // the kernel writes -- an entry-time symbol would hold
+        // the value from before the assignment.
         if (dg.getComponentAttr() && dg.getIndices().empty()) {
           auto flatName = traceToDecl(dg.getResult());
           if (flatName.empty()) return "?";
+          if (assignedInItsFunction(dg.getMemref())) return flatName;
           return internPosSymbol(flatName, 1);
         }
         // ``s % lb(1)`` carries the component and the index in one designate: name the member, not the record.
@@ -175,7 +235,7 @@ std::string buildIndexExpr(mlir::Value v, int d) {
         // (a) loads ``ind_indices[0]`` BEFORE the body's
         // initialiser runs.
         //
-        // Gate: if the source declare is the LHS of any
+        // Gate: if the source variable is the LHS of any
         // ``hlfir.assign`` in the enclosing function (walked
         // through chained ``hlfir.designate`` ops on the
         // LHS), treat it as mutable and fall through to (b).
@@ -191,28 +251,7 @@ std::string buildIndexExpr(mlir::Value v, int d) {
           consts.push_back(*c);
         }
         if (allConstScalar && consts.size() == 1) {
-          bool isMutable = false;
-          if (auto srcDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(dg.getMemref().getDefiningOp())) {
-            if (auto func = srcDecl->getParentOfType<mlir::func::FuncOp>()) {
-              func.walk([&](hlfir::AssignOp aop) {
-                auto lhs = aop.getLhs();
-                for (int hop = 0; hop < 8 && lhs; ++hop) {
-                  if (lhs == srcDecl.getResult(0) || lhs == srcDecl.getResult(1)) {
-                    isMutable = true;
-                    return;
-                  }
-                  auto* ld = lhs.getDefiningOp();
-                  if (!ld) break;
-                  if (auto innerDg = mlir::dyn_cast<hlfir::DesignateOp>(ld)) {
-                    lhs = innerDg.getMemref();
-                    continue;
-                  }
-                  break;
-                }
-              });
-            }
-          }
-          if (!isMutable) return internPosSymbol(arrName, consts[0]);
+          if (!assignedInItsFunction(dg.getMemref())) return internPosSymbol(arrName, consts[0]);
           // Mutable source  --  fall through.  The matching
           // Python-side fix lives in
           // ``builder/access.py::build_memlet_index``: the
