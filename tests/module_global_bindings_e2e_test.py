@@ -9,9 +9,11 @@ from pathlib import Path
 
 import numpy as np
 
-from dace_fortran.bindings.build_fortran_library import build_fortran_library
+from dace_fortran.bindings.build_fortran_library import build_fortran_library, compiled_init_symbols
+from dace_fortran.bindings.emit_bindings import emit_bindings
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.fortran_interface import OriginalArg, OriginalInterface
+from dace_fortran.bindings.frozen_signature import get_frozen_signature
 from tests._util import build_sdfg
 
 _N = 4
@@ -51,7 +53,8 @@ end subroutine run_kern
 """
 
 
-def _gfortran(out_so: Path, *sources, mod_dir: Path):
+def _gfortran(out_so: Path, *sources, mod_dir: Path, link_so: Path | None = None):
+    link = [f"-L{link_so.parent}", f"-Wl,-rpath,{link_so.parent}", f"-l:{link_so.name}"] if link_so else []
     subprocess.check_call(
         [
             "gfortran",
@@ -65,6 +68,7 @@ def _gfortran(out_so: Path, *sources, mod_dir: Path):
             *[str(s) for s in sources],
             "-o",
             str(out_so),
+            *link,
         ],
         cwd=mod_dir,
     )
@@ -381,6 +385,125 @@ end subroutine run_kern
     y_dace, _ = _invoke(dace_lib, x, [5.0], 0)
     y_ref, _ = _invoke(ref_lib, x.copy(order="F"), [5.0], 0)
     np.testing.assert_allclose(y_dace, y_ref, rtol=1e-12, err_msg="aliased module array disagrees with reference")
+
+
+def test_e2e_allocatable_module_array_without_target_is_copied(tmp_path: Path):
+    """Linked against modules compiled as they are, the binding cannot alias an allocatable module array that lacks
+    TARGET.  With ``module_allocatables_are_targets=False`` it copies the array in and, as the kernel writes it, back
+    out; an array the caller left unallocated stays unallocated."""
+    src = """
+module mod_plain
+  implicit none
+  real(8), allocatable :: tab(:)
+end module mod_plain
+
+module mod_plain_kern
+  implicit none
+contains
+  subroutine scale_tab(x, y)
+    use mod_plain, only: tab
+    real(8), intent(in) :: x(4)
+    real(8), intent(out) :: y(4)
+    integer :: i
+    y = x
+    if (x(1) > 0) then
+      do i = 1, 4
+        y(i) = x(i) + tab(i)
+        tab(i) = 2 * tab(i)
+      end do
+    end if
+  end subroutine scale_tab
+end module mod_plain_kern
+"""
+    src_path = tmp_path / "plain.f90"
+    src_path.write_text(src)
+    sdfg_dir = tmp_path / "sdfg"
+    sdfg_dir.mkdir(parents=True, exist_ok=True)
+    builder = build_sdfg(src, sdfg_dir, name="scale_tab", entry="mod_plain_kern::scale_tab")
+    plan = FlattenPlan.from_dict(builder.module.get_flatten_plan())
+    sdfg = builder.build()
+    sdfg.validate()
+    sdfg.name = "scale_tab"
+    sdfg.build_folder = str(tmp_path / "dacecache")
+    compiled = sdfg.compile()
+    sdfg_so = Path(compiled._lib._library_filename)
+
+    bindings = tmp_path / "scale_tab_bindings.f90"
+    emit_bindings(
+        get_frozen_signature(sdfg),
+        _iface("scale_tab"),
+        plan,
+        bindings,
+        tuple(compiled._sig or ()),
+        init_symbols=compiled_init_symbols(sdfg_so, sdfg.name),
+        module_allocatables_are_targets=False,
+    )
+    assert "=> tab__mod" not in bindings.read_text()
+
+    # run_kern: tab allocated and set by the caller, read back after the call.  run_unallocated: tab left unallocated,
+    # on a path that does not touch it.
+    shim = """
+subroutine run_kern(xin, yout, tab_io) bind(c, name="run_kern")
+  use iso_c_binding
+  use mod_plain, only: tab
+  {use}
+  real(c_double), intent(in) :: xin(4)
+  real(c_double), intent(out) :: yout(4)
+  real(c_double), intent(inout) :: tab_io(4)
+  allocate(tab(4))
+  tab = tab_io
+  call {call}(xin, yout)
+  tab_io = tab
+  deallocate(tab)
+end subroutine run_kern
+
+subroutine run_unallocated(xin, yout, allocated_after) bind(c, name="run_unallocated")
+  use iso_c_binding
+  use mod_plain, only: tab
+  {use}
+  real(c_double), intent(in) :: xin(4)
+  real(c_double), intent(out) :: yout(4)
+  integer(c_int), intent(out) :: allocated_after
+  call {call}(xin, yout)
+  allocated_after = merge(1, 0, allocated(tab))
+end subroutine run_unallocated
+"""
+    libs = {}
+    for kind, use, call, extra in (
+        ("dace", "use scale_tab_dace_bindings, only: scale_tab_dace", "scale_tab_dace", [bindings]),
+        ("ref", "use mod_plain_kern, only: scale_tab", "scale_tab", []),
+    ):
+        build_dir = tmp_path / kind
+        build_dir.mkdir(parents=True, exist_ok=True)
+        shim_path = build_dir / "shim.f90"
+        shim_path.write_text(shim.format(use=use, call=call))
+        out_so = build_dir / f"libscale_tab_{kind}.so"
+        # The module is compiled as it is: no TARGET is added to tab.
+        _gfortran(out_so, src_path, *extra, shim_path, mod_dir=build_dir, link_so=sdfg_so if kind == "dace" else None)
+        libs[kind] = ctypes.CDLL(str(out_so))
+
+    results = {}
+    for kind, lib in libs.items():
+        x = np.asfortranarray(np.arange(1, _N + 1, dtype=np.float64))
+        y = np.zeros(_N, dtype=np.float64, order="F")
+        tab = np.asfortranarray(np.full(_N, 5.0))
+        lib.run_kern.restype = None
+        lib.run_kern(ctypes.c_void_p(x.ctypes.data), ctypes.c_void_p(y.ctypes.data), ctypes.c_void_p(tab.ctypes.data))
+        x_skip = -x  # x(1) <= 0: the kernel does not touch tab
+        y_skip = np.zeros(_N, dtype=np.float64, order="F")
+        allocated_after = ctypes.c_int(-1)
+        lib.run_unallocated.restype = None
+        lib.run_unallocated(
+            ctypes.c_void_p(x_skip.ctypes.data), ctypes.c_void_p(y_skip.ctypes.data), ctypes.byref(allocated_after)
+        )
+        results[kind] = (y, tab, y_skip, allocated_after.value)
+
+    y_dace, tab_dace, y_skip_dace, allocated_dace = results["dace"]
+    y_ref, tab_ref, y_skip_ref, allocated_ref = results["ref"]
+    np.testing.assert_allclose(y_dace, y_ref, rtol=1e-12, err_msg="kernel output disagrees with reference")
+    np.testing.assert_allclose(tab_dace, tab_ref, rtol=1e-12, err_msg="module array not copied back")
+    np.testing.assert_allclose(y_skip_dace, y_skip_ref, rtol=1e-12, err_msg="skipped-path output disagrees")
+    assert allocated_dace == allocated_ref == 0, "the binding allocated a module array the caller left unallocated"
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ def emit_bindings(
     acc_residency: AccTransferPlan | None = None,
     init_symbols: tuple[str, ...] | None = None,
     directive: Directive = Directive.OPENACC,
+    module_allocatables_are_targets: bool = True,
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -64,6 +65,10 @@ def emit_bindings(
 
     ``directive`` picks the language the staging is written in: OpenACC (nvfortran, ICON) or OpenMP offload
     (e.g. ROCm amdflang); the plan is the same.
+
+    ``module_allocatables_are_targets=False`` is for a caller whose modules are compiled as they are, without the
+    TARGET attribute :func:`build_fortran_library` patches into their deferred arrays: the binding then copies an
+    allocatable module array in and out instead of aliasing it, which pointer association would not allow.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -76,10 +81,20 @@ def emit_bindings(
     blocks = {
         "c_interface": build_c_interface(frozen, iface, dace_arglist, init_symbols),
         "handle_state": build_handle_state(iface),
-        "wrapper_head": build_wrapper_head(frozen, iface, plan, enum_maps=enum_maps),
-        "wrapper_body": build_wrapper_body(frozen, iface, plan, enum_maps=enum_maps),
+        "wrapper_head": build_wrapper_head(
+            frozen, iface, plan, enum_maps=enum_maps, module_allocatables_are_targets=module_allocatables_are_targets
+        ),
+        "wrapper_body": build_wrapper_body(
+            frozen, iface, plan, enum_maps=enum_maps, module_allocatables_are_targets=module_allocatables_are_targets
+        ),
         "wrapper_tail": build_wrapper_tail(
-            frozen, iface, plan, dace_arglist, enum_maps=enum_maps, init_symbols=init_symbols
+            frozen,
+            iface,
+            plan,
+            dace_arglist,
+            enum_maps=enum_maps,
+            init_symbols=init_symbols,
+            module_allocatables_are_targets=module_allocatables_are_targets,
         ),
         "finalize": build_finalize(iface),
     }
