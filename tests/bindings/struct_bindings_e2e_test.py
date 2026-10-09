@@ -1088,6 +1088,58 @@ def test_e2e_array_of_pointer_rank3_structs_with_lower_bounds(tmp_path: Path):
     assert not np.allclose(p_ref, p_out0)
 
 
+_JAGN_KERNEL_SRC = """
+module kern_jagn_mod
+contains
+subroutine kern_jagn(a)
+  use mo_bag
+  use iso_c_binding
+  implicit none
+  type(bag), intent(inout) :: a(:)
+  integer :: i, j, n
+  n = size(a)
+  do i = 1, n
+     do j = 1, size(a(i)%w)
+        a(i)%w(j) = a(i)%w(j) * 2.0_c_double + ubound(a, 1)
+     end do
+  end do
+end subroutine kern_jagn
+end module kern_jagn_mod
+"""
+
+
+def test_e2e_assumed_shape_array_of_jagged_alloc_structs_size_queries(tmp_path: Path):
+    """``type(bag) :: a(:)``, assumed shape, with ``size(a)`` and ``ubound(a, 1)``: the queries on the array of records
+    itself are answered by the companion's outer extent once the dummy is flattened, vs gfortran."""
+    driver = _JAG_DRIVER.replace("kern_jag", "kern_jagn").replace("run_jag", "run_jagn")
+    ref_driver = _JAG_REF_DRIVER.replace("kern_jag", "kern_jagn").replace("run_jag", "run_jagn")
+    sdfg_lib = _build_sdfg_lib(
+        tmp_path,
+        kernel_src=_JAG_TYPES_SRC + _JAGN_KERNEL_SRC,
+        types_src=_JAG_TYPES_SRC,
+        name="kern_jagn",
+        entry="kern_jagn_mod::kern_jagn",
+        driver_src=driver,
+    )
+    sdfg_lib.run_jagn.argtypes = [ctypes.POINTER(ctypes.c_double)]
+    sdfg_lib.run_jagn.restype = None
+    ref_lib = _build_reference_lib(
+        tmp_path, types_src=_JAG_TYPES_SRC, kernel_src=_JAGN_KERNEL_SRC, ref_driver_src=ref_driver, name="kern_jagn"
+    )
+    ref_lib.run_jagn_ref.argtypes = [ctypes.POINTER(ctypes.c_double)]
+    ref_lib.run_jagn_ref.restype = None
+
+    rng = np.random.default_rng(11)
+    p_init = np.asfortranarray(rng.standard_normal(9))
+    p_ref = p_init.copy(order="F")
+    ref_lib.run_jagn_ref(p_ref.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+    p_sdfg = p_init.copy(order="F")
+    sdfg_lib.run_jagn(p_sdfg.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+
+    np.testing.assert_allclose(p_sdfg, p_ref, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(p_ref, p_init * 2.0 + 3.0, rtol=1e-12, atol=1e-12)
+
+
 if __name__ == "__main__":
     import pytest
 
