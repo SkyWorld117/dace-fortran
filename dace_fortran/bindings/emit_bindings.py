@@ -73,10 +73,10 @@ def emit_bindings(
     ``directive`` picks the language the staging is written in: OpenACC (nvfortran, ICON) or OpenMP offload
     (e.g. ROCm amdflang); the plan is the same.
 
-    ``specialization`` (optional): the SDFG was specialised to these integer values; the wrapper checks them before
-    it does any work and declines the call otherwise (:mod:`dace_fortran.bindings.specialization`).
-    ``record_symbols_to`` (optional): a file the wrapper appends the integer symbols of every call to, the input of
-    :func:`dace_fortran.bindings.specialization.recorded_invariants`.
+    ``specialization`` (optional): the SDFG was specialised to these symbol and scalar values; the wrapper checks
+    them before it does any work and declines the call otherwise (:mod:`dace_fortran.bindings.specialization`).
+    ``record_symbols_to`` (optional): a file the wrapper appends the integer symbols and scalar inputs of every call
+    to, the input of :func:`dace_fortran.bindings.specialization.recorded_invariants`.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -104,7 +104,7 @@ def emit_bindings(
         blocks["wrapper_body"] = "\n".join([*guard, "", blocks["wrapper_body"]])
     if record_symbols_to is not None:
         blocks["wrapper_body"] = "\n".join(
-            [blocks["wrapper_body"], "", *render_symbol_record(frozen, record_symbols_to)]
+            [blocks["wrapper_body"], "", *render_symbol_record(frozen, iface, plan, record_symbols_to)]
         )
     extra = guard_module_sources(specialization, iface, plan) if specialization is not None else None
     out_file.write_text(assemble_module(iface, frozen, blocks, plan, extra_sources=extra))

@@ -217,7 +217,7 @@ def build_fortran_library(
     ``extra_flags`` (``amdflang`` with ``--offload-arch=gfx942``, say).
 
     ``specialization`` and ``record_symbols_to`` go to :func:`emit_bindings`: the guard of an SDFG specialised to
-    integer values, and the file a general binding records its integer symbols to.
+    the values of its symbols and scalar inputs, and the file a general binding records those values to.
 
     :raises SignatureDriftError: live SDFG drifted from the snapshot.
     """
