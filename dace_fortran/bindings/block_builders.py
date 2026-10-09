@@ -70,6 +70,10 @@ def _shorten_long_idents(src: str, limit: int = _FORTRAN_IDENT_LIMIT) -> str:
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
+#: Optional logical dummy of a specialised SDFG's wrapper: set when the wrapper declines the call.
+DECLINED_FLAG = "dace_declined"
+
+
 def _load(name: str) -> str:
     return (_TEMPLATE_DIR / name).read_text()
 
@@ -318,12 +322,19 @@ def _optional_absent_scratch(sdfg_name: str) -> str:
 
 
 def build_wrapper_head(
-    frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, enum_maps: dict | None = None
+    frozen: FrozenSignature,
+    iface: OriginalInterface,
+    plan: FlattenPlan,
+    enum_maps: dict | None = None,
+    declinable: bool = False,
 ) -> str:
     """Render the <entry>_dace subroutine header + declaration section
     (template: templates/wrapper_head.f90.in). Walks plan.entries: aliasable
     recipes -> pointer decl, non-aliasable -> allocatable/target scratch decl.
-    Free symbols not already outer dummies become local integer(c_int) scalars."""
+    Free symbols not already outer dummies become local integer(c_int) scalars.
+
+    ``declinable``: the wrapper of a specialised SDFG takes an optional ``dace_declined`` flag, set when the call's
+    values are not the ones the SDFG was specialised to (see :mod:`dace_fortran.bindings.specialization`)."""
     tpl = _load("wrapper_head.f90.in")
     outer_dummy_names = [a.name for a in iface.args]
     outer_dummy_set = set(outer_dummy_names)
@@ -351,6 +362,8 @@ def build_wrapper_head(
         )
 
     outer_dummy_decls = "\n".join(_outer_decl(a) for a in iface.args)
+    if declinable:
+        outer_dummy_decls += f"\n    logical, intent(out), optional :: {DECLINED_FLAG}"
 
     # One integer(c_int) scratch per enum-mapped arg holds the SELECT CASE result
     # the SDFG receives: declared here, populated in the body, passed in the tail.
@@ -479,7 +492,7 @@ def build_wrapper_head(
 
     return tpl.format(
         entry=iface.entry,
-        outer_dummy_list=", ".join(outer_dummy_names),
+        outer_dummy_list=", ".join([*outer_dummy_names, *([DECLINED_FLAG] if declinable else [])]),
         outer_dummy_decls=outer_dummy_decls or "    ! (no dummies)",
         flat_ptr_decls="\n".join(flat_ptr_lines) or "    ! (no flat pointers)",
         scratch_decls="\n".join(scratch_lines) or "    ! (no scratch)",
@@ -495,6 +508,21 @@ def build_wrapper_head(
 class SymbolBlocks(NamedTuple):
     early: list[str]
     late: list[str]
+
+
+def buffer_local_names(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan | None) -> set[str]:
+    """Wrapper locals that hold data only once the wrapper has allocated, copied or aliased it: the module arrays it
+    copies, the buffers of absent optionals, and the flat companions of record members.  A symbol whose value reads
+    one of them can only be assigned after that step."""
+    names = {a.sdfg_name for a, _m, _mem in _orphan_module_args(frozen, iface, plan) if a.rank > 0}
+    names |= {a.sdfg_name for a in _aos_module_args(frozen)}
+    names |= {a.sdfg_name for a in _unsourced_array_args(frozen, iface, plan)}
+    # Copy-in/alias companions are also buffer-derived: a symbol reading their
+    # lbound/size can only run AFTER the copy-in associates the companion, else it
+    # reads an unassociated pointer (garbage lbound -> out-of-bounds SDFG index).
+    if plan is not None:
+        names |= {f for e in plan.entries for f in e.recipe.flat_names}
+    return names
 
 
 def partition_symbol_blocks(sym_lines: list[str], buffer_names: Collection[str]) -> SymbolBlocks:
@@ -609,14 +637,7 @@ def build_wrapper_body(
     # buffer-EXTENT sym (size of a buffer we allocate) can only be assigned AFTER.
     sym_lines = _build_symbol_assigns(frozen, plan, outer_dummy_set, iface)
     extra_syms = _extra_local_symbols(frozen, iface, plan)
-    _buffer_names = {a.sdfg_name for a, _m, _mem in _orphan_module_args(frozen, iface, plan) if a.rank > 0}
-    _buffer_names |= {a.sdfg_name for a in _aos_module_args(frozen)}
-    _buffer_names |= {a.sdfg_name for a in _unsourced_array_args(frozen, iface, plan)}
-    # Copy-in/alias companions are also buffer-derived: a symbol reading their
-    # lbound/size can only run AFTER the copy-in associates the companion, else it
-    # reads an unassociated pointer (garbage lbound -> out-of-bounds SDFG index).
-    if plan is not None:
-        _buffer_names |= {f for e in plan.entries for f in e.recipe.flat_names}
+    _buffer_names = buffer_local_names(frozen, iface, plan)
 
     def _buffer_derived(rhs: str) -> bool:
         # RHS reads size/lbound of a buffer this wrapper allocates below.
@@ -984,15 +1005,25 @@ def build_finalize(iface: OriginalInterface) -> str:
 
 
 def assemble_module(
-    iface: OriginalInterface, frozen: FrozenSignature, blocks: dict, plan: FlattenPlan | None = None
+    iface: OriginalInterface,
+    frozen: FrozenSignature,
+    blocks: dict,
+    plan: FlattenPlan | None = None,
+    guarded: FrozenSignature | None = None,
 ) -> str:
     """Stitch the rendered blocks into the complete Fortran module
-    (template: templates/module.f90.in)."""
+    (template: templates/module.f90.in).
+
+    ``guarded``: the signature the symbols of a specialisation guard come from, whose module sources are imported
+    alongside ``frozen``'s (the specialised SDFG no longer takes them)."""
     use_lines = [f"  use {mod}, only: {', '.join(syms)}" for mod, syms in sorted(iface.used_modules.items())]
     # Module-sourced free symbols: import each member under a <sym>__mod alias so
     # it doesn't clash with the wrapper's own local <sym>. Group by module.
+    sources = effective_module_sources(frozen, iface, plan)
+    if guarded is not None:
+        sources = {**effective_module_sources(guarded, iface, plan), **sources}
     by_mod: dict = {}
-    for sym, (mod, member) in sorted(effective_module_sources(frozen, iface, plan).items()):
+    for sym, (mod, member) in sorted(sources.items()):
         by_mod.setdefault(mod, []).append(f"{_module_symbol_alias(sym)} => {member}")
     for mod, renames in sorted(by_mod.items()):
         use_lines.append(f"  use {mod}, only: {', '.join(sorted(set(renames)))}")

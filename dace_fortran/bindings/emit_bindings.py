@@ -24,6 +24,7 @@ from dace_fortran.bindings.block_builders import (
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.fortran_interface import OriginalInterface
 from dace_fortran.bindings.frozen_signature import FrozenSignature
+from dace_fortran.bindings.specialization import Specialization, build_specialization_guard, render_symbol_record
 
 
 def emit_bindings(
@@ -36,6 +37,8 @@ def emit_bindings(
     acc_residency: AccTransferPlan | None = None,
     init_symbols: tuple[str, ...] | None = None,
     directive: Directive = Directive.OPENACC,
+    specialization: Specialization | None = None,
+    record_symbols_to: str | Path | None = None,
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -64,6 +67,11 @@ def emit_bindings(
 
     ``directive`` picks the language the staging is written in: OpenACC (nvfortran, ICON) or OpenMP offload
     (e.g. ROCm amdflang); the plan is the same.
+
+    ``specialization`` (optional): the SDFG was specialised to these integer values; the wrapper checks them before
+    it does any work and declines the call otherwise (:mod:`dace_fortran.bindings.specialization`).
+    ``record_symbols_to`` (optional): a file the wrapper appends the integer symbols of every call to, the input of
+    :func:`dace_fortran.bindings.specialization.recorded_invariants`.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -76,7 +84,9 @@ def emit_bindings(
     blocks = {
         "c_interface": build_c_interface(frozen, iface, dace_arglist, init_symbols),
         "handle_state": build_handle_state(iface),
-        "wrapper_head": build_wrapper_head(frozen, iface, plan, enum_maps=enum_maps),
+        "wrapper_head": build_wrapper_head(
+            frozen, iface, plan, enum_maps=enum_maps, declinable=specialization is not None
+        ),
         "wrapper_body": build_wrapper_body(frozen, iface, plan, enum_maps=enum_maps),
         "wrapper_tail": build_wrapper_tail(
             frozen, iface, plan, dace_arglist, enum_maps=enum_maps, init_symbols=init_symbols
@@ -84,5 +94,13 @@ def emit_bindings(
         "finalize": build_finalize(iface),
     }
     blocks = splice_acc_staging(blocks, iface.entry, acc_residency, directive)
-    out_file.write_text(assemble_module(iface, frozen, blocks, plan))
+    if specialization is not None:
+        guard = build_specialization_guard(specialization, iface, plan)
+        blocks["wrapper_body"] = "\n".join([*guard, "", blocks["wrapper_body"]])
+    if record_symbols_to is not None:
+        blocks["wrapper_body"] = "\n".join(
+            [blocks["wrapper_body"], "", *render_symbol_record(frozen, record_symbols_to)]
+        )
+    guarded = specialization.frozen if specialization is not None else None
+    out_file.write_text(assemble_module(iface, frozen, blocks, plan, guarded=guarded))
     return out_file
