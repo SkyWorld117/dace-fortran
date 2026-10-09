@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         extract_make_compile_args,
         find_openmpi_include,
         mpi_stub_source,
+        openacc_stub_source,
         prepare_flang_translation_unit,
         vendor_netcdf_fortran,
     )
@@ -87,6 +88,7 @@ _LAZY = {
     "extract_make_compile_args": "dace_fortran.flang_codebase",
     "vendor_netcdf_fortran": "dace_fortran.flang_codebase",
     "mpi_stub_source": "dace_fortran.flang_codebase",
+    "openacc_stub_source": "dace_fortran.flang_codebase",
     "find_openmpi_include": "dace_fortran.flang_codebase",
     "LIBRARY_STUBS": "dace_fortran.flang_codebase",
     "FLANG_BUG_PATCHES": "dace_fortran.flang_codebase",
@@ -125,6 +127,7 @@ __all__ = [
     "merge_used_modules",
     "mpi_stub_source",
     "normalize_kind_parameters",
+    "openacc_stub_source",
     "prepare_flang_translation_unit",
     "preprocess_fortran",
     "preprocess_fortran_source",
