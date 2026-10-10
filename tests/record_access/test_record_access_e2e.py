@@ -262,6 +262,51 @@ end module ra_section_into_zero_based_dummy
         out="do i = 1, 4; out((i-1)*n+1:i*n) = q(i)%sf; end do",
         nout=4,
     ),
+    # A dummy array of records sized by a module variable, passed down through two inlined callees.
+    "module_sized_dummy_through_callees": dict(
+        src=f"""
+module ra_module_sized_dummy_through_callees
+  implicit none
+{_TYPES}
+  integer :: nsys = 3
+contains
+  subroutine finalize(flux, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(nsys), intent(inout) :: flux
+    integer :: i, j
+    do i = 1, nsys
+      do j = 1, n
+        flux(i)%sf(j) = flux(i)%sf(j) + i
+      end do
+    end do
+  end subroutine finalize
+
+  subroutine solve(flux, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(nsys), intent(inout) :: flux
+    call finalize(flux, n)
+  end subroutine solve
+
+  subroutine kern(flux, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(nsys), intent(inout) :: flux
+    call solve(flux, n)
+  end subroutine kern
+end module ra_module_sized_dummy_through_callees
+""",
+        local="type(scalar_field) :: flux(3)",
+        setup="""
+  do i = 1, 3
+    allocate(flux(i)%sf(n))
+    do j = 1, n
+      flux(i)%sf(j) = 100*i + j
+    end do
+  end do
+""",
+        call="kern(flux, n)",
+        out="do i = 1, 3; out((i-1)*n+1:i*n) = flux(i)%sf; end do",
+        nout=3,
+    ),
     # A rank-2 dummy array of records with a pointer member.
     "rank2_dummy": dict(
         src=f"""

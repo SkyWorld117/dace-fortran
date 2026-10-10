@@ -4185,8 +4185,11 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
             // whose only component accesses come through one (ICON-O coriolis' ``vn_dual(i,j,k)%x`` inside the
             // inlined ``rot_vertex_ocean_3d``, a ``call inner(q(2:3))``) is still recognised as component-accessed
             // and flattened -- otherwise it is silently skipped and the access leaks as an unregistered
-            // flat-companion name (``p_vn_dual_x``) at the libcall.
-            if (viewedArray(u) == v && hasComponentReachable(u->getResult(0))) return true;
+            // flat-companion name (``p_vn_dual_x``) at the libcall.  Both results of a declare: the alias of an
+            // alias with a runtime extent declares the raw memref result #1 again.
+            if (viewedArray(u) == v)
+              for (mlir::Value r : u->getResults())
+                if (hasComponentReachable(r)) return true;
           }
           return false;
         };
@@ -5171,7 +5174,7 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
             for (mlir::Operation* x : llvm::to_vector(w.getUsers())) {
               if (viewedArray(x) == w) {
                 memberViews.push_back(x);
-                pending.emplace_back(x->getResult(0), sectionShape(x, shape));
+                for (mlir::Value r : x->getResults()) pending.emplace_back(r, sectionShape(x, shape));
                 continue;
               }
               // ``size`` / ``lbound`` of the view: its extent (the section's, else the companion's of that member
