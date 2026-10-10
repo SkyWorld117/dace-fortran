@@ -242,6 +242,10 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
     entries.insert(entries.end(), tail.begin(), tail.end());
   };
   mlir::Value parent_val = innermost.getMemref();
+  // Set once the walk hopped from an inlined dummy into the struct-member actual it is bound to: the actual reaches the
+  // caller's chain through box reinterprets (``box_addr(load(flux_n(id) % vf))``), which the walk must step through or
+  // the caller's record subscripts (``id``) are dropped.
+  bool viaComponentDummy = false;
   for (int level = 0; level < limits::kAliasMemrefWalkDepth; ++level) {
     if (!parent_val) break;
     auto* def = parent_val.getDefiningOp();
@@ -263,9 +267,16 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
       // memlet under-ranks.
       if (dc.getDummyScope() && leadsToComponentDesignate(dc.getMemref())) {
         parent_val = dc.getMemref();
+        viaComponentDummy = true;
         continue;
       }
       break;
+    }
+    if (viaComponentDummy) {
+      if (mlir::Value const peeled = peelBoxReinterpret(parent_val); peeled != parent_val) {
+        parent_val = peeled;
+        continue;
+      }
     }
     // Pointer/allocatable deref: ``fir.load`` between two designates (e.g. ``arr(ia) % box(ir)`` where ``box`` is
     // allocatable). Walk through the load or the chain breaks and record-index ``ia`` is lost.

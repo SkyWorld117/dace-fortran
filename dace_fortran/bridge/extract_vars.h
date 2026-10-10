@@ -69,6 +69,9 @@ struct VarInfo {
   std::string aos_origin_struct;
   std::string aos_member_path;
   int aos_outer_rank = 0;
+  /// Subscripts of a module root that is itself an array of records (``flux_n(id) % vf(i) % sf``: 1); the companion's
+  /// leading dims, ahead of the ``aos_outer_rank`` record dims of the member segment. 0 for a scalar record root.
+  int aos_root_rank = 0;
   bool global_alloc_inside = false;
   /// aos_struct_pointer/aos_member_pointer flag a Fortran POINTER (vs ALLOCATABLE) struct/component; binding must guard
   /// with associated() not allocated() (wrong intrinsic is a hard type error), falling back to a degenerate buffer

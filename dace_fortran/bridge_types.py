@@ -98,6 +98,9 @@ class VarRecord(Protocol):
     def aos_outer_rank(self) -> int: ...
 
     @property
+    def aos_root_rank(self) -> int: ...
+
+    @property
     def global_alloc_inside(self) -> bool: ...
 
     @property

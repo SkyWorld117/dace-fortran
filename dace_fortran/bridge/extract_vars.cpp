@@ -4030,16 +4030,19 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
   // in both a tasklet body and a memlet subset).
   {
     // Walk a designate's memref back through the reinterpret hops to its root: a struct-typed DUMMY (a declare with a
-    // dummy scope), a module-global record (``qp % vf(i) % sf``, ``qp`` a module variable), or neither.
+    // dummy scope), a module-global record or array of records (``qp % vf(i) % sf``, ``fl(id) % vf(i) % sf``, ``qp`` and
+    // ``fl`` module variables), or neither.
     enum class StructRoot { None, Dummy, ModuleGlobal };
     auto structRootOf = [](hlfir::DesignateOp dg) -> StructRoot {
       mlir::Value v = dg.getMemref();
       for (int i = 0; i < limits::kSsaBackWalkDepth && v; ++i) {
         auto* d = v.getDefiningOp();
         if (!d) return StructRoot::None;
-        if (auto addr = mlir::dyn_cast<fir::AddrOfOp>(d))
-          return mlir::isa<fir::RecordType>(fir::unwrapRefType(addr.getType())) ? StructRoot::ModuleGlobal
-                                                                                : StructRoot::None;
+        if (auto addr = mlir::dyn_cast<fir::AddrOfOp>(d)) {
+          mlir::Type t = peelTypeLayers(addr.getType());
+          if (auto seq = mlir::dyn_cast<fir::SequenceType>(t)) t = seq.getEleTy();
+          return mlir::isa<fir::RecordType>(t) ? StructRoot::ModuleGlobal : StructRoot::None;
+        }
         if (auto dc = mlir::dyn_cast<hlfir::DeclareOp>(d)) {
           if (!dc.getDummyScope()) {
             // Local whole-object POINTER rebound to a struct-dummy component
@@ -4136,6 +4139,9 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       // varying record dims (``dual_cart_normal(je,jb) % x``).
       std::vector<bool> record_const;
       int outer_rank = 0;
+      // Subscripts of a module-global root that is itself an array of records (``fl(id) % vf(i) % sf``: 1); they
+      // lead the companion's dims, ahead of every segment's.
+      int root_dims = 0;
     };
     // box<ptr<...>> = Fortran POINTER, box<heap<...>> = ALLOCATABLE; the
     // binding guards them with ``associated`` vs ``allocated`` (wrong one is a
@@ -4201,6 +4207,9 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
               mc.root_module = origin.first;
               mc.root = origin.second;
               mc.ok = !mc.root.empty();
+              // Pending subscripts at the root index the root itself, an array of records.
+              mc.root_dims = pendingRec;
+              mc.outer_rank = pendingRec;
               break;
             }
             v = dc.getMemref();
@@ -4437,8 +4446,10 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           ++recSegCount;
           if (recSeg < 0) recSeg = i;
         }
-        int const recDims = (mc.ok && recSegCount == 1) ? mc.record_dims[recSeg] : 0;
-        if (moduleRoot && recDims < 1) continue;
+        int const segDims = (mc.ok && recSegCount == 1) ? mc.record_dims[recSeg] : 0;
+        if (moduleRoot && segDims < 1) continue;
+        // A module root that is an array of records adds its own subscripts ahead of the segment's.
+        int const recDims = segDims + (moduleRoot ? mc.root_dims : 0);
         // Leading record dim(s): runtime extent (= ``size(<record-array>)``),
         // resolved caller-side from the allocated SoA buffer by
         // ``_sym_from_intrinsic``.
@@ -4498,7 +4509,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
             memberPath += (memberPath.empty() ? "" : "%") + mc.names[i];
           mv.aos_origin_struct = originStruct;
           mv.aos_member_path = memberPath;
-          mv.aos_outer_rank = recDims;
+          mv.aos_outer_rank = segDims;
+          mv.aos_root_rank = moduleRoot ? mc.root_dims : 0;
           mv.aos_struct_pointer = mc.is_pointer[recIdx];
           mv.aos_member_pointer = mc.is_pointer.back();
         }
