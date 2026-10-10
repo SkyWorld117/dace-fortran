@@ -33,7 +33,9 @@ from pathlib import Path
 #: Name of the accessor of variable ``v``.
 ACCESSOR_PREFIX = "dace_access_"
 
-_TYPE_KEYWORD = re.compile(r"\s*(type|class|real|integer|logical|complex|character|double\s+precision)\b", re.IGNORECASE)
+_TYPE_KEYWORD = re.compile(
+    r"\s*(type|class|real|integer|logical|complex|character|double\s+precision)\b", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,8 +152,13 @@ def _accessor(var: ExposedVariable) -> list[str]:
     shape = "" if var.rank == 0 else "(" + ", ".join([":"] * var.rank) + ")"
     lines = [f"function {var.accessor}() result(p)", f"    {var.type_spec}, pointer :: p{shape}"]
     if var.allocatable:
-        lines += [f"    if (allocated({var.name})) then", f"        p => {var.name}", "    else", "        nullify(p)",
-                  "    end if"]
+        lines += [
+            f"    if (allocated({var.name})) then",
+            f"        p => {var.name}",
+            "    else",
+            "        nullify(p)",
+            "    end if",
+        ]
     else:
         lines.append(f"    p => {var.name}")
     lines.append(f"end function {var.accessor}")
