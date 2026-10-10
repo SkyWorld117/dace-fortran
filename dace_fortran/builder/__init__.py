@@ -1827,6 +1827,7 @@ class SDFGBuilder:
                     aos_origin_struct=v.aos_origin_struct if v is not None else "",
                     aos_member_path=v.aos_member_path if v is not None else "",
                     aos_outer_rank=int(v.aos_outer_rank) if v is not None else 0,
+                    aos_root_rank=int(v.aos_root_rank) if v is not None else 0,
                     global_alloc_inside=bool(v.global_alloc_inside) if v is not None else False,
                     aos_struct_pointer=bool(v.aos_struct_pointer) if v is not None else False,
                     aos_member_pointer=bool(v.aos_member_pointer) if v is not None else False,

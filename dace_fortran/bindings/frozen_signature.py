@@ -84,12 +84,16 @@ class FrozenArg:
     #   aos_origin_mod/struct -- owning module / AoS global name.
     #   aos_member_path       -- '%'-joined component path.
     #   aos_outer_rank        -- leading record-array (element) dim count.
+    #   aos_root_rank         -- dims of a root that is itself an array of
+    #                            records (``flux_n(j) % vf(i) % sf``), ahead
+    #                            of the aos_outer_rank ones.
     #   global_alloc_inside   -- kernel ALLOCATEs the component: binding
     #                            allocates the host global, skips copy-in.
     aos_origin_mod: str = ""
     aos_origin_struct: str = ""
     aos_member_path: str = ""
     aos_outer_rank: int = 0
+    aos_root_rank: int = 0
     global_alloc_inside: bool = False
     aos_struct_pointer: bool = False
     aos_member_pointer: bool = False

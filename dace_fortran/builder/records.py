@@ -47,6 +47,7 @@ class SyntheticVar:
     aos_origin_struct: str = ""
     aos_member_path: str = ""
     aos_outer_rank: int = 0
+    aos_root_rank: int = 0
     global_alloc_inside: bool = False
     aos_struct_pointer: bool = False
     aos_member_pointer: bool = False

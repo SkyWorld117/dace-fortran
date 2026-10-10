@@ -501,8 +501,9 @@ def build_wrapper_head(
         ftype = fortran_c_type(a.dtype)
         spec = "(" + ", ".join(":" for _ in range(a.rank)) + ")" if a.rank else ""
         scratch_lines.append(f"    {ftype}, allocatable, target :: {a.sdfg_name}{spec}")
-        its, lowers, uppers, _mrank, _elem = _aos_loop_pieces(a)
-        int_names = its + lowers + uppers  # scalar-struct (outer_rank 0): no loop vars
+        pieces = _aos_loop_pieces(a)
+        # scalar-struct (outer_rank 0): no loop vars
+        int_names = pieces.loop_vars + pieces.lower_vars + pieces.upper_vars + pieces.segment_caps
         if int_names:
             scratch_lines.append(f"    integer(c_int) :: {', '.join(int_names)}")
 
@@ -1578,25 +1579,87 @@ class AosLoopPieces(NamedTuple):
     upper_vars: list[str]
     member_rank: int
     accessor: str
+    segment_caps: list[str]  # per segment dim under a root array of records: the largest extent over its elements
+
+
+def _aos_lead(a: FrozenArg) -> int:
+    """The SoA buffer's leading record dims: a root array of records' own (``flux_n(j)`` of ``flux_n(j) % vf(i) % sf``),
+    then the record segment's."""
+    return a.aos_root_rank + a.aos_outer_rank
+
+
+def _aos_root_and_segment(a: FrozenArg) -> tuple[str, str]:
+    """``flux_n`` and ``vf`` of ``aos_origin_struct`` ``flux_n % vf`` (a root that is itself an array of records)."""
+    root, _, segment = a.aos_origin_struct.partition("%")
+    return root.strip(), segment.strip()
 
 
 def _aos_loop_pieces(a: FrozenArg) -> AosLoopPieces:
     """Per-outer-dim loop vars / per-member-dim bound-var names + host element
     accessor for an AoS-component arg. aos_outer_rank == N: N element-index loop
     vars are the SoA buffer's LEADING dims, matching the bridge's
-    [element-dims..., member-dims...] layout. aos_outer_rank == 0 (scalar struct
+    [element-dims..., member-dims...] layout, after the root's own loop vars when the
+    root is an array of records (aos_root_rank). aos_outer_rank == 0 (scalar struct
     global): no loop, accessor is the bare struct%member."""
     base = a.sdfg_name
-    member_rank = a.rank - a.aos_outer_rank
-    if a.aos_outer_rank == 0:
-        return AosLoopPieces([], [], [], member_rank, f"{a.aos_origin_struct}%{a.aos_member_path}")
+    member_rank = a.rank - _aos_lead(a)
+    if _aos_lead(a) == 0:
+        return AosLoopPieces([], [], [], member_rank, f"{a.aos_origin_struct}%{a.aos_member_path}", [])
     # Fortran identifiers must start with a letter (no leading ``_``).
-    its = [f"aos_{base}_i{k}" for k in range(a.aos_outer_rank)]
+    its = [f"aos_{base}_i{k}" for k in range(_aos_lead(a))]
     lowers = [f"aos_{base}_l{j}" for j in range(member_rank)]
     uppers = [f"aos_{base}_u{j}" for j in range(member_rank)]
+    if a.aos_root_rank:
+        root, segment = _aos_root_and_segment(a)
+        roots, segs = its[: a.aos_root_rank], its[a.aos_root_rank :]
+        elem = f"{root}({', '.join(roots)})%{segment}({', '.join(segs)})%{a.aos_member_path}"
+        caps = [f"aos_{base}_n{k}" for k in range(len(segs))]
+        return AosLoopPieces(its, lowers, uppers, member_rank, elem, caps)
     # member_path is %-joined (k / x / a%b): becxx(i0)%k / p_diag%p_vn_dual(i0,i1,i2)%x
     elem = f"{a.aos_origin_struct}({', '.join(its)})%{a.aos_member_path}"
-    return AosLoopPieces(its, lowers, uppers, member_rank, elem)
+    return AosLoopPieces(its, lowers, uppers, member_rank, elem, [])
+
+
+class AosLoops(NamedTuple):
+    prelude: list[str]  # statements computing the segment extents under a root array of records
+    do_open: list[str]
+    do_close: list[str]
+    outer_dims: str  # extents of the leading dims, as an allocate spec
+    one_dims: str
+    present: str  # the record array exists
+
+
+def _aos_loops(a: FrozenArg, pieces: AosLoopPieces) -> AosLoops:
+    """The element loops over the leading dims of an AoS-component arg, their extents and the guard that the record
+    array exists. Under a root that is itself an array of records, each root element's segment is guarded and its
+    extent is the largest over the root's elements."""
+    its = pieces.loop_vars
+    one_dims = ", ".join("1" for _ in its)
+    if not a.aos_root_rank:
+        struct = a.aos_origin_struct
+        return AosLoops(
+            [],
+            [f"      do {itv} = 1, size({struct}, {k + 1})" for k, itv in enumerate(its)],
+            ["      end do" for _ in its],
+            ", ".join(f"size({struct}, {k + 1})" for k in range(len(its))),
+            one_dims,
+            _present(struct, a.aos_struct_pointer),
+        )
+    root, segment = _aos_root_and_segment(a)
+    roots, segs = its[: a.aos_root_rank], its[a.aos_root_rank :]
+    element_segment = f"{root}({', '.join(roots)})%{segment}"
+    root_present = f"allocated({root})"
+    segment_present = _present(element_segment, a.aos_struct_pointer)
+    do_root = [f"      do {j} = 1, size({root}, {k + 1})" for k, j in enumerate(roots)]
+    prelude = [f"    {c} = 0" for c in pieces.segment_caps]
+    prelude += [f"    if ({root_present}) then", *do_root, f"        if ({segment_present}) then"]
+    prelude += [f"          {c} = max({c}, size({element_segment}, {k + 1}))" for k, c in enumerate(pieces.segment_caps)]
+    prelude += ["        end if", *("      end do" for _ in roots), "    end if"]
+    do_open = [*do_root, f"      if ({segment_present}) then"]
+    do_open += [f"      do {i} = 1, size({element_segment}, {k + 1})" for k, i in enumerate(segs)]
+    do_close = [*("      end do" for _ in segs), "      end if", *("      end do" for _ in roots)]
+    outer = [f"size({root}, {k + 1})" for k in range(len(roots))] + [f"max({c}, 1)" for c in pieces.segment_caps]
+    return AosLoops(prelude, do_open, do_close, ", ".join(outer), one_dims, root_present)
 
 
 def _own_bounds(member: str, rank: int) -> str:
@@ -1609,7 +1672,7 @@ def _aos_member_is_static(a: FrozenArg) -> bool:
     """True when the AoS component is a fixed-shape VALUE member (every dim a
     compile-time literal) rather than ALLOCATABLE/POINTER. Unconditionally present,
     so the copy skips the per-element cap-max scan and presence guard."""
-    member_dims = a.shape[a.aos_outer_rank :]
+    member_dims = a.shape[_aos_lead(a) :]
     return bool(member_dims) and all(str(d).isdigit() for d in member_dims)
 
 
@@ -1620,8 +1683,9 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
     index range -- the offsets the SDFG reads off the buffer are the members'.
     Skips the data copy when global_alloc_inside (kernel allocates the component
     itself; host has no data yet)."""
-    its, lowers, uppers, mrank, elem = _aos_loop_pieces(a)
-    if a.aos_outer_rank == 0:
+    pieces = _aos_loop_pieces(a)
+    its, lowers, uppers, mrank, elem = pieces[:5]
+    if _aos_lead(a) == 0:
         # SCALAR struct global member, POINTER/ALLOCATABLE, may be undefined on
         # entry. When defined, size the SoA companion from the LIVE member -- a
         # shape-degenerate buffer would under-allocate and the kernel's mesh-bounded
@@ -1633,7 +1697,7 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
         if a.rank and _aos_member_is_static(a):
             # Fixed-shape VALUE member: unconditionally present, no guard needed
             # (allocated/associated are illegal on non-ALLOCATABLE/non-POINTER).
-            static_dims = ", ".join(str(d) for d in a.shape[a.aos_outer_rank :])
+            static_dims = ", ".join(str(d) for d in a.shape[_aos_lead(a) :])
             out.append(f"    allocate({a.sdfg_name}({static_dims})); {a.sdfg_name} = {member}")
         elif a.rank:
             mp = _present(member, a.aos_member_pointer)
@@ -1648,19 +1712,16 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
             out.append(f"    {a.sdfg_name} = {zero}")
         return out
     struct = a.aos_origin_struct
-    sp = _present(struct, a.aos_struct_pointer)  # struct allocated/associated?
     zero = _zero_literal(a.dtype)
-    # N nested element loops + matching closers; outer-dim allocate specs.
-    do_open = [f"      do {itv} = 1, size({struct}, {k + 1})" for k, itv in enumerate(its)]
-    do_close = ["      end do" for _ in its]
-    outer_dims = ", ".join(f"size({struct}, {k + 1})" for k in range(len(its)))
-    one_dims = ", ".join("1" for _ in its)
+    # N nested element loops + matching closers; outer-dim allocate specs; struct allocated/associated?
+    prelude, do_open, do_close, outer_dims, one_dims, sp = _aos_loops(a, pieces)
     idx = ", ".join(its)
     if mrank == 0:
         # SCALAR member of a record array (plain value per element, not
         # allocatable): gather one value per element, no member guard needed.
         # Outer struct may itself be unallocated -> degenerate size-1 buffer.
         out = [f"    ! ----- AoS->SoA gather (scalar member): {a.sdfg_name} <- {struct}(:)%{a.aos_member_path} -----"]
+        out += prelude
         out.append(f"    if ({sp}) then")
         out.append(f"      allocate({a.sdfg_name}({outer_dims}))")
         out += do_open
@@ -1673,13 +1734,14 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
     if _aos_member_is_static(a):
         # Fixed-shape VALUE member: always present, literal extents -- skip the
         # cap-max scan. Buffer is [outer-dims..., literal-member-dims...].
-        member_dims = list(a.shape[a.aos_outer_rank :])
+        member_dims = list(a.shape[_aos_lead(a) :])
         cap_dims = ", ".join(member_dims)
         slc = ", ".join(f"1:{d}" for d in member_dims)
         out = [
             f"    ! ----- AoS->SoA copy-in (static value member): {a.sdfg_name} <- "
             f"{struct}(:)%{a.aos_member_path} -----"
         ]
+        out += prelude
         out.append(f"    if ({sp}) then")
         out.append(f"      allocate({a.sdfg_name}({outer_dims}, {cap_dims})); {a.sdfg_name} = {zero}")
         out += do_open
@@ -1693,6 +1755,7 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
     # spanning every element's; struct and component are both guarded.
     mp = _present(elem, a.aos_member_pointer)  # element's component defined?
     out = [f"    ! ----- AoS->SoA copy-in: {a.sdfg_name} <- {struct}(:)%{a.aos_member_path} -----"]
+    out += prelude
     for lo, hi in zip(lowers, uppers, strict=True):
         out.append(f"    {lo} = huge({lo})")
         out.append(f"    {hi} = -huge({hi})")
@@ -1730,8 +1793,9 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
 def _render_aos_copy_out(a: FrozenArg) -> list[str]:
     """Pack the SoA buffer back into the host AoS component (only when the arg
     is WRITTEN), allocating each component first if the kernel created it."""
-    its, _lowers, _uppers, mrank, elem = _aos_loop_pieces(a)
-    if a.aos_outer_rank == 0:
+    pieces = _aos_loop_pieces(a)
+    its, _lowers, _uppers, mrank, elem = pieces[:5]
+    if _aos_lead(a) == 0:
         # Scalar-struct member: pack writes back when the host member is defined
         # (companion was sized from it in copy-in); undefined -> nothing to write.
         out = []
@@ -1745,9 +1809,7 @@ def _render_aos_copy_out(a: FrozenArg) -> list[str]:
         out.append(f"    deallocate({a.sdfg_name})")
         return out
     struct = a.aos_origin_struct
-    sp = _present(struct, a.aos_struct_pointer)
-    do_open = [f"      do {itv} = 1, size({struct}, {k + 1})" for k, itv in enumerate(its)]
-    do_close = ["      end do" for _ in its]
+    _prelude, do_open, do_close, _outer_dims, _one_dims, sp = _aos_loops(a, pieces)
     idx = ", ".join(its)
     if mrank == 0:
         # Scalar member of a record array: scatter one value per element back.
@@ -1761,7 +1823,7 @@ def _render_aos_copy_out(a: FrozenArg) -> list[str]:
         return out
     if _aos_member_is_static(a):
         # Fixed-shape VALUE member: always present -- scatter every element back.
-        member_dims = list(a.shape[a.aos_outer_rank :])
+        member_dims = list(a.shape[_aos_lead(a) :])
         slc = ", ".join(f"1:{d}" for d in member_dims)
         out = [
             f"    ! ----- SoA->AoS copy-out (static value member): {struct}(:)%"
@@ -1781,7 +1843,7 @@ def _render_aos_copy_out(a: FrozenArg) -> list[str]:
     if a.global_alloc_inside:
         alloc_dims = ", ".join(
             f"lbound({a.sdfg_name}, {k}):ubound({a.sdfg_name}, {k})"
-            for k in range(a.aos_outer_rank + 1, a.aos_outer_rank + mrank + 1)
+            for k in range(_aos_lead(a) + 1, _aos_lead(a) + mrank + 1)
         )
         out.append(f"        if (.not. {mp}) allocate({elem}({alloc_dims}))")
     slc = _own_bounds(elem, mrank)
@@ -2020,7 +2082,7 @@ def _build_symbol_assigns(
             # from the HOST member's real storage class instead.
             if (
                 fa is not None
-                and fa.aos_outer_rank > 0
+                and _aos_lead(fa) > 0
                 and sym.endswith("_allocated")
                 and pres_base in _struct_member_paths
             ):
@@ -2031,7 +2093,7 @@ def _build_symbol_assigns(
             # so test the host member itself.
             if (
                 fa is not None
-                and fa.aos_outer_rank == 0
+                and _aos_lead(fa) == 0
                 and fa.aos_origin_struct
                 and fa.aos_member_path
                 and sym.endswith("_allocated")
