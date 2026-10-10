@@ -4029,13 +4029,17 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
   // integer member scalars are uniformly modelled as symbols (a symbol is legal
   // in both a tasklet body and a memlet subset).
   {
-    // Walk a designate's memref back through the reinterpret hops to its root
-    // declare; true iff that root is a struct-typed DUMMY (has a dummy scope).
-    auto rootedAtStructDummy = [](hlfir::DesignateOp dg) -> bool {
+    // Walk a designate's memref back through the reinterpret hops to its root: a struct-typed DUMMY (a declare with a
+    // dummy scope), a module-global record (``qp % vf(i) % sf``, ``qp`` a module variable), or neither.
+    enum class StructRoot { None, Dummy, ModuleGlobal };
+    auto structRootOf = [](hlfir::DesignateOp dg) -> StructRoot {
       mlir::Value v = dg.getMemref();
       for (int i = 0; i < limits::kSsaBackWalkDepth && v; ++i) {
         auto* d = v.getDefiningOp();
-        if (!d) return false;
+        if (!d) return StructRoot::None;
+        if (auto addr = mlir::dyn_cast<fir::AddrOfOp>(d))
+          return mlir::isa<fir::RecordType>(fir::unwrapRefType(addr.getType())) ? StructRoot::ModuleGlobal
+                                                                                : StructRoot::None;
         if (auto dc = mlir::dyn_cast<hlfir::DeclareOp>(d)) {
           if (!dc.getDummyScope()) {
             // Local whole-object POINTER rebound to a struct-dummy component
@@ -4082,7 +4086,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
             v = dc.getMemref();
             continue;
           }
-          return mlir::isa<fir::RecordType>(peelTypeLayers(dc.getResult(0).getType()));
+          return mlir::isa<fir::RecordType>(peelTypeLayers(dc.getResult(0).getType())) ? StructRoot::Dummy
+                                                                                      : StructRoot::None;
         }
         if (auto inner = mlir::dyn_cast<hlfir::DesignateOp>(d)) {
           v = inner.getMemref();
@@ -4097,10 +4102,11 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           v = peeled;
           continue;
         }
-        return false;
+        return StructRoot::None;
       }
-      return false;
+      return StructRoot::None;
     };
+    auto rootedAtStructDummy = [&](hlfir::DesignateOp dg) { return structRootOf(dg) == StructRoot::Dummy; };
     // The structured component path of a nested-AoR array member, recovered by
     // walking a leaf whole-member designate's memref back to its dummy root.
     // ``names`` / ``is_pointer`` / ``record_dims`` are parallel, root->leaf;
@@ -4111,7 +4117,9 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
     // let the EXISTING ``_render_aos_copy_in`` bind the member's data.
     struct MemberChain {
       bool ok = false;
-      std::string root_dummy;
+      // The root dummy, or the module variable a module-global record root is, in ``root_module``.
+      std::string root;
+      std::string root_module;
       std::vector<std::string> names;
       std::vector<bool> is_pointer;
       std::vector<int> record_dims;
@@ -4188,6 +4196,13 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
               v = src;
               continue;
             }
+            if (auto addr = dc.getMemref().getDefiningOp<fir::AddrOfOp>()) {
+              auto origin = decodeModuleGlobalSymbol(addr.getSymbol().getRootReference().getValue().str());
+              mc.root_module = origin.first;
+              mc.root = origin.second;
+              mc.ok = !mc.root.empty();
+              break;
+            }
             v = dc.getMemref();
             continue;
           }
@@ -4223,8 +4238,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
             v = dc.getMemref();
             continue;
           }
-          mc.root_dummy = extractName(dc.getUniqName().str());
-          mc.ok = !mc.root_dummy.empty();
+          mc.root = extractName(dc.getUniqName().str());
+          mc.ok = !mc.root.empty();
           break;
         }
         // Storage-transparent box reinterprets go through the shared peel (the
@@ -4283,11 +4298,16 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
     // One representative WHOLE-MEMBER component designate per flat name (the
     // selector carrying the member's full type), keyed by the flat name.
     llvm::StringMap<hlfir::DesignateOp> memberDg;
+    // Members rooted at a module-global record.  Only those under an array-of-records component are registered here;
+    // a direct member of a module record is backed by the module-global walk above.
+    std::set<std::string> moduleRooted;
     module.walk([&](hlfir::DesignateOp dg) {
       if (!dg.getComponentAttr()) return;  // element / section, not a member
       std::string const flat = traceToDecl(dg.getResult());
       if (flat.empty() || flat.find('_') == std::string::npos) return;
-      if (!rootedAtStructDummy(dg)) return;
+      StructRoot const root = structRootOf(dg);
+      if (root == StructRoot::None) return;
+      if (root == StructRoot::ModuleGlobal) moduleRooted.insert(flat);
       // Prefer the WHOLE-MEMBER selector (no own indices) so an array member's
       // full SequenceType is visible; a scalar member has no indices either.
       auto it = memberDg.find(flat);
@@ -4328,9 +4348,24 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       }
       return false;
     };
+    // Members the kernel stores to: the binding copies those back to the host after the call.
+    std::set<std::string> writtenMembers;
+    if (!memberDg.empty())
+      module.walk([&](mlir::Operation* op) {
+        mlir::Value dest;
+        if (auto st = mlir::dyn_cast<fir::StoreOp>(op))
+          dest = st.getMemref();
+        else if (auto as = mlir::dyn_cast<hlfir::AssignOp>(op))
+          dest = as.getLhs();
+        else
+          return;
+        std::string const flat = traceToDecl(dest);
+        if (memberDg.count(flat)) writtenMembers.insert(flat);
+      });
     for (auto& kv : memberDg) {
       std::string const s = kv.first().str();
       if (existingNames.count(s)) continue;
+      bool const moduleRoot = moduleRooted.count(s) > 0;
       // When the ONLY witness selects a scalar ELEMENT of a fixed-shape array
       // member (``vec_in(jc, jk) % x(k)`` -- the worker fully inlined, so no
       // whole-member ``% x`` designate exists), recover the member's declared
@@ -4372,7 +4407,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
         mv.fortran_name = s;
         mv.mangled_name = s;
         mv.dtype = dt;
-        mv.intent = "in";
+        mv.is_written = writtenMembers.count(s) > 0;
+        mv.intent = mv.is_written ? "inout" : "in";
         mv.role = "array";
         int recSeg = -1;
         int recSegCount = 0;
@@ -4402,6 +4438,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           if (recSeg < 0) recSeg = i;
         }
         int const recDims = (mc.ok && recSegCount == 1) ? mc.record_dims[recSeg] : 0;
+        if (moduleRoot && recDims < 1) continue;
         // Leading record dim(s): runtime extent (= ``size(<record-array>)``),
         // resolved caller-side from the allocated SoA buffer by
         // ``_sym_from_intrinsic``.
@@ -4435,12 +4472,14 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           // index/indices): ``aos_origin_struct`` is the host expression up to
           // and including it (``patch_3d % p_patch_1d`` / ``p_diag %
           // p_vn_dual``); ``aos_member_path`` is the rest (``dolic_e`` /
-          // ``edges%vertex_blk`` / ``x``).  ``aos_origin_mod`` stays EMPTY -- a
-          // dummy root needs no ``use`` import (unlike the QE module-global AoS
-          // path).  ``aos_outer_rank`` is the segment's index count (1 for a
-          // single-index record array, N for an N-dim cartesian array member).
+          // ``edges%vertex_blk`` / ``x``).  ``aos_origin_mod`` names the module
+          // of a module-global root, which the binding imports; a dummy root
+          // needs no ``use`` import and leaves it empty.  ``aos_outer_rank`` is
+          // the segment's index count (1 for a single-index record array, N for
+          // an N-dim cartesian array member).
           int const recIdx = recSeg;
-          std::string originStruct = mc.root_dummy;
+          mv.aos_origin_mod = mc.root_module;
+          std::string originStruct = mc.root;
           for (int i = 0; i <= recIdx; ++i) {
             originStruct += " % " + mc.names[i];
             // A constant record-array hop STRICTLY BEFORE the varying record
@@ -4468,7 +4507,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
         continue;
       }
       // (A/C) Integer scalar member used symbolically.
-      if (!mlir::isa<mlir::IntegerType>(peeled)) continue;
+      if (moduleRoot || !mlir::isa<mlir::IntegerType>(peeled)) continue;
       VarInfo mv;
       mv.fortran_name = s;
       mv.mangled_name = s;
