@@ -36,6 +36,13 @@
 //     attribute ``hlfir.configuration_candidates`` (``"module::name"`` ->
 //     Fortran type), so a caller can find out which values to fix.
 //
+// Rounds:
+//     A variable the module still passes on is retried once the branches the
+//     other values decide are folded and the procedures only they called are
+//     gone; the pipeline runs the pass again after inlining, where a value
+//     passed to an ``intent(in)`` dummy has become a plain load.  Candidates
+//     are listed before any value is applied and again after the rounds.
+//
 // Safety:
 //     A global the remaining module stores to, assigns, passes to a call or
 //     uses in any other way than a load is left alone (and reported): its
@@ -49,6 +56,7 @@
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -58,7 +66,9 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/Passes.h"
 #include "passes/Passes.h"
 
 namespace hlfir_bridge {
@@ -259,9 +269,9 @@ std::string scalarTypeName(mlir::Type type) {
   return "";
 }
 
-/// Record every non-constant integer, real or logical module scalar ``module`` reads and never writes as the module
-/// attribute ``hlfir.configuration_candidates`` (``"module::name"`` -> Fortran type).
-void recordCandidates(mlir::ModuleOp module) {
+/// Every non-constant integer, real or logical module scalar ``module`` reads and never writes (``"module::name"``,
+/// ``"module::name%component"`` or ``"module::name(k)%component"`` -> Fortran type).
+llvm::SmallVector<mlir::NamedAttribute, 64> collectCandidates(mlir::ModuleOp module) {
   llvm::StringMap<llvm::SmallVector<fir::AddrOfOp, 4>> addresses;
   module.walk([&](fir::AddrOfOp addr) { addresses[addr.getSymbol().getRootReference().getValue()].push_back(addr); });
   mlir::Builder b(module.getContext());
@@ -301,7 +311,7 @@ void recordCandidates(mlir::ModuleOp module) {
       candidates.push_back(b.getNamedAttr(key, b.getStringAttr(scalarType)));
     }
   }
-  module->setAttr("hlfir.configuration_candidates", b.getDictionaryAttr(candidates));
+  return candidates;
 }
 
 /// The value of an ``i1`` condition that folds to a literal, through ``fir.convert``s.
@@ -342,6 +352,52 @@ bool foldConstantIf(fir::IfOp ifOp) {
   return true;
 }
 
+/// Fold what the constants decide: comparisons and logic first, then the branches on them, until nothing changes.
+/// Only arith, cf and fir.convert patterns: enough to decide a condition and take the branch it decides, and nothing
+/// the later passes do not expect. Returns the number of ``fir.if``s folded.
+unsigned foldConstantBranches(mlir::ModuleOp module) {
+  mlir::MLIRContext* context = module.getContext();
+  mlir::RewritePatternSet patterns(context);
+  for (mlir::RegisteredOperationName op : context->getRegisteredOperations()) {
+    llvm::StringRef const dialect = op.getDialectNamespace();
+    if (dialect == mlir::arith::ArithDialect::getDialectNamespace() ||
+        dialect == mlir::cf::ControlFlowDialect::getDialectNamespace())
+      op.getCanonicalizationPatterns(patterns, context);
+  }
+  fir::ConvertOp::getCanonicalizationPatterns(patterns, context);
+  mlir::FrozenRewritePatternSet const frozen(std::move(patterns));
+  // Normal region simplification erases the blocks a decided branch leaves unreachable. The default, aggressive level
+  // also merges blocks that differ only in their operands -- the cases of a SELECT CASE that read different arrays --
+  // into one block taking the array as a block argument, which the later passes cannot trace to its variable.
+  mlir::GreedyRewriteConfig config;
+  config.setRegionSimplificationLevel(mlir::GreedySimplifyRegionLevel::Normal);
+  unsigned folded = 0;
+  for (bool changed = true; changed;) {
+    // A parenthesised condition (``if ((a .and. b))``) reaches its branch through an ``hlfir.no_reassoc``, which
+    // means nothing for a constant and would hide it from the folding.
+    llvm::SmallVector<hlfir::NoReassocOp, 8> parens;
+    module.walk([&](hlfir::NoReassocOp op) {
+      if (op.getVal().getDefiningOp<mlir::arith::ConstantOp>()) parens.push_back(op);
+    });
+    for (hlfir::NoReassocOp op : parens) {
+      op.replaceAllUsesWith(op.getVal());
+      op.erase();
+    }
+    (void)mlir::applyPatternsGreedily(module, frozen, config);
+    // Post-order, inner ifs first: folding one never touches an if still to come, while an outer if folded first
+    // would erase the inner ones of the branch it drops.
+    llvm::SmallVector<fir::IfOp, 16> ifs;
+    module.walk<mlir::WalkOrder::PostOrder>([&](fir::IfOp op) { ifs.push_back(op); });
+    changed = !parens.empty();
+    for (fir::IfOp op : ifs)
+      if (foldConstantIf(op)) {
+        changed = true;
+        ++folded;
+      }
+  }
+  return folded;
+}
+
 struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, mlir::OperationPass<mlir::ModuleOp>> {
   // NOLINTNEXTLINE(misc-const-correctness): 'id' is defined by the LLVM MLIR_DEFINE_*_TYPE_ID macro.
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SpecializeGlobalsPass)
@@ -349,7 +405,7 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
   llvm::StringRef getArgument() const final { return "hlfir-specialize-globals"; }
   llvm::StringRef getDescription() const final {
     return "Replace loads of named, never-written module scalars by their given values and fold the branches "
-           "that become constant, before inlining.";
+           "that become constant.";
   }
 
   void getDependentDialects(mlir::DialectRegistry& registry) const override {
@@ -358,7 +414,13 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
 
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
-    recordCandidates(module);
+    // The first run lists the candidates, before any value is applied and again once the given values have pruned the
+    // code they decide (a variable passed on only in a dead branch is read-only in what remains); a later run, after
+    // inlining, leaves the list alone.
+    constexpr llvm::StringLiteral kCandidates = "hlfir.configuration_candidates";
+    bool const first = !module->hasAttr(kCandidates);
+    mlir::Builder builder(module.getContext());
+    if (first) module->setAttr(kCandidates, builder.getDictionaryAttr(collectCandidates(module)));
     auto attr = module->getAttrOfType<mlir::DictionaryAttr>("hlfir.specialized_globals");
     if (!attr || attr.empty()) return;
     // mangled symbol, with ``%component`` for a component of a record -> value text
@@ -372,84 +434,79 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
             text.getValue().str();
       }
 
-    // Every address-of a named global, by symbol.
-    llvm::StringMap<llvm::SmallVector<fir::AddrOfOp, 4>> addresses;
-    module.walk([&](fir::AddrOfOp addr) { addresses[addr.getSymbol().getRootReference().getValue()].push_back(addr); });
-
+    // Apply the values in rounds: a variable the module still passes on (to a call, say) may be read-only once the
+    // branches the other values decide are folded and the procedures only those branches called are gone.
+    llvm::StringMap<std::string> heldBack;  // key -> why it is not applied (yet)
+    llvm::StringSet<> done;
     unsigned folded = 0;
-    for (auto& [key, text] : values) {
-      size_t const cut = llvm::StringRef(key).find_first_of("(%");
-      llvm::StringRef const sym = llvm::StringRef(key).take_front(cut);
-      std::optional<ScalarPath> path = parseScalarPath(llvm::StringRef(key).drop_front(std::min(cut, key.size())));
-      if (!path) {
-        llvm::errs() << "hlfir-specialize-globals: left `" << key << "` alone: not a scalar of a module variable.\n";
-        continue;
-      }
-      auto it = addresses.find(sym);
-      if (it == addresses.end()) continue;  // nothing reads it
-      llvm::SmallVector<fir::LoadOp, 8> loads;
-      bool readOnly = true;
-      for (fir::AddrOfOp addr : it->second) readOnly = readOnly && onlyLoaded(addr, loads, *path);
-      if (!readOnly) {
-        llvm::errs() << "hlfir-specialize-globals: left `" << key << "` alone: the module writes or passes it on.\n";
-        continue;
-      }
-      unsigned replaced = 0;
-      for (fir::LoadOp load : loads) {
-        mlir::OpBuilder b(load);
-        mlir::Value constant = buildConstant(b, load.getLoc(), load.getType(), text);
-        if (!constant) {
-          llvm::errs() << "hlfir-specialize-globals: left `" << key << "` alone: `" << text
-                       << "` is no value of its type.\n";
-          break;
+    for (bool progress = true; progress;) {
+      progress = false;
+      // Every address-of a named global, by symbol.
+      llvm::StringMap<llvm::SmallVector<fir::AddrOfOp, 4>> addresses;
+      module.walk(
+          [&](fir::AddrOfOp addr) { addresses[addr.getSymbol().getRootReference().getValue()].push_back(addr); });
+      for (auto& [key, text] : values) {
+        if (done.contains(key)) continue;
+        size_t const cut = llvm::StringRef(key).find_first_of("(%");
+        llvm::StringRef const sym = llvm::StringRef(key).take_front(cut);
+        std::optional<ScalarPath> path = parseScalarPath(llvm::StringRef(key).drop_front(std::min(cut, key.size())));
+        if (!path) {
+          heldBack[key] = "not a scalar of a module variable";
+          done.insert(key);
+          continue;
         }
-        load.replaceAllUsesWith(constant);
-        load.erase();
-        ++replaced;
+        auto it = addresses.find(sym);
+        if (it == addresses.end()) {  // nothing reads it (any more)
+          heldBack.erase(key);
+          continue;
+        }
+        llvm::SmallVector<fir::LoadOp, 8> loads;
+        bool readOnly = true;
+        for (fir::AddrOfOp addr : it->second) readOnly = readOnly && onlyLoaded(addr, loads, *path);
+        if (!readOnly) {
+          heldBack[key] = "the module writes or passes it on";
+          continue;
+        }
+        unsigned replaced = 0;
+        for (fir::LoadOp load : loads) {
+          mlir::OpBuilder b(load);
+          mlir::Value constant = buildConstant(b, load.getLoc(), load.getType(), text);
+          if (!constant) {
+            heldBack[key] = "`" + text + "` is no value of its type";
+            break;
+          }
+          load.replaceAllUsesWith(constant);
+          load.erase();
+          ++replaced;
+        }
+        if (replaced != loads.size()) {
+          done.insert(key);
+          continue;
+        }
+        heldBack.erase(key);
+        done.insert(key);
+        progress = progress || replaced > 0;
+        llvm::errs() << "hlfir-specialize-globals: `" << key << "` = " << text << " (" << replaced << " load(s)).\n";
       }
-      llvm::errs() << "hlfir-specialize-globals: `" << key << "` = " << text << " (" << replaced << " load(s)).\n";
+      folded += foldConstantBranches(module);
+      if (!progress) break;
+      // Drop the procedures only a folded branch called: their uses of a held-back variable no longer count.
+      mlir::OpPassManager dce(mlir::ModuleOp::getOperationName());
+      dce.addPass(mlir::createSymbolDCEPass());
+      if (mlir::failed(runPipeline(dce, module))) return signalPassFailure();
+    }
+    for (auto& [key, why] : heldBack)
+      llvm::errs() << "hlfir-specialize-globals: left `" << key.str() << "` alone: " << why << ".\n";
+    if (first) {
+      llvm::StringMap<mlir::Attribute> merged;
+      for (mlir::NamedAttribute entry : module->getAttrOfType<mlir::DictionaryAttr>(kCandidates))
+        merged[entry.getName().getValue()] = entry.getValue();
+      for (mlir::NamedAttribute entry : collectCandidates(module)) merged[entry.getName().getValue()] = entry.getValue();
+      llvm::SmallVector<mlir::NamedAttribute, 64> all;
+      for (auto& [key, type] : merged) all.push_back(builder.getNamedAttr(key, type));
+      module->setAttr(kCandidates, builder.getDictionaryAttr(all));
     }
 
-    // Fold what the constants decide: comparisons and logic first, then the branches on them, until nothing changes.
-    // Only arith, cf and fir.convert patterns: enough to decide a condition and take the branch it decides, and nothing
-    // the later passes do not expect.
-    mlir::RewritePatternSet patterns(&getContext());
-    for (mlir::RegisteredOperationName op : getContext().getRegisteredOperations()) {
-      llvm::StringRef const dialect = op.getDialectNamespace();
-      if (dialect == mlir::arith::ArithDialect::getDialectNamespace() ||
-          dialect == mlir::cf::ControlFlowDialect::getDialectNamespace())
-        op.getCanonicalizationPatterns(patterns, &getContext());
-    }
-    fir::ConvertOp::getCanonicalizationPatterns(patterns, &getContext());
-    mlir::FrozenRewritePatternSet const frozen(std::move(patterns));
-    // Normal region simplification erases the blocks a decided branch leaves unreachable. The default, aggressive level
-    // also merges blocks that differ only in their operands -- the cases of a SELECT CASE that read different arrays --
-    // into one block taking the array as a block argument, which the later passes cannot trace to its variable.
-    mlir::GreedyRewriteConfig config;
-    config.setRegionSimplificationLevel(mlir::GreedySimplifyRegionLevel::Normal);
-    for (bool changed = true; changed;) {
-      // A parenthesised condition (``if ((a .and. b))``) reaches its branch through an ``hlfir.no_reassoc``, which
-      // means nothing for a constant and would hide it from the folding.
-      llvm::SmallVector<hlfir::NoReassocOp, 8> parens;
-      module.walk([&](hlfir::NoReassocOp op) {
-        if (op.getVal().getDefiningOp<mlir::arith::ConstantOp>()) parens.push_back(op);
-      });
-      for (hlfir::NoReassocOp op : parens) {
-        op.replaceAllUsesWith(op.getVal());
-        op.erase();
-      }
-      (void)mlir::applyPatternsGreedily(module, frozen, config);
-      // Post-order, inner ifs first: folding one never touches an if still to come, while an outer if folded first
-      // would erase the inner ones of the branch it drops.
-      llvm::SmallVector<fir::IfOp, 16> ifs;
-      module.walk<mlir::WalkOrder::PostOrder>([&](fir::IfOp op) { ifs.push_back(op); });
-      changed = !parens.empty();
-      for (fir::IfOp op : ifs)
-        if (foldConstantIf(op)) {
-          changed = true;
-          ++folded;
-        }
-    }
     // Flang declares every variable of a used module in each procedure; the declares nothing reads any more -- the
     // specialised variables', and those only a dead branch used -- would still count as the entry's inputs.
     llvm::SmallVector<hlfir::DeclareOp, 16> unused;
