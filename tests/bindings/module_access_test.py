@@ -13,17 +13,25 @@ from dace_fortran.bindings.module_access import (
 )
 
 # The declaration forms a large code base uses for module state: several entities per statement, attribute lists with
-# a dimension, scalar records, trailing doc comments, and private-by-default with a public list on one line.
-_OWNER = """
-module owner
+# a dimension, scalar records, trailing doc comments, and private-by-default with a public list on one line. The
+# record types come from a module of their own, so a binding can declare pointers of them.
+_FIELDS = """
+module fields
     implicit none
-    private; public :: s_init, n_public
     type scalar_field
         real(8), pointer :: sf(:, :, :) => null()
     end type scalar_field
     type vector_field
         type(scalar_field), allocatable :: vf(:)
     end type vector_field
+end module fields
+"""
+
+_OWNER = """
+module owner
+    use fields
+    implicit none
+    private; public :: s_init, n_public
     integer, parameter :: nmax = 4
     integer :: n_public = 0
     type(vector_field) :: q_cons, q_prim  !< state at the quadrature points
@@ -86,8 +94,11 @@ subroutine user_report(n) bind(c, name="user_report")
 end subroutine user_report
 """
 
+# The binding points at the state through pointer variables: ``associate`` on an accessor's result is not safe, gfortran
+# copies a record selector with allocatable components and deallocates the copy's components, which are the module's.
 _BINDING = """
 program binding
+    use fields, only: vector_field
     use owner, only: s_init, dace_access_q_prim, dace_access_ql_rsx
     implicit none
     interface
@@ -95,12 +106,12 @@ program binding
             integer, intent(out) :: n
         end subroutine user_report
     end interface
+    type(vector_field), pointer :: q
     real(8), pointer :: ql(:, :, :, :)
     integer :: n
     call s_init(4)
-    associate (q => dace_access_q_prim())
-        print '(3i4, f8.1)', lbound(q%vf(2)%sf), q%vf(2)%sf(-3, 0, 0)
-    end associate
+    q => dace_access_q_prim()
+    print '(3i4, f8.1)', lbound(q%vf(2)%sf), q%vf(2)%sf(-3, 0, 0)
     ql => dace_access_ql_rsx()
     call user_report(n)
     print '(f8.1, i4)', ql(4, 4, 4, 2), n
@@ -116,6 +127,9 @@ def test_the_copy_links_in_place_of_the_original_object(tmp_path: Path):
     orig, copy = tmp_path / "orig", tmp_path / "copy"
     orig.mkdir()
     copy.mkdir()
+    for d in (orig, copy):
+        (d / "fields.f90").write_text(_FIELDS)
+        _compile("gfortran", d / "fields.f90", d / "fields.o", d)
     (orig / "owner.f90").write_text(_OWNER)
     (orig / "user.f90").write_text(_USER)
     _compile("gfortran", orig / "owner.f90", orig / "owner.o", orig)
@@ -129,8 +143,8 @@ def test_the_copy_links_in_place_of_the_original_object(tmp_path: Path):
     assert changed_global_data_symbols(orig / "owner.o", copy / "owner.o") == []
 
     exe = tmp_path / "run"
-    subprocess.run(["gfortran", str(copy / "binding.o"), str(orig / "user.o"), str(copy / "owner.o"), "-o", str(exe)],
-                   check=True)
+    objects = [copy / "binding.o", orig / "user.o", copy / "owner.o", orig / "fields.o"]
+    subprocess.run(["gfortran", *map(str, objects), "-o", str(exe)], check=True)
     out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.split()
     assert out == ["-3", "0", "0", "20.0", "7.0", "4"]
 

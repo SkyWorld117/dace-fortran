@@ -16,6 +16,10 @@ accessor per variable appended, compiled with the original flags and linked in p
   with the same size. Other objects of the program, compiled against the original module, reference only those symbols
   and the module's public procedures, whose names do not change; an empty result means the copy can replace the
   original at link time.
+
+A binding points at the state through pointer variables of the variables' types (``q => dace_access_q()``), not through
+``associate (q => dace_access_q())``: gfortran copies a record selector with allocatable components into a temporary
+and deallocates the temporary's components at the end of the construct -- the module's own arrays.
 """
 
 from __future__ import annotations
