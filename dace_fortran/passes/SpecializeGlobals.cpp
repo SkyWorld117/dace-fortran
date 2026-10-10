@@ -267,7 +267,8 @@ void recordCandidates(mlir::ModuleOp module) {
     llvm::SmallVector<std::pair<ScalarPath, std::string>, 8> scalars;  // (path, Fortran type)
     mlir::Type type = global.getType();
     llvm::SmallVector<std::optional<int64_t>, 4> elements{std::nullopt};
-    if (auto seq = mlir::dyn_cast<fir::SequenceType>(type); seq && seq.getDimension() == 1 && seq.hasConstantShape()) {
+    if (auto seq = mlir::dyn_cast<fir::SequenceType>(type); seq && seq.getDimension() == 1 &&
+                                                          seq.getShape()[0] != fir::SequenceType::getUnknownExtent()) {
       type = seq.getEleTy();
       elements.clear();
       for (int64_t k : constantElements(addrs)) elements.push_back(k);
