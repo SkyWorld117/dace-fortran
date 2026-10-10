@@ -67,11 +67,11 @@ def test_ndim_cartesian_copy_in_indexes_all_outer_dims():
 
 
 def test_static_value_member_emits_no_presence_guard():
-    """``x(3)`` is fixed-shape: no allocated/associated guard or cap-max scan on
+    """``x(3)`` is fixed-shape: no allocated/associated guard or bounds scan on
     it, only the struct-present (``associated``) guard remains."""
     src = "\n".join(_render_aos_copy_in(_cartesian_member_arg()))
     assert "allocated(p_diag % p_vn_dual(" not in src  # member is not allocatable
-    assert "aos_p_diag_p_vn_dual_x_c0" not in src  # no cap-max scan var
+    assert "aos_p_diag_p_vn_dual_x_l0" not in src  # no bounds scan var
     assert "associated(p_diag % p_vn_dual)" in src  # struct-pointer guard kept
 
 
@@ -88,12 +88,12 @@ def test_static_value_member_copy_out_scatters_all_dims():
 
 def test_1d_allocatable_member_unchanged():
     """Regression: QE ``becxx(:)%k`` 1-D allocatable path keeps its single element
-    loop, cap-max scan, and member ``allocated`` guard after the N-dim generalisation."""
+    loop, bounds scan, and member ``allocated`` guard after the N-dim generalisation."""
     src = "\n".join(_render_aos_copy_in(_becxx_member_arg()))
     assert "do aos_becxx_k_i0 = 1, size(becxx, 1)" in src
     assert "allocated(becxx(aos_becxx_k_i0)%k)" in src  # allocatable member guard
-    assert "aos_becxx_k_c0 = max(aos_becxx_k_c0, size(becxx(aos_becxx_k_i0)%k, 1))" in src
-    assert "aos_becxx_k_c1 = max(aos_becxx_k_c1, size(becxx(aos_becxx_k_i0)%k, 2))" in src
+    assert "aos_becxx_k_l0 = min(aos_becxx_k_l0, lbound(becxx(aos_becxx_k_i0)%k, 1))" in src
+    assert "aos_becxx_k_u1 = max(aos_becxx_k_u1, ubound(becxx(aos_becxx_k_i0)%k, 2))" in src
 
 
 if __name__ == "__main__":
