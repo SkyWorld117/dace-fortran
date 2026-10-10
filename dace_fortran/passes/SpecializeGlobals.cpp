@@ -202,7 +202,12 @@ bool onlyReads(mlir::Value v, int depth = 0) {
 /// no loads) if anything may change it: a user of its address other than a load or the source of an assignment, of
 /// its record or element other than designators of other components, or a non-reading use of another element (whose
 /// subscript may be the same).
-bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, ScalarPath const& path = {}) {
+bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, ScalarPath const& path = {},
+                mlir::Operation** blocker = nullptr) {
+  auto blocked = [&](mlir::Operation* op) {
+    if (blocker) *blocker = op;
+    return false;
+  };
   // How far a value has come along ``path``: at the variable, at its element, or at the scalar itself.
   enum Stage { Variable, Element, Target };
   auto next = [&](Stage stage) {
@@ -229,11 +234,11 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, S
         if (constantElement(designate) == path.element)
           work.push_back({designate.getResult(), next(stage)});
         else if (!onlyReads(designate.getResult()))
-          return false;
+          return blocked(user);
       } else if (designate && stage != Target && isScalarComponent(designate)) {
         if (*designate.getComponent() == path.component) work.push_back({designate.getResult(), Target});
       } else {
-        return false;
+        return blocked(user);
       }
     }
   }
@@ -472,9 +477,14 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
         }
         llvm::SmallVector<fir::LoadOp, 8> loads;
         bool readOnly = true;
-        for (fir::AddrOfOp addr : it->second) readOnly = readOnly && onlyLoaded(addr, loads, *path);
+        mlir::Operation* blocker = nullptr;
+        for (fir::AddrOfOp addr : it->second) readOnly = readOnly && onlyLoaded(addr, loads, *path, &blocker);
         if (!readOnly) {
-          heldBack[key] = "the module writes or passes it on";
+          std::string why;
+          llvm::raw_string_ostream os(why);
+          os << "the module writes or passes it on";
+          if (blocker) os << " (" << blocker->getName() << " at " << blocker->getLoc() << ")";
+          heldBack[key] = why;
           continue;
         }
         unsigned replaced = 0;
