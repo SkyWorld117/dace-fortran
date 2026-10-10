@@ -206,3 +206,35 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_loop_counters_indexing_one_array_of_records_are_no_toggle(tmp_path):
+    """Two DO loops index one allocatable array of records with their counters (``v%vf(i)``, ``v%vf(l)``).  Flang
+    stores a counter on every trip, but that is iteration, not a switch between time levels: the toggle pass must
+    leave the loops alone -- it used to take the counters for toggles and reject the loops for their runtime trip
+    count."""
+    src = """
+module m
+  type :: field
+    real(kind=8), pointer :: sf(:) => null()
+  end type
+  type :: fields
+    type(field), allocatable :: vf(:)
+  end type
+contains
+  subroutine driver(v, n, out)
+    integer, intent(in) :: n
+    type(fields), intent(inout) :: v
+    real(kind=8), intent(out) :: out
+    integer :: i, l
+    out = 0.0d0
+    do i = 1, n
+      out = out + v % vf(i) % sf(1)
+    end do
+    do l = 1, n
+      v % vf(l) % sf(1) = out
+    end do
+  end subroutine
+end module
+"""
+    build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()

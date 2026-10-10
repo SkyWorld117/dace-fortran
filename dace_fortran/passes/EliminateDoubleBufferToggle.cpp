@@ -284,6 +284,34 @@ struct EliminateDoubleBufferTogglePass
     return false;
   }
 
+  /// Is ``v`` (through converts) a value a ``fir.do_loop`` yields for its counter: one of its block arguments, or one
+  /// of its results (the counter's value after the loop)?
+  static bool isLoopCounterValue(mlir::Value v) {
+    v = peelConvert(v);
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v))
+      return mlir::isa_and_nonnull<fir::DoLoopOp>(arg.getOwner()->getParentOp());
+    return mlir::isa_and_nonnull<fir::DoLoopOp>(v.getDefiningOp());
+  }
+
+  /// Is ``u`` a store of a new value into ``slot`` -- not of a DO loop's counter?  Flang stores a DO variable on
+  /// every trip and its final value after the loop: that is iteration, not a switch between time levels.
+  static bool reassigns(mlir::Operation* u, mlir::Value slot) {
+    if (auto st = mlir::dyn_cast<fir::StoreOp>(u)) return st.getMemref() == slot && !isLoopCounterValue(st.getValue());
+    if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u)) return as.getLhs() == slot && !isLoopCounterValue(as.getRhs());
+    return false;
+  }
+
+  /// Is ``slot`` reassigned in-kernel other than as a DO loop's counter (directly, or through an element/component
+  /// designate)?
+  static bool reassignedInKernel(mlir::Value slot) {
+    for (auto* u : slot.getUsers()) {
+      if (reassigns(u, slot)) return true;
+      if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(u))
+        if (dg.getMemref() == slot && addressIsStored(dg.getResult())) return true;
+    }
+    return false;
+  }
+
   /// Trace an array-of-records element index back to its declared scalar slot.
   static mlir::Value indexSlot(mlir::Value idx) {
     idx = peelConvert(idx);
@@ -339,12 +367,13 @@ struct EliminateDoubleBufferTogglePass
       slotsPerGroup[{root.getAsOpaquePointer(), path}].insert(slot);
     });
 
-    // 2. A toggle is a slot in a >= 2-symbol group that is reassigned in-kernel.
+    // 2. A toggle is a slot in a >= 2-symbol group that is reassigned in-kernel -- not merely counted by a DO loop
+    //    (two loops indexing one array of records by their counters are no double buffer).
     llvm::DenseSet<mlir::Value> toggleSlots;
     for (auto& [key, slots] : slotsPerGroup) {
       if (slots.size() < 2) continue;  // single index -> ordinary AoR access
       for (mlir::Value const slot : slots)
-        if (addressIsStored(slot)) toggleSlots.insert(slot);
+        if (reassignedInKernel(slot)) toggleSlots.insert(slot);
     }
     if (toggleSlots.empty()) return;
 
@@ -353,12 +382,7 @@ struct EliminateDoubleBufferTogglePass
     llvm::DenseSet<mlir::Operation*> doneLoops;
     for (mlir::Value const slot : toggleSlots) {
       for (auto* u : llvm::to_vector(slot.getUsers())) {
-        bool isStore = false;
-        if (auto st = mlir::dyn_cast<fir::StoreOp>(u))
-          isStore = st.getMemref() == slot;
-        else if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u))
-          isStore = as.getLhs() == slot;
-        if (!isStore) continue;
+        if (!reassigns(u, slot)) continue;
         auto loop = u->getParentOfType<fir::DoLoopOp>();
         if (!loop || doneLoops.contains(loop)) continue;
         doneLoops.insert(loop);
