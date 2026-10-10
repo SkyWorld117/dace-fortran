@@ -4712,6 +4712,18 @@ FortranInterfaceInfo extractFortranInterface(mlir::ModuleOp module, const std::s
         decl = d;
         break;
       }
+    // A VALUE dummy is declared over a local copy the entry stores the argument into.
+    for (auto* u : barg.getUsers()) {
+      auto st = mlir::dyn_cast<fir::StoreOp>(u);
+      if (decl || !st || st.getValue() != barg) continue;
+      for (auto* mu : st.getMemref().getUsers())
+        if (auto d = mlir::dyn_cast<hlfir::DeclareOp>(mu);
+            d && d.getFortranAttrs() &&
+            bitEnumContainsAny(*d.getFortranAttrs(), fir::FortranVariableFlagsEnum::value)) {
+          decl = d;
+          break;
+        }
+    }
     if (!decl) continue;
 
     FortranArgInfo a;
