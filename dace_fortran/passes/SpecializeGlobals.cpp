@@ -40,8 +40,8 @@
 //     A variable the module still passes on is retried once the branches the
 //     other values decide are folded and the procedures only they called are
 //     gone; the pipeline runs the pass again after inlining, where a value
-//     passed to an ``intent(in)`` dummy has become a plain load.  Candidates
-//     are listed before any value is applied and again after the rounds.
+//     passed to an ``intent(in)`` dummy has become a plain load.  Each run
+//     adds candidates, before any value is applied and after the rounds.
 //
 // Safety:
 //     A global the remaining module stores to, assigns, passes to a call or
@@ -398,6 +398,18 @@ unsigned foldConstantBranches(mlir::ModuleOp module) {
   return folded;
 }
 
+/// Add the candidates of ``module`` as it is now to its ``hlfir.configuration_candidates`` attribute.
+void addCandidates(mlir::ModuleOp module, mlir::Builder& builder) {
+  constexpr llvm::StringLiteral kCandidates = "hlfir.configuration_candidates";
+  llvm::StringMap<mlir::Attribute> merged;
+  if (auto listed = module->getAttrOfType<mlir::DictionaryAttr>(kCandidates))
+    for (mlir::NamedAttribute entry : listed) merged[entry.getName().getValue()] = entry.getValue();
+  for (mlir::NamedAttribute entry : collectCandidates(module)) merged[entry.getName().getValue()] = entry.getValue();
+  llvm::SmallVector<mlir::NamedAttribute, 64> all;
+  for (auto& [key, type] : merged) all.push_back(builder.getNamedAttr(key, type));
+  module->setAttr(kCandidates, builder.getDictionaryAttr(all));
+}
+
 struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, mlir::OperationPass<mlir::ModuleOp>> {
   // NOLINTNEXTLINE(misc-const-correctness): 'id' is defined by the LLVM MLIR_DEFINE_*_TYPE_ID macro.
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SpecializeGlobalsPass)
@@ -414,13 +426,11 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
 
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
-    // The first run lists the candidates, before any value is applied and again once the given values have pruned the
-    // code they decide (a variable passed on only in a dead branch is read-only in what remains); a later run, after
-    // inlining, leaves the list alone.
-    constexpr llvm::StringLiteral kCandidates = "hlfir.configuration_candidates";
-    bool const first = !module->hasAttr(kCandidates);
+    // Each run adds to the candidates: before any value is applied, and again once the given values have pruned the
+    // code they decide (a variable passed on only in a dead branch is read-only in what remains); the run after
+    // inlining adds the variables the entry passed to ``intent(in)`` dummies.
     mlir::Builder builder(module.getContext());
-    if (first) module->setAttr(kCandidates, builder.getDictionaryAttr(collectCandidates(module)));
+    addCandidates(module, builder);
     auto attr = module->getAttrOfType<mlir::DictionaryAttr>("hlfir.specialized_globals");
     if (!attr || attr.empty()) return;
     // mangled symbol, with ``%component`` for a component of a record -> value text
@@ -497,15 +507,7 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
     }
     for (auto& [key, why] : heldBack)
       llvm::errs() << "hlfir-specialize-globals: left `" << key.str() << "` alone: " << why << ".\n";
-    if (first) {
-      llvm::StringMap<mlir::Attribute> merged;
-      for (mlir::NamedAttribute entry : module->getAttrOfType<mlir::DictionaryAttr>(kCandidates))
-        merged[entry.getName().getValue()] = entry.getValue();
-      for (mlir::NamedAttribute entry : collectCandidates(module)) merged[entry.getName().getValue()] = entry.getValue();
-      llvm::SmallVector<mlir::NamedAttribute, 64> all;
-      for (auto& [key, type] : merged) all.push_back(builder.getNamedAttr(key, type));
-      module->setAttr(kCandidates, builder.getDictionaryAttr(all));
-    }
+    addCandidates(module, builder);
 
     // Flang declares every variable of a used module in each procedure; the declares nothing reads any more -- the
     // specialised variables', and those only a dead branch used -- would still count as the entry's inputs.
