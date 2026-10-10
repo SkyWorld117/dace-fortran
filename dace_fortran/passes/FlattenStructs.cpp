@@ -2388,6 +2388,10 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
   /// Array leaves stay whole-array assigns; scalar leaves stay scalar
   /// assigns.
   ///
+  /// When one side is an element of an array of records, an array leaf
+  /// is copied element by element: flattened, it is a slice of the
+  /// per-member array, which a whole-array assign would not address.
+  ///
   /// Out of scope: array-of-struct copies (whole-AoS-to-AoS).  Those
   /// would need to wrap each per-leaf assign in an outer-dim DO loop
   ///  --  separate work.
@@ -2479,6 +2483,18 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
       return cur;
     };
 
+    // One element of an array of records (``tab(2)``, scalar subscripts): its array leaf is a slice of the per-member
+    // array once flattened, which a whole-array assign would lower to a whole-container copy without the element
+    // index.  Such a leaf is copied element by element instead.
+    auto isRecordArrayElement = [](mlir::Value v) {
+      auto dg = v.getDefiningOp<hlfir::DesignateOp>();
+      if (!dg || dg.getComponent().has_value() || dg.getIndices().empty()) return false;
+      for (bool const triplet : dg.getIsTriplet())
+        if (triplet) return false;
+      return true;
+    };
+    bool const elementwise = isRecordArrayElement(src) || isRecordArrayElement(dst);
+
     for (auto& leaf : leaves) {
       mlir::Value const lhsLeaf = buildLeafDesignate(dst, leaf);
       mlir::Value const rhsLeaf = buildLeafDesignate(src, leaf);
@@ -2487,6 +2503,25 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         // bail out for this assign  --  leave it intact and let
         // downstream gates flag it loudly.
         return;
+      }
+      if (elementwise && !isSimpleScalar(leaf.leafTy)) {
+        auto seq = mlir::cast<fir::SequenceType>(leaf.leafTy);
+        auto elementRef = fir::ReferenceType::get(seq.getEleTy());
+        mlir::OpBuilder::InsertionGuard const guard(b);
+        mlir::Value const one = b.create<mlir::arith::ConstantIndexOp>(loc, 1);
+        llvm::SmallVector<mlir::Value, 4> indices(seq.getDimension());
+        // Innermost loop over the first (contiguous) dimension.
+        for (unsigned d = seq.getDimension(); d-- > 0;) {
+          mlir::Value const extent = b.create<mlir::arith::ConstantIndexOp>(loc, seq.getShape()[d]);
+          auto loop = b.create<fir::DoLoopOp>(loc, one, extent, one);
+          indices[d] = loop.getInductionVar();
+          b.setInsertionPointToStart(loop.getBody());
+        }
+        auto read = b.create<hlfir::DesignateOp>(loc, elementRef, rhsLeaf, indices);
+        mlir::Value const value = b.create<fir::LoadOp>(loc, read);
+        auto write = b.create<hlfir::DesignateOp>(loc, elementRef, lhsLeaf, indices);
+        b.create<hlfir::AssignOp>(loc, value, write);
+        continue;
       }
       // For scalar leaves, load the source ref first so
       // ``hlfir.assign`` carries a value RHS (matching the
