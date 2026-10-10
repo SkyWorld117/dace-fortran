@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -218,6 +218,72 @@ def expose_module_variables(source: str, module: str, names: Sequence[str]) -> t
     else:
         out = [*lines[:contains], *spec_lines, *lines[contains:end], *procedures, *lines[end:]]
     return "\n".join(out) + "\n", {v.name: v for v in variables}
+
+
+#: Words of a type spec that are no names to import: intrinsic types and type-parameter keywords.
+_TYPE_SPEC_WORDS = frozenset(
+    {"real", "integer", "logical", "complex", "character", "double", "precision", "type", "class", "kind", "len"}
+)
+
+
+def _uses(source: str, module: str) -> list[tuple[str, dict[str, str] | None]]:
+    """The ``use`` statements of ``module``'s specification part: the used module and, for an ``only`` list, its local
+    names mapped to their ``only`` items (``local`` or ``local => remote``)."""
+    lines = source.splitlines()
+    start, end, contains = _module_span(lines, module)
+    uses = []
+    for statement in _statements(lines[start + 1 : contains if contains is not None else end]):
+        m = re.match(r"\s*use\b\s*(?:,\s*\w+\s*::)?\s*(\w+)\s*(?:,\s*only\s*:\s*(.*))?$", statement, re.IGNORECASE)
+        if not m:
+            continue
+        only = None
+        if m.group(2) is not None:
+            only = {item.split("=>")[0].strip().lower(): item.strip() for item in _split_top_level(m.group(2)) if item}
+        uses.append((m.group(1).lower(), only))
+    return uses
+
+
+def _provides(sources: Mapping[str, str], module: str, name: str, depth: int = 3) -> bool:
+    """True when ``name`` is accessible from ``module``: declared in its specification part (a derived type, a named
+    constant, a variable) or taken from a module it uses (visibility not modelled)."""
+    if module not in sources or depth < 0:
+        return False
+    lines = sources[module].splitlines()
+    start, end, contains = _module_span(lines, module)
+    for statement in _statements(lines[start + 1 : contains if contains is not None else end]):
+        if re.match(rf"\s*type\b\s*(?:,[^:]*)?(?:::)?\s*{name}\s*$", statement, re.IGNORECASE):
+            return True
+        parsed = _parse_declaration(statement)
+        if parsed and any(re.match(rf"\s*{name}\b", entity, re.IGNORECASE) for entity in parsed[2]):
+            return True
+    return any(
+        (only is not None and name in only) or (only is None and _provides(sources, used, name, depth - 1))
+        for used, only in _uses(sources[module], module)
+    )
+
+
+def declaration_imports(variables: Sequence[ExposedVariable], module: str, sources: Mapping[str, str]) -> list[str]:
+    """The ``use`` lines another scope needs to declare ``variables`` of ``module`` as their declarations are written:
+    for every kind or derived type their type specs name, the module ``module`` takes it from.
+
+    :raises ModuleAccessError: a name is ``module``'s own (no other scope can import it from elsewhere) or comes from
+        no module ``module`` uses.
+    """
+    names = sorted(
+        {w.lower() for v in variables for w in re.findall(r"[A-Za-z_]\w*", v.type_spec)} - _TYPE_SPEC_WORDS
+    )
+    found: dict[str, set[str]] = {}
+    for name in names:
+        for used, only in _uses(sources[module], module):
+            if only is not None and name in only:
+                found.setdefault(used, set()).add(only[name])
+                break
+            if only is None and _provides(sources, used, name):
+                found.setdefault(used, set()).add(name)
+                break
+        else:
+            raise ModuleAccessError(f"cannot tell which module {module!r} takes {name!r} from")
+    return [f"use {used}, only: {', '.join(sorted(items))}" for used, items in sorted(found.items())]
 
 
 def public_variables(source: str, module: str) -> set[str]:

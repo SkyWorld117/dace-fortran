@@ -8,6 +8,7 @@ Real work lives in sibling modules (``flatten_plan.py`` data model,
 ``assemble_module``); this file is pure orchestration.
 """
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from dace_fortran.bindings.acc_transfers import AccTransferPlan, Directive
@@ -24,6 +25,7 @@ from dace_fortran.bindings.block_builders import (
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.fortran_interface import OriginalInterface
 from dace_fortran.bindings.frozen_signature import FrozenSignature
+from dace_fortran.bindings.module_access import ExposedVariable
 from dace_fortran.bindings.specialization import (
     Specialization,
     build_specialization_guard,
@@ -47,6 +49,8 @@ def emit_bindings(
     specialization: Specialization | None = None,
     record_symbols_to: str | Path | None = None,
     record_only: bool = False,
+    private_access: Mapping[str, Mapping[str, ExposedVariable]] | None = None,
+    private_imports: Sequence[str] = (),
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -89,6 +93,8 @@ def emit_bindings(
     to, the input of :func:`dace_fortran.bindings.specialization.recorded_invariants`.
     ``record_only`` (with ``record_symbols_to`` and ``specialization``): the wrapper declines every call once it has
     recorded it, so the caller runs its own code -- a sizing run that never executes the general SDFG.
+    ``private_access`` / ``private_imports``: module variables their modules keep private, reached through the
+    accessors of the modules' copies, and the ``use`` lines their declarations need (see :func:`assemble_module`).
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -143,5 +149,16 @@ def emit_bindings(
             record += decline_after_record()
         blocks["wrapper_body"] = "\n".join([blocks["wrapper_body"], "", *record])
     extra = guard_module_sources(specialization, iface, plan) if specialization is not None else None
-    out_file.write_text(assemble_module(iface, frozen, blocks, plan, acc_residency, extra_sources=extra))
+    out_file.write_text(
+        assemble_module(
+            iface,
+            frozen,
+            blocks,
+            plan,
+            acc_residency,
+            extra_sources=extra,
+            private_access=private_access,
+            private_imports=private_imports,
+        )
+    )
     return out_file

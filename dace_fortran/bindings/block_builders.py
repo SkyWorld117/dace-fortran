@@ -44,6 +44,7 @@ from dace_fortran.bindings.loop_copy import (
 
 if TYPE_CHECKING:
     from dace_fortran.bindings.acc_transfers import AccTransferPlan
+    from dace_fortran.bindings.module_access import ExposedVariable
 
 #: gfortran caps identifiers at 63 chars (no flag to lift it); longer generated names must be renamed.
 _FORTRAN_IDENT_LIMIT = 63
@@ -1149,12 +1150,31 @@ def assemble_module(
     plan: FlattenPlan | None = None,
     acc_residency: AccTransferPlan | None = None,
     extra_sources: Mapping[str, ModuleOrigin] | None = None,
+    private_access: Mapping[str, Mapping[str, ExposedVariable]] | None = None,
+    private_imports: Sequence[str] = (),
 ) -> str:
     """Stitch the rendered blocks into the complete Fortran module
     (template: templates/module.f90.in).
 
     ``extra_sources``: module variables of symbols the SDFG no longer takes but the wrapper still reads (those of a
-    specialisation guard), imported alongside ``frozen``'s."""
+    specialisation guard), imported alongside ``frozen``'s.
+
+    ``private_access``: per module, the variables it keeps private, reached through the accessors of a module copy
+    (:func:`dace_fortran.bindings.module_access.expose_module_variables`): each is a module-level pointer under the
+    name an import would have given it, pointed at the variable when the wrapper starts. ``private_imports``: the
+    ``use`` lines the pointers' declarations need (the kinds and types their type specs name)."""
+    private = {m.lower(): {n.lower(): v for n, v in vs.items()} for m, vs in (private_access or {}).items()}
+    pointers: list[tuple[str, ExposedVariable]] = []  # (name in the binding, variable)
+    accessors: dict[str, set[str]] = {}
+
+    def through_accessor(mod: str, name: str, local: str) -> bool:
+        var = private.get(mod.lower(), {}).get(name.lower())
+        if var is None:
+            return False
+        pointers.append((local, var))
+        accessors.setdefault(mod, set()).add(var.accessor)
+        return True
+
     use_lines = [f"  use {mod}, only: {', '.join(syms)}" for mod, syms in sorted(iface.used_modules.items())]
     if acc_residency is not None and acc_residency.deviceptr:
         use_lines.append("  use openacc, only: acc_deviceptr")
@@ -1163,7 +1183,8 @@ def assemble_module(
     sources = {**(extra_sources or {}), **effective_module_sources(frozen, iface, plan)}
     by_mod: dict = {}
     for sym, (mod, member) in sorted(sources.items()):
-        by_mod.setdefault(mod, []).append(f"{_module_symbol_alias(sym)} => {member}")
+        if not through_accessor(mod, member, _module_symbol_alias(sym)):
+            by_mod.setdefault(mod, []).append(f"{_module_symbol_alias(sym)} => {member}")
     for mod, renames in sorted(by_mod.items()):
         use_lines.append(f"  use {mod}, only: {', '.join(sorted(set(renames)))}")
     # AoS-struct components: import the HOST STRUCT plainly (no __mod alias, the
@@ -1173,20 +1194,41 @@ def assemble_module(
     aos_by_mod: dict = {}
     for a in _aos_module_args(frozen):
         if a.aos_origin_mod:
-            aos_by_mod.setdefault(a.aos_origin_mod, set()).add(a.aos_origin_struct.split("%")[0].strip())
+            struct = a.aos_origin_struct.split("%")[0].strip()
+            if not any(local == struct for local, _ in pointers) and not through_accessor(a.aos_origin_mod, struct, struct):
+                aos_by_mod.setdefault(a.aos_origin_mod, set()).add(struct)
     for mod, structs in sorted(aos_by_mod.items()):
         use_lines.append(f"  use {mod}, only: {', '.join(sorted(structs))}")
+    use_lines += [f"  use {mod}, only: {', '.join(sorted(names))}" for mod, names in sorted(accessors.items())]
+    if pointers:
+        use_lines += [line if line.startswith("  ") else f"  {line}" for line in private_imports]
     use_statements = "\n".join(use_lines)
-    wrapper_body = blocks["wrapper_head"] + "\n" + blocks["wrapper_body"] + "\n" + blocks["wrapper_tail"]
+    handle_state = blocks["handle_state"]
+    associations = ""
+    if pointers:
+        declarations = ["  ! Private module variables, reached through the accessors of the module's copy"]
+        for local, var in pointers:
+            shape = "(" + ", ".join([":"] * var.rank) + ")" if var.rank else ""
+            attributes = "pointer, contiguous" if var.rank else "pointer"
+            declarations.append(f"  {var.type_spec}, {attributes} :: {local}{shape} => null()")
+        handle_state = "\n".join([*declarations, "", handle_state])
+        associations = "\n".join(f"    {local} => {var.accessor}()" for local, var in pointers) + "\n"
+    wrapper_body = (
+        blocks["wrapper_head"] + "\n" + associations + blocks["wrapper_body"] + "\n" + blocks["wrapper_tail"]
+    )
     module_src = _load("module.f90.in").format(
         entry=iface.entry,
         schema_version=frozen.schema_version,
         use_statements=use_statements,
         c_interface=blocks["c_interface"],
-        handle_state=blocks["handle_state"],
+        handle_state=handle_state,
         wrapper_body=wrapper_body,
         finalize_body=blocks["finalize"],
     )
+    # A private variable is a pointer here: ``associated`` asks what ``allocated`` asks of the variable (its accessor
+    # returns a null pointer for an unallocated allocatable).
+    for local, _ in pointers:
+        module_src = re.sub(rf"\ballocated\(\s*{re.escape(local)}\s*\)", f"associated({local})", module_src, flags=re.I)
     # gfortran rejects identifiers over 63 chars; rename any such name uniquely.  Then keep every line within the
     # standard's limit.
     return fold_long_lines(_shorten_long_idents(module_src))
