@@ -498,8 +498,8 @@ def build_wrapper_head(
         ftype = fortran_c_type(a.dtype)
         spec = "(" + ", ".join(":" for _ in range(a.rank)) + ")" if a.rank else ""
         scratch_lines.append(f"    {ftype}, allocatable, target :: {a.sdfg_name}{spec}")
-        its, caps, _mrank, _elem = _aos_loop_pieces(a)
-        int_names = its + caps  # scalar-struct (outer_rank 0): no loop vars
+        its, lowers, uppers, _mrank, _elem = _aos_loop_pieces(a)
+        int_names = its + lowers + uppers  # scalar-struct (outer_rank 0): no loop vars
         if int_names:
             scratch_lines.append(f"    integer(c_int) :: {', '.join(int_names)}")
 
@@ -1530,13 +1530,14 @@ def _recipe_presence_guard(iface: OriginalInterface, recipe: FlattenRecipe) -> s
 
 class AosLoopPieces(NamedTuple):
     loop_vars: list[str]
-    cap_vars: list[str]
+    lower_vars: list[str]
+    upper_vars: list[str]
     member_rank: int
     accessor: str
 
 
 def _aos_loop_pieces(a: FrozenArg) -> AosLoopPieces:
-    """Per-outer-dim loop vars / per-member-dim cap-var names + host element
+    """Per-outer-dim loop vars / per-member-dim bound-var names + host element
     accessor for an AoS-component arg. aos_outer_rank == N: N element-index loop
     vars are the SoA buffer's LEADING dims, matching the bridge's
     [element-dims..., member-dims...] layout. aos_outer_rank == 0 (scalar struct
@@ -1544,13 +1545,20 @@ def _aos_loop_pieces(a: FrozenArg) -> AosLoopPieces:
     base = a.sdfg_name
     member_rank = a.rank - a.aos_outer_rank
     if a.aos_outer_rank == 0:
-        return AosLoopPieces([], [], member_rank, f"{a.aos_origin_struct}%{a.aos_member_path}")
+        return AosLoopPieces([], [], [], member_rank, f"{a.aos_origin_struct}%{a.aos_member_path}")
     # Fortran identifiers must start with a letter (no leading ``_``).
     its = [f"aos_{base}_i{k}" for k in range(a.aos_outer_rank)]
-    caps = [f"aos_{base}_c{j}" for j in range(member_rank)]
+    lowers = [f"aos_{base}_l{j}" for j in range(member_rank)]
+    uppers = [f"aos_{base}_u{j}" for j in range(member_rank)]
     # member_path is %-joined (k / x / a%b): becxx(i0)%k / p_diag%p_vn_dual(i0,i1,i2)%x
     elem = f"{a.aos_origin_struct}({', '.join(its)})%{a.aos_member_path}"
-    return AosLoopPieces(its, caps, member_rank, elem)
+    return AosLoopPieces(its, lowers, uppers, member_rank, elem)
+
+
+def _own_bounds(member: str, rank: int) -> str:
+    """``lbound(m, 1):ubound(m, 1), ...`` -- the index range a member occupies in a buffer laid out with the member's
+    own bounds."""
+    return ", ".join(f"lbound({member}, {k}):ubound({member}, {k})" for k in range(1, rank + 1))
 
 
 def _aos_member_is_static(a: FrozenArg) -> bool:
@@ -1562,10 +1570,13 @@ def _aos_member_is_static(a: FrozenArg) -> bool:
 
 
 def _render_aos_copy_in(a: FrozenArg) -> list[str]:
-    """Allocate the SoA buffer (per-member-dim cap = max over elements) + pack the
-    host AoS component in. Skips the data copy when global_alloc_inside (kernel
-    allocates the component itself; host has no data yet)."""
-    its, caps, mrank, elem = _aos_loop_pieces(a)
+    """Allocate the SoA buffer + pack the host AoS component in. A deferred-shape
+    member keeps its own bounds: per member dim the buffer spans the lowest lower
+    to the highest upper bound over the elements, and each element fills its own
+    index range -- the offsets the SDFG reads off the buffer are the members'.
+    Skips the data copy when global_alloc_inside (kernel allocates the component
+    itself; host has no data yet)."""
+    its, lowers, uppers, mrank, elem = _aos_loop_pieces(a)
     if a.aos_outer_rank == 0:
         # SCALAR struct global member, POINTER/ALLOCATABLE, may be undefined on
         # entry. When defined, size the SoA companion from the LIVE member -- a
@@ -1582,7 +1593,7 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
             out.append(f"    allocate({a.sdfg_name}({static_dims})); {a.sdfg_name} = {member}")
         elif a.rank:
             mp = _present(member, a.aos_member_pointer)
-            live_dims = ", ".join(f"size({member}, {k + 1})" for k in range(a.rank))
+            live_dims = _own_bounds(member, a.rank)
             degen_dims = ", ".join("1" for _ in range(a.rank))
             out.append(f"    if ({mp}) then")
             out.append(f"      allocate({a.sdfg_name}({live_dims})); {a.sdfg_name} = {member}")
@@ -1634,32 +1645,35 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
         out.append(f"      allocate({a.sdfg_name}({one_dims}, {cap_dims})); {a.sdfg_name} = {zero}")
         out.append("    end if")
         return out
-    # member_rank > 0: 2D+ ALLOCATABLE/POINTER component per element. Cap = max
-    # member extent over elements; struct and component are both guarded.
+    # member_rank > 0: 2D+ ALLOCATABLE/POINTER component per element, bounds
+    # spanning every element's; struct and component are both guarded.
     mp = _present(elem, a.aos_member_pointer)  # element's component defined?
     out = [f"    ! ----- AoS->SoA copy-in: {a.sdfg_name} <- {struct}(:)%{a.aos_member_path} -----"]
-    for c in caps:
-        out.append(f"    {c} = 0")
+    for lo, hi in zip(lowers, uppers, strict=True):
+        out.append(f"    {lo} = huge({lo})")
+        out.append(f"    {hi} = -huge({hi})")
     out.append(f"    if ({sp}) then")
     out += do_open
     if not a.global_alloc_inside:
         out.append(f"        if ({mp}) then")
-        for j, c in enumerate(caps):
-            out.append(f"          {c} = max({c}, size({elem}, {j + 1}))")
+        for j, (lo, hi) in enumerate(zip(lowers, uppers, strict=True)):
+            out.append(f"          {lo} = min({lo}, lbound({elem}, {j + 1}))")
+            out.append(f"          {hi} = max({hi}, ubound({elem}, {j + 1}))")
         out.append("        end if")
     out += do_close
     out.append("    end if")
-    for c in caps:
-        out.append(f"    if ({c} == 0) {c} = 1")
-    cap_dims = ", ".join(caps)
+    for lo, hi in zip(lowers, uppers, strict=True):  # no element present: a one-element dim
+        out.append(f"    if ({lo} > {hi}) {lo} = 1")
+        out.append(f"    {hi} = max({hi}, {lo})")
+    bound_dims = ", ".join(f"{lo}:{hi}" for lo, hi in zip(lowers, uppers, strict=True))
     out.append(f"    if ({sp}) then")
-    out.append(f"      allocate({a.sdfg_name}({outer_dims}, {cap_dims}))")
+    out.append(f"      allocate({a.sdfg_name}({outer_dims}, {bound_dims}))")
     out.append("    else")
-    out.append(f"      allocate({a.sdfg_name}({one_dims}, {cap_dims}))")
+    out.append(f"      allocate({a.sdfg_name}({one_dims}, {bound_dims}))")
     out.append("    end if")
     out.append(f"    {a.sdfg_name} = {zero}")
     if not a.global_alloc_inside:
-        slc = ", ".join(f"1:size({elem}, {j + 1})" for j in range(mrank))
+        slc = _own_bounds(elem, mrank)
         out.append(f"    if ({sp}) then")
         out += do_open
         out.append(f"        if ({mp}) &")
@@ -1672,7 +1686,7 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
 def _render_aos_copy_out(a: FrozenArg) -> list[str]:
     """Pack the SoA buffer back into the host AoS component (only when the arg
     is WRITTEN), allocating each component first if the kernel created it."""
-    its, _caps, mrank, elem = _aos_loop_pieces(a)
+    its, _lowers, _uppers, mrank, elem = _aos_loop_pieces(a)
     if a.aos_outer_rank == 0:
         # Scalar-struct member: pack writes back when the host member is defined
         # (companion was sized from it in copy-in); undefined -> nothing to write.
@@ -1721,9 +1735,12 @@ def _render_aos_copy_out(a: FrozenArg) -> list[str]:
     out.append(f"    if ({sp}) then")
     out += do_open
     if a.global_alloc_inside:
-        alloc_dims = ", ".join(f"size({a.sdfg_name}, {a.aos_outer_rank + j + 1})" for j in range(mrank))
+        alloc_dims = ", ".join(
+            f"lbound({a.sdfg_name}, {k}):ubound({a.sdfg_name}, {k})"
+            for k in range(a.aos_outer_rank + 1, a.aos_outer_rank + mrank + 1)
+        )
         out.append(f"        if (.not. {mp}) allocate({elem}({alloc_dims}))")
-    slc = ", ".join(f"1:size({elem}, {j + 1})" for j in range(mrank))
+    slc = _own_bounds(elem, mrank)
     out.append(f"        if ({mp}) &")
     out.append(f"          {elem} = {a.sdfg_name}({idx}, {slc})")
     out += do_close
