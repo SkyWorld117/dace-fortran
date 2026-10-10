@@ -451,6 +451,13 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
             text.getValue().str();
       }
 
+    // Procedures nothing calls -- after inlining, the inlined callees' own copies -- do not count.
+    auto dropUncalled = [&] {
+      mlir::OpPassManager dce(mlir::ModuleOp::getOperationName());
+      dce.addPass(mlir::createSymbolDCEPass());
+      return runPipeline(dce, module);
+    };
+    if (mlir::failed(dropUncalled())) return signalPassFailure();
     // Apply the values in rounds: a variable the module still passes on (to a call, say) may be read-only once the
     // branches the other values decide are folded and the procedures only those branches called are gone.
     llvm::StringMap<std::string> heldBack;  // key -> why it is not applied (yet)
@@ -507,15 +514,14 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
         }
         heldBack.erase(key);
         done.insert(key);
-        progress = progress || replaced > 0;
+        if (replaced == 0) continue;
+        progress = true;
         llvm::errs() << "hlfir-specialize-globals: `" << key << "` = " << text << " (" << replaced << " load(s)).\n";
       }
       folded += foldConstantBranches(module);
       if (!progress) break;
       // Drop the procedures only a folded branch called: their uses of a held-back variable no longer count.
-      mlir::OpPassManager dce(mlir::ModuleOp::getOperationName());
-      dce.addPass(mlir::createSymbolDCEPass());
-      if (mlir::failed(runPipeline(dce, module))) return signalPassFailure();
+      if (mlir::failed(dropUncalled())) return signalPassFailure();
     }
     for (auto& [key, why] : heldBack)
       llvm::errs() << "hlfir-specialize-globals: left `" << key.str() << "` alone: " << why << ".\n";
