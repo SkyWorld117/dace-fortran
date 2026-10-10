@@ -17,6 +17,7 @@ value. That needs how each dummy is passed (``OriginalArg.passing``, from the br
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,12 +32,17 @@ class UnsupportedStandinError(ValueError):
 @dataclass(frozen=True, slots=True)
 class RecordedValue:
     """A module variable a recording stand-in writes: ``module::name`` (``name%component`` for a scalar component of a
-    record variable) and its Fortran type (``logical(4)``, ``integer(4)``, ``real(8)``), as
+    record variable, ``name(k)%component`` for one of an element of an array of records) and its Fortran type (``logical(4)``, ``integer(4)``, ``real(8)``), as
     ``SDFGBuilder.configuration_candidates`` lists them."""
 
     module: str
     name: str
     fortran_type: str
+
+
+def _variable(name: str) -> str:
+    """The module variable of a recorded scalar: ``bc_x`` of ``bc_x%beg``, ``idwbuff`` of ``idwbuff(1)%beg``."""
+    return re.split(r"[(%]", name, maxsplit=1)[0]
 
 
 def standin_name(kind: str, entry: str) -> str:
@@ -143,13 +149,13 @@ def emit_recording_standin(
     """Write ``dace_record_<entry>``: on every call it appends ``module::name value`` for each of ``values`` and an
     empty line to ``record_path``, then calls the original with the arguments unchanged. The variables must be public
     in their modules."""
-    uses = [f"use {v.module}, only: dace_value_{i} => {v.name.partition('%')[0]}" for i, v in enumerate(values)]
+    uses = [f"use {v.module}, only: dace_value_{i} => {_variable(v.name)}" for i, v in enumerate(values)]
     local = ["integer :: dace_record_unit", *_character_constant("dace_record_path", str(record_path))]
     for i, v in enumerate(values):
         local += _character_constant(f"dace_label_{i}", f"{v.module}::{v.name}")
     body = [
         "open(newunit=dace_record_unit, file=dace_record_path, position='append', action='write')",
-        *(_write(f"dace_value_{i}" + "".join(v.name.partition("%")[1:]), v.fortran_type, f"dace_label_{i}")
+        *(_write(f"dace_value_{i}{v.name[len(_variable(v.name)):]}", v.fortran_type, f"dace_label_{i}")
           for i, v in enumerate(values)),
         "write(dace_record_unit, '(a)') ''",
         "close(dace_record_unit)",

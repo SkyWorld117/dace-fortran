@@ -17,7 +17,8 @@
 //     The caller names module variables and their values (module attribute
 //     ``hlfir.specialized_globals``: ``"module::name"`` or a mangled symbol ->
 //     value; ``"module::name%component"`` for a scalar component of a record
-//     variable).  For every named scalar the remaining module only ever reads,
+//     variable, ``"module::name(k)%component"`` for one of element ``k`` of a
+//     fixed-size array of records).  For every named scalar the remaining module only ever reads,
 //     each ``fir.load`` of it becomes the constant; a ``fir.if`` whose
 //     condition then folds to a constant is replaced by the branch it takes,
 //     and a ``cf.cond_br`` (a lowered ``select case``) by a branch to its
@@ -29,7 +30,8 @@
 //
 // Candidates:
 //     Every non-constant integer, real or logical module scalar, and scalar
-//     component of a module record, the module reads and never writes --
+//     component of a module record or of an element of a module array of
+//     records read at a constant subscript, the module reads and never writes --
 //     whatever the configuration of a run could fix -- is recorded first, before any value is applied, as the module
 //     attribute ``hlfir.configuration_candidates`` (``"module::name"`` ->
 //     Fortran type), so a caller can find out which values to fix.
@@ -110,31 +112,132 @@ bool isScalarComponent(hlfir::DesignateOp d) {
          !d.getShape() && d.getTypeparams().empty() && !d.getComplexPart().has_value();
 }
 
-/// Every load of ``global``'s address -- of its component ``component`` when one is given -- through the declares
-/// and converts on the way; false (and no loads) if the address (the component) has any other user, which may change
-/// the value. A load of the whole record and designators of its other components read or address other storage.
-bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, llvm::StringRef component = {}) {
-  // (value, whether it addresses the variable itself -- the component, if one is given)
-  llvm::SmallVector<std::pair<mlir::Value, bool>, 4> work{{addr.getResult(), component.empty()}};
+/// The value of an integer subscript that is a literal, through ``fir.convert``s.
+std::optional<int64_t> constantIndex(mlir::Value v) {
+  for (int i = 0; i < 8 && v; ++i) {
+    mlir::Operation* def = v.getDefiningOp();
+    if (auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantOp>(def)) {
+      if (auto attr = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue())) return attr.getInt();
+      return std::nullopt;
+    }
+    auto conv = mlir::dyn_cast_or_null<fir::ConvertOp>(def);
+    if (!conv) break;
+    v = conv.getValue();
+  }
+  return std::nullopt;
+}
+
+/// ``array(k)`` with one scalar subscript: an element of a rank-1 array of records.
+std::optional<int64_t> constantElement(hlfir::DesignateOp d) {
+  if (d.getComponent().has_value() || d.getIndices().size() != 1 || !d.getSubstring().empty() ||
+      d.getComplexPart().has_value())
+    return std::nullopt;
+  for (bool const triplet : d.getIsTriplet())
+    if (triplet) return std::nullopt;
+  return constantIndex(d.getIndices()[0]);
+}
+
+/// A scalar inside a module variable: the variable itself, its ``component`` (a record), or the ``component`` of its
+/// element ``element`` (a fixed-size array of records, ``idwbuff(1)%beg``).
+struct ScalarPath {
+  std::optional<int64_t> element;
+  std::string component;
+};
+
+/// Parses the part of a key after the variable's name: "", ``%component`` or ``(k)%component``; nullopt otherwise.
+std::optional<ScalarPath> parseScalarPath(llvm::StringRef rest) {
+  ScalarPath path;
+  if (rest.consume_front("(")) {
+    auto [number, after] = rest.split(')');
+    int64_t k = 0;
+    if (number.trim().getAsInteger(10, k) || after.size() == rest.size()) return std::nullopt;
+    path.element = k;
+    rest = after;
+    if (!rest.starts_with("%")) return std::nullopt;  // an element of an array of records has no scalar value
+  }
+  if (rest.consume_front("%")) {
+    if (rest.empty()) return std::nullopt;
+    path.component = rest.lower();
+  } else if (!rest.empty()) {
+    return std::nullopt;
+  }
+  return path;
+}
+
+/// True when every user of ``v`` only reads through it: loads, and declares, converts and designators leading to
+/// loads.
+bool onlyReads(mlir::Value v, int depth = 0) {
+  if (depth > 16) return false;
+  for (mlir::OpOperand& use : v.getUses()) {
+    mlir::Operation* user = use.getOwner();
+    if (mlir::isa<fir::LoadOp>(user)) continue;
+    if (mlir::isa<hlfir::DeclareOp, fir::ConvertOp>(user) ||
+        (mlir::isa<hlfir::DesignateOp>(user) && mlir::cast<hlfir::DesignateOp>(user).getMemref() == v)) {
+      for (mlir::Value r : user->getResults())
+        if (!onlyReads(r, depth + 1)) return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/// Every load of the scalar ``path`` names in ``global``, through the declares and converts on the way; false (and
+/// no loads) if anything may change it: a user of its address other than a load, of its record or element other than
+/// designators of other components, or a non-reading use of another element (whose subscript may be the same).
+bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, ScalarPath const& path = {}) {
+  // How far a value has come along ``path``: at the variable, at its element, or at the scalar itself.
+  enum Stage { Variable, Element, Target };
+  auto next = [&](Stage stage) {
+    if (stage == Variable && path.element) return Element;
+    return Target;
+  };
+  Stage const first = (!path.element && path.component.empty()) ? Target : Variable;
+  llvm::SmallVector<std::pair<mlir::Value, Stage>, 4> work{{addr.getResult(), first}};
   while (!work.empty()) {
-    auto [v, target] = work.pop_back_val();
+    auto [v, stage] = work.pop_back_val();
     for (mlir::OpOperand& use : v.getUses()) {
       mlir::Operation* user = use.getOwner();
       auto designate = mlir::dyn_cast<hlfir::DesignateOp>(user);
+      if (designate && designate.getMemref() != v) designate = nullptr;
       if (auto load = mlir::dyn_cast<fir::LoadOp>(user)) {
-        if (target) loads.push_back(load);
+        if (stage == Target) loads.push_back(load);
       } else if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(user)) {
-        for (mlir::Value r : decl->getResults()) work.push_back({r, target});
+        for (mlir::Value r : decl->getResults()) work.push_back({r, stage});
       } else if (auto conv = mlir::dyn_cast<fir::ConvertOp>(user)) {
-        work.push_back({conv.getResult(), target});
-      } else if (!target && designate && designate.getMemref() == v && isScalarComponent(designate)) {
-        if (*designate.getComponent() == component) work.push_back({designate.getResult(), true});
+        work.push_back({conv.getResult(), stage});
+      } else if (designate && stage == Variable && path.element) {
+        if (constantElement(designate) == path.element)
+          work.push_back({designate.getResult(), next(stage)});
+        else if (!onlyReads(designate.getResult()))
+          return false;
+      } else if (designate && stage != Target && isScalarComponent(designate)) {
+        if (*designate.getComponent() == path.component) work.push_back({designate.getResult(), Target});
       } else {
         return false;
       }
     }
   }
   return true;
+}
+
+/// The distinct literal subscripts ``global`` (a rank-1 array) is designated at, through declares and converts.
+llvm::SmallVector<int64_t, 4> constantElements(llvm::ArrayRef<fir::AddrOfOp> addrs) {
+  llvm::SmallVector<int64_t, 4> elements;
+  llvm::SmallVector<mlir::Value, 8> work;
+  for (fir::AddrOfOp addr : addrs) work.push_back(addr.getResult());
+  while (!work.empty()) {
+    mlir::Value v = work.pop_back_val();
+    for (mlir::Operation* user : v.getUsers()) {
+      if (mlir::isa<hlfir::DeclareOp, fir::ConvertOp>(user)) {
+        for (mlir::Value r : user->getResults()) work.push_back(r);
+      } else if (auto d = mlir::dyn_cast<hlfir::DesignateOp>(user)) {
+        if (auto k = constantElement(d); k && !llvm::is_contained(elements, *k)) elements.push_back(*k);
+      }
+    }
+  }
+  llvm::sort(elements);
+  return elements;
 }
 
 /// The Fortran type of an integer, real or logical scalar (``integer(4)``, ``real(8)``, ``logical(4)``), or "".
@@ -159,22 +262,33 @@ void recordCandidates(mlir::ModuleOp module) {
     if (!global || (global.getConstant().has_value() && *global.getConstant())) continue;
     auto [mod, name] = decodeModuleGlobalSymbol(sym.str());
     if (mod.empty()) continue;
-    // The variable itself when it is a scalar, else each scalar component of a record.
-    llvm::SmallVector<std::pair<std::string, std::string>, 8> scalars;  // (component or "", Fortran type)
-    if (auto record = mlir::dyn_cast<fir::RecordType>(global.getType())) {
-      for (auto& [component, type] : record.getTypeList())
-        if (std::string t = scalarTypeName(type); !t.empty()) scalars.push_back({component, t});
-    } else if (std::string t = scalarTypeName(global.getType()); !t.empty()) {
-      scalars.push_back({"", t});
+    // The variable itself when it is a scalar, each scalar component of a record, and each scalar component of every
+    // element of a fixed-size rank-1 array of records read at a literal subscript.
+    llvm::SmallVector<std::pair<ScalarPath, std::string>, 8> scalars;  // (path, Fortran type)
+    mlir::Type type = global.getType();
+    llvm::SmallVector<std::optional<int64_t>, 4> elements{std::nullopt};
+    if (auto seq = mlir::dyn_cast<fir::SequenceType>(type); seq && seq.getDimension() == 1 && seq.hasConstantShape()) {
+      type = seq.getEleTy();
+      elements.clear();
+      for (int64_t k : constantElements(addrs)) elements.push_back(k);
     }
-    for (auto& [component, type] : scalars) {
+    if (auto record = mlir::dyn_cast<fir::RecordType>(type)) {
+      for (std::optional<int64_t> element : elements)
+        for (auto& [component, componentType] : record.getTypeList())
+          if (std::string t = scalarTypeName(componentType); !t.empty())
+            scalars.push_back({ScalarPath{element, component}, t});
+    } else if (std::string t = scalarTypeName(type); !t.empty() && elements.front() == std::nullopt) {
+      scalars.push_back({ScalarPath{}, t});
+    }
+    for (auto& [path, scalarType] : scalars) {
       llvm::SmallVector<fir::LoadOp, 8> loads;
       bool readOnly = true;
-      for (fir::AddrOfOp addr : addrs) readOnly = readOnly && onlyLoaded(addr, loads, component);
+      for (fir::AddrOfOp addr : addrs) readOnly = readOnly && onlyLoaded(addr, loads, path);
       if (!readOnly || loads.empty()) continue;
       std::string key = mod + "::" + name;
-      if (!component.empty()) key += "%" + component;
-      candidates.push_back(b.getNamedAttr(key, b.getStringAttr(type)));
+      if (path.element) key += "(" + std::to_string(*path.element) + ")";
+      if (!path.component.empty()) key += "%" + path.component;
+      candidates.push_back(b.getNamedAttr(key, b.getStringAttr(scalarType)));
     }
   }
   module->setAttr("hlfir.configuration_candidates", b.getDictionaryAttr(candidates));
@@ -241,10 +355,11 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
     llvm::StringMap<std::string> values;
     for (mlir::NamedAttribute entry : attr)
       if (auto text = mlir::dyn_cast<mlir::StringAttr>(entry.getValue())) {
-        auto [variable, component] = entry.getName().getValue().split('%');
-        std::string key = globalSymbol(variable);
-        if (!component.empty()) key += "%" + component.lower();
-        values[key] = text.getValue().str();
+        // ``module::name`` or a mangled symbol, then the path to a scalar inside it: ``%component``, ``(k)%component``.
+        llvm::StringRef const name = entry.getName().getValue();
+        size_t const cut = name.find_first_of("(%");
+        values[globalSymbol(name.take_front(cut)) + name.drop_front(std::min(cut, name.size())).lower()] =
+            text.getValue().str();
       }
 
     // Every address-of a named global, by symbol.
@@ -253,12 +368,18 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
 
     unsigned folded = 0;
     for (auto& [key, text] : values) {
-      auto [sym, component] = llvm::StringRef(key).split('%');
+      size_t const cut = llvm::StringRef(key).find_first_of("(%");
+      llvm::StringRef const sym = llvm::StringRef(key).take_front(cut);
+      std::optional<ScalarPath> path = parseScalarPath(llvm::StringRef(key).drop_front(std::min(cut, key.size())));
+      if (!path) {
+        llvm::errs() << "hlfir-specialize-globals: left `" << key << "` alone: not a scalar of a module variable.\n";
+        continue;
+      }
       auto it = addresses.find(sym);
       if (it == addresses.end()) continue;  // nothing reads it
       llvm::SmallVector<fir::LoadOp, 8> loads;
       bool readOnly = true;
-      for (fir::AddrOfOp addr : it->second) readOnly = readOnly && onlyLoaded(addr, loads, component);
+      for (fir::AddrOfOp addr : it->second) readOnly = readOnly && onlyLoaded(addr, loads, *path);
       if (!readOnly) {
         llvm::errs() << "hlfir-specialize-globals: left `" << key << "` alone: the module writes or passes it on.\n";
         continue;
