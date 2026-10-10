@@ -18,6 +18,7 @@ from dace import SDFG
 from dace_fortran.array_split import split_array
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.frozen_signature import attach_to_sdfg, get_frozen_signature
+from dace_fortran.bindings.loop_copy import aos_outer_rank
 
 
 def split_record_companions(sdfg: SDFG, plan: FlattenPlan) -> dict[str, dict[int, str]]:
@@ -34,7 +35,8 @@ def split_record_companions(sdfg: SDFG, plan: FlattenPlan) -> dict[str, dict[int
     split: dict[str, dict[int, str]] = {}
     for entry in plan.entries:
         recipe = entry.recipe
-        if not recipe.aos_alloc:
+        # One record dimension only: an element of a rank-N array of records is no single split index.
+        if not recipe.aos_alloc or aos_outer_rank(recipe) != 1:
             continue
         flat = recipe.flat_names[0]
         position = next((i for i, a in enumerate(args) if a.sdfg_name == flat), None)

@@ -225,7 +225,87 @@ end module ra_rank2_dummy
         call="kern(b, n)",
         out="do k = 1, 2; do i = 1, 2; out((2*(k-1)+i-1)*n+1:(2*(k-1)+i)*n) = b(i, k)%sf; end do; end do",
         nout=4,
-        xfail=(RuntimeError, "the flattening pass takes pointer members of rank-1 record-array dummies only"),
+    ),
+    # A rank-2 dummy array of records with an integer allocatable member of rank 3, read and written.
+    "rank2_integer_member": dict(
+        src="""
+module ra_rank2_integer_member
+  implicit none
+  type integer_field
+    integer, allocatable :: sf(:, :, :)
+  end type
+contains
+  subroutine kern(bc, n)
+    integer, intent(in) :: n
+    type(integer_field), dimension(1:3, 1:2), intent(inout) :: bc
+    integer :: d, s, j
+    do s = 1, 2
+      do d = 1, 3
+        do j = 1, n
+          bc(d, s)%sf(j, 0, 1) = bc(d, s)%sf(j, 0, 1) + bc(1, 1)%sf(j, 1, 1) * s + d
+        end do
+      end do
+    end do
+  end subroutine kern
+end module ra_rank2_integer_member
+""",
+        local="type(integer_field) :: bc(3, 2)",
+        setup="""
+  do k = 1, 2
+    do i = 1, 3
+      allocate(bc(i, k)%sf(n, 0:1, 1))
+      bc(i, k)%sf = 0
+      do j = 1, n
+        bc(i, k)%sf(j, 0, 1) = 100*i + 10*k + j
+        bc(i, k)%sf(j, 1, 1) = j
+      end do
+    end do
+  end do
+""",
+        call="kern(bc, n)",
+        out="do k = 1, 2; do i = 1, 3; out((3*(k-1)+i-1)*n+1:(3*(k-1)+i)*n) = bc(i, k)%sf(:, 0, 1); end do; end do",
+        nout=6,
+    ),
+    # A rank-3 dummy array of records with lower bounds other than 1, every element read and written.
+    "rank3_dummy_with_bounds": dict(
+        src=f"""
+module ra_rank3_dummy_with_bounds
+  implicit none
+{_TYPES}
+contains
+  subroutine kern(c, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(0:1, 2:3, -1:0), intent(inout) :: c
+    integer :: a, b, e, j
+    do e = -1, 0
+      do b = 2, 3
+        do a = 0, 1
+          do j = 1, n
+            c(a, b, e)%sf(j) = c(a, b, e)%sf(j) * 2 + a + 10*b + 100*e
+          end do
+        end do
+      end do
+    end do
+  end subroutine kern
+end module ra_rank3_dummy_with_bounds
+""",
+        local="type(scalar_field) :: c(0:1, 2:3, -1:0)",
+        setup="""
+  do k = -1, 0
+    do i = 2, 3
+      do m = 0, 1
+        allocate(c(m, i, k)%sf(n))
+        do j = 1, n
+          c(m, i, k)%sf(j) = 1000*m + 100*i + 10*k + j
+        end do
+      end do
+    end do
+  end do
+""",
+        call="kern(c, n)",
+        out="""l = 0
+  do k = -1, 0; do i = 2, 3; do m = 0, 1; out(l*n+1:(l+1)*n) = c(m, i, k)%sf; l = l + 1; end do; end do; end do""",
+        nout=8,
     ),
     # A whole member passed to a dummy with its own lower bound.
     "member_with_lower_bound": dict(
@@ -274,7 +354,7 @@ subroutine run{suffix}(n, out) bind(c, name='run{suffix}')
   implicit none
   integer(c_int), value :: n
   real(c_double), intent(out) :: out({nout}*n)
-  integer :: i, j, k
+  integer :: i, j, k, l, m
   {local}
 {setup}
   call {call}

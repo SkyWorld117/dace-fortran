@@ -127,8 +127,8 @@
 //       AoS's own outer bounds and the member's lower bounds
 //   It synthesises a declare for each scalar named after its symbol so
 //   ``traceToDecl`` resolves the data declare's extents and lower bounds
-//   to ``cap_...`` / ``lb_...`` on the SDFG signature.  The outer rank
-//   must be 1.
+//   to ``cap_...`` / ``lb_...`` on the SDFG signature.  The array of
+//   records may have any rank; its dims come first in the buffer.
 //   ``recordAosAllocEntry`` emits one ``aos_alloc=True`` FlattenEntry
 //   per allocatable member; ``recordStructArgEntry`` takes an
 //   exclude-set so non-allocatable siblings are still covered by a
@@ -4314,13 +4314,6 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
       // degenerate buffer that silently truncates the kernel's writes.
       // Fail rather than miscompile; pass the struct as ``intent(inout)``
       // with pre-allocated members instead.
-      if (!p.aosAllocMembers.empty() && p.outerShape.size() != 1) {
-        p.argDecl->emitError(
-            "AoS allocatable/pointer member on a struct dummy of rank " + std::to_string(p.outerShape.size()) +
-            " is unsupported: the padded companion's pack/unpack handles a rank-1 array of records only.");
-        signalPassFailure();
-        continue;
-      }
       if (!p.aosAllocMembers.empty() && intentStr == "out") {
         p.argDecl->emitError(
             "AoS allocatable/pointer member on an intent(out) struct dummy "

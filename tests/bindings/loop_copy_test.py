@@ -225,6 +225,35 @@ def test_render_aos_alloc_pack_for_rank3_pointer_member():
     assert "q(i1)%sf = q_sf(i1, 1:size(q(i1)%sf, 1), 1:size(q(i1)%sf, 2), 1:size(q(i1)%sf, 3))" in pack_out
 
 
+def test_render_aos_alloc_pack_for_a_rank2_array_of_records():
+    """A rank-2 array of records: a loop per record dim (the last outermost), every record dim in the buffer's
+    subscripts ahead of the member's, and the device pack loops number the member dims after the record dims."""
+    r = FlattenRecipe(
+        flat_names=("bc_sf",),
+        read_exprs=("bc($i1, $i2)%sf($i3, $i4)",),
+        rank=4,
+        shape_exprs=("size(bc, dim=1)", "size(bc, dim=2)", "cap_bc_sf_d0", "cap_bc_sf_d1"),
+        aliasable=False,
+        aos_alloc=True,
+        cap_symbols=("cap_bc_sf_d0", "cap_bc_sf_d1"),
+        lb_symbols=("lb_bc_sf_d0", "lb_bc_sf_d1"),
+    )
+    pack_in = render_aos_alloc_pack_in(r, outer_expr="bc")
+    assert [ln.strip() for ln in pack_in if ln.strip().startswith("do ")][:2] == [
+        "do i2 = 1, size(bc, dim=2)",
+        "do i1 = 1, size(bc, dim=1)",
+    ]
+    joined = "\n".join(pack_in)
+    assert "allocate(bc_sf(size(bc, dim=1), size(bc, dim=2), cap_bc_sf_d0, cap_bc_sf_d1))" in joined
+    assert "bc_sf(i1, i2, 1:size(bc(i1, i2)%sf, 1), 1:size(bc(i1, i2)%sf, 2)) = bc(i1, i2)%sf" in joined
+    assert "exit" not in joined  # an exit would leave only the innermost record loop
+    pack_out = "\n".join(render_aos_alloc_pack_out(r, outer_expr="bc"))
+    assert "bc(i1, i2)%sf = bc_sf(i1, i2, 1:size(bc(i1, i2)%sf, 1), 1:size(bc(i1, i2)%sf, 2))" in pack_out
+    device = "\n".join(render_aos_alloc_pack_in(r, outer_expr="bc", device=True))
+    assert "do i3 = 1, bc_sf_ext1" in device and "do i4 = 1, bc_sf_ext2" in device
+    assert "bc_sf(i1, i2, i3, i4) = bc(i1, i2)%sf(lb_bc_sf_d0 + i3 - 1, lb_bc_sf_d1 + i4 - 1)" in device
+
+
 def test_render_aos_alloc_pack_in_raises_on_non_aos_alloc():
     plain = FlattenRecipe(
         flat_names=("a_w",),

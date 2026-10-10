@@ -149,23 +149,58 @@ def render_copy_out_loop(recipe: FlattenRecipe, outer_expr: str) -> list[str]:
 # ``FlattenRecipe.aos_alloc`` in ``flatten_plan.py``; this module
 # implements the two emitters that read those fields.
 #
-# Helpers below extract `A($i1)%w` from recipe.read_exprs[0] by dropping the
-# trailing member subscript list -- safe because the bridge always emits
-# aos_alloc recipes as `<outer>($i1)%<member>($i2, ...)`.  i1 is the iterator
-# build_wrapper_head declares for any non-aliasable rank>=1 recipe.
+# Helpers below extract `A($i1, ..., $iR)%w` from recipe.read_exprs[0] by dropping the trailing member subscript
+# list -- safe because the bridge always emits aos_alloc recipes as `<outer>($i1, ..., $iR)%<member>($iR+1, ...)`
+# for an array of records of rank R.  i1 ... iR are the element indices; the wrapper head declares i1 ... i<rank> for
+# any non-aliasable recipe of rank >= 1.
+
+
+def aos_outer_rank(recipe: FlattenRecipe) -> int:
+    """The rank of an aos_alloc recipe's array of records: its dimensions before the member's."""
+    return recipe.rank - len(recipe.cap_symbols)
+
+
+def _element_indices(recipe: FlattenRecipe) -> list[str]:
+    """The element indices of an aos_alloc recipe, ``i1 ... iR``."""
+    return [f"i{d}" for d in range(1, aos_outer_rank(recipe) + 1)]
 
 
 def _aos_alloc_member_at_i(recipe: FlattenRecipe) -> str:
-    """Extract ``<outer>(i1)%<member>`` (no member subscripts) from an
-    aos_alloc recipe's ``read_exprs[0]``, for presence / size() / lbound()
-    queries in the pack-in/pack-out emitters."""
-    template = recipe.read_exprs[0]  # "A($i1)%w($i2, ...)"
-    return template.rsplit("(", 1)[0].replace("$i1", "i1")
+    """Extract ``<outer>(i1, ..., iR)%<member>`` (no member subscripts) from an aos_alloc recipe's
+    ``read_exprs[0]``, for presence / size() / lbound() queries in the pack-in/pack-out emitters."""
+    member = recipe.read_exprs[0].rsplit("(", 1)[0]  # "A($i1, ..., $iR)%w"
+    for d in range(aos_outer_rank(recipe), 0, -1):  # $i12 before $i1
+        member = member.replace(f"$i{d}", f"i{d}")
+    return member
+
+
+def _aos_alloc_extents(recipe: FlattenRecipe, outer_expr: str) -> list[str]:
+    """The extents of an aos_alloc recipe's array of records, one per dimension."""
+    rank = aos_outer_rank(recipe)
+    if len(recipe.shape_exprs) >= rank:
+        return list(recipe.shape_exprs[:rank])
+    return [f"size({outer_expr}, {d})" for d in range(1, rank + 1)]
+
+
+def _over_elements(recipe: FlattenRecipe, outer_expr: str, body: list[str]) -> list[str]:
+    """``body`` -- lines indented for one loop level -- inside a loop nest over every element of the array of records,
+    its last dimension outermost."""
+    extents = _aos_alloc_extents(recipe, outer_expr)
+    rank = len(extents)
+    lines = [f"    {'  ' * depth}do i{d} = 1, {extents[d - 1]}" for depth, d in enumerate(range(rank, 0, -1))]
+    lines += [("  " * (rank - 1)) + line for line in body]
+    lines += [f"    {'  ' * depth}end do" for depth in reversed(range(rank))]
+    return lines
 
 
 def _aos_alloc_presence(recipe: FlattenRecipe, member: str) -> str:
     """Presence query for one element's member: ``associated`` for a pointer, else ``allocated``."""
     return f"associated({member})" if recipe.member_pointer else f"allocated({member})"
+
+
+def aos_bounds_locals(recipe: FlattenRecipe) -> tuple[str, ...]:
+    """Logical locals the pack-in of an aos_alloc recipe needs: whether the elements' common lower bounds were taken."""
+    return (f"{recipe.flat_names[0]}_lb_taken",)
 
 
 def aos_pack_extent_locals(recipe: FlattenRecipe) -> tuple[str, ...]:
@@ -175,16 +210,17 @@ def aos_pack_extent_locals(recipe: FlattenRecipe) -> tuple[str, ...]:
 
 def _device_pack_loop(recipe: FlattenRecipe, member_at_i: str, assign: str) -> list[str]:
     """An OpenACC loop nest over one present element's member, running ``assign`` per element of it: the buffer
-    index of member dim ``k`` is ``i<k+1>`` (``i1`` is the element index), the member's own subscript its lower
-    bound plus that.  Member and buffer are both present on the device.  The trip counts are taken on the host into
-    scalars first: as loop bounds, ``size(<array>(i1)%<member>, k)`` gives nvfortran a garbage launch geometry."""
+    index of member dim ``k`` is ``i<R+k>`` (``i1 ... iR`` are the element indices), the member's own subscript its
+    lower bound plus that.  Member and buffer are both present on the device.  The trip counts are taken on the host
+    into scalars first: as loop bounds, ``size(<array>(i1)%<member>, k)`` gives nvfortran a garbage launch geometry."""
     rank = len(recipe.cap_symbols)
+    outer = aos_outer_rank(recipe)
     dims = range(1, rank + 1)
     extents = aos_pack_extent_locals(recipe)
     lines = [f"        {ext} = size({member_at_i}, {k})" for k, ext in zip(dims, extents, strict=True)]
     lines.append(f"        !$acc parallel loop collapse({rank}) default(present)")
     for k in reversed(list(dims)):
-        lines.append("  " * (rank - k) + f"        do i{k + 1} = 1, {extents[k - 1]}")
+        lines.append("  " * (rank - k) + f"        do i{outer + k} = 1, {extents[k - 1]}")
     lines.append("  " * rank + "        " + assign)
     lines.extend("  " * (rank - k) + "        end do" for k in dims)
     return lines
@@ -192,10 +228,12 @@ def _device_pack_loop(recipe: FlattenRecipe, member_at_i: str, assign: str) -> l
 
 def aos_pack_subscripts(recipe: FlattenRecipe) -> tuple[str, str]:
     """``(buffer subscripts, member subscripts)`` of one element's value in a device pack loop: ``i1, i2, i3`` and
-    ``lb1 + i2 - 1, lb2 + i3 - 1`` for a rank-2 member, with the recipe's common lower-bound symbols."""
+    ``lb1 + i2 - 1, lb2 + i3 - 1`` for a rank-2 member of a rank-1 array of records, with the recipe's common
+    lower-bound symbols."""
+    outer = aos_outer_rank(recipe)
     dims = range(1, len(recipe.cap_symbols) + 1)
-    buffer = ", ".join(["i1", *(f"i{k + 1}" for k in dims)])
-    member = ", ".join(f"{lb} + i{k + 1} - 1" for k, lb in zip(dims, recipe.lb_symbols, strict=True))
+    buffer = ", ".join([*_element_indices(recipe), *(f"i{outer + k}" for k in dims)])
+    member = ", ".join(f"{lb} + i{outer + k} - 1" for k, lb in zip(dims, recipe.lb_symbols, strict=True))
     return buffer, member
 
 
@@ -213,7 +251,8 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
         raise ValueError("render_aos_alloc_pack_in called on non-aos_alloc recipe")
     flat = recipe.flat_names[0]
     caps = recipe.cap_symbols
-    n_extent = _aos_alloc_count(recipe, outer_expr)
+    shape = ", ".join([*_aos_alloc_extents(recipe, outer_expr), *caps])
+    elements = ", ".join(_element_indices(recipe))
     member_at_i = _aos_alloc_member_at_i(recipe)
     present = _aos_alloc_presence(recipe, member_at_i)
     dims = range(1, len(caps) + 1)
@@ -222,34 +261,38 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
         buffer_idx, member_idx = aos_pack_subscripts(recipe)
         padded = " .or. ".join(f"size({member_at_i}, {k}) < {cap}" for k, cap in zip(dims, caps, strict=True))
         fill = [
-            f"    allocate({flat}({n_extent}, {', '.join(caps)}))",
+            f"    allocate({flat}({shape}))",
             f"    !$acc enter data create({flat})",
             f"    {flat}_padded = .false.",
-            f"    do i1 = 1, {n_extent}",
-            f"      if ({present}) then",
-            f"        if ({padded}) {flat}_padded = .true.",
-            "      end if",
-            "    end do",
+            *_over_elements(
+                recipe,
+                outer_expr,
+                [f"      if ({present}) then", f"        if ({padded}) {flat}_padded = .true.", "      end if"],
+            ),
             f"    if ({flat}_padded) then",
             "      !$acc kernels default(present)",
             f"      {flat} = 0",
             "      !$acc end kernels",
             "    end if",
-            f"    do i1 = 1, {n_extent}",
-            f"      if ({present}) then",
-            *_device_pack_loop(recipe, member_at_i, f"{flat}({buffer_idx}) = {member_at_i}({member_idx})"),
-            "      end if",
-            "    end do",
+            *_over_elements(
+                recipe,
+                outer_expr,
+                [
+                    f"      if ({present}) then",
+                    *_device_pack_loop(recipe, member_at_i, f"{flat}({buffer_idx}) = {member_at_i}({member_idx})"),
+                    "      end if",
+                ],
+            ),
         ]
     else:
         fill = [
-            f"    allocate({flat}({n_extent}, {', '.join(caps)}))",
+            f"    allocate({flat}({shape}))",
             f"    {flat} = 0",
-            f"    do i1 = 1, {n_extent}",
-            f"      if ({present}) then",
-            f"        {flat}(i1, {live}) = {member_at_i}",
-            "      end if",
-            "    end do",
+            *_over_elements(
+                recipe,
+                outer_expr,
+                [f"      if ({present}) then", f"        {flat}({elements}, {live}) = {member_at_i}", "      end if"],
+            ),
         ]
     return [
         f"    ! ----- AoS pack-in: {outer_expr} -> {flat} (cap = {', '.join(caps)}){' on the device' if device else ''} -----",
@@ -258,44 +301,43 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
     ]
 
 
-def _aos_alloc_count(recipe: FlattenRecipe, outer_expr: str) -> str:
-    """The number of elements of an aos_alloc recipe's array of records."""
-    return recipe.shape_exprs[0] if recipe.shape_exprs else "size(" + outer_expr + ")"
-
-
 def _aos_alloc_bounds(recipe: FlattenRecipe, outer_expr: str) -> list[str]:
     """Assign the recipe's lower-bound symbols the members' common lower bounds and its cap symbols their largest
     extents, over the present elements."""
     caps, lbs = recipe.cap_symbols, recipe.lb_symbols
-    n_extent = _aos_alloc_count(recipe, outer_expr)
     member_at_i = _aos_alloc_member_at_i(recipe)
     present = _aos_alloc_presence(recipe, member_at_i)
     dims = range(1, len(caps) + 1)
     differs = "error stop 'elements of " + outer_expr + " differ in their lower bounds'"
+    (taken,) = aos_bounds_locals(recipe)
     return [
         *(f"    {cap} = 0" for cap in caps),
         *(f"    {lb} = 1" for lb in lbs),
         # The buffer takes the lower bounds of the first present non-empty element (an empty one has lbound 1 in a
         # zero-extent dim); every other non-empty element must agree.
-        f"    do i1 = 1, {n_extent}",
-        f"      if ({present}) then",
-        f"        if (size({member_at_i}) > 0) then",
-        *(f"          {lb} = lbound({member_at_i}, {k})" for k, lb in zip(dims, lbs, strict=True)),
-        "          exit",
-        "        end if",
-        "      end if",
-        "    end do",
-        f"    do i1 = 1, {n_extent}",
-        f"      if ({present}) then",
-        f"        if (size({member_at_i}) > 0) then",
-        *(f"          if (lbound({member_at_i}, {k}) /= {lb}) {differs}" for k, lb in zip(dims, lbs, strict=True)),
-        "        end if",
-        *(
-            f"        if (size({member_at_i}, {k}) > {cap}) {cap} = size({member_at_i}, {k})"
-            for k, cap in zip(dims, caps, strict=True)
+        f"    {taken} = .false.",
+        *_over_elements(
+            recipe,
+            outer_expr,
+            [
+                f"      if ({present}) then",
+                f"        if (size({member_at_i}) > 0) then",
+                f"          if (.not. {taken}) then",
+                *(f"            {lb} = lbound({member_at_i}, {k})" for k, lb in zip(dims, lbs, strict=True)),
+                f"            {taken} = .true.",
+                "          end if",
+                *(
+                    f"          if (lbound({member_at_i}, {k}) /= {lb}) {differs}"
+                    for k, lb in zip(dims, lbs, strict=True)
+                ),
+                "        end if",
+                *(
+                    f"        if (size({member_at_i}, {k}) > {cap}) {cap} = size({member_at_i}, {k})"
+                    for k, cap in zip(dims, caps, strict=True)
+                ),
+                "      end if",
+            ],
         ),
-        "      end if",
-        "    end do",
         # Empty-batch sentinel: keep every cap >= 1 so the buffer is non-degenerate.
         *(f"    if ({cap} == 0) {cap} = 1" for cap in caps),
     ]
@@ -311,6 +353,8 @@ def render_aos_alloc_members(
     ``declined_flag`` (when the wrapper has one and the caller passes it) or stops."""
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_members called on non-aos_alloc recipe")
+    if aos_outer_rank(recipe) != 1:
+        raise ValueError("render_aos_alloc_members takes the members of a rank-1 array of records")
     member_at_i = _aos_alloc_member_at_i(recipe)
     present = _aos_alloc_presence(recipe, member_at_i)
     dims = range(1, len(recipe.cap_symbols) + 1)
@@ -350,7 +394,7 @@ def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str, device: bo
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_pack_out called on non-aos_alloc recipe")
     flat = recipe.flat_names[0]
-    n_extent = recipe.shape_exprs[0] if recipe.shape_exprs else "size(" + outer_expr + ")"
+    elements = ", ".join(_element_indices(recipe))
     member_at_i = _aos_alloc_member_at_i(recipe)
     present = _aos_alloc_presence(recipe, member_at_i)
     live = ", ".join(f"1:size({member_at_i}, {k})" for k in range(1, len(recipe.cap_symbols) + 1))
@@ -358,14 +402,10 @@ def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str, device: bo
         buffer_idx, member_idx = aos_pack_subscripts(recipe)
         unpack = _device_pack_loop(recipe, member_at_i, f"{member_at_i}({member_idx}) = {flat}({buffer_idx})")
     else:
-        unpack = [f"        {member_at_i} = {flat}(i1, {live})"]
+        unpack = [f"        {member_at_i} = {flat}({elements}, {live})"]
     return [
         f"    ! ----- AoS pack-out: {flat} -> {outer_expr}{' on the device' if device else ''} -----",
-        f"    do i1 = 1, {n_extent}",
-        f"      if ({present}) then",
-        *unpack,
-        "      end if",
-        "    end do",
+        *_over_elements(recipe, outer_expr, [f"      if ({present}) then", *unpack, "      end if"]),
         *render_aos_alloc_release(recipe, device),
     ]
 

@@ -211,11 +211,11 @@ end subroutine
     assert r.shape_exprs == ("size(q, dim=1)", "cap_q_sf_d0", "cap_q_sf_d1", "cap_q_sf_d2")
 
 
-def test_aos_pointer_member_on_rank2_dummy_fails_loudly(tmp_path: Path, capfd):
-    """The padded pack/unpack handles a rank-1 array of records only: a rank-2 one is rejected, not miscompiled."""
-    with pytest.raises(RuntimeError):
-        _plan_from_fortran(
-            """
+def test_aos_pointer_member_on_rank2_dummy_records_every_record_dim(tmp_path: Path):
+    """A pointer member of a rank-2 array of records: the recipe indexes the elements by both record dims, ahead of
+    the member's, and sizes both from the array."""
+    plan = _plan_from_fortran(
+        """
 module fields_mod
   implicit none
   type, public :: field_t
@@ -230,9 +230,14 @@ subroutine kernel(q)
   q(1, 2)%sf(1) = q(2, 1)%sf(1)
 end subroutine
 """,
-            tmp_path,
-        )
-    assert "rank 2" in capfd.readouterr().err
+        tmp_path,
+    )
+    assert len(plan.entries) == 1
+    r = plan.entries[0].recipe
+    assert r.aos_alloc is True
+    assert r.rank == 3
+    assert r.read_exprs == ("q($i1, $i2)%sf($i3)",)
+    assert r.shape_exprs == ("size(q, dim=1)", "size(q, dim=2)", "cap_q_sf")
 
 
 def test_mixed_aos_alloc_and_plain_member_split_into_two_entries(tmp_path: Path):

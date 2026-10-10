@@ -30,6 +30,7 @@ from dace_fortran.bindings.fortran_interface import (
 )
 from dace_fortran.bindings.frozen_signature import FrozenArg, FrozenArgKind, FrozenSignature, ModuleOrigin
 from dace_fortran.bindings.loop_copy import (
+    aos_bounds_locals,
     aos_pack_extent_locals,
     fortran_scalar_type,
     render_alias_calls,
@@ -407,9 +408,9 @@ def build_wrapper_head(
                 max_loop_rank = max(max_loop_rank, r.rank)
             for flat in r.flat_names:
                 scratch_lines.append(f"    {ftype}, allocatable, target :: {flat}{shape_dims}")
+            if r.aos_alloc:
+                scratch_lines.append(f"    logical :: {', '.join(aos_bounds_locals(r))}")
             if r.aos_alloc and r.flat_names[0] in device_pack:
-                # The device pack loops run over the member's dims behind the element index.
-                max_loop_rank = max(max_loop_rank, 1 + len(r.cap_symbols))
                 scratch_lines.append(f"    logical :: {r.flat_names[0]}_padded")
                 scratch_lines.append(f"    {fortran_c_type('int64')} :: {', '.join(aos_pack_extent_locals(r))}")
 
@@ -424,6 +425,7 @@ def build_wrapper_head(
             f"    {fortran_scalar_type(r.scratch_dtype)}, pointer, contiguous :: {name}{member_dims}"
             for name in elements.values()
         ]
+        flat_ptr_lines.append(f"    logical :: {', '.join(aos_bounds_locals(r))}")
         max_loop_rank = max(max_loop_rank, 1)
 
     # A free symbol that's also a frozen arg must use that arg's C type (e.g.
