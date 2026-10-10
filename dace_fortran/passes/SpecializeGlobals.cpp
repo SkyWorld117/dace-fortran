@@ -22,7 +22,9 @@
 //     and a ``cf.cond_br`` (a lowered ``select case``) by a branch to its
 //     target, the blocks no longer reached going with it.  The ``symbol-dce``
 //     that follows drops the procedures only a dead branch called, so
-//     ``hlfir-inline-all`` never sees them.
+//     ``hlfir-inline-all`` never sees them.  Flang declares every variable of
+//     a used module in each procedure; the declarations nothing reads any more
+//     go too, or the bridge would still take those variables as inputs.
 //
 // Safety:
 //     A global the remaining module stores to, assigns, passes to a call or
@@ -43,6 +45,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "passes/Passes.h"
@@ -233,7 +236,23 @@ struct SpecializeGlobalsPass
           ++folded;
         }
     }
-    llvm::errs() << "hlfir-specialize-globals: " << folded << " branch(es) folded.\n";
+    // Flang declares every variable of a used module in each procedure; the declares nothing reads any more -- the
+    // specialised variables', and those only a dead branch used -- would still count as the entry's inputs.
+    llvm::SmallVector<hlfir::DeclareOp, 16> unused;
+    module.walk([&](hlfir::DeclareOp decl) {
+      if (decl->use_empty() && mlir::isa_and_nonnull<fir::AddrOfOp>(decl.getMemref().getDefiningOp()))
+        unused.push_back(decl);
+    });
+    for (hlfir::DeclareOp decl : unused) {
+      llvm::SmallVector<mlir::Operation*, 4> feeding;
+      for (mlir::Value operand : decl->getOperands())
+        if (mlir::Operation* def = operand.getDefiningOp()) feeding.push_back(def);
+      decl.erase();
+      for (mlir::Operation* def : feeding)
+        if (mlir::isOpTriviallyDead(def)) def->erase();
+    }
+    llvm::errs() << "hlfir-specialize-globals: " << folded << " branch(es) folded, " << unused.size()
+                 << " unused module variable declaration(s) erased.\n";
     llvm::errs().flush();
   }
 };
