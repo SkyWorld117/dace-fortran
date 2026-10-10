@@ -32,6 +32,7 @@ from dace_fortran.bindings.frozen_signature import FrozenArg, FrozenArgKind, Fro
 from dace_fortran.bindings.loop_copy import (
     aos_bounds_locals,
     aos_pack_extent_locals,
+    aos_pack_offset_locals,
     fortran_scalar_type,
     render_alias_calls,
     render_aos_alloc_members,
@@ -414,6 +415,7 @@ def build_wrapper_head(
             if r.aos_alloc and r.flat_names[0] in device_pack:
                 scratch_lines.append(f"    logical :: {r.flat_names[0]}_padded")
                 scratch_lines.append(f"    {fortran_c_type('int64')} :: {', '.join(aos_pack_extent_locals(r))}")
+                scratch_lines.append(f"    {fortran_c_type('int64')} :: {', '.join(aos_pack_offset_locals(r))}")
 
     for dt in sorted(guard_scratch_dtypes):
         flat_ptr_lines.append(f"    {fortran_scalar_type(dt)}, target :: {_presence_scratch_name(dt)}(1)")
