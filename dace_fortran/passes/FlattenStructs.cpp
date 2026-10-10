@@ -5142,10 +5142,86 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         llvm::SmallVector<mlir::Value, 4> const outerIdx =
             rebaseSubscripts(pb, parent.getLoc(), *outer, decl.getResult(0), flatBase);
 
+        // The lower bounds of the companion's member dims: those the elements share, the bounds of the loaded box.
+        llvm::SmallVector<mlir::Value, 4> memberLbs;
+        if (auto flatDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(flatBase.getDefiningOp())) {
+          std::vector<mlir::Value> const lbs = classifyShapeOperand(flatDecl.getShape()).lbs;
+          for (size_t d = outerIdx.size(); d < lbs.size(); ++d) memberLbs.push_back(lbs[d]);
+        }
+        auto toIndexAt = [](mlir::OpBuilder& b, mlir::Location loc, mlir::Value v) -> mlir::Value {
+          if (!v) return b.create<mlir::arith::ConstantIndexOp>(loc, 1).getResult();
+          return v.getType().isIndex() ? v : b.create<fir::ConvertOp>(loc, b.getIndexType(), v).getResult();
+        };
+        // Views of the member -- a callee's dummy declared over it with bounds of its own (``f(0:)`` over
+        // ``q(i)%sf``, through the rebox flang passes), a member section -- become dead once every access through
+        // them reads the companion; erased before the load they view.
+        llvm::SmallVector<mlir::Operation*, 8> memberViews;
+        // The shape a section imposes on the views after it (its designate's shape operand), null for views of the
+        // whole member, whose extents are the companion's.
+        auto sectionShape = [](mlir::Operation* view, mlir::Value inherited) -> mlir::Value {
+          auto section = mlir::dyn_cast<hlfir::DesignateOp>(view);
+          return section ? section.getShape() : inherited;
+        };
+        auto collapseViewAccesses = [&](mlir::Operation* view) {
+          llvm::SmallVector<std::pair<mlir::Value, mlir::Value>, 4> pending{
+              {view->getResult(0), sectionShape(view, {})}};
+          memberViews.push_back(view);
+          while (!pending.empty()) {
+            auto [w, shape] = pending.pop_back_val();
+            for (mlir::Operation* x : llvm::to_vector(w.getUsers())) {
+              if (viewedArray(x) == w) {
+                memberViews.push_back(x);
+                pending.emplace_back(x->getResult(0), sectionShape(x, shape));
+                continue;
+              }
+              // ``size`` / ``lbound`` of the view: its extent (the section's, else the companion's of that member
+              // dim) and its own lower bound.
+              if (auto bd = mlir::dyn_cast<fir::BoxDimsOp>(x)) {
+                auto dim = traceConstInt(bd.getDim());
+                if (!dim || !bd.getResult(2).use_empty()) continue;
+                mlir::Value ext;
+                if (shape) {
+                  llvm::SmallVector<mlir::Value, 4> const exts = extractExtents(shape);
+                  if (static_cast<size_t>(*dim) < exts.size()) ext = exts[*dim];
+                } else {
+                  ext = companionExtent(flatBase, outerIdx.size() + static_cast<unsigned>(*dim));
+                }
+                if (!ext) continue;
+                mlir::OpBuilder b(bd);
+                bd.getResult(1).replaceAllUsesWith(toIndexAt(b, bd.getLoc(), ext));
+                if (!bd.getResult(0).use_empty()) {
+                  llvm::SmallVector<mlir::Value, 4> const lbs = arrayLowerBounds(w);
+                  mlir::Value const lb = static_cast<size_t>(*dim) < lbs.size() ? lbs[*dim] : mlir::Value{};
+                  bd.getResult(0).replaceAllUsesWith(toIndexAt(b, bd.getLoc(), lb));
+                }
+                eraseInner.push_back(bd);
+                continue;
+              }
+              auto element = mlir::dyn_cast<hlfir::DesignateOp>(x);
+              if (!element || element.getComponentAttr() || element.getIndices().empty()) continue;
+              mlir::OpBuilder b(element);
+              auto member =
+                  subscriptsThroughViews(b, element.getLoc(), w, element.getIndices(), load.getResult(), memberLbs);
+              if (!member) continue;
+              llvm::SmallVector<mlir::Value, 4> merged;
+              for (mlir::Value v : outerIdx) merged.push_back(toIndexAt(b, element.getLoc(), v));
+              merged.append(member->begin(), member->end());
+              auto flat = b.create<hlfir::DesignateOp>(element.getLoc(), element.getResult().getType(), flatBase,
+                                                       mlir::ValueRange{merged});
+              element.getResult().replaceAllUsesWith(flat.getResult());
+              eraseInner.push_back(element);
+            }
+          }
+        };
+
         // For each user of the loaded box: if it's an
         // element-form designate, rewrite to a direct designate over
         // flatBase merging the outer and the member subscripts.
         for (auto* u : load.getResult().getUsers()) {
+          if (viewedArray(u) == load.getResult()) {
+            collapseViewAccesses(u);
+            continue;
+          }
           // ``size(A(i)%member)`` / ``lbound`` lower to ``fir.box_dims``
           // on the loaded per-instance member box.  That box no longer
           // exists after flattening, so redirect the query to the packed
@@ -5203,7 +5279,8 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         }
         // The load + the member/parent designate chain become
         // dead once the inner designate is erased.  Schedule
-        // them for the second sweep.
+        // them for the second sweep, after the views of the member.
+        eraseRest.append(memberViews.rbegin(), memberViews.rend());
         eraseRest.push_back(load);
         eraseRest.push_back(memDg);
         eraseRest.push_back(parent);

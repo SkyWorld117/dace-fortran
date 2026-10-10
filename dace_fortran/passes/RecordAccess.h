@@ -40,6 +40,18 @@ std::optional<llvm::SmallVector<mlir::Value, 4>> subscriptsInRoot(mlir::OpBuilde
                                                                   mlir::Value view, mlir::ValueRange subscripts,
                                                                   hlfir::DeclareOp root);
 
+/// The same for a root whose lower bounds are known to the caller rather than its IR -- a loaded member box, whose
+/// bounds a flat companion holds -- given as ``rootLbs`` (a null value stands for 1).
+std::optional<llvm::SmallVector<mlir::Value, 4>> subscriptsThroughViews(mlir::OpBuilder& b, mlir::Location loc,
+                                                                        mlir::Value view, mlir::ValueRange subscripts,
+                                                                        mlir::Value root,
+                                                                        llvm::ArrayRef<mlir::Value> rootLbs);
+
+/// The lower bounds in which subscripts of ``array`` are given, one per dim, a null value standing for 1: from a
+/// declaration's or box's shape or shift (1 without one), a conversion's operand's, 1 for a section.  Bounds a box
+/// carries only at run time are not modelled.
+llvm::SmallVector<mlir::Value, 4> arrayLowerBounds(mlir::Value array);
+
 /// ``subscripts`` of the leading dims of ``from`` as subscripts of the same elements of ``to``, which holds them in
 /// the same positions with lower bounds of its own (a flat companion of a record array, say).
 llvm::SmallVector<mlir::Value, 4> rebaseSubscripts(mlir::OpBuilder& b, mlir::Location loc, mlir::ValueRange subscripts,

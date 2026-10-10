@@ -8,6 +8,7 @@
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
 namespace hlfir_bridge {
@@ -120,11 +121,15 @@ mlir::Value viewedArray(mlir::Operation* op) {
   return {};
 }
 
-std::optional<llvm::SmallVector<mlir::Operation*, 4>> traceArrayViews(mlir::Value view, hlfir::DeclareOp root) {
+namespace {
+
+/// The views from ``view`` to the first value ``isRoot`` accepts, access first.
+std::optional<llvm::SmallVector<mlir::Operation*, 4>> traceViews(mlir::Value view,
+                                                                 llvm::function_ref<bool(mlir::Value)> isRoot) {
   llvm::SmallVector<mlir::Operation*, 4> hops;
   for (int i = 0; i < 64 && view; ++i) {
+    if (isRoot(view)) return hops;
     mlir::Operation* def = view.getDefiningOp();
-    if (def == root.getOperation()) return hops;
     if (!def) return std::nullopt;
     mlir::Value const next = viewedArray(def);
     if (!next) return std::nullopt;
@@ -140,14 +145,14 @@ std::optional<llvm::SmallVector<mlir::Operation*, 4>> traceArrayViews(mlir::Valu
   return std::nullopt;
 }
 
-std::optional<llvm::SmallVector<mlir::Value, 4>> subscriptsInRoot(mlir::OpBuilder& b, mlir::Location loc,
-                                                                  mlir::Value view, mlir::ValueRange subscripts,
-                                                                  hlfir::DeclareOp root) {
-  auto hops = traceArrayViews(view, root);
-  if (!hops || subscripts.size() != arrayRank(view)) return std::nullopt;
+/// Compose ``subscripts`` of ``view`` through ``hops`` into the index space of the root, whose lower bounds are
+/// ``rootLbs`` (a null value stands for 1).  The lower bounds of the views in between cancel out; only the first
+/// view's and the root's matter.
+llvm::SmallVector<mlir::Value, 4> compose(mlir::OpBuilder& b, mlir::Location loc, mlir::ValueRange subscripts,
+                                          llvm::ArrayRef<mlir::Operation*> hops, llvm::ArrayRef<mlir::Value> rootLbs) {
   llvm::SmallVector<mlir::Value, 4> subs;
   for (mlir::Value s : subscripts) subs.push_back(toIndex(b, loc, s));
-  for (mlir::Operation* hop : *hops) {
+  for (auto [h, hop] : llvm::enumerate(hops)) {
     mlir::Value const next = viewedArray(hop);
     if (auto section = mlir::dyn_cast<hlfir::DesignateOp>(hop)) {
       // ``lo + (u - 1) * st`` for the j-th triplet dim (a section starts at 1); a scalar subscript stays.
@@ -170,11 +175,38 @@ std::optional<llvm::SmallVector<mlir::Value, 4>> subscriptsInRoot(mlir::OpBuilde
       subs = std::move(mapped);
     } else if (!mlir::isa<fir::ConvertOp>(hop)) {
       llvm::SmallVector<mlir::Value, 4> const from = lowerBounds(hop->getResult(0));
-      llvm::SmallVector<mlir::Value, 4> const to = lowerBounds(next);
-      for (size_t k = 0; k < subs.size(); ++k) subs[k] = rebase(b, loc, subs[k], from[k], to[k]);
+      llvm::SmallVector<mlir::Value, 4> const to =
+          h + 1 == hops.size() ? llvm::SmallVector<mlir::Value, 4>(rootLbs) : lowerBounds(next);
+      for (size_t k = 0; k < subs.size(); ++k)
+        subs[k] = rebase(b, loc, subs[k], from[k], k < to.size() ? to[k] : mlir::Value{});
     }
   }
   return subs;
+}
+
+}  // namespace
+
+llvm::SmallVector<mlir::Value, 4> arrayLowerBounds(mlir::Value array) { return lowerBounds(array); }
+
+std::optional<llvm::SmallVector<mlir::Operation*, 4>> traceArrayViews(mlir::Value view, hlfir::DeclareOp root) {
+  return traceViews(view, [&](mlir::Value v) { return v.getDefiningOp() == root.getOperation(); });
+}
+
+std::optional<llvm::SmallVector<mlir::Value, 4>> subscriptsInRoot(mlir::OpBuilder& b, mlir::Location loc,
+                                                                  mlir::Value view, mlir::ValueRange subscripts,
+                                                                  hlfir::DeclareOp root) {
+  auto hops = traceArrayViews(view, root);
+  if (!hops || subscripts.size() != arrayRank(view)) return std::nullopt;
+  return compose(b, loc, subscripts, *hops, lowerBounds(root.getResult(0)));
+}
+
+std::optional<llvm::SmallVector<mlir::Value, 4>> subscriptsThroughViews(mlir::OpBuilder& b, mlir::Location loc,
+                                                                        mlir::Value view, mlir::ValueRange subscripts,
+                                                                        mlir::Value root,
+                                                                        llvm::ArrayRef<mlir::Value> rootLbs) {
+  auto hops = traceViews(view, [&](mlir::Value v) { return v == root; });
+  if (!hops || subscripts.size() != arrayRank(view)) return std::nullopt;
+  return compose(b, loc, subscripts, *hops, rootLbs);
 }
 
 llvm::SmallVector<mlir::Value, 4> rebaseSubscripts(mlir::OpBuilder& b, mlir::Location loc, mlir::ValueRange subscripts,

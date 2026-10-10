@@ -11,7 +11,6 @@ import ctypes
 
 import numpy as np
 import pytest
-from dace.sdfg.validation import InvalidSDFGEdgeError
 
 from tests.bindings.module_global_aos_struct_test import _build_module, _link_pair
 
@@ -415,7 +414,41 @@ end module ra_member_with_lower_bound
         call="kern(q, n)",
         out="do i = 1, 2; out((i-1)*n+1:i*n) = q(i)%sf; end do",
         nout=2,
-        xfail=(InvalidSDFGEdgeError, "the record subscript is lost at the member's rebox (memlet rank 1, array 2)"),
+    ),
+    # A section of a member passed to an assumed-shape dummy that asks for its size and lower bound.
+    "member_section_argument": dict(
+        src=f"""
+module ra_member_section_argument
+  implicit none
+{_TYPES}
+contains
+  subroutine scale(f)
+    real(8), dimension(:), intent(inout) :: f
+    integer :: j
+    do j = 1, size(f)
+      f(j) = 2*f(j) + lbound(f, 1) + 10*size(f)
+    end do
+  end subroutine scale
+
+  subroutine kern(q, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(2), intent(inout) :: q
+    call scale(q(2)%sf(3:n))
+  end subroutine kern
+end module ra_member_section_argument
+""",
+        local="type(scalar_field) :: q(2)",
+        setup="""
+  do i = 1, 2
+    allocate(q(i)%sf(n))
+    do j = 1, n
+      q(i)%sf(j) = 100*i + j
+    end do
+  end do
+""",
+        call="kern(q, n)",
+        out="do i = 1, 2; out((i-1)*n+1:i*n) = q(i)%sf; end do",
+        nout=2,
     ),
 }
 
