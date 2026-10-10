@@ -997,12 +997,13 @@ def assemble_module(
     for mod, renames in sorted(by_mod.items()):
         use_lines.append(f"  use {mod}, only: {', '.join(sorted(set(renames)))}")
     # AoS-struct components: import the HOST STRUCT plainly (no __mod alias, the
-    # copy loop references it directly). A DUMMY-rooted component (empty
+    # copy loop references it directly) -- the module variable the host expression
+    # starts from (``qp`` of ``qp % vf``). A DUMMY-rooted component (empty
     # aos_origin_mod) needs no import -- its root is already a wrapper argument.
     aos_by_mod: dict = {}
     for a in _aos_module_args(frozen):
         if a.aos_origin_mod:
-            aos_by_mod.setdefault(a.aos_origin_mod, set()).add(a.aos_origin_struct)
+            aos_by_mod.setdefault(a.aos_origin_mod, set()).add(a.aos_origin_struct.split("%")[0].strip())
     for mod, structs in sorted(aos_by_mod.items()):
         use_lines.append(f"  use {mod}, only: {', '.join(sorted(structs))}")
     use_statements = "\n".join(use_lines)
