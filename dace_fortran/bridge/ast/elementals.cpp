@@ -262,10 +262,10 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
         parent_val = sec.getMemref();
         continue;
       }
-      // Inlined-call dummy on a struct-member actual (gate #12): traceToDecl/walkMemberChain hop through to the caller
-      // chain via leadsToComponentDesignate, so the parent-walk must hop too or the record subscript is dropped and the
-      // memlet under-ranks.
-      if (dc.getDummyScope() && leadsToComponentDesignate(dc.getMemref())) {
+      // Inlined-call dummy on a struct-member actual (gate #12), possibly through the inlined dummies it is passed on as:
+      // traceToDecl/walkMemberChain hop through to the caller chain, so the parent-walk must hop too or the record
+      // subscript is dropped and the memlet under-ranks.
+      if (dc.getDummyScope() && dummyChainLeadsToComponent(dc)) {
         parent_val = dc.getMemref();
         viaComponentDummy = true;
         continue;

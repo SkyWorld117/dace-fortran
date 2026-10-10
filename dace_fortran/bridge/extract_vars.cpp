@@ -4085,7 +4085,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           // access is rooted at the OUTER struct dummy ``diag``, not the
           // inlined ``pvd`` dummy whose own type is a record ARRAY (a
           // SequenceType, so the RecordType check below would wrongly fail).
-          if (leadsToComponentDesignate(dc.getMemref())) {
+          // Also through the inlined dummies the member is passed on as.
+          if (dummyChainLeadsToComponent(dc)) {
             v = dc.getMemref();
             continue;
           }
@@ -4243,7 +4244,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           // segment (``diag % pvd``) and roots at the OUTER dummy ``diag``,
           // not the inlined ``pvd`` dummy -- the prepended pvd(i) record
           // index then attaches to the ``pvd`` segment (outer_rank == 1).
-          if (leadsToComponentDesignate(dc.getMemref())) {
+          if (dummyChainLeadsToComponent(dc)) {
             v = dc.getMemref();
             continue;
           }

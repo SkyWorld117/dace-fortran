@@ -186,6 +186,10 @@ mlir::Value peelBoxReinterpret(mlir::Value v, int maxDepth = limits::kAliasMemre
 /// block-arg/alloca). Callers walk through to the caller-side member (gate #11 in traceToDecl; reused as gate #12 by
 /// rootedAtStructDummy/walkMemberChain).
 bool leadsToComponentDesignate(mlir::Value mr);
+/// True when an inlined dummy's declare is bound to a struct-COMPONENT actual, directly (``leadsToComponentDesignate``
+/// of its memref) or through the declares of the inlined dummies it is passed on as (``twice(w)`` called from
+/// ``mid(w)``, itself called with ``fl(id) % vf``).
+bool dummyChainLeadsToComponent(hlfir::DeclareOp dc);
 
 /// If v peels to a PURE array-of-records SECTION designate (triplet/scalar subscripts, no component selector,
 /// RecordType element) whose base leads to a struct COMPONENT, return that section, else null. Narrow gate for the

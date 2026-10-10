@@ -193,6 +193,17 @@ bool leadsToComponentDesignate(mlir::Value mr) {
   return dg && static_cast<bool>(dg.getComponentAttr());
 }
 
+bool dummyChainLeadsToComponent(hlfir::DeclareOp dc) {
+  mlir::Value mr = dc.getMemref();
+  for (int i = 0; i < limits::kAliasMemrefWalkDepth && mr; ++i) {
+    if (leadsToComponentDesignate(mr)) return true;
+    auto outer = peelBoxReinterpret(mr).getDefiningOp<hlfir::DeclareOp>();
+    if (!outer || !outer.getDummyScope()) return false;
+    mr = outer.getMemref();
+  }
+  return false;
+}
+
 // Peel a section's base through box reinterprets, inlined whole-array-dummy aliases, and nested non-component
 // designates; true iff it reaches a struct-COMPONENT designate. Stricter-peeling variant of leadsToComponentDesignate,
 // which stops at the intermediate inlined dummy declare.
