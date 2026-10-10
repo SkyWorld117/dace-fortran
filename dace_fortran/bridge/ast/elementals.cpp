@@ -1,5 +1,4 @@
 // ast_helpers.h carries the cross-TU API + thread-local state shared with the other ast/*.cpp files.
-#include <algorithm>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -213,10 +212,6 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
   // innermost.getComponentAttr() is empty even though the access is a flattened struct member, so the flat name needs
   // traceToDecl on the innermost RESULT instead.
   bool sawComponentParent = false;
-  // Set once a record subscript has been prepended: an outer record hop whose subscripts are all constant
-  // (``dq(1) % vf(i) % sf``, ``p_patch_2d(1) % edges(je) % x``) is then part of the host expression, not a dimension of
-  // the flat member -- the same rule extract_vars applies when it shapes the member.
-  bool recordPrepended = false;
   // Per-block AoR section hop (e.g. ``vec_in(jc, jk) % x(k)`` over ``p_vn(:, :, blockno)``): composes the section
   // positionally into [jc, jk, blockno, k]. Do NOT use the generic triplet loop below -- it drops the member tail.
   auto applySectionHop = [](hlfir::DesignateOp sec, std::vector<DimEntry>& entries) {
@@ -305,14 +300,9 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
       // PREPEND the parent's record indices for a struct-field chain (innermost.getComponentAttr() or
       // sawComponentParent); otherwise overwrite, for plain nested-element access on a non-struct array.
       if (innermost.getComponentAttr() || sawComponentParent) {
-        bool const constantHop = std::all_of(pidxOps.begin(), pidxOps.end(),
-                                             [](mlir::Value iv) { return traceConstInt(iv).has_value(); });
-        if (!(recordPrepended && constantHop)) {
-          std::vector<DimEntry> combined = std::move(parent_entries);
-          for (auto& e : entries) combined.push_back(std::move(e));
-          entries = std::move(combined);
-          recordPrepended = true;
-        }
+        std::vector<DimEntry> combined = std::move(parent_entries);
+        for (auto& e : entries) combined.push_back(std::move(e));
+        entries = std::move(combined);
       } else {
         entries = std::move(parent_entries);
       }
