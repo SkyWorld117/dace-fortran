@@ -26,6 +26,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "passes/RecordAccess.h"
 
 namespace hlfir_bridge {
 
@@ -3133,7 +3134,25 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
               for (auto it = levels.rbegin(); it != levels.rend(); ++it)
                 for (auto& s : *it) aosElemIdx.push_back(s);
             }
+            // The section's subscripts are in the coordinates of the designated object -- an inlined dummy declared
+            // ``dimension(lb:, ...)`` among them -- whose lower bounds the 0-based subset subtracts (null: 1).
+            llvm::SmallVector<mlir::Value, 4> const secLbs = arrayLowerBounds(sec.getMemref());
+            unsigned dimPos = 0;
+            auto lowerBoundAt = [&](unsigned d) -> mlir::Value { return d < secLbs.size() ? secLbs[d] : mlir::Value{}; };
+            auto isOne = [](mlir::Value lb) { return !lb || traceConstInt(lb) == std::optional<int64_t>(1); };
+            // ``v - lb + plus`` as text, folded when both are literals; "" when the bound does not render.
+            auto minusLb = [](mlir::Value v, std::string const& vs, mlir::Value lb, int64_t plus) -> std::string {
+              auto vC = traceConstInt(v);
+              auto lbC = traceConstInt(lb);
+              if (vC && lbC) return std::to_string(*vC - *lbC + plus);
+              std::string const lbs = lbC ? std::to_string(*lbC) : renderBound(lb);
+              if (lbs.empty() || vs.empty()) return "";
+              std::string out = "(" + vs + ")-(" + lbs + ")";
+              if (plus != 0) out += "+" + std::to_string(plus);
+              return out;
+            };
             for (bool const triplet : triplets) {
+              mlir::Value const lb = lowerBoundAt(dimPos++);
               if (triplet && cursor + 2 < secIdx.size()) {
                 if (isWholeBoxDim(secIdx[cursor], secIdx[cursor + 2])) {
                   // Full dim, offset 0.  Render ``0:<extent>`` from the
@@ -3154,7 +3173,14 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
                 auto stC = traceConstInt(secIdx[cursor + 2]);
                 bool const is_full = (loC && *loC == 1) && (stC && *stC == 1);
                 if (!is_full) is_trivial_section = false;
-                if (!lo.empty() && !hi.empty()) {
+                std::string const loLb = isOne(lb) ? "" : minusLb(secIdx[cursor], lo, lb, 0);
+                std::string const hiLb = isOne(lb) ? "" : minusLb(secIdx[cursor + 1], hi, lb, 1);
+                if (!lo.empty() && !hi.empty() && !isOne(lb) && !loLb.empty() && !hiLb.empty()) {
+                  // Lower bound lb: ``lo-lb:hi-lb+1`` (0-based, exclusive upper).
+                  std::string s = loLb + ":" + hiLb;
+                  if (!st.empty() && st != "1") s += ":" + st;
+                  subset.push_back(std::move(s));
+                } else if (!lo.empty() && !hi.empty() && isOne(lb)) {
                   // DaCe subset uses ``lo-1:hi`` (0-based,
                   // inclusive upper).  Literal ``-1`` for
                   // constant lo; ``(lo)-1`` for symbolic.
@@ -3179,10 +3205,13 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
                   // form for the view_alias path
                   // ("(k)-1" / literal-minus-one).
                   std::string zero_based;
-                  if (auto c = traceConstInt(secIdx[cursor]))
+                  if (!isOne(lb))
+                    zero_based = minusLb(secIdx[cursor], k, lb, 0);
+                  else if (auto c = traceConstInt(secIdx[cursor]))
                     zero_based = std::to_string(*c - 1);
                   else
                     zero_based = "(" + k + ")-1";
+                  if (zero_based.empty()) zero_based = "?";
                   subset.push_back(zero_based);
                   // ``dim_map`` stays 1-based  --  it's
                   // spliced into index_exprs which
