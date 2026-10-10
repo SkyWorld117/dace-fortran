@@ -50,11 +50,21 @@ def standin_name(kind: str, entry: str) -> str:
     return f"dace_{kind}_{entry}"
 
 
+def _explicit_shape(a: OriginalArg) -> bool:
+    """True when every extent of an array passed by address is known (``dimension(sys_size)``): the stand-in then
+    declares it explicit-shape, so that it can hand the array on to an assumed-shape dummy (a binding's wrapper),
+    which an assumed-size array cannot be."""
+    return bool(a.rank) and len(a.shape) == a.rank and all(e.strip() not in ("", "*", ":", "?") for e in a.shape)
+
+
 def _declaration(a: OriginalArg) -> str:
     attributes = [a.fortran_type]
     shape = ""
     if a.passing == "address":
-        shape = "(*)" if a.rank else ""
+        if _explicit_shape(a):
+            shape = "(" + ", ".join(e.strip() for e in a.shape) + ")"
+        else:
+            shape = "(*)" if a.rank else ""
     elif a.passing in ("descriptor", "allocatable", "pointer"):
         if a.rank == 0 and a.passing == "descriptor":
             raise UnsupportedStandinError(f"dummy {a.name!r} is a scalar passed by descriptor (polymorphic)")
@@ -86,6 +96,13 @@ def render_dummies(iface: OriginalInterface) -> tuple[list[str], list[str]]:
             if not module:
                 raise UnsupportedStandinError(f"dummy {a.name!r}: no module defines type {a.struct_type!r}")
             uses.append(f"use {module}, only: {a.struct_type}")
+    # The names explicit extents use (module variables such as ``sys_size``).
+    extents = {w.lower() for a in iface.args if a.passing == "address" and _explicit_shape(a) for e in a.shape
+               for w in re.findall(r"[A-Za-z_]\w*", e)}
+    for module, syms in sorted(iface.used_modules.items()):
+        names = sorted(s for s in syms if s.lower() in extents)
+        if names:
+            uses.append(f"use {module}, only: {', '.join(names)}")
     return list(dict.fromkeys(uses)), [_declaration(a) for a in iface.args]
 
 
