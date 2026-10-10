@@ -264,8 +264,13 @@ struct SpecializeGlobalsPass
     }
     fir::ConvertOp::getCanonicalizationPatterns(patterns, &getContext());
     mlir::FrozenRewritePatternSet const frozen(std::move(patterns));
+    // Normal region simplification erases the blocks a decided branch leaves unreachable. The default, aggressive level
+    // also merges blocks that differ only in their operands -- the cases of a SELECT CASE that read different arrays --
+    // into one block taking the array as a block argument, which the later passes cannot trace to its variable.
+    mlir::GreedyRewriteConfig config;
+    config.setRegionSimplificationLevel(mlir::GreedySimplifyRegionLevel::Normal);
     for (bool changed = true; changed;) {
-      (void)mlir::applyPatternsGreedily(module, frozen);
+      (void)mlir::applyPatternsGreedily(module, frozen, config);
       // Post-order, inner ifs first: folding one never touches an if still to come, while an outer if folded first
       // would erase the inner ones of the branch it drops.
       llvm::SmallVector<fir::IfOp, 16> ifs;
