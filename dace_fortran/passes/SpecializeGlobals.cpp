@@ -26,6 +26,13 @@
 //     a used module in each procedure; the declarations nothing reads any more
 //     go too, or the bridge would still take those variables as inputs.
 //
+// Candidates:
+//     Every non-constant integer, real or logical module scalar the module
+//     reads and never writes -- whatever the configuration of a run could fix
+//     -- is recorded first, before any value is applied, as the module
+//     attribute ``hlfir.configuration_candidates`` (``"module::name"`` ->
+//     Fortran type), so a caller can find out which values to fix.
+//
 // Safety:
 //     A global the remaining module stores to, assigns, passes to a call or
 //     uses in any other way than a load is left alone (and reported): its
@@ -48,6 +55,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "bridge/extract_vars.h"
 #include "passes/Passes.h"
 
 namespace hlfir_bridge {
@@ -117,6 +125,36 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads) {
   return true;
 }
 
+/// The Fortran type of an integer, real or logical scalar (``integer(4)``, ``real(8)``, ``logical(4)``), or "".
+std::string scalarTypeName(mlir::Type type) {
+  if (auto logical = mlir::dyn_cast<fir::LogicalType>(type)) return "logical(" + std::to_string(logical.getFKind()) + ")";
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
+    return "integer(" + std::to_string(integer.getWidth() / 8) + ")";
+  if (auto real = mlir::dyn_cast<mlir::FloatType>(type)) return "real(" + std::to_string(real.getWidth() / 8) + ")";
+  return "";
+}
+
+/// Record every non-constant integer, real or logical module scalar ``module`` reads and never writes as the module
+/// attribute ``hlfir.configuration_candidates`` (``"module::name"`` -> Fortran type).
+void recordCandidates(mlir::ModuleOp module) {
+  llvm::StringMap<llvm::SmallVector<fir::AddrOfOp, 4>> addresses;
+  module.walk([&](fir::AddrOfOp addr) { addresses[addr.getSymbol().getRootReference().getValue()].push_back(addr); });
+  mlir::Builder b(module.getContext());
+  llvm::SmallVector<mlir::NamedAttribute, 64> candidates;
+  for (auto& [sym, addrs] : addresses) {
+    auto global = module.lookupSymbol<fir::GlobalOp>(sym);
+    if (!global || (global.getConstant().has_value() && *global.getConstant())) continue;
+    std::string const type = scalarTypeName(global.getType());
+    auto [mod, name] = decodeModuleGlobalSymbol(sym.str());
+    if (type.empty() || mod.empty()) continue;
+    llvm::SmallVector<fir::LoadOp, 8> loads;
+    bool readOnly = true;
+    for (fir::AddrOfOp addr : addrs) readOnly = readOnly && onlyLoaded(addr, loads);
+    if (readOnly && !loads.empty()) candidates.push_back(b.getNamedAttr(mod + "::" + name, b.getStringAttr(type)));
+  }
+  module->setAttr("hlfir.configuration_candidates", b.getDictionaryAttr(candidates));
+}
+
 /// The value of an ``i1`` condition that folds to a literal, through ``fir.convert``s.
 std::optional<bool> constantCondition(mlir::Value v) {
   for (int i = 0; i < 16 && v; ++i) {
@@ -172,6 +210,7 @@ struct SpecializeGlobalsPass
 
   void runOnOperation() override {
     mlir::ModuleOp module = getOperation();
+    recordCandidates(module);
     auto attr = module->getAttrOfType<mlir::DictionaryAttr>("hlfir.specialized_globals");
     if (!attr || attr.empty()) return;
     llvm::StringMap<std::string> values;  // mangled symbol -> value text
