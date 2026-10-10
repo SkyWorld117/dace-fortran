@@ -227,10 +227,12 @@ struct SpecializeGlobalsPass
     mlir::FrozenRewritePatternSet const frozen(std::move(patterns));
     for (bool changed = true; changed;) {
       (void)mlir::applyPatternsGreedily(module, frozen);
+      // Post-order, inner ifs first: folding one never touches an if still to come, while an outer if folded first
+      // would erase the inner ones of the branch it drops.
       llvm::SmallVector<fir::IfOp, 16> ifs;
-      module.walk([&](fir::IfOp op) { ifs.push_back(op); });
+      module.walk<mlir::WalkOrder::PostOrder>([&](fir::IfOp op) { ifs.push_back(op); });
       changed = false;
-      for (fir::IfOp op : llvm::reverse(ifs))
+      for (fir::IfOp op : ifs)
         if (foldConstantIf(op)) {
           changed = true;
           ++folded;
