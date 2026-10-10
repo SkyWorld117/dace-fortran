@@ -3999,7 +3999,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
   // in both a tasklet body and a memlet subset).
   {
     // Walk a designate's memref back through the reinterpret hops to its root: a struct-typed DUMMY (a declare with a
-    // dummy scope), a module-global record (``qp % vf(i) % sf``, ``qp`` a module variable), or neither.
+    // dummy scope), a module-global record or array of records (``qp % vf(i) % sf``, ``dq(1) % vf(i) % sf``), or
+    // neither.
     enum class StructRoot { None, Dummy, ModuleGlobal };
     auto structRootOf = [](hlfir::DesignateOp dg) -> StructRoot {
       mlir::Value v = dg.getMemref();
@@ -4007,8 +4008,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
         auto* d = v.getDefiningOp();
         if (!d) return StructRoot::None;
         if (auto addr = mlir::dyn_cast<fir::AddrOfOp>(d))
-          return mlir::isa<fir::RecordType>(fir::unwrapRefType(addr.getType())) ? StructRoot::ModuleGlobal
-                                                                                : StructRoot::None;
+          return mlir::isa<fir::RecordType>(peelTypeLayers(addr.getType())) ? StructRoot::ModuleGlobal
+                                                                            : StructRoot::None;
         if (auto dc = mlir::dyn_cast<hlfir::DeclareOp>(d)) {
           if (!dc.getDummyScope()) {
             // Local whole-object POINTER rebound to a struct-dummy component
