@@ -200,8 +200,8 @@ bool onlyReads(mlir::Value v, int depth = 0) {
 
 /// Every load of the scalar ``path`` names in ``global``, through the declares and converts on the way; false (and
 /// no loads) if anything may change it: a user of its address other than a load or the source of an assignment, of
-/// its record or element other than designators of other components, or a non-reading use of another element (whose
-/// subscript may be the same).
+/// its record or element other than designators of other components, or a non-reading use of an element at a runtime
+/// subscript (which may be the same).
 bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, ScalarPath const& path = {},
                 mlir::Operation** blocker = nullptr) {
   auto blocked = [&](mlir::Operation* op) {
@@ -231,9 +231,11 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, S
       } else if (auto conv = mlir::dyn_cast<fir::ConvertOp>(user)) {
         work.push_back({conv.getResult(), stage});
       } else if (designate && stage == Variable && path.element) {
-        if (constantElement(designate) == path.element)
+        // Another literal element is other storage; an element at a runtime subscript may be this one.
+        std::optional<int64_t> const element = constantElement(designate);
+        if (element == path.element)
           work.push_back({designate.getResult(), next(stage)});
-        else if (!onlyReads(designate.getResult()))
+        else if (!element && !onlyReads(designate.getResult()))
           return blocked(user);
       } else if (designate && stage != Target && isScalarComponent(designate)) {
         if (*designate.getComponent() == path.component) work.push_back({designate.getResult(), Target});
