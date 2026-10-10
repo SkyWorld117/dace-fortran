@@ -164,13 +164,19 @@ std::optional<ScalarPath> parseScalarPath(llvm::StringRef rest) {
   return path;
 }
 
-/// True when every user of ``v`` only reads through it: loads, and declares, converts and designators leading to
-/// loads.
+/// True when ``use`` reads the value it addresses whole: the source of an assignment (``is1 = idwbuff(1)``).
+bool isAssignedFrom(mlir::OpOperand& use) {
+  auto assign = mlir::dyn_cast<hlfir::AssignOp>(use.getOwner());
+  return assign && use.get() == assign.getRhs() && use.get() != assign.getLhs();
+}
+
+/// True when every user of ``v`` only reads through it: loads, sources of assignments, and declares, converts and
+/// designators leading to those.
 bool onlyReads(mlir::Value v, int depth = 0) {
   if (depth > 16) return false;
   for (mlir::OpOperand& use : v.getUses()) {
     mlir::Operation* user = use.getOwner();
-    if (mlir::isa<fir::LoadOp>(user)) continue;
+    if (mlir::isa<fir::LoadOp>(user) || isAssignedFrom(use)) continue;
     if (mlir::isa<hlfir::DeclareOp, fir::ConvertOp>(user) ||
         (mlir::isa<hlfir::DesignateOp>(user) && mlir::cast<hlfir::DesignateOp>(user).getMemref() == v)) {
       for (mlir::Value r : user->getResults())
@@ -183,8 +189,9 @@ bool onlyReads(mlir::Value v, int depth = 0) {
 }
 
 /// Every load of the scalar ``path`` names in ``global``, through the declares and converts on the way; false (and
-/// no loads) if anything may change it: a user of its address other than a load, of its record or element other than
-/// designators of other components, or a non-reading use of another element (whose subscript may be the same).
+/// no loads) if anything may change it: a user of its address other than a load or the source of an assignment, of
+/// its record or element other than designators of other components, or a non-reading use of another element (whose
+/// subscript may be the same).
 bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, ScalarPath const& path = {}) {
   // How far a value has come along ``path``: at the variable, at its element, or at the scalar itself.
   enum Stage { Variable, Element, Target };
@@ -202,6 +209,8 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, S
       if (designate && designate.getMemref() != v) designate = nullptr;
       if (auto load = mlir::dyn_cast<fir::LoadOp>(user)) {
         if (stage == Target) loads.push_back(load);
+      } else if (isAssignedFrom(use)) {
+        // Copied whole (``is1 = idwbuff(1)``): read, not changed; the copy keeps reading memory.
       } else if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(user)) {
         for (mlir::Value r : decl->getResults()) work.push_back({r, stage});
       } else if (auto conv = mlir::dyn_cast<fir::ConvertOp>(user)) {
