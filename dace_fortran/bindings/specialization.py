@@ -105,6 +105,17 @@ def render_symbol_record(
     return lines
 
 
+def decline_after_record() -> list[str]:
+    """Wrapper lines that follow :func:`render_symbol_record` in a sizing run: decline the call before the SDFG runs."""
+    from dace_fortran.bindings.block_builders import DECLINED_FLAG
+
+    return [
+        f"{_INDENT}! Sizing run: the caller runs its own code.",
+        f"{_INDENT}if (present({DECLINED_FLAG})) {DECLINED_FLAG} = .true.",
+        f"{_INDENT}return",
+    ]
+
+
 def _parse(text: str) -> Value:
     try:
         return int(text)

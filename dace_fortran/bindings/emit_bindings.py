@@ -27,6 +27,7 @@ from dace_fortran.bindings.frozen_signature import FrozenSignature
 from dace_fortran.bindings.specialization import (
     Specialization,
     build_specialization_guard,
+    decline_after_record,
     guard_module_sources,
     render_symbol_record,
 )
@@ -45,6 +46,7 @@ def emit_bindings(
     module_allocatables_are_targets: bool = True,
     specialization: Specialization | None = None,
     record_symbols_to: str | Path | None = None,
+    record_only: bool = False,
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -85,6 +87,8 @@ def emit_bindings(
     them before it does any work and declines the call otherwise (:mod:`dace_fortran.bindings.specialization`).
     ``record_symbols_to`` (optional): a file the wrapper appends the integer symbols and scalar inputs of every call
     to, the input of :func:`dace_fortran.bindings.specialization.recorded_invariants`.
+    ``record_only`` (with ``record_symbols_to`` and ``specialization``): the wrapper declines every call once it has
+    recorded it, so the caller runs its own code -- a sizing run that never executes the general SDFG.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -131,10 +135,13 @@ def emit_bindings(
     if specialization is not None:
         guard = build_specialization_guard(specialization, iface, plan)
         blocks["wrapper_body"] = "\n".join([*guard, "", blocks["wrapper_body"]])
+    if record_only and (record_symbols_to is None or specialization is None):
+        raise ValueError("record_only needs record_symbols_to and a specialization (the wrapper declines through it)")
     if record_symbols_to is not None:
-        blocks["wrapper_body"] = "\n".join(
-            [blocks["wrapper_body"], "", *render_symbol_record(frozen, iface, plan, record_symbols_to)]
-        )
+        record = render_symbol_record(frozen, iface, plan, record_symbols_to)
+        if record_only:
+            record += decline_after_record()
+        blocks["wrapper_body"] = "\n".join([blocks["wrapper_body"], "", *record])
     extra = guard_module_sources(specialization, iface, plan) if specialization is not None else None
     out_file.write_text(assemble_module(iface, frozen, blocks, plan, acc_residency, extra_sources=extra))
     return out_file
