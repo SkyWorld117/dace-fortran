@@ -179,3 +179,32 @@ DO i = 1, n
 ENDDO
 END SUBROUTINE driver
 """, "loop_carried_scalar")
+
+
+def test_symbol_reuse_as_index(tmp_path):
+    """Reused INTEGER index variable (role ``symbol``, not ``scalar``) assigned twice with a
+    compute reading it in between::
+
+        k = 2  ;  c(i) = a(k)
+        k = n  ;  c(i) = c(i) + a(k)
+
+    The loop batch path keys staged symbol writes by target NAME, so both writes collapsed onto
+    one pre-body interstate edge and BOTH reads used the last ``k`` (``c = a(n) + a(n)`` instead
+    of ``a(2) + a(n)``).  Covers ``emit_loop``'s repeated-symbol-write fallback to the
+    source-order path (which closes an edge at each intervening compute)."""
+    _run(
+        tmp_path, """
+SUBROUTINE driver(a, b, c, n)
+integer, intent(in) :: n
+double precision, intent(in) :: a(n), b(n)
+double precision, intent(inout) :: c(n)
+integer k, i
+DO i = 1, n
+    k = 2
+    c(i) = a(k)
+    k = n
+    c(i) = c(i) + a(k)
+ENDDO
+END SUBROUTINE driver
+""", "symbol_reuse_index")
+

@@ -256,6 +256,152 @@ def count_gpu(sdfg):
     return n_gpu, n_dev
 
 
+def _reroute_host_scalar_accesses(sdfg, culprit):
+    """Give every host-side scalar access of a device-resident container a host mirror.
+
+    The demotion below exists because a container promoted to GPU_Global may also be touched by
+    HOST code, which the validator refuses.  Demoting the container is only sound when it is NOT
+    also touched by device code: otherwise codegen is left holding a device tasklet and a host
+    array and has no legal register<->host copy to bridge them (`IllegalCopy`).  This helper
+    covers that case the other way round -- keep the container device-resident and route each
+    host scalar access through a host-resident (CPU_Heap) mirror, linked by a GPU_Global<->CPU_Heap
+    copy for which a dispatcher *does* exist.  It keys on storage and access shape only, never on a
+    container's name, so it is WRF-agnostic.  Returns the number of accesses re-routed; 0 means it
+    cannot help and the caller must fall back to demoting.
+
+    Handled: a direct AccessNode<->Tasklet scalar edge, and a single-element read inside a
+    loop/branch condition (a LoopRegion or interstate-edge condition), whose condition text is
+    rewritten to read the mirror.  Anything else -- a dynamic map range, an ambiguous multi-read
+    condition -- is left for the caller, which demotes as before.
+    """
+    from copy import deepcopy
+    from dace import Memlet
+    from dace.sdfg.scope import is_devicelevel_gpu
+    from dace.subsets import Range
+    from dace.properties import CodeBlock
+    import re as _re
+
+    # Only a container that is BOTH device- and host-accessed is worth re-routing: demotion
+    # strands its device tasklets, which is the defect.  For a host-only container demotion is
+    # already sound, so leave it exactly as before -- this keeps every existing demotion (and
+    # hence any other user of these trees, MFC included) byte-for-byte unchanged.
+    def _gpu_boundary(pn):
+        return (isinstance(pn, (nodes.EntryNode, nodes.ExitNode)) and getattr(pn, 'map', None) is not None
+                and pn.map.schedule in dace.dtypes.GPU_SCHEDULES)
+
+    device_accessed = False
+    for st in sdfg.all_states():
+        if not isinstance(st, SDFGState):
+            continue
+        for nd in st.nodes():
+            if not (isinstance(nd, nodes.AccessNode) and nd.data == culprit):
+                continue
+            if is_devicelevel_gpu(sdfg, st, nd) or any(
+                    _gpu_boundary(pe.src) or _gpu_boundary(pe.dst)
+                    for e in st.all_edges(nd) for pe in st.memlet_path(e)):
+                device_accessed = True
+                break
+        if device_accessed:
+            break
+    if not device_accessed:
+        return 0
+
+    dtype = sdfg.arrays[culprit].dtype
+
+    def _new_mirror():
+        # A 1-element host transient: its shape is a LITERAL, so it never drags an array's shape
+        # symbol (e.g. a `shape_symbols`-only extent) into the generated program signature, which
+        # would desync the ABI.  The copy memlets carry the element index through `other_subset`.
+        name = f'__host_mirror_{len(sdfg.arrays)}'
+        while name in sdfg.arrays:
+            name += '_'
+        sdfg.add_array(name, [1], dtype, transient=True, storage=dace.dtypes.StorageType.Default)
+        return name
+
+    def _one():
+        return Range([(0, 0, 1)])
+
+    n = 0
+    for state in list(sdfg.all_states()):
+        if not isinstance(state, SDFGState):
+            continue
+        for e in list(state.edges()):
+            if e.data is None or e.data.data != culprit or e.data.num_elements() != 1:
+                continue
+            if len(state.memlet_path(e)) != 1:  # only a direct AccessNode<->Tasklet edge
+                continue
+            src, dst = e.src, e.dst
+            read = isinstance(src, nodes.AccessNode) and isinstance(dst, nodes.Tasklet)
+            write = isinstance(dst, nodes.AccessNode) and isinstance(src, nodes.Tasklet)
+            if not (read or write):
+                continue
+            tasklet = dst if read else src
+            if is_devicelevel_gpu(sdfg, state, tasklet):
+                continue  # a device access to a GPU_Global container is legal as it stands
+            sub = deepcopy(e.data.subset)
+            src_conn, dst_conn = e.src_conn, e.dst_conn
+            mname = _new_mirror()
+            mnode = state.add_access(mname)
+            state.remove_edge(e)
+            if read:
+                # culprit[sub] -> mirror[0] -> tasklet
+                state.add_edge(src, src_conn, mnode, None,
+                               Memlet(data=culprit, subset=sub, other_subset=_one()))
+                state.add_edge(mnode, None, dst, dst_conn, Memlet(data=mname, subset=_one()))
+            else:
+                # tasklet -> mirror[0] -> culprit[sub]
+                state.add_edge(src, src_conn, mnode, None, Memlet(data=mname, subset=_one()))
+                state.add_edge(mnode, None, dst, dst_conn,
+                               Memlet(data=mname, subset=_one(), other_subset=deepcopy(sub)))
+            n += 1
+
+    # Host reads in a loop/branch CONDITION (a LoopRegion or interstate-edge condition) are not
+    # tasklet edges, so the loop above cannot reach them.  Re-route them the same way: mirror the
+    # read element with a copy placed in the condition edge's SOURCE state (which runs immediately
+    # before the condition is evaluated), and rewrite the condition/assignments to read the mirror.
+    # Still keyed on the read memlets and their shape, never on a container's name.  Only a single
+    # unambiguous read on the edge is re-routed; anything else is left to the demotion fallback.
+    pat = _re.compile(r'\b%s\s*\[[^\]]*\]' % _re.escape(culprit))
+    for region in list(sdfg.all_control_flow_regions()):
+        for e in list(region.edges()):
+            d = getattr(e, 'data', None)
+            if d is None or not isinstance(e.src, SDFGState):
+                continue
+            try:
+                reads = [
+                    m for m in d.get_read_memlets(sdfg.arrays)
+                    if m.data == culprit and m.subset is not None and m.subset.num_elements() == 1
+                ]
+            except Exception:
+                continue
+            if len(reads) != 1:
+                continue
+            cond = getattr(d, 'condition', None)
+            assignments = getattr(d, 'assignments', None) or {}
+            occ = sum(len(pat.findall(v)) for v in assignments.values())
+            occ += len(pat.findall(cond.as_string)) if cond is not None else 0
+            if occ != 1:
+                continue
+            sub = deepcopy(reads[0].subset)
+            mname = _new_mirror()
+            src_node = next((nd for nd in e.src.nodes()
+                             if isinstance(nd, nodes.AccessNode) and nd.data == culprit), None)
+            if src_node is None:
+                src_node = e.src.add_access(culprit)
+            mnode = e.src.add_access(mname)
+            e.src.add_edge(src_node, None, mnode, None,
+                           Memlet(data=culprit, subset=sub, other_subset=_one()))
+            repl = f'{mname}[0]'
+            if assignments:
+                d.assignments = {k: pat.sub(repl, v) for k, v in assignments.items()}
+            # Re-set the condition even when unchanged: the assignment rewrite above must
+            # invalidate the edge's cached condition symbols.
+            if cond is not None:
+                d.condition = CodeBlock(pat.sub(repl, cond.as_string), language=cond.language)
+            n += 1
+    return n
+
+
 def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False,
                             permissive_ltm=False):
     """Schedule + storage assignment for device-resident offload. In place.
@@ -419,7 +565,10 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
 
     from dace.sdfg.validation import InvalidSDFGEdgeError, InvalidSDFGInterstateEdgeError
     demoted = []
-    for _ in range(len(promoted) + 1):
+    rerouted = set()
+    # Each round either demotes one container or re-routes one container's host scalar accesses,
+    # both of which strictly shrink the residual host access, so a linear budget suffices.
+    for _ in range(4 * (len(promoted) + 1)):
         try:
             sdfg.validate()
             break
@@ -431,6 +580,16 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
             culprit = (m.group(1) or m.group(2)) if m else None
             if culprit is None or culprit not in sdfg.arrays or culprit in demoted:
                 raise
+            if culprit not in rerouted:
+                # Prefer keeping the container device-resident: demoting it would strand any
+                # device tasklet that also touches it (the IllegalCopy gap).  Fall through to
+                # demotion only if the host access is not a scalar tasklet edge we can mirror.
+                rerouted.add(culprit)
+                n = _reroute_host_scalar_accesses(sdfg, culprit)
+                if n > 0:
+                    print(f"[dace_fortran.offload] kept {culprit} device-resident; re-routed "
+                          f"{n} host scalar access(es) through a host mirror")
+                    continue
             sdfg.arrays[culprit].storage = dace.dtypes.StorageType.Default
             demoted.append(culprit)
             n_dev -= 1

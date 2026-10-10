@@ -870,7 +870,17 @@ def emit_loop(builder, ctx: '_Ctx', n, region, iter_map=None):
         hazardous = _hoist_hazard_targets(symbol_assign_pairs, compute_targets)
         hazardous |= _hoist_hazard_targets(per_sym_assigns, compute_targets | {t for t, _ in symbol_assign_pairs})
 
-        if hazardous:
+        # A symbol TARGET written more than once in the same loop body cannot ride a single
+        # pre-body edge: the batch is keyed by target NAME, so a later write silently
+        # overwrites the earlier one and every compute in the body then reads the LAST value
+        # (``k = kts+1 ; b = a(k) ; k = kte ; b = b + a(k)`` returned ``a(kte)`` for both
+        # terms).  The source-order path below closes an edge at each intervening compute, so
+        # it is correct for this reuse; fall back to it.  Keyed solely on a target repeating,
+        # never on any name, so it holds for any source program.
+        symbol_targets = [t for t, _ in symbol_assign_pairs] + [t for t, _ in per_sym_assigns]
+        repeated_symbol_write = len(symbol_targets) != len(set(symbol_targets))
+
+        if hazardous or repeated_symbol_write:
             # At least one hoisted assignment reads a value something it skips past defines, so the
             # hoist would rotate it by an iteration (see ``_hoist_hazard_targets``).  Emit the batch
             # statement by statement in SOURCE order instead: computes land in the current state,
