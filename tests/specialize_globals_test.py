@@ -32,7 +32,9 @@ contains
     do s = 1, nsweeps
       y = y + scale*x
     end do
-    if (use_extra) call extra(y)
+    if (use_extra) then
+      if (nsweeps > 1) call extra(y)
+    end if
   end subroutine step
 
   subroutine rescale(x, y)
