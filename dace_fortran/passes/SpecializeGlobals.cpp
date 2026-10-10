@@ -41,6 +41,7 @@
 //     (dace_fortran.bindings.specialization).
 // ============================================================================
 
+#include "bridge/extract_vars.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
@@ -55,7 +56,6 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "bridge/extract_vars.h"
 #include "passes/Passes.h"
 
 namespace hlfir_bridge {
@@ -127,7 +127,8 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads) {
 
 /// The Fortran type of an integer, real or logical scalar (``integer(4)``, ``real(8)``, ``logical(4)``), or "".
 std::string scalarTypeName(mlir::Type type) {
-  if (auto logical = mlir::dyn_cast<fir::LogicalType>(type)) return "logical(" + std::to_string(logical.getFKind()) + ")";
+  if (auto logical = mlir::dyn_cast<fir::LogicalType>(type))
+    return "logical(" + std::to_string(logical.getFKind()) + ")";
   if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
     return "integer(" + std::to_string(integer.getWidth() / 8) + ")";
   if (auto real = mlir::dyn_cast<mlir::FloatType>(type)) return "real(" + std::to_string(real.getWidth() / 8) + ")";
@@ -193,8 +194,7 @@ bool foldConstantIf(fir::IfOp ifOp) {
   return true;
 }
 
-struct SpecializeGlobalsPass
-    : public mlir::PassWrapper<SpecializeGlobalsPass, mlir::OperationPass<mlir::ModuleOp>> {
+struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, mlir::OperationPass<mlir::ModuleOp>> {
   // NOLINTNEXTLINE(misc-const-correctness): 'id' is defined by the LLVM MLIR_DEFINE_*_TYPE_ID macro.
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SpecializeGlobalsPass)
 
