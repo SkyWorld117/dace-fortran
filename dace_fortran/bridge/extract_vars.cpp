@@ -4007,9 +4007,11 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       for (int i = 0; i < limits::kSsaBackWalkDepth && v; ++i) {
         auto* d = v.getDefiningOp();
         if (!d) return StructRoot::None;
-        if (auto addr = mlir::dyn_cast<fir::AddrOfOp>(d))
-          return mlir::isa<fir::RecordType>(peelTypeLayers(addr.getType())) ? StructRoot::ModuleGlobal
-                                                                            : StructRoot::None;
+        if (auto addr = mlir::dyn_cast<fir::AddrOfOp>(d)) {
+          mlir::Type t = peelTypeLayers(addr.getType());
+          if (auto seq = mlir::dyn_cast<fir::SequenceType>(t)) t = peelTypeLayers(seq.getEleTy());
+          return mlir::isa<fir::RecordType>(t) ? StructRoot::ModuleGlobal : StructRoot::None;
+        }
         if (auto dc = mlir::dyn_cast<hlfir::DeclareOp>(d)) {
           if (!dc.getDummyScope()) {
             // Local whole-object POINTER rebound to a struct-dummy component
@@ -4105,6 +4107,11 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       // past one and collapses ``recDims`` to 0, dropping the member's real
       // varying record dims (``dual_cart_normal(je,jb) % x``).
       std::vector<bool> record_const;
+      // Parallel to ``record_const``: the constant subscripts of a constant segment, in source order -- what the host
+      // expression writes for it (``p_patch_2d(1)``).
+      std::vector<std::vector<int64_t>> record_subscripts;
+      // The constant subscripts of an array-of-records root (``dq(1) % vf``); empty for a scalar root.
+      std::vector<int64_t> root_subscripts;
       int outer_rank = 0;
     };
     // box<ptr<...>> = Fortran POINTER, box<heap<...>> = ALLOCATABLE; the
@@ -4150,8 +4157,18 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       // since the last component flush is a compile-time constant.  Reset at
       // each flush; cleared by any loop-varying subscript.
       bool pendingConst = true;
+      // The values of the pending subscripts while they are all constant, in source order.
+      std::vector<int64_t> pendingVals;
+      std::vector<std::vector<int64_t>> subsR{{}};
       auto allConstIdx = [](mlir::OperandRange idxs) -> bool {
         return std::all_of(idxs.begin(), idxs.end(), [](mlir::Value iv) { return traceConstInt(iv).has_value(); });
+      };
+      // Prepend the constant values of ``idxs`` (designates are met leaf to root, subscripts root-ward come first).
+      auto takeConstIdx = [&](mlir::OperandRange idxs) {
+        std::vector<int64_t> vals;
+        for (mlir::Value iv : idxs)
+          if (auto c = traceConstInt(iv)) vals.push_back(*c);
+        pendingVals.insert(pendingVals.begin(), vals.begin(), vals.end());
       };
       for (int i = 0; i < limits::kSsaBackWalkDepth && v; ++i) {
         auto* d = v.getDefiningOp();
@@ -4170,7 +4187,9 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
               auto origin = decodeModuleGlobalSymbol(addr.getSymbol().getRootReference().getValue().str());
               mc.root_module = origin.first;
               mc.root = origin.second;
-              mc.ok = !mc.root.empty();
+              // An array-of-records root needs constant subscripts: the host expression names one element of it.
+              mc.ok = !mc.root.empty() && (pendingRec == 0 || pendingConst);
+              if (pendingRec > 0) mc.root_subscripts = pendingVals;
               break;
             }
             v = dc.getMemref();
@@ -4240,13 +4259,17 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
             ptrR.push_back(boxIsPointer(dg2.getResult().getType()));
             recR.push_back(pendingRec + static_cast<int>(dg2.getIndices().size()));
             recConstR.push_back(pendingConst && allConstIdx(dg2.getIndices()));
+            takeConstIdx(dg2.getIndices());
+            subsR.push_back(recConstR.back() ? pendingVals : std::vector<int64_t>{});
             pendingRec = 0;
             pendingConst = true;
+            pendingVals.clear();
           } else {
             // A pure element/record-index designate over a loaded box: its
             // subscripts index the component reached next (root-ward).
             pendingRec += static_cast<int>(dg2.getIndices().size());
             pendingConst = pendingConst && allConstIdx(dg2.getIndices());
+            takeConstIdx(dg2.getIndices());
           }
           v = dg2.getMemref();
           continue;
@@ -4259,6 +4282,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
         mc.is_pointer.push_back(ptrR[i]);
         mc.record_dims.push_back(recR[i]);
         mc.record_const.push_back(recConstR[i]);
+        mc.record_subscripts.push_back(subsR[i]);
         mc.outer_rank += recR[i];
       }
       return mc;
@@ -4449,7 +4473,12 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           // an N-dim cartesian array member).
           int const recIdx = recSeg;
           mv.aos_origin_mod = mc.root_module;
-          std::string originStruct = mc.root;
+          auto subscripts = [](const std::vector<int64_t>& vals) {
+            std::string text;
+            for (int64_t const v : vals) text += (text.empty() ? "(" : ", ") + std::to_string(v);
+            return text.empty() ? text : text + ")";
+          };
+          std::string originStruct = mc.root + subscripts(mc.root_subscripts);
           for (int i = 0; i <= recIdx; ++i) {
             originStruct += " % " + mc.names[i];
             // A constant record-array hop STRICTLY BEFORE the varying record
@@ -4461,7 +4490,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
             // the outer hop bare (``p_patch_2d % edges % primal_cart_normal``)
             // makes the binding reference a POINTER component to the right of a
             // nonzero-rank part reference -- an illegal Fortran designator.
-            if (i < recIdx && mc.record_dims[i] > 0 && mc.record_const[i]) originStruct += "(1)";
+            if (i < recIdx && mc.record_dims[i] > 0 && mc.record_const[i])
+              originStruct += subscripts(mc.record_subscripts[i]);
           }
           std::string memberPath;
           for (int i = recIdx + 1; i < static_cast<int>(mc.names.size()); ++i)
