@@ -12,6 +12,10 @@ accessor per variable appended, compiled with the original flags and linked in p
   ``dace_access_<name>()`` returning a pointer to it (null for an unallocated allocatable), and a ``target`` attribute
   statement for those that are neither pointers nor targets yet. The declarations themselves are left as they are, so
   the module's data keeps its layout.
+* Each variable also gets a ``bind(c)`` subroutine (``dace_access_<module>_<name>``) that hands out the variable's
+  address, bounds and presence. A scope that must not compile against the copy -- any scope that also uses an original
+  module depending on it, whose module file refers to the original -- reaches the variable through an interface to it
+  and ``c_f_pointer`` (:func:`c_accessor_interface`, :func:`c_accessor_association`).
 * :func:`changed_global_data_symbols` checks that: every global data symbol of the original object must be in the copy
   with the same size. Other objects of the program, compiled against the original module, reference only those symbols
   and the module's public procedures, whose names do not change; an empty result means the copy can replace the
@@ -48,6 +52,7 @@ class ExposedVariable:
     rank: int
     allocatable: bool
     pointer: bool
+    c_accessor: str = ""  # binding name of the ``bind(c)`` accessor: ``dace_access_<module>_<name>``
 
 
 class ModuleAccessError(ValueError):
@@ -165,6 +170,70 @@ def _accessor(var: ExposedVariable) -> list[str]:
     return lines
 
 
+def _present_test(var: ExposedVariable) -> str:
+    if var.allocatable:
+        return f"allocated({var.name})"
+    if var.pointer:
+        return f"associated({var.name})"
+    return ".true."
+
+
+def _c_accessor(var: ExposedVariable) -> list[str]:
+    """``subroutine <accessor>_c(addr, lbounds, ubounds, present) bind(c, name=<c_accessor>)``: the variable's address,
+    its bounds per dim and whether it exists (allocated / associated)."""
+    proc = f"{var.accessor}_c"
+    lines = [
+        f"subroutine {proc}(addr, lbounds, ubounds, present) bind(c, name='{var.c_accessor}')",
+        "    use, intrinsic :: iso_c_binding, only: c_ptr, c_int, c_int64_t, c_loc, c_null_ptr",
+        "    type(c_ptr), intent(out) :: addr",
+        "    integer(c_int64_t), intent(out) :: lbounds(*), ubounds(*)",
+        "    integer(c_int), intent(out) :: present",
+        "    addr = c_null_ptr",
+        "    present = 0",
+        f"    if (.not. {_present_test(var)}) return",
+        "    present = 1",
+        f"    addr = c_loc({var.name})",
+    ]
+    for k in range(1, var.rank + 1):
+        lines.append(f"    lbounds({k}) = lbound({var.name}, {k})")
+        lines.append(f"    ubounds({k}) = ubound({var.name}, {k})")
+    lines.append(f"end subroutine {proc}")
+    return lines
+
+
+def c_accessor_interface(var: ExposedVariable, name: str) -> list[str]:
+    """An interface block declaring ``var``'s ``bind(c)`` accessor under the local name ``name``."""
+    return [
+        "interface",
+        f"    subroutine {name}(addr, lbounds, ubounds, present) bind(c, name='{var.c_accessor}')",
+        "        import :: c_ptr, c_int, c_int64_t",
+        "        type(c_ptr), intent(out) :: addr",
+        "        integer(c_int64_t), intent(out) :: lbounds(*), ubounds(*)",
+        "        integer(c_int), intent(out) :: present",
+        f"    end subroutine {name}",
+        "end interface",
+    ]
+
+
+def c_accessor_association(var: ExposedVariable, accessor: str, pointer: str) -> list[str]:
+    """Statements pointing ``pointer`` (a pointer of ``var``'s type and rank) at ``var`` through its ``bind(c)``
+    accessor declared as ``accessor``, with ``var``'s own bounds, or nullifying it when ``var`` does not exist. They use
+    the locals ``dace_addr`` (``type(c_ptr)``), ``dace_lb`` / ``dace_ub`` (``integer(c_int64_t)``, rank entries or
+    more) and ``dace_present`` (``integer(c_int)``)."""
+    lines = [f"call {accessor}(dace_addr, dace_lb, dace_ub, dace_present)", f"nullify({pointer})"]
+    if var.rank == 0:
+        return [*lines, f"if (dace_present /= 0) call c_f_pointer(dace_addr, {pointer})"]
+    dims = f"1:{var.rank}"
+    lower = ", ".join(f"dace_lb({k}):" for k in range(1, var.rank + 1))
+    return [
+        *lines,
+        "if (dace_present /= 0) then",
+        f"    call c_f_pointer(dace_addr, {pointer}, dace_ub({dims}) - dace_lb({dims}) + 1)",
+        f"    {pointer}({lower}) => {pointer}",
+        "end if",
+    ]
+
+
 def expose_module_variables(source: str, module: str, names: Sequence[str]) -> tuple[str, dict[str, ExposedVariable]]:
     """``source`` with accessors to the variables ``names`` of ``module`` appended, and what each accessor returns.
 
@@ -192,6 +261,7 @@ def expose_module_variables(source: str, module: str, names: Sequence[str]) -> t
             found[key] = ExposedVariable(
                 name=key,
                 accessor=ACCESSOR_PREFIX + key,
+                c_accessor=f"{ACCESSOR_PREFIX}{module.lower()}_{key}",
                 type_spec=type_spec,
                 rank=_rank(entity[name.end() :].split("=", 1)[0]) or _rank(dimension),
                 allocatable="allocatable" in attributes,
@@ -203,7 +273,12 @@ def expose_module_variables(source: str, module: str, names: Sequence[str]) -> t
     if missing:
         raise ModuleAccessError(f"no variable {missing} declared in the specification part of module {module!r}")
     variables = [found[n.lower()] for n in names]
-    taken = [v.accessor for v in variables if re.search(rf"\b{v.accessor}\b", source, re.IGNORECASE)]
+    taken = [
+        name
+        for v in variables
+        for name in (v.accessor, f"{v.accessor}_c")
+        if re.search(rf"\b{name}\b", source, re.IGNORECASE)
+    ]
     if taken:
         raise ModuleAccessError(f"module {module!r} already declares {taken}")
 
@@ -212,7 +287,7 @@ def expose_module_variables(source: str, module: str, names: Sequence[str]) -> t
     if needs_target:
         spec_lines.append(f"    target :: {', '.join(needs_target)}")
     spec_lines.append(f"    public :: {', '.join(v.accessor for v in variables)}")
-    procedures = [f"    {line}" for v in variables for line in _accessor(v)]
+    procedures = [f"    {line}" for v in variables for line in [*_accessor(v), *_c_accessor(v)]]
     if contains is None:
         out = [*lines[:end], *spec_lines, "contains", *procedures, *lines[end:]]
     else:

@@ -1160,20 +1160,22 @@ def assemble_module(
     ``extra_sources``: module variables of symbols the SDFG no longer takes but the wrapper still reads (those of a
     specialisation guard), imported alongside ``frozen``'s.
 
-    ``private_access``: per module, the variables it keeps private, reached through the accessors of a module copy
-    (:func:`dace_fortran.bindings.module_access.expose_module_variables`): each is a module-level pointer under the
-    name an import would have given it, pointed at the variable when the wrapper starts. ``private_imports``: the
-    ``use`` lines the pointers' declarations need (the kinds and types their type specs name)."""
+    ``private_access``: per module, the variables it keeps private, reached through the ``bind(c)`` accessors of a
+    module copy (:func:`dace_fortran.bindings.module_access.expose_module_variables`): each is a module-level pointer
+    under the name an import would have given it, pointed at the variable when the wrapper starts. The binding never
+    uses the copy itself: its module file would meet, in the same compilation, original modules that depend on the
+    original. ``private_imports``: the ``use`` lines the pointers' declarations need (the kinds and types their type
+    specs name)."""
+    from dace_fortran.bindings.module_access import c_accessor_association, c_accessor_interface
+
     private = {m.lower(): {n.lower(): v for n, v in vs.items()} for m, vs in (private_access or {}).items()}
     pointers: list[tuple[str, ExposedVariable]] = []  # (name in the binding, variable)
-    accessors: dict[str, set[str]] = {}
 
     def through_accessor(mod: str, name: str, local: str) -> bool:
         var = private.get(mod.lower(), {}).get(name.lower())
         if var is None:
             return False
         pointers.append((local, var))
-        accessors.setdefault(mod, set()).add(var.accessor)
         return True
 
     use_lines = [f"  use {mod}, only: {', '.join(syms)}" for mod, syms in sorted(iface.used_modules.items())]
@@ -1200,20 +1202,32 @@ def assemble_module(
                 aos_by_mod.setdefault(a.aos_origin_mod, set()).add(struct)
     for mod, structs in sorted(aos_by_mod.items()):
         use_lines.append(f"  use {mod}, only: {', '.join(sorted(structs))}")
-    use_lines += [f"  use {mod}, only: {', '.join(sorted(names))}" for mod, names in sorted(accessors.items())]
     if pointers:
         use_lines += [line if line.startswith("  ") else f"  {line}" for line in private_imports]
     use_statements = "\n".join(use_lines)
     handle_state = blocks["handle_state"]
     associations = ""
     if pointers:
-        declarations = ["  ! Private module variables, reached through the accessors of the module's copy"]
+        declarations = ["  ! Private module variables, reached through the bind(c) accessors of the module's copy"]
+        interfaces = {}
         for local, var in pointers:
             shape = "(" + ", ".join([":"] * var.rank) + ")" if var.rank else ""
             attributes = "pointer, contiguous" if var.rank else "pointer"
             declarations.append(f"  {var.type_spec}, {attributes} :: {local}{shape} => null()")
+            interfaces.setdefault(var.c_accessor, var)
+        for name, var in sorted(interfaces.items()):
+            declarations += [f"  {line}" for line in c_accessor_interface(var, name)]
         handle_state = "\n".join([*declarations, "", handle_state])
-        associations = "\n".join(f"    {local} => {var.accessor}()" for local, var in pointers) + "\n"
+        rank = max([var.rank for _, var in pointers] + [1])
+        body = [
+            "    block",
+            "      type(c_ptr) :: dace_addr",
+            f"      integer(c_int64_t) :: dace_lb({rank}), dace_ub({rank})",
+            "      integer(c_int) :: dace_present",
+        ]
+        for local, var in pointers:
+            body += [f"      {line}" for line in c_accessor_association(var, var.c_accessor, local)]
+        associations = "\n".join([*body, "    end block"]) + "\n"
     wrapper_body = (
         blocks["wrapper_head"] + "\n" + associations + blocks["wrapper_body"] + "\n" + blocks["wrapper_tail"]
     )
@@ -1643,12 +1657,12 @@ def _aos_loops(a: FrozenArg, pieces: AosLoopPieces) -> AosLoops:
             ["      end do" for _ in its],
             ", ".join(f"size({struct}, {k + 1})" for k in range(len(its))),
             one_dims,
-            _present(struct, a.aos_struct_pointer),
+            ".true." if a.aos_struct_static else _present(struct, a.aos_struct_pointer),
         )
     root, segment = _aos_root_and_segment(a)
     roots, segs = its[: a.aos_root_rank], its[a.aos_root_rank :]
     element_segment = f"{root}({', '.join(roots)})%{segment}"
-    root_present = f"allocated({root})"
+    root_present = ".true." if a.aos_struct_static else f"allocated({root})"
     segment_present = _present(element_segment, a.aos_struct_pointer)
     do_root = [f"      do {j} = 1, size({root}, {k + 1})" for k, j in enumerate(roots)]
     prelude = [f"    {c} = 0" for c in pieces.segment_caps]

@@ -2617,6 +2617,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
                       // the outer marshalling guard picks ``associated`` /
                       // ``allocated``.
                       mv.aos_struct_pointer = isPointerAttr;
+                      mv.aos_struct_static = !isPointerAttr && !isAllocatableAttr;
                       // Allocation provenance (binding correctness): if the
                       // kernel ALLOCATEs the AoS global itself (``allocate(
                       // becxx(...))``), the host has no data to copy IN and the
@@ -4172,6 +4173,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       // Subscripts of a module-global root that is itself an array of records (``fl(id) % vf(i) % sf``: 1); they
       // lead the companion's dims, ahead of every segment's.
       int root_dims = 0;
+      // The module-global root has a fixed size (no descriptor: neither allocatable nor pointer).
+      bool root_static = false;
     };
     // box<ptr<...>> = Fortran POINTER, box<heap<...>> = ALLOCATABLE; the
     // binding guards them with ``associated`` vs ``allocated`` (wrong one is a
@@ -4240,6 +4243,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
               // Pending subscripts at the root index the root itself, an array of records.
               mc.root_dims = pendingRec;
               mc.outer_rank = pendingRec;
+              mc.root_static = !mlir::isa<fir::BaseBoxType>(fir::unwrapRefType(addr.getType()));
               break;
             }
             v = dc.getMemref();
@@ -4541,6 +4545,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           mv.aos_member_path = memberPath;
           mv.aos_outer_rank = segDims;
           mv.aos_root_rank = moduleRoot ? mc.root_dims : 0;
+          mv.aos_struct_static = moduleRoot && mc.root_static;
           mv.aos_struct_pointer = mc.is_pointer[recIdx];
           mv.aos_member_pointer = mc.is_pointer.back();
         }

@@ -94,6 +94,7 @@ class FrozenArg:
     aos_member_path: str = ""
     aos_outer_rank: int = 0
     aos_root_rank: int = 0
+    aos_struct_static: bool = False  # the root record array has a fixed size: no presence guard
     global_alloc_inside: bool = False
     aos_struct_pointer: bool = False
     aos_member_pointer: bool = False

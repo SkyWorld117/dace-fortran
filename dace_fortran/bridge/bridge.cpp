@@ -522,6 +522,7 @@ NB_MODULE(hlfir_bridge, m) {
       .def_ro("aos_member_path", &VarInfo::aos_member_path)
       .def_ro("aos_outer_rank", &VarInfo::aos_outer_rank)
       .def_ro("aos_root_rank", &VarInfo::aos_root_rank)
+      .def_ro("aos_struct_static", &VarInfo::aos_struct_static)
       .def_ro("global_alloc_inside", &VarInfo::global_alloc_inside)
       .def_ro("aos_struct_pointer", &VarInfo::aos_struct_pointer)
       .def_ro("aos_member_pointer", &VarInfo::aos_member_pointer)
