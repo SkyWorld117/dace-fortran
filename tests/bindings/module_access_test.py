@@ -79,8 +79,10 @@ def test_constants_unknown_names_and_taken_accessor_names_are_refused():
         expose_module_variables(_OWNER, "owner", ["nmax"])
     with pytest.raises(ModuleAccessError, match="no variable"):
         expose_module_variables(_OWNER, "owner", ["q_missing"])
+    taken = _OWNER.replace(
+        "    integer :: n_public = 0\n", "    integer :: n_public = 0\n    integer :: dace_access_q_prim\n"
+    )
     with pytest.raises(ModuleAccessError, match="already declares"):
-        taken = _OWNER.replace("    integer :: n_public = 0\n", "    integer :: n_public = 0\n    integer :: dace_access_q_prim\n")
         expose_module_variables(taken, "owner", ["q_prim"])
     with pytest.raises(ModuleAccessError, match="no module"):
         expose_module_variables(_OWNER, "other", ["q_prim"])
