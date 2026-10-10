@@ -2391,6 +2391,15 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
                     if (auto edg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(lu))
                       if (!edg.getComponentAttr()) scanRoots.push_back(edg.getResult());
                 }
+                // Static array of records at module scope (``type(t) :: tab(3)``): the element designate hangs off
+                // the declare itself, with no load between.  Its component designates name the fields -- and so do
+                // those of an inlined callee's dummy declared on the element (``call f(tab(2))``).
+                if (auto edg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(u)) {
+                  if (!edg.getComponentAttr()) {
+                    scanRoots.push_back(edg.getResult());
+                    for (auto ad : aliasDeclaresOf(edg.getResult())) scanRoots.push_back(ad.getResult(0));
+                  }
+                }
                 // Whole-record POINTER rebind re-root (RewritePointerAssigns
                 // ``params_oce => v_params``): the re-rooted member reads/writes
                 // root on a ``fir.convert %declare : (ref<record>) -> ptr<record>``
