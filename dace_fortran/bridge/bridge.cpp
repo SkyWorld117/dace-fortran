@@ -314,6 +314,7 @@ class HLFIRModule {
       d["is_struct"] = a.is_struct;
       d["struct_name"] = a.struct_name;
       d["struct_module"] = a.struct_module;
+      d["passing"] = a.passing;
       args.append(d);
     }
     for (auto& kv : info.used_modules) {

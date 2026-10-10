@@ -97,6 +97,10 @@ class OriginalArg:
     optional: bool = False
     # fortran_type == 'type(<name>)' -> points at OriginalInterface.struct_types.
     struct_type: str | None = None
+    # How the caller passes it: 'address' (scalar, explicit-shape or assumed-size), 'descriptor' (assumed-shape),
+    # 'allocatable' / 'pointer' (the descriptor of such a dummy), 'value', 'character'; '' when not known (a
+    # hand-written interface).
+    passing: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +163,7 @@ def build_auto_interface(raw: dict, entry: str) -> OriginalInterface:
                 intent=a["intent"],
                 optional=bool(a.get("optional", False)),
                 struct_type=struct_type,
+                passing=a.get("passing", ""),
             )
         )
     used_modules = {mod: tuple(syms) for mod, syms in raw["used_modules"].items()}

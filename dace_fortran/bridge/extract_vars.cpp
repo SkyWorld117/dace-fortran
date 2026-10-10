@@ -4782,10 +4782,40 @@ FortranInterfaceInfo extractFortranInterface(mlir::ModuleOp module, const std::s
         decl = d;
         break;
       }
+    // A VALUE dummy is declared over a local copy the entry stores the argument into.
+    for (auto* u : barg.getUsers()) {
+      auto st = mlir::dyn_cast<fir::StoreOp>(u);
+      if (decl || !st || st.getValue() != barg) continue;
+      for (auto* mu : st.getMemref().getUsers())
+        if (auto d = mlir::dyn_cast<hlfir::DeclareOp>(mu);
+            d && d.getFortranAttrs() &&
+            bitEnumContainsAny(*d.getFortranAttrs(), fir::FortranVariableFlagsEnum::value)) {
+          decl = d;
+          break;
+        }
+    }
     if (!decl) continue;
 
     FortranArgInfo a;
     a.name = extractName(decl.getUniqName().str());
+    mlir::Type const argTy = barg.getType();
+    if (mlir::isa<fir::BaseBoxType>(argTy)) {
+      a.passing = "descriptor";
+    } else if (auto ref = mlir::dyn_cast<fir::ReferenceType>(argTy)) {
+      auto box = mlir::dyn_cast<fir::BaseBoxType>(ref.getEleTy());
+      if (!box)
+        a.passing = "address";
+      else if (mlir::isa<fir::PointerType>(box.getEleTy()))
+        a.passing = "pointer";
+      else if (mlir::isa<fir::HeapType>(box.getEleTy()))
+        a.passing = "allocatable";
+      else
+        a.passing = "descriptor";
+    } else if (mlir::isa<fir::BoxCharType>(argTy)) {
+      a.passing = "character";
+    } else {
+      a.passing = "value";
+    }
     if (auto fa = decl.getFortranAttrs()) {
       auto f = *fa;
       if (bitEnumContainsAny(f, fir::FortranVariableFlagsEnum::intent_inout))

@@ -121,6 +121,10 @@ struct FortranArgInfo {
   bool is_struct = false;                  // derived-type dummy
   std::string struct_name;                 // ``point`` when ``is_struct``
   std::string struct_module;               // defining module (``mo_pt``) or ``""``
+  /// How the caller passes it (the entry block argument's type): ``address`` (scalar, explicit-shape or
+  /// assumed-size), ``descriptor`` (assumed-shape or polymorphic), ``allocatable`` / ``pointer`` (the descriptor of
+  /// an allocatable / pointer dummy), ``value`` (VALUE), ``character``.
+  std::string passing;
 };
 
 /// One field of a Fortran derived-type entry dummy, populated alongside FortranArgInfo; extractFortranInterface walks
