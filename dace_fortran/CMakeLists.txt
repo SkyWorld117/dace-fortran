@@ -409,6 +409,7 @@ add_library(hlfir_bridge_passes STATIC
     passes/FoldConstantScalars.cpp
     passes/RestoreCountedLoops.cpp
     passes/SpecializeGlobals.cpp
+    passes/RecordAccess.cpp
 )
 target_link_libraries(hlfir_bridge_passes PUBLIC
     hlfir_bridge_core

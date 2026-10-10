@@ -188,7 +188,80 @@ end module ra_section_argument
         call="kern(q, n)",
         out="do i = 1, 4; out((i-1)*n+1:i*n) = q(i)%sf; end do",
         nout=4,
-        xfail=(KeyError, "a section of a record-array dummy is not collapsed"),
+    ),
+    # A strided section of a record-array dummy.
+    "strided_section_argument": dict(
+        src=f"""
+module ra_strided_section_argument
+  implicit none
+{_TYPES}
+contains
+  subroutine inner(v, m, n)
+    integer, intent(in) :: m, n
+    type(scalar_field), dimension(:), intent(inout) :: v
+    integer :: i, j
+    do i = 1, m
+      do j = 1, n
+        v(i)%sf(j) = 3*v(i)%sf(j) - i
+      end do
+    end do
+  end subroutine inner
+
+  subroutine kern(q, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(5), intent(inout) :: q
+    call inner(q(1:5:2), 3, n)
+  end subroutine kern
+end module ra_strided_section_argument
+""",
+        local="type(scalar_field) :: q(5)",
+        setup="""
+  do i = 1, 5
+    allocate(q(i)%sf(n))
+    do j = 1, n
+      q(i)%sf(j) = 100*i + j
+    end do
+  end do
+""",
+        call="kern(q, n)",
+        out="do i = 1, 5; out((i-1)*n+1:i*n) = q(i)%sf; end do",
+        nout=5,
+    ),
+    # A section passed to a dummy whose lower bound is 0.
+    "section_into_zero_based_dummy": dict(
+        src=f"""
+module ra_section_into_zero_based_dummy
+  implicit none
+{_TYPES}
+contains
+  subroutine inner(v, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(0:), intent(inout) :: v
+    integer :: j
+    do j = 1, n
+      v(0)%sf(j) = v(0)%sf(j) + v(1)%sf(j)
+    end do
+  end subroutine inner
+
+  subroutine kern(q, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(4), intent(inout) :: q
+    call inner(q(3:4), n)
+  end subroutine kern
+end module ra_section_into_zero_based_dummy
+""",
+        local="type(scalar_field) :: q(4)",
+        setup="""
+  do i = 1, 4
+    allocate(q(i)%sf(n))
+    do j = 1, n
+      q(i)%sf(j) = 100*i + j
+    end do
+  end do
+""",
+        call="kern(q, n)",
+        out="do i = 1, 4; out((i-1)*n+1:i*n) = q(i)%sf; end do",
+        nout=4,
     ),
     # A rank-2 dummy array of records with a pointer member.
     "rank2_dummy": dict(

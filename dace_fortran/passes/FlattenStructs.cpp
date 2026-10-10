@@ -218,6 +218,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "passes/Passes.h"
+#include "passes/RecordAccess.h"
 #include "passes/ragged_aos.h"
 #include "passes/shallow_alias.h"
 
@@ -4178,19 +4179,14 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
               // designate on the boxed value.
               if (hasComponentReachable(ld.getResult())) return true;
             }
-            if (auto dcl = mlir::dyn_cast<hlfir::DeclareOp>(u)) {
-              // Inlined-callee alias declare (``%alias = hlfir.declare
-              // %arg#N ...``): after ``hlfir-inline-all`` the callee's
-              // dummy reads designate over this alias, not the block arg
-              // directly.  Follow it so an AoS struct dummy whose only
-              // component accesses come through an inlined alias (e.g.
-              // ICON-O coriolis' ``vn_dual(i,j,k)%x`` inside the inlined
-              // ``rot_vertex_ocean_3d``) is still recognised as
-              // component-accessed and flattened -- otherwise it is
-              // silently skipped and the access leaks as an unregistered
-              // flat-companion name (``p_vn_dual_x``) at the libcall.
-              if (hasComponentReachable(dcl.getResult(0))) return true;
-            }
+            // A view of the array -- an inlined callee's alias declare (``%alias = hlfir.declare %arg#N ...``), a
+            // section passed as an argument, the boxes and conversions between them: after ``hlfir-inline-all`` the
+            // callee's reads designate over the view, not the block arg directly.  Follow it so an AoS struct dummy
+            // whose only component accesses come through one (ICON-O coriolis' ``vn_dual(i,j,k)%x`` inside the
+            // inlined ``rot_vertex_ocean_3d``, a ``call inner(q(2:3))``) is still recognised as component-accessed
+            // and flattened -- otherwise it is silently skipped and the access leaks as an unregistered
+            // flat-companion name (``p_vn_dual_x``) at the libcall.
+            if (viewedArray(u) == v && hasComponentReachable(u->getResult(0))) return true;
           }
           return false;
         };
@@ -5087,36 +5083,10 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
   ///   ``fir.ptr<...>`` that doesn't match the static 2D
   ///   companion.  Future TODO if real code hits this.
   static void collapseAosAllocReads(hlfir::DeclareOp decl, llvm::StringRef memName, mlir::Value flatBase) {
-    // Phase 5c-B: also recognise inlined-callee aliased declares.
-    // When ``hlfir-inline-all`` splices a module-contained
-    // ``call kernel(A)`` body into the caller, the kernel's
-    // ``A`` dummy becomes a fresh ``hlfir.declare %caller_A_decl
-    // dummy_scope %dsc {uniq_name="..."}`` aliasing the same
-    // storage.  Designates inside the inlined kernel body are
-    // rooted at the alias's results, not ``decl``'s  --  without
-    // following alias chains we'd miss every read inside the
-    // inlined call.
-    auto isDeclOrAlias = [&](mlir::Value v) -> bool {
-      for (int i = 0; i < kFlattenMaxDepth && v; ++i) {
-        if (v == decl.getResult(0) || v == decl.getResult(1)) return true;
-        auto* d = v.getDefiningOp();
-        if (!d) return false;
-        if (auto inner = mlir::dyn_cast<hlfir::DeclareOp>(d)) {
-          v = inner.getMemref();
-          continue;
-        }
-        if (auto eb = mlir::dyn_cast<fir::EmboxOp>(d)) {
-          v = eb.getMemref();
-          continue;
-        }
-        if (auto cv = mlir::dyn_cast<fir::ConvertOp>(d)) {
-          v = cv.getValue();
-          continue;
-        }
-        return false;
-      }
-      return false;
-    };
+    // Elements are reached through views of ``decl`` too: when ``hlfir-inline-all`` splices a module-contained
+    // ``call kernel(A)`` body into the caller, the kernel's ``A`` dummy becomes a declare aliasing the same storage
+    // (with bounds of its own); a section passed as the argument (``call kernel(A(2:3))``) puts the section between
+    // them.  ``traceArrayViews`` / ``subscriptsInRoot`` (RecordAccess.h) follow them and compose the subscripts.
     // Resolve dimension ``dim`` of the packed companion to the extent
     // value baked into its declare's shape op.  Used to redirect a
     // ``size(A(i)%member)`` query onto the companion's matching dim --
@@ -5157,52 +5127,20 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
         if (!compAttr || compAttr.getValue() != memName) return;
         auto parent = mlir::dyn_cast_or_null<hlfir::DesignateOp>(memDg.getMemref().getDefiningOp());
         if (!parent) return;
-        if (!isDeclOrAlias(parent.getMemref())) return;
+        if (!traceArrayViews(parent.getMemref(), decl)) return;
         // parent must be element-form (no triplets).
         for (bool const t : parent.getIsTriplet())
           if (t) return;
         if (parent.getIndices().empty()) return;
 
-        // Collect the outer indices (typically a single scalar i for a 1-D
-        // AoS).  They are relative to the declare the parent designates:
-        // an inlined callee's alias declares bounds of its own (``q_c(nf)``
-        // for a caller's ``q(0:nf-1)``), so rebase them to the flat
-        // companion's.
-        llvm::SmallVector<mlir::Value, 4> outerIdx(parent.getIndices().begin(), parent.getIndices().end());
-        {
-          hlfir::DeclareOp viewDecl;
-          for (mlir::Value v = parent.getMemref(); v && !viewDecl;) {
-            auto* d = v.getDefiningOp();
-            if (auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(d))
-              viewDecl = decl;
-            else if (auto eb = mlir::dyn_cast_or_null<fir::EmboxOp>(d))
-              v = eb.getMemref();
-            else if (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(d))
-              v = cv.getValue();
-            else
-              break;
-          }
-          auto flatDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(flatBase.getDefiningOp());
-          auto viewLbs = viewDecl ? classifyShapeOperand(viewDecl.getShape()).lbs : std::vector<mlir::Value>{};
-          auto flatLbs = flatDecl ? classifyShapeOperand(flatDecl.getShape()).lbs : std::vector<mlir::Value>{};
-          auto constLb = [](mlir::Value lb) { return lb ? traceConstInt(lb) : std::optional<int64_t>(1); };
-          mlir::OpBuilder pb(parent->getContext());
-          pb.setInsertionPointAfter(parent);
-          auto idxTy = pb.getIndexType();
-          auto asIndex = [&](mlir::Value v) {
-            if (!v) return pb.create<mlir::arith::ConstantOp>(parent.getLoc(), idxTy, pb.getIndexAttr(1)).getResult();
-            return v.getType() == idxTy ? v : pb.create<fir::ConvertOp>(parent.getLoc(), idxTy, v).getResult();
-          };
-          for (size_t d = 0; d < outerIdx.size(); ++d) {
-            mlir::Value const from = d < viewLbs.size() ? viewLbs[d] : mlir::Value{};
-            mlir::Value const to = d < flatLbs.size() ? flatLbs[d] : mlir::Value{};
-            auto cf = constLb(from);
-            auto ct = constLb(to);
-            if (from == to || (cf && ct && *cf == *ct)) continue;
-            auto shifted = pb.create<mlir::arith::SubIOp>(parent.getLoc(), asIndex(outerIdx[d]), asIndex(from));
-            outerIdx[d] = pb.create<mlir::arith::AddIOp>(parent.getLoc(), shifted, asIndex(to)).getResult();
-          }
-        }
+        // The outer indices in ``decl``'s own index space, then in the flat companion's (whose lower bounds are
+        // ``decl``'s for a dummy, 1 for a local instance).
+        mlir::OpBuilder pb(parent->getContext());
+        pb.setInsertionPointAfter(parent);
+        auto outer = subscriptsInRoot(pb, parent.getLoc(), parent.getMemref(), parent.getIndices(), decl);
+        if (!outer) return;
+        llvm::SmallVector<mlir::Value, 4> const outerIdx =
+            rebaseSubscripts(pb, parent.getLoc(), *outer, decl.getResult(0), flatBase);
 
         // For each user of the loaded box: if it's an
         // element-form designate, rewrite to a direct designate over
