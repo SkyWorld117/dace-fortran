@@ -3766,6 +3766,31 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
     // the in-kernel-mutation reject below.
     std::map<std::string, mlir::Value> symAddr;
     bool bail = false;
+    // Is ``addr`` written only as a DO loop's counter?  Flang stores a DO variable on every trip (a loop block
+    // argument) and its final value after the loop (a loop result): an index stepping through the elements, not a
+    // time-level symbol.
+    auto onlyCountsLoops = [](mlir::Value addr) {
+      bool stored = false;
+      for (auto* u : addr.getUsers()) {
+        mlir::Value value;
+        if (auto st = mlir::dyn_cast<fir::StoreOp>(u)) {
+          if (st.getMemref() != addr) continue;
+          value = st.getValue();
+        } else if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u)) {
+          if (as.getLhs() != addr) continue;
+          value = as.getRhs();
+        } else {
+          continue;
+        }
+        while (auto cv = value.getDefiningOp<fir::ConvertOp>()) value = cv.getValue();
+        auto arg = mlir::dyn_cast<mlir::BlockArgument>(value);
+        bool const counter = arg ? mlir::isa_and_nonnull<fir::DoLoopOp>(arg.getOwner()->getParentOp())
+                                 : mlir::isa_and_nonnull<fir::DoLoopOp>(value.getDefiningOp());
+        if (!counter) return false;
+        stored = true;
+      }
+      return stored;
+    };
 
     func.walk([&](hlfir::DesignateOp elemDg) {
       if (bail) return;
@@ -3819,6 +3844,9 @@ struct FlattenStructsPass : public mlir::PassWrapper<FlattenStructsPass, mlir::O
           symAddr[sym] = m;
         }
       }
+      // A DO loop's counter picks one element per trip: an ordinary array-of-records access, left to the regular
+      // flatten -- two loops indexing one array by their counters are no double buffer.
+      if (auto addrIt = symAddr.find(sym); addrIt != symAddr.end() && onlyCountsLoops(addrIt->second)) return;
       Key key;
       key.root = v.getAsOpaquePointer();
       key.path.assign(walkedPath.rbegin(), walkedPath.rend());
