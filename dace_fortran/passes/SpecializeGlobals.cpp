@@ -297,12 +297,22 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
     mlir::GreedyRewriteConfig config;
     config.setRegionSimplificationLevel(mlir::GreedySimplifyRegionLevel::Normal);
     for (bool changed = true; changed;) {
+      // A parenthesised condition (``if ((a .and. b))``) reaches its branch through an ``hlfir.no_reassoc``, which
+      // means nothing for a constant and would hide it from the folding.
+      llvm::SmallVector<hlfir::NoReassocOp, 8> parens;
+      module.walk([&](hlfir::NoReassocOp op) {
+        if (op.getVal().getDefiningOp<mlir::arith::ConstantOp>()) parens.push_back(op);
+      });
+      for (hlfir::NoReassocOp op : parens) {
+        op.replaceAllUsesWith(op.getVal());
+        op.erase();
+      }
       (void)mlir::applyPatternsGreedily(module, frozen, config);
       // Post-order, inner ifs first: folding one never touches an if still to come, while an outer if folded first
       // would erase the inner ones of the branch it drops.
       llvm::SmallVector<fir::IfOp, 16> ifs;
       module.walk<mlir::WalkOrder::PostOrder>([&](fir::IfOp op) { ifs.push_back(op); });
-      changed = false;
+      changed = !parens.empty();
       for (fir::IfOp op : ifs)
         if (foldConstantIf(op)) {
           changed = true;
