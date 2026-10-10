@@ -68,6 +68,18 @@ def test_a_branch_on_a_specialised_flag_takes_its_callee_away(tmp_path):
     np.testing.assert_array_equal(y, 1 + 2 * 1.5 * x)
 
 
+def test_the_candidates_are_the_module_scalars_read_and_never_written(tmp_path):
+    hlfir = compile_to_hlfir(_SRC, tmp_path / "hlfir", name="kern")
+    assert SDFGBuilder(str(hlfir), entry="kern::step").configuration_candidates == {
+        "cfg::use_extra": "logical(4)",
+        "cfg::nsweeps": "integer(4)",
+        "cfg::scale": "real(8)",
+    }
+    # Recorded before the values apply; a scalar the entry writes is none.
+    rescale = SDFGBuilder(str(hlfir), entry="kern::rescale", specialized_globals={"cfg::scale": 1.5})
+    assert "cfg::scale" not in rescale.configuration_candidates
+
+
 def test_a_global_the_entry_writes_keeps_its_value_open(tmp_path):
     sdfg = _build(tmp_path, "kern::rescale", {"cfg::scale": 1.5})
     assert "scale" in set(sdfg.arglist())

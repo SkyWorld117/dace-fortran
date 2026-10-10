@@ -821,6 +821,13 @@ class SDFGBuilder:
 
         self._classify()
 
+    @property
+    def configuration_candidates(self) -> dict[str, str]:
+        """The module scalars the entry reads and never writes -- the values ``specialized_globals`` could fix --
+        ``"module::name"`` -> Fortran type (``logical(4)``, ``integer(4)``, ``real(8)``), as ``hlfir-specialize-globals``
+        found them before applying any value.  Empty when the pipeline does not run that pass."""
+        return dict(self.module.get_configuration_candidates())
+
     @classmethod
     def from_files(cls, hlfir_paths: Sequence[str], *, entry: str, pipeline: str = MULTI_FILE_PIPELINE) -> SDFGBuilder:
         """Parse and merge several HLFIR files, keep ``entry`` as the only

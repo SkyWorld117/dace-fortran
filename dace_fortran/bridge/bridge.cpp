@@ -449,6 +449,18 @@ class HLFIRModule {
     module_->getOperation()->setAttr("hlfir.stub_symbols", mlir::ArrayAttr::get(&ctx_, attrs));
   }
 
+  /// The module scalars hlfir-specialize-globals found the module reads and never writes, before it applied any
+  /// value: ``"module::name"`` -> Fortran type.
+  nb::dict get_configuration_candidates() {
+    nb::dict out;
+    if (!module_) return out;
+    if (auto attr = module_->getOperation()->getAttrOfType<mlir::DictionaryAttr>("hlfir.configuration_candidates"))
+      for (mlir::NamedAttribute entry : attr)
+        if (auto type = mlir::dyn_cast<mlir::StringAttr>(entry.getValue()))
+          out[nb::str(entry.getName().str().c_str())] = type.str();
+    return out;
+  }
+
   /// Records module variables and the values hlfir-specialize-globals bakes into the code that reads them
   /// (``"module::name"`` or a mangled symbol -> value text).
   void set_specialized_globals(const std::map<std::string, std::string>& values) {
@@ -627,6 +639,9 @@ NB_MODULE(hlfir_bridge, m) {
       .def("set_specialized_globals", &HLFIRModule::set_specialized_globals,
            "Record module variables and their values for hlfir-specialize-globals to bake into the code that "
            "reads them before inlining (\"module::name\" or a mangled symbol -> value text)")
+      .def("get_configuration_candidates", &HLFIRModule::get_configuration_candidates,
+           "The module scalars hlfir-specialize-globals found the module reads and never writes, before it applied "
+           "any value (\"module::name\" -> Fortran type)")
       .def("get_fortran_interface", &HLFIRModule::get_fortran_interface,
            "Describe the entry's dummies (pre-flatten) for auto-iface")
       .def("get_flatten_plan", &HLFIRModule::get_flatten_plan,
