@@ -29,6 +29,7 @@
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 
 // Standard MLIR dialects needed by Flang's HLFIR output
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -448,6 +449,16 @@ class HLFIRModule {
     module_->getOperation()->setAttr("hlfir.stub_symbols", mlir::ArrayAttr::get(&ctx_, attrs));
   }
 
+  /// Records module variables and the values hlfir-specialize-globals bakes into the code that reads them
+  /// (``"module::name"`` or a mangled symbol -> value text).
+  void set_specialized_globals(const std::map<std::string, std::string>& values) {
+    if (!module_) throw std::runtime_error("set_specialized_globals: no module parsed");
+    llvm::SmallVector<mlir::NamedAttribute, 8> attrs;
+    for (const auto& [name, value] : values)
+      attrs.emplace_back(mlir::StringAttr::get(&ctx_, name), mlir::StringAttr::get(&ctx_, value));
+    module_->getOperation()->setAttr("hlfir.specialized_globals", mlir::DictionaryAttr::get(&ctx_, attrs));
+  }
+
  private:
   mlir::DialectRegistry registry_;
   mlir::MLIRContext ctx_;
@@ -613,6 +624,9 @@ NB_MODULE(hlfir_bridge, m) {
            "Record do_not_emit (stub) symbol names so hlfir-drop-stub-calls "
            "erases their calls up front -- a known-dead call is still an opaque "
            "use that blocks later rewrites")
+      .def("set_specialized_globals", &HLFIRModule::set_specialized_globals,
+           "Record module variables and their values for hlfir-specialize-globals to bake into the code that "
+           "reads them before inlining (\"module::name\" or a mangled symbol -> value text)")
       .def("get_fortran_interface", &HLFIRModule::get_fortran_interface,
            "Describe the entry's dummies (pre-flatten) for auto-iface")
       .def("get_flatten_plan", &HLFIRModule::get_flatten_plan,

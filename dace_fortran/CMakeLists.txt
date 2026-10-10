@@ -408,6 +408,7 @@ add_library(hlfir_bridge_passes STATIC
     passes/PruneNeverAllocatedMemberDeref.cpp
     passes/FoldConstantScalars.cpp
     passes/RestoreCountedLoops.cpp
+    passes/SpecializeGlobals.cpp
 )
 target_link_libraries(hlfir_bridge_passes PUBLIC
     hlfir_bridge_core
