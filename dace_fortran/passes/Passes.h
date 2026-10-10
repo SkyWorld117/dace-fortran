@@ -50,6 +50,7 @@ std::unique_ptr<mlir::Pass> createMarkBoundsRemapViewsPass();
 std::unique_ptr<mlir::Pass> createFoldAssumedRankQueriesPass();
 std::unique_ptr<mlir::Pass> createPruneNeverAllocatedMemberDerefPass();
 std::unique_ptr<mlir::Pass> createFoldConstantScalarsPass();
+std::unique_ptr<mlir::Pass> createSpecializeGlobalsPass();
 
 // --- Registry ---
 

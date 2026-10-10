@@ -43,7 +43,7 @@ from __future__ import annotations
 import ast
 import gc
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
 from dace import SDFG, InterstateEdge, SDFGState, config
@@ -127,6 +127,11 @@ DEFAULT_PIPELINE = (
     # a plain CFG that lift-cf-to-scf turns back into nested scf.if for
     # the bridge to consume.
     "lower-fir-select-case,"
+    # Bake the configuration values the caller fixed (``specialized_globals``) into the code that reads them, fold
+    # the branches they decide and drop what only a dead branch called -- before the inliner and the passes after
+    # it see code the configuration never runs.  A no-op when nothing is specialised.
+    "hlfir-specialize-globals,"
+    "symbol-dce,"
     # Structurize callees BEFORE inlining: an early ``RETURN`` (``if (c)
     # return``) or other in-callee CFG makes the callee a multi-block
     # function, and ``mlir::inlineCall`` then splices those blocks into the
@@ -385,6 +390,11 @@ MULTI_FILE_PIPELINE = (
     # call tree in its existing fixed-point loop.  This is the
     # ``WP-2`` fix; the LU numerical correctness test passes
     # element-wise against the gfortran reference after this lands.
+    # Bake the configuration values the caller fixed (``specialized_globals``) into the code that reads them, fold
+    # the branches they decide and drop what only a dead branch called -- before the inliner and the passes after
+    # it see code the configuration never runs.  A no-op when nothing is specialised.
+    "hlfir-specialize-globals,"
+    "symbol-dce,"
     "lift-cf-to-scf,"
     "hlfir-inline-all,"
     "hlfir-fold-element-aliases,"
@@ -625,6 +635,15 @@ def _resolve_entry_symbol(module: HlfirModule, entry: str) -> str:
     )
 
 
+def _global_value_text(value: bool | int | float) -> str:
+    """The text ``hlfir-specialize-globals`` parses a value from: a logical as true/false, a real exactly."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return repr(value)
+    return str(int(value))
+
+
 class SDFGBuilder:
     """Walks the HLFIR ASTNode tree and emits a DaCe SDFG.
 
@@ -707,7 +726,13 @@ class SDFGBuilder:
         self._id_counter = 0
         self.access_caches = weakref.WeakKeyDictionary()
 
-    def __init__(self, hlfir_path: str, pipeline: str = DEFAULT_PIPELINE, entry: str | None = None) -> None:
+    def __init__(
+        self,
+        hlfir_path: str,
+        pipeline: str = DEFAULT_PIPELINE,
+        entry: str | None = None,
+        specialized_globals: Mapping[str, bool | int | float] | None = None,
+    ) -> None:
         """Parse HLFIR, run the pass pipeline, and classify variables.
 
         If ``entry`` is set, every other ``func.func`` in the module is
@@ -715,6 +740,11 @@ class SDFGBuilder:
         them after ``hlfir-inline-all`` has flattened their bodies in.
         Needed when the source contains a module-scope callee that would
         otherwise leak dummy-arg declares into ``extract_vars``.
+
+        ``specialized_globals`` (``"module::name"`` -> value) bakes module variables the entry only reads into its code
+        before anything is inlined (``hlfir-specialize-globals``): the branches they decide fold, and what only a dead
+        branch called is never inlined.  The values must hold in every run the result serves; a binding guards them
+        (:mod:`dace_fortran.bindings.specialization`).
         """
         self.module = hb.HLFIRModule()
         if not self.module.parse_file(hlfir_path):
@@ -723,6 +753,10 @@ class SDFGBuilder:
         if entry is not None:
             entry = _resolve_entry_symbol(self.module, entry)
             self.module.set_entry_symbol(entry)
+        if specialized_globals:
+            self.module.set_specialized_globals(
+                {name: _global_value_text(v) for name, v in specialized_globals.items()}
+            )
         # Cache the (resolved, mangled) entry name so ``sdfg_name`` can name
         # the SDFG (and therefore the generated ``.so``) after the actual
         # procedure.
