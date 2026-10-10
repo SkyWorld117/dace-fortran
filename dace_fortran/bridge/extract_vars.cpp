@@ -3141,7 +3141,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
             auto lowerBoundAt = [&](unsigned d) -> mlir::Value { return d < secLbs.size() ? secLbs[d] : mlir::Value{}; };
             auto isOne = [](mlir::Value lb) { return !lb || traceConstInt(lb) == std::optional<int64_t>(1); };
             // ``v - lb + plus`` as text, folded when both are literals; "" when the bound does not render.
-            auto minusLb = [](mlir::Value v, std::string const& vs, mlir::Value lb, int64_t plus) -> std::string {
+            auto minusLb = [&](mlir::Value v, std::string const& vs, mlir::Value lb, int64_t plus) -> std::string {
               auto vC = traceConstInt(v);
               auto lbC = traceConstInt(lb);
               if (vC && lbC) return std::to_string(*vC - *lbC + plus);
