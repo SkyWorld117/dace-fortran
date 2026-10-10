@@ -652,7 +652,7 @@ def _resolve_entry_symbol(module: HlfirModule, entry: str) -> str:
     )
 
 
-def _global_value_text(value: bool | int | float) -> str:
+def _global_value_text(value: bool | float) -> str:
     """The text ``hlfir-specialize-globals`` parses a value from: a logical as true/false, a real exactly."""
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -748,7 +748,7 @@ class SDFGBuilder:
         hlfir_path: str,
         pipeline: str = DEFAULT_PIPELINE,
         entry: str | None = None,
-        specialized_globals: Mapping[str, bool | int | float] | None = None,
+        specialized_globals: Mapping[str, bool | float] | None = None,
     ) -> None:
         """Parse HLFIR, run the pass pipeline, and classify variables.
 
