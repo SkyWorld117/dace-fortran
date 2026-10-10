@@ -10,6 +10,7 @@ from dace_fortran.bindings.module_access import (
     ModuleAccessError,
     changed_global_data_symbols,
     expose_module_variables,
+    public_variables,
 )
 
 # The declaration forms a large code base uses for module state: several entities per statement, attribute lists with
@@ -72,6 +73,14 @@ def test_accessors_are_appended_and_the_declarations_kept():
     assert exposed["view"].pointer and exposed["view"].rank == 1
     assert "real(8), pointer :: p(:, :, :, :)" in copy
     assert "if (allocated(flux_n)) then" in copy
+
+
+def test_public_variables_follow_the_default_lists_and_attributes():
+    assert public_variables(_OWNER, "owner") == {"n_public"}  # private default, constants are no variables
+    open_module = (
+        "module cfg\n    integer :: a\n    real(8), private :: b\n    integer :: c\n    private :: c\nend module cfg\n"
+    )
+    assert public_variables(open_module, "cfg") == {"a"}
 
 
 def test_constants_unknown_names_and_taken_accessor_names_are_refused():

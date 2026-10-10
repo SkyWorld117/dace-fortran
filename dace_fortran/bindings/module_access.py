@@ -220,6 +220,34 @@ def expose_module_variables(source: str, module: str, names: Sequence[str]) -> t
     return "\n".join(out) + "\n", {v.name: v for v in variables}
 
 
+def public_variables(source: str, module: str) -> set[str]:
+    """The variables declared in the specification part of ``module`` that are public: by default unless a bare
+    ``private`` statement makes private the default, then per ``public`` / ``private`` lists and attributes."""
+    lines = source.splitlines()
+    start, end, contains = _module_span(lines, module)
+    declared: dict[str, str] = {}  # name -> accessibility its declaration gives ("" for none)
+    listed: dict[str, str] = {}
+    default = "public"
+    for statement in _statements(lines[start + 1 : contains if contains is not None else end]):
+        access = re.match(r"\s*(public|private)\b\s*(::)?\s*(.*)$", statement, re.IGNORECASE)
+        if access:
+            names = [n.lower() for n in _split_top_level(access.group(3)) if n]
+            if names:
+                listed.update(dict.fromkeys(names, access.group(1).lower()))
+            else:
+                default = access.group(1).lower()
+            continue
+        parsed = _parse_declaration(statement)
+        if parsed is None or "parameter" in parsed[1]:
+            continue
+        mark = "public" if "public" in parsed[1] else "private" if "private" in parsed[1] else ""
+        for entity in parsed[2]:
+            name = re.match(r"\s*([A-Za-z_]\w*)", entity)
+            if name:
+                declared[name.group(1).lower()] = mark
+    return {n for n, mark in declared.items() if (mark or listed.get(n, default)) == "public"}
+
+
 def _global_data_symbols(obj: Path) -> dict[str, int]:
     """Global data symbols an object defines (``nm`` types B, C, D, G, R, S), by name, with their sizes."""
     listing = subprocess.run(["nm", "-S", "--defined-only", str(obj)], capture_output=True, text=True, check=True)
