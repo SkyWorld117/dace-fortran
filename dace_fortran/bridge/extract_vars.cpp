@@ -862,9 +862,20 @@ static const DesignateLiterals& designateIndexLiterals(hlfir::DesignateOp dg, ml
   auto it = cache.find(dg.getOperation());
   if (it != cache.end()) return it->second;
   DesignateLiterals lits;
+  // One slot per subscripted dimension: a section's triplet takes three operands (lower bound, upper bound, stride),
+  // of which the lower bound is the first element the designate reaches; a scalar subscript takes one.  Reading the
+  // operands as one per dimension would hand a later dimension the lower bound, upper bound or stride of an earlier
+  // one (``a(lb:ub, 1:n)`` would show dimension 2 the element ``ub``).
   // Peel a single ``fir.load %x`` indirection (inlined-callee pattern: caller
   // passes -5, callee stores it to a local, then loads it for the index).
-  for (auto idx : dg.getIndices()) lits.push_back(traceConstIntThroughLoad(idx, func, writeCache));
+  auto const indices = dg.getIndices();
+  auto const triplets = dg.getIsTriplet();
+  unsigned cursor = 0;
+  for (unsigned dim = 0; cursor < indices.size(); ++dim) {
+    bool const triplet = dim < triplets.size() && triplets[dim];
+    lits.push_back(traceConstIntThroughLoad(indices[cursor], func, writeCache));
+    cursor += triplet ? 3 : 1;
+  }
   return cache.try_emplace(dg.getOperation(), std::move(lits)).first->second;
 }
 
