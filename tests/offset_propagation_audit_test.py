@@ -58,9 +58,8 @@ subroutine two_outer(arr, out)
 end subroutine two_outer
 """
     sdfg = _build(src, tmp_path, "two_outer")
-    assert dict(getattr(sdfg, "_fortran_offset_values", sdfg.constants)).get("offset_arr_d0") == -4, (
-        f"2-level inline literal should propagate -4; got "
-        f"{dict(getattr(sdfg, '_fortran_offset_values', sdfg.constants)).get('offset_arr_d0')}"
+    assert sdfg._fortran_offset_floors.get("offset_arr_d0") == -4, (
+        f"2-level inline literal should propagate the floor -4; got {sdfg._fortran_offset_floors}"
     )
     arr = np.asfortranarray(np.array([10, 20, 30, 40, 50], dtype=np.int32))
     out = np.zeros(1, dtype=np.int32, order="F")
@@ -142,9 +141,8 @@ subroutine read_member(p, out)
 end subroutine read_member
 """
     sdfg = _build(src, tmp_path, "read_member")
-    assert dict(getattr(sdfg, "_fortran_offset_values", sdfg.constants)).get("offset_p_tbl_d0") == -7, (
-        f"struct allocatable member literal -7 should specialise; got "
-        f"{dict(getattr(sdfg, '_fortran_offset_values', sdfg.constants)).get('offset_p_tbl_d0')}"
+    assert sdfg._fortran_offset_floors.get("offset_p_tbl_d0") == -7, (
+        f"struct allocatable member literal -7 should be the floor; got {sdfg._fortran_offset_floors}"
     )
     # p_tbl(-7..5): 13 elements
     tbl = np.asfortranarray(np.array([(i - 7) for i in range(13)], dtype=np.int32))
@@ -168,9 +166,8 @@ subroutine computed_dummy(arr, out)
 end subroutine computed_dummy
 """
     sdfg = _build(src, tmp_path, "computed_dummy")
-    assert dict(getattr(sdfg, "_fortran_offset_values", sdfg.constants)).get("offset_arr_d0") == -5, (
-        f"PARAMETER arithmetic should fold to literal -5; got "
-        f"{dict(getattr(sdfg, '_fortran_offset_values', sdfg.constants)).get('offset_arr_d0')}"
+    assert sdfg._fortran_offset_floors.get("offset_arr_d0") == -5, (
+        f"PARAMETER arithmetic should fold to the floor -5; got {sdfg._fortran_offset_floors}"
     )
     # arr(lb-1) = arr(-5); buffer arr(-5..5), 11 elements, offset -5 -> arr(-5) reads buf[0]
     arr = np.asfortranarray(np.array([777] + [0] * 10, dtype=np.int32))

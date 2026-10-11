@@ -698,6 +698,7 @@ class SDFGBuilder:
         "object_alias_defs",
         "object_alias_flat_members",
         "object_aliases",
+        "offset_floors",
         "offset_values",
         "scalars",
         "symbols",
@@ -721,6 +722,8 @@ class SDFGBuilder:
     scalars: dict[str, VarLike]
     complex_component_aliases: dict[str, VarLike]
     offset_values: dict[str, int | str | None]
+    #: Free offset symbols with a known floor (the smallest sub-1 literal subscript): a direct call's default.
+    offset_floors: dict[str, int]
     extent_aliases: dict[str, str]
     object_aliases: dict[str, str]
     object_alias_defs: set[str]
@@ -738,6 +741,7 @@ class SDFGBuilder:
         self.write_set = None
         self.complex_component_aliases = {}
         self.offset_values = {}
+        self.offset_floors = {}
         self.extent_aliases = {}
         self.object_aliases = {}
         self.object_alias_defs = set()
@@ -1107,6 +1111,7 @@ class SDFGBuilder:
         # ``specialize_symbols`` substitutes them as literal integers in
         # every subset.
         sdfg._fortran_offset_values = dict(const_offsets)
+        sdfg._fortran_offset_floors = dict(self.offset_floors)
         # Before any symbol substitution: ``specialize_symbols`` parses every subset it rewrites, so a leaked ``?``
         # surfaces there as a bare ``SyntaxError: invalid syntax (<unknown>, line 1)`` with no indication of which
         # edge or which Fortran construct produced it.  Check first and name the site.

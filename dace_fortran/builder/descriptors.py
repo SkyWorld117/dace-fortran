@@ -967,6 +967,11 @@ def add_descriptors(builder: SDFGBuilder, sdfg: SDFG) -> None:
                 continue
             lb = v.lower_bounds[d] if d < len(v.lower_bounds) else "1"
             builder.offset_values[sym_name] = _offset_value(lb)
+            floors = getattr(v, "lower_bound_floors", ())
+            if builder.offset_values[sym_name] is None and d < len(floors) and floors[d]:
+                # The bound only the caller knows: a direct call defaults the free offset to the smallest literal
+                # subscript the code uses (the bound is at or below it), a binding passes ``lbound``.
+                builder.offset_floors[sym_name] = int(floors[d])
 
     # Scalars that are the TARGET of a scalar POINTER rebind (``tmp => x``)
     # must be materialised as a length-1 ARRAY, not a ``Scalar``: the rebind

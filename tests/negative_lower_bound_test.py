@@ -266,8 +266,9 @@ end module sym_idx_mod
 
 def test_dummy_arg_allocatable_literal_negative_index(tmp_path: Path):
     """Dummy-arg deferred-shape allocatable with literal negative indices,
-    mirroring ICON velocity_tendencies' flattened ``start_block(-10)`` reads;
-    literal-index inference sets ``offset_arr_d0`` without bindings-layer involvement."""
+    mirroring ICON velocity_tendencies' flattened ``start_block(-10)`` reads: the bound is the caller's
+    (``offset_arr_d0`` stays free, bound from ``lbound`` by a binding); the most negative literal is its floor,
+    the default a direct call takes."""
     src = """
 module read_dummy_mod
 contains
@@ -285,9 +286,9 @@ end module read_dummy_mod
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     sdfg = build_sdfg(src, sdfg_dir, name="read_dummy", entry="read_dummy_mod::read_dummy").build()
     sdfg.validate()
-    assert dict(getattr(sdfg, "_fortran_offset_values", sdfg.constants)).get("offset_arr_d0") == -3, (
-        f"expected offset_arr_d0 == -3 (most-negative literal); "
-        f"got {dict(getattr(sdfg, '_fortran_offset_values', sdfg.constants)).get('offset_arr_d0')}"
+    assert "offset_arr_d0" not in dict(getattr(sdfg, "_fortran_offset_values", sdfg.constants)), "bound not free"
+    assert sdfg._fortran_offset_floors.get("offset_arr_d0") == -3, (
+        f"expected floor offset_arr_d0 == -3 (most-negative literal); got {sdfg._fortran_offset_floors}"
     )
 
     # Buffer is 1-based numpy; SDFG reads at arr[N-(-3)]=arr[N+3], so for

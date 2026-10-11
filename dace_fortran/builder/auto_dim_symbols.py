@@ -38,6 +38,7 @@ class AutoDimSDFG(dace.SDFG):
     The annotated attributes are the sidecars ``SDFGBuilder.build`` stashes for the binding emitter."""
 
     _fortran_offset_values: dict[str, int]
+    _fortran_offset_floors: dict[str, int]
     _fortran_interface_raw: Any
     _flatten_plan_raw: Any
 
@@ -56,10 +57,10 @@ class AutoDimSDFG(dace.SDFG):
                 kwargs[sym] = int(shape[idx])  # always the correct extent
             elif is_offset:
                 # Defaults to Fortran's 1-based lower bound (access lowers to
-                # ``arr[idx - offset]``); non-default bounds (e.g. ICON's
-                # ``end_block(min_rl:)``) are passed explicitly by the bindings
-                # emitter via ``lbound``.  A default of 0 would read every such array off by one.
-                kwargs[sym] = 1
+                # ``arr[idx - offset]``), or to the smallest sub-1 literal subscript the code uses on the array
+                # (its floor: ``end_block(-10)`` needs a bound at or below -10); the real bound of a
+                # caller-allocated array is passed by the bindings emitter via ``lbound``.
+                kwargs[sym] = getattr(self, "_fortran_offset_floors", {}).get(sym, 1)
             else:
                 arr = m.group("arr")
                 if arr in self._touched_arrays():

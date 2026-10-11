@@ -503,6 +503,7 @@ NB_MODULE(hlfir_bridge, m) {
       .def_ro("is_written", &VarInfo::is_written)
       .def_ro("shape_symbols", &VarInfo::shape_symbols)
       .def_ro("lower_bounds", &VarInfo::lower_bounds)
+      .def_ro("lower_bound_floors", &VarInfo::lower_bound_floors)
       .def_ro("role", &VarInfo::role)
       .def_ro("const_data", &VarInfo::const_data)
       .def_ro("view_source", &VarInfo::view_source)

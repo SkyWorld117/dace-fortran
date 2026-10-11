@@ -882,7 +882,8 @@ static const DesignateLiterals& designateIndexLiterals(hlfir::DesignateOp dg, ml
 static void inferLowerBoundsFromLiteralAccesses(
     hlfir::DeclareOp decl, std::vector<std::string>& lbs, int rank, std::map<mlir::Operation*, FuncWrites>& writeCache,
     const llvm::DenseMap<mlir::Operation*, llvm::SmallVector<hlfir::DesignateOp, 4>>& designatesByDecl,
-    llvm::DenseMap<mlir::Operation*, DesignateLiterals>& dgLitCache, std::vector<bool>* seenLitOut = nullptr) {
+    llvm::DenseMap<mlir::Operation*, DesignateLiterals>& dgLitCache, std::vector<bool>* seenLitOut = nullptr,
+    std::vector<int64_t>* minLitOut = nullptr) {
   if (rank <= 0) return;
   auto func = decl->getParentOfType<mlir::func::FuncOp>();
   if (!func) return;
@@ -918,6 +919,7 @@ static void inferLowerBoundsFromLiteralAccesses(
     if (minLit[d] < curr) lbs[d] = std::to_string(minLit[d]);
   }
 
+  if (minLitOut) *minLitOut = minLit;
   if (seenLitOut) *seenLitOut = std::move(seenLit);
 }
 
@@ -2766,8 +2768,11 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
     // bounds) stays authoritative via the ``lbs[d] != "1"`` guard
     // inside the heuristic.
     bool const plainShapeOp = op.getShape() && mlir::isa_and_nonnull<fir::ShapeOp>(op.getShape().getDefiningOp());
+    std::vector<bool> litSeen;
+    std::vector<int64_t> litMin;
     if (!plainShapeOp)
-      inferLowerBoundsFromLiteralAccesses(op, v.lower_bounds, v.rank, writeCache, designatesByDecl, dgLitCache);
+      inferLowerBoundsFromLiteralAccesses(op, v.lower_bounds, v.rank, writeCache, designatesByDecl, dgLitCache,
+                                          &litSeen, &litMin);
 
     // Dummy-arg deferred-shape ALLOCATABLE/POINTER fallback: the
     // declare is a function block-arg, its declared type has no
@@ -2821,47 +2826,21 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
         // ``_is_value_record``.
         v.lower_bounds.assign(v.rank, "1");
       } else {
-        // A genuine deferred-shape ALLOCATABLE/POINTER dummy's bounds are set by
-        // the caller's ALLOCATE / pointer association -- invisible here -- so a
-        // dim accessed only with symbolic or NON-NEGATIVE-literal subscripts has
-        // no statically-known lower bound.  A non-negative literal access
-        // (``rho(jc, 1, jb)``) does NOT reveal the allocation bound: Fortran
-        // ``arr(1)`` addresses index 1 whatever ``lbound`` is, so that class of
-        // dim is left free ("?"); descriptors.py stamps each
-        // ``offset_<arr>_d<i>`` as a free symbol the caller binds via
-        // ``lbound(arr, dim=...)``.  Freeing it (vs the old ``"1"``) keeps the
-        // dim's ``_lb`` slot in the marshalled callback ABI, matching the
-        // callee's bind_c_shim (one ``_lb`` per dim of a dynamic member) so an
-        // SDFG-to-SDFG velocity call stays slot-for-slot.
-        //
-        // EXCEPTION -- a SUB-1 literal subscript, NEGATIVE *or* ZERO (ICON's
-        // ``end_block(-10)`` and 0-based ``arr(0)``): unlike ``arr(1)``,
-        // ``arr(-10)`` / ``arr(0)`` is valid ONLY if ``lbound <= that literal``,
-        // so it IS a sound static lower-bound constraint.  A direct ``sdfg()`` /
-        // bindings caller cannot recover the run-time bound (both default the
-        // free offset to 1, giving ``arr[-11]`` / ``arr[-1]`` -- an out-of-bounds
-        // read that SEGVs).  ``inferLowerBoundsFromLiteralAccesses`` (run above)
-        // already folded such dims to the literal; keep that fold and free only
-        // the remaining dims.  A literal >= 1 (``arr(1)``) does NOT reveal the
-        // bound (Fortran ``arr(1)`` addresses index 1 whatever ``lbound`` is) ->
-        // free it.  ABI-wise the marshal (commit 9bf289a) mints the ``_lb`` slot
-        // for a concrete offset < 1 the same as for a free offset, so preserving
-        // zero keeps the callback ABI slot-for-slot.
-        auto isSubOneLiteral = [](const std::string& s) -> bool {
-          if (s.empty()) return false;
-          bool const neg = s.front() == '-';
-          size_t const i = neg ? 1 : 0;
-          if (i >= s.size()) return false;  // a lone '-' is not a literal
-          for (size_t j = i; j < s.size(); ++j)
-            if (s[j] < '0' || s[j] > '9') return false;  // not a pure integer literal
-          if (neg) return true;                          // any negative is < 1
-          for (size_t j = i; j < s.size(); ++j)
-            if (s[j] != '0') return false;  // a non-negative literal is < 1 only when exactly zero
-          return true;
-        };
+        // A genuine deferred-shape ALLOCATABLE/POINTER dummy's bounds, or a module global's whose ALLOCATE is not
+        // in this TU, are set by the caller -- invisible here -- so no subscript reveals them: ``arr(1)``
+        // addresses index 1 whatever ``lbound`` is, and ``arr(-10)`` or ``arr(0)`` only says the bound is at or
+        // below that literal (ICON allocates ``end_block(min_rl:)`` and reads ``end_block(-10)``; a solver
+        // allocates its state ``(lb:)`` and reads ``state(0)`` and ``state(-1)`` at a boundary).  Taking the literal
+        // for the bound lands every other access ``bound - literal`` elements off.  Every dim is therefore left
+        // free ("?"): descriptors.py stamps each ``offset_<arr>_d<i>`` as a free symbol the binding binds via
+        // ``lbound(arr, dim=...)``, which keeps the dim's ``_lb`` slot in the marshalled callback ABI (one per dim
+        // of a dynamic member, slot-for-slot with the callee's bind_c_shim).  The smallest sub-1 literal is kept as
+        // the dim's FLOOR: a direct ``sdfg()`` call, which has no descriptor to read the bound from, defaults the
+        // free offset to it instead of to 1 (``arr[-1]`` for ``arr(0)`` would be out of bounds).
+        v.lower_bound_floors.assign(v.rank, "");
         for (int d = 0; d < v.rank; ++d) {
-          bool const keepSubOneFold = d < (int)v.lower_bounds.size() && isSubOneLiteral(v.lower_bounds[d]);
-          if (keepSubOneFold) continue;
+          if (d < (int)litSeen.size() && litSeen[d] && litMin[d] < 1)
+            v.lower_bound_floors[d] = std::to_string(litMin[d]);
           if (d < (int)v.lower_bounds.size())
             v.lower_bounds[d] = "?";
           else

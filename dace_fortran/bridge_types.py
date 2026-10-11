@@ -44,6 +44,9 @@ class VarRecord(Protocol):
     def lower_bounds(self) -> Sequence[str]: ...
 
     @property
+    def lower_bound_floors(self) -> Sequence[str]: ...
+
+    @property
     def role(self) -> str: ...
 
     @property
