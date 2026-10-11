@@ -88,6 +88,35 @@ end subroutine carried
 """
 
 
+INDEXED_SRC = """
+subroutine indexed(n, idir, perm, a, b)
+  implicit none
+  integer, intent(in) :: n, idir
+  integer, intent(in) :: perm(3)
+  real(8), intent(in) :: a(n)
+  real(8), intent(inout) :: b(n)
+  real(8) :: w(3)
+  integer :: i
+  if (idir == 1) then
+    do i = 1, n
+      w(1) = a(i)
+      w(2) = 2.0d0*a(i)
+      w(3) = 3.0d0*a(i)
+      b(i) = w(perm(1)) - w(perm(2))
+    end do
+  end if
+  if (idir == 2) then
+    do i = 1, n
+      w(3) = a(i) + 1.0d0
+      w(2) = a(i) - 1.0d0
+      w(1) = a(i)*a(i)
+      b(i) = w(perm(3))*w(perm(1))
+    end do
+  end if
+end subroutine indexed
+"""
+
+
 def _loops(sdfg) -> list[LoopRegion]:
     return [r for r in sdfg.all_control_flow_regions(recursive=True) if isinstance(r, LoopRegion)]
 
@@ -138,3 +167,21 @@ def test_a_temporary_written_on_every_branch_is_local(tmp_path, direction):
     sdfg(n=9, idir=direction, a=a, b=b)
     ref.branched(direction, a, b_ref)
     np.testing.assert_array_equal(b, b_ref)
+
+
+def test_a_read_at_a_runtime_index_is_local_once_every_element_is_written(tmp_path):
+    """``w(perm(k))`` names no constant element, but each nest has written all of ``w`` before it."""
+    sdfg = build_sdfg(INDEXED_SRC, tmp_path / "sdfg", name="indexed").build()
+    renamed = privatize_loop_local_arrays(sdfg)
+    assert list(renamed) == ["w"] and len(renamed["w"]) == 1
+    sdfg = build_sdfg(INDEXED_SRC, tmp_path / "sdfg2", name="indexed").build()
+    optimize(sdfg)
+    assert _loops(sdfg) == [], "a nest stayed a loop"
+    ref = f2py_compile(INDEXED_SRC, tmp_path / "ref", "indexed_ref")
+    a = np.linspace(-2.0, 3.0, 9).copy()
+    perm = np.array([3, 1, 2], dtype=np.int32)
+    for direction in (1, 2):
+        b, b_ref = np.zeros(9), np.zeros(9)
+        sdfg(n=9, idir=direction, perm=perm, a=a, b=b)
+        ref.indexed(direction, perm, a, b_ref)
+        np.testing.assert_array_equal(b, b_ref)

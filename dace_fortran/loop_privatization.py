@@ -11,8 +11,9 @@ from one nest to another.
 is covered by a write earlier in the same iteration: then the loops cannot exchange values through it, and each copy
 is local to its loop for ``LoopToMap`` to privatise.  Scalars are covered too: ``ScalarFission`` splits a scalar only
 where one write dominates its reads and leaves it whole otherwise.  The check is conservative -- a write counts once
-every path through the iteration makes it and names constant elements, a read only if it names constant elements
-already written -- and an array it cannot decide is left as it is.
+every path through the iteration makes it and names constant elements, a read (in dataflow or on an interstate edge)
+only if it names constant elements already written, or any element once the whole array is -- and an array it cannot
+decide is left as it is.
 """
 
 from __future__ import annotations
@@ -41,9 +42,9 @@ def privatize_loop_local_arrays(sdfg: SDFG) -> dict[str, list[str]]:
 
 
 def _privatize(sdfg: SDFG) -> dict[str, list[str]]:
-    users: dict[str, dict[LoopRegion, list[tuple[SDFGState, nodes.AccessNode]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
+    # Per array and outermost loop: the blocks accessing it -- states through access nodes, and the source blocks of
+    # interstate edges whose condition or assignments read an element of it.
+    users: dict[str, dict[LoopRegion, list[ControlFlowBlock]]] = defaultdict(lambda: defaultdict(list))
     outside: set[str] = set()
     for state in sdfg.states():
         loop = _outermost_loop(state, sdfg)
@@ -53,14 +54,22 @@ def _privatize(sdfg: SDFG) -> dict[str, list[str]]:
             if loop is None:
                 outside.add(node.data)
             else:
-                users[node.data][loop].append((state, node))
-    interstate_reads = {str(s) for e in sdfg.all_interstate_edges() for s in e.data.read_symbols()}
+                users[node.data][loop].append(state)
+    for edge in sdfg.all_interstate_edges(recursive=True):
+        loop = _outermost_loop(edge.src, sdfg)
+        for read in edge.data.get_read_memlets(sdfg.arrays):
+            if read.data not in sdfg.arrays or not sdfg.arrays[read.data].transient:
+                continue
+            if loop is None:
+                outside.add(read.data)
+            else:
+                users[read.data][loop].append(edge.src)
 
     renamed: dict[str, list[str]] = {}
     for name, loops in users.items():
-        if name in outside or name in interstate_reads or len(loops) < 2:
+        if name in outside or len(loops) < 2:
             continue
-        if not all(_iteration_local(name, loop, accesses) for loop, accesses in loops.items()):
+        if not all(_iteration_local(name, loop, blocks) for loop, blocks in loops.items()):
             continue
         copies = []
         for loop in list(loops)[1:]:
@@ -72,6 +81,8 @@ def _privatize(sdfg: SDFG) -> dict[str, list[str]]:
                 for edge in state.edges():
                     if edge.data.data == name:
                         edge.data.data = new_name
+            for edge in loop.all_interstate_edges(recursive=True):
+                edge.data.replace(name, new_name, replace_keys=False)
             copies.append(new_name)
         renamed[name] = copies
     return renamed
@@ -113,10 +124,10 @@ def _elements(subset: subsets.Subset | None) -> set[tuple[int, ...]] | None:
     return set(product(*ranges))
 
 
-def _iteration_local(name: str, loop: LoopRegion, accesses) -> bool:
+def _iteration_local(name: str, loop: LoopRegion, blocks: list[ControlFlowBlock]) -> bool:
     """Is every read of ``name`` in ``loop`` covered by a write earlier in the same iteration of the innermost loop
-    that holds all its accesses?"""
-    chains = [_loop_chain(state, loop) for state, _node in accesses]
+    that holds all its accesses (``blocks``: the states and edge sources accessing it)?"""
+    chains = [_loop_chain(block, loop) for block in blocks]
     common = set(chains[0])
     for chain in chains[1:]:
         common &= set(chain)
@@ -131,6 +142,7 @@ def _written_after(region: ControlFlowRegion, name: str, written: set) -> set | 
     reads must be covered, its writes do not count after it, as it may run no iteration."""
     if any(not e.data.is_unconditional() for e in region.edges()):
         return None  # branches as conditional edges: which blocks run is not plain to see
+    whole = _whole(region.sdfg, name)
     for block in cfg_analysis.blockorder_topological_sort(region, recursive=False, ignore_nonstate_blocks=False):
         if isinstance(block, SDFGState):
             if not _state_covered(block, name, written):
@@ -154,12 +166,31 @@ def _written_after(region: ControlFlowRegion, name: str, written: set) -> set | 
             written = inner
         else:
             return None  # a block kind the walk does not know
+        # The reads of the edges leaving ``block`` come after its writes; ``written`` does not change along them.
+        for edge in region.out_edges(block):
+            for read in edge.data.get_read_memlets(region.sdfg.arrays):
+                if read.data == name and not _covered(whole, written, _elements(read.subset)):
+                    return None
     return written
+
+
+def _whole(sdfg: SDFG, name: str) -> set[tuple[int, ...]] | None:
+    """Every element of ``name``, when its shape is constant."""
+    return _elements(subsets.Range.from_array(sdfg.arrays[name]))
+
+
+def _covered(whole: set | None, written: set, elems: set | None) -> bool:
+    """Is a read of ``elems`` covered by ``written``?  A read whose element cannot be named (``w(idx)`` with ``idx``
+    a symbol) is covered once every element of the array has been written."""
+    if elems is None:
+        return whole is not None and whole <= written
+    return elems <= written
 
 
 def _state_covered(state: SDFGState, name: str, written: set) -> bool:
     """Walk ``state``'s accesses to ``name`` in dataflow order: adds the elements it certainly writes to ``written``,
     and says whether each read is covered."""
+    whole = _whole(state.sdfg, name)
     for node in dfs_topological_sort(state):
         if not isinstance(node, nodes.AccessNode) or node.data != name:
             continue
@@ -167,7 +198,7 @@ def _state_covered(state: SDFGState, name: str, written: set) -> bool:
             if edge.data.is_empty():
                 continue
             elems = _elements(edge.data.get_dst_subset(edge, state))
-            if edge.data.wcr is not None and (elems is None or not elems <= written):
+            if edge.data.wcr is not None and not _covered(whole, written, elems):
                 return False  # an accumulation reads the element it updates
             # A nested SDFG's memlet may cover more than it writes: only a direct write is certain.
             if not edge.data.dynamic and not isinstance(edge.src, nodes.NestedSDFG) and elems is not None:
@@ -175,7 +206,6 @@ def _state_covered(state: SDFGState, name: str, written: set) -> bool:
         for edge in state.out_edges(node):
             if edge.data.is_empty():
                 continue
-            elems = _elements(edge.data.get_src_subset(edge, state))
-            if elems is None or not elems <= written:
+            if not _covered(whole, written, _elements(edge.data.get_src_subset(edge, state))):
                 return False
     return True
