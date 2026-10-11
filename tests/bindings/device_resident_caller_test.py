@@ -48,7 +48,8 @@ def test_device_pack_in_runs_openacc_loops_over_present_members():
     assert "allocate(q_sf(size(q, dim=1), cap_q_sf_d0, cap_q_sf_d1, cap_q_sf_d2))" in text
     assert "!$acc enter data create(q_sf)" in text
     assert "!$acc parallel loop collapse(3) default(present)" in text
-    assert "q_sf(i1, i2, i3, i4) = q(i1)%sf(lb_q_sf_d0 + i2 - 1, lb_q_sf_d1 + i3 - 1, lb_q_sf_d2 + i4 - 1)" in text
+    assert ("q_sf(i1, q_sf_off1 + i2, q_sf_off2 + i3, q_sf_off3 + i4) = q(i1)%sf(lb_q_sf_d0 + q_sf_off1 + i2 - 1, "
+            "lb_q_sf_d1 + q_sf_off2 + i3 - 1, lb_q_sf_d2 + q_sf_off3 + i4 - 1)") in text
     # The trip counts come from host scalars, never from the member's descriptor in the loop bounds.
     assert "q_sf_ext3 = size(q(i1)%sf, 3)" in text and "do i4 = 1, q_sf_ext3" in text
     assert text.index("q_sf_ext1 = size(q(i1)%sf, 1)") < text.index("!$acc parallel loop collapse(3)")
@@ -63,14 +64,17 @@ def test_device_pack_in_runs_openacc_loops_over_present_members():
 
 def test_device_pack_out_mirrors_the_pack_in_and_frees_the_device_copy():
     text = "\n".join(render_aos_alloc_pack_out(_rank3_pointer_member(), "q", device=True))
-    assert "q(i1)%sf(lb_q_sf_d0 + i2 - 1, lb_q_sf_d1 + i3 - 1, lb_q_sf_d2 + i4 - 1) = q_sf(i1, i2, i3, i4)" in text
+    assert ("q(i1)%sf(lb_q_sf_d0 + q_sf_off1 + i2 - 1, lb_q_sf_d1 + q_sf_off2 + i3 - 1, lb_q_sf_d2 + q_sf_off3 + i4 - 1)"
+            " = q_sf(i1, q_sf_off1 + i2, q_sf_off2 + i3, q_sf_off3 + i4)") in text
     assert text.index("!$acc exit data delete(q_sf)") < text.index("deallocate(q_sf)")
 
 
 def test_host_pack_is_unchanged():
     text = "\n".join(render_aos_alloc_pack_in(_rank3_pointer_member(), "q"))
     assert "!$acc" not in text
-    assert "q_sf(i1, 1:size(q(i1)%sf, 1), 1:size(q(i1)%sf, 2), 1:size(q(i1)%sf, 3)) = q(i1)%sf" in text
+    assert ("q_sf(i1, lbound(q(i1)%sf, 1) - lb_q_sf_d0 + 1:ubound(q(i1)%sf, 1) - lb_q_sf_d0 + 1, "
+            "lbound(q(i1)%sf, 2) - lb_q_sf_d1 + 1:ubound(q(i1)%sf, 2) - lb_q_sf_d1 + 1, "
+            "lbound(q(i1)%sf, 3) - lb_q_sf_d2 + 1:ubound(q(i1)%sf, 3) - lb_q_sf_d2 + 1) = q(i1)%sf") in text
 
 
 # ----- planning ----------------------------------------------------------------
@@ -160,6 +164,30 @@ def test_each_kind_of_array_takes_its_own_route():
     assert acc.data_region == (("COPYIN", "s_w"), ("COPYIN", "fp_g"), ("CREATE", "presence_scratch_float64"))
     assert acc.storage["nb"] is HOST and acc.storage["gam"] is DEVICE  # the lifted module scalar stays on the host
     assert acc.active
+
+
+def test_module_record_array_images_pack_on_the_device():
+    """The image of a deferred-shape member of a module array of records is the caller's device data; the image of a
+    fixed-shape value member is host data."""
+    gpu = dace.StorageType.GPU_Global
+    sdfg = _synthetic_sdfg({"qp_vf_sf": gpu, "idw_beg": gpu})
+    deferred = FrozenArg(
+        fortran_name="qp_vf_sf", sdfg_name="qp_vf_sf", kind=FrozenArgKind.ARRAY, dtype="float64", rank=4,
+        shape=("qp_vf_sf_d0", "qp_vf_sf_d1", "qp_vf_sf_d2", "qp_vf_sf_d3"), is_written=True,
+        aos_origin_mod="m_fields", aos_origin_struct="qp % vf", aos_member_path="sf", aos_outer_rank=1,
+        aos_member_pointer=True,
+    )
+    static = FrozenArg(
+        fortran_name="idw_beg", sdfg_name="idw_beg", kind=FrozenArgKind.ARRAY, dtype="float64", rank=2,
+        shape=("idw_beg_d0", "3"), aos_origin_mod="m_bounds", aos_origin_struct="idw", aos_member_path="beg",
+        aos_outer_rank=1, aos_struct_static=True,
+    )
+    frozen = FrozenSignature(entry="k", mangled="_QPk", args=(deferred, static), free_symbols=("n",))
+    iface = OriginalInterface(entry="k", args=())
+    acc = plan_device_resident_caller(sdfg, frozen, iface, FlattenPlan(entries=()))
+    assert acc.device_pack == ("qp_vf_sf",)
+    assert acc.use_device == ("qp_vf_sf", "idw_beg")
+    assert acc.data_region == (("COPY", "idw_beg"),)  # host data, staged as before
 
 
 def test_a_host_sdfg_plans_nothing():

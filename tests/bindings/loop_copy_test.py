@@ -180,16 +180,16 @@ def test_render_aos_alloc_pack_in_emits_cap_max_loop():
     # Cap = max per-instance size, guarded by allocated() so unalloc'd rows don't poison it.
     assert "cap_a_w = 0" in joined
     assert "if (allocated(a(i1)%w))" in joined
-    assert "if (size(a(i1)%w, 1) > cap_a_w) cap_a_w = size(a(i1)%w, 1)" in joined
-    # The buffer takes the first allocated element's lower bound; the others must agree.
+    assert "cap_a_w = max(cap_a_w, ubound(a(i1)%w, 1) - lb_a_w + 1)" in joined
+    # The buffer spans the elements' lower bounds: the lowest one is its own.
     assert "lb_a_w = lbound(a(i1)%w, 1)" in joined
-    assert "if (lbound(a(i1)%w, 1) /= lb_a_w) error stop" in joined
+    assert "lb_a_w = min(lb_a_w, lbound(a(i1)%w, 1))" in joined
     # Empty-batch sentinel keeps the buffer non-degenerate.
     assert "if (cap_a_w == 0) cap_a_w = 1" in joined
     # Buffer allocate at (N, cap) shape, zero-init, then per-row copy.
     assert "allocate(a_w(size(a, dim=1), cap_a_w))" in joined
     assert "a_w = 0" in joined
-    assert "a_w(i1, 1:size(a(i1)%w, 1)) = a(i1)%w" in joined
+    assert "a_w(i1, lbound(a(i1)%w, 1) - lb_a_w + 1:ubound(a(i1)%w, 1) - lb_a_w + 1) = a(i1)%w" in joined
 
 
 def test_render_aos_alloc_pack_out_copies_back_live_region():
@@ -197,7 +197,7 @@ def test_render_aos_alloc_pack_out_copies_back_live_region():
     joined = "\n".join(lines)
     # Per-row copy-back, guarded by allocated() -- unalloc'd rows stay zeroed (bindings policy).
     assert "if (allocated(a(i1)%w))" in joined
-    assert "a(i1)%w = a_w(i1, 1:size(a(i1)%w, 1))" in joined
+    assert "a(i1)%w = a_w(i1, lbound(a(i1)%w, 1) - lb_a_w + 1:ubound(a(i1)%w, 1) - lb_a_w + 1)" in joined
     assert "deallocate(a_w)" in joined
 
 
@@ -218,11 +218,14 @@ def test_render_aos_alloc_pack_for_rank3_pointer_member():
     assert "if (associated(q(i1)%sf))" in pack_in
     assert "allocated(" not in pack_in
     assert "lb_q_sf_d2 = lbound(q(i1)%sf, 3)" in pack_in
-    assert "if (size(q(i1)%sf, 3) > cap_q_sf_d2) cap_q_sf_d2 = size(q(i1)%sf, 3)" in pack_in
+    assert "cap_q_sf_d2 = max(cap_q_sf_d2, ubound(q(i1)%sf, 3) - lb_q_sf_d2 + 1)" in pack_in
     assert "allocate(q_sf(size(q, dim=1), cap_q_sf_d0, cap_q_sf_d1, cap_q_sf_d2))" in pack_in
-    assert "q_sf(i1, 1:size(q(i1)%sf, 1), 1:size(q(i1)%sf, 2), 1:size(q(i1)%sf, 3)) = q(i1)%sf" in pack_in
+    own = ("lbound(q(i1)%sf, 1) - lb_q_sf_d0 + 1:ubound(q(i1)%sf, 1) - lb_q_sf_d0 + 1, "
+           "lbound(q(i1)%sf, 2) - lb_q_sf_d1 + 1:ubound(q(i1)%sf, 2) - lb_q_sf_d1 + 1, "
+           "lbound(q(i1)%sf, 3) - lb_q_sf_d2 + 1:ubound(q(i1)%sf, 3) - lb_q_sf_d2 + 1")
+    assert f"q_sf(i1, {own}) = q(i1)%sf" in pack_in
     pack_out = "\n".join(render_aos_alloc_pack_out(r, outer_expr="q"))
-    assert "q(i1)%sf = q_sf(i1, 1:size(q(i1)%sf, 1), 1:size(q(i1)%sf, 2), 1:size(q(i1)%sf, 3))" in pack_out
+    assert f"q(i1)%sf = q_sf(i1, {own})" in pack_out
 
 
 def test_render_aos_alloc_pack_for_a_rank2_array_of_records():
@@ -245,13 +248,16 @@ def test_render_aos_alloc_pack_for_a_rank2_array_of_records():
     ]
     joined = "\n".join(pack_in)
     assert "allocate(bc_sf(size(bc, dim=1), size(bc, dim=2), cap_bc_sf_d0, cap_bc_sf_d1))" in joined
-    assert "bc_sf(i1, i2, 1:size(bc(i1, i2)%sf, 1), 1:size(bc(i1, i2)%sf, 2)) = bc(i1, i2)%sf" in joined
+    own = ("lbound(bc(i1, i2)%sf, 1) - lb_bc_sf_d0 + 1:ubound(bc(i1, i2)%sf, 1) - lb_bc_sf_d0 + 1, "
+           "lbound(bc(i1, i2)%sf, 2) - lb_bc_sf_d1 + 1:ubound(bc(i1, i2)%sf, 2) - lb_bc_sf_d1 + 1")
+    assert f"bc_sf(i1, i2, {own}) = bc(i1, i2)%sf" in joined
     assert "exit" not in joined  # an exit would leave only the innermost record loop
     pack_out = "\n".join(render_aos_alloc_pack_out(r, outer_expr="bc"))
-    assert "bc(i1, i2)%sf = bc_sf(i1, i2, 1:size(bc(i1, i2)%sf, 1), 1:size(bc(i1, i2)%sf, 2))" in pack_out
+    assert f"bc(i1, i2)%sf = bc_sf(i1, i2, {own})" in pack_out
     device = "\n".join(render_aos_alloc_pack_in(r, outer_expr="bc", device=True))
     assert "do i3 = 1, bc_sf_ext1" in device and "do i4 = 1, bc_sf_ext2" in device
-    assert "bc_sf(i1, i2, i3, i4) = bc(i1, i2)%sf(lb_bc_sf_d0 + i3 - 1, lb_bc_sf_d1 + i4 - 1)" in device
+    assert ("bc_sf(i1, i2, bc_sf_off1 + i3, bc_sf_off2 + i4) = "
+            "bc(i1, i2)%sf(lb_bc_sf_d0 + bc_sf_off1 + i3 - 1, lb_bc_sf_d1 + bc_sf_off2 + i4 - 1)") in device
 
 
 def test_render_aos_alloc_pack_in_raises_on_non_aos_alloc():

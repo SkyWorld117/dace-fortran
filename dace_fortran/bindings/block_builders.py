@@ -506,6 +506,8 @@ def build_wrapper_head(
         pieces = _aos_loop_pieces(a)
         # scalar-struct (outer_rank 0): no loop vars
         int_names = pieces.loop_vars + pieces.lower_vars + pieces.upper_vars + pieces.segment_caps
+        if a.sdfg_name in device_pack:
+            int_names += [*pieces.member_loop_vars, *pieces.element_lower_vars, *pieces.element_upper_vars]
         if int_names:
             scratch_lines.append(f"    integer(c_int) :: {', '.join(int_names)}")
 
@@ -786,7 +788,7 @@ def build_wrapper_body(
         body.append("")
         body.append("    ! ----- Module-global AoS-struct components (AoS->SoA) -----")
         for a in aos_args:
-            body.extend(_render_aos_copy_in(a))
+            body.extend(_render_aos_copy_in(a, device=a.sdfg_name in device_pack))
 
     unsourced = _unsourced_array_args(frozen, iface, plan)
     if unsourced:
@@ -973,9 +975,12 @@ def build_wrapper_tail(
     # WRITTEN, always deallocate the buffer allocated in the body's copy-in.
     aos_out_lines: list[str] = []
     for a in _aos_module_args(frozen):
+        device = a.sdfg_name in device_pack
         if a.is_written:
-            aos_out_lines.extend(_render_aos_copy_out(a))
+            aos_out_lines.extend(_render_aos_copy_out(a, device=device))
         else:
+            if device:
+                aos_out_lines.append(f"    !$acc exit data delete({a.sdfg_name})")
             aos_out_lines.append(f"    deallocate({a.sdfg_name})")
     for a in _unsourced_array_args(frozen, iface, plan):
         aos_out_lines.append(f"    deallocate({a.sdfg_name})")
@@ -1596,6 +1601,9 @@ class AosLoopPieces(NamedTuple):
     member_rank: int
     accessor: str
     segment_caps: list[str]  # per segment dim under a root array of records: the largest extent over its elements
+    member_loop_vars: tuple[str, ...] = ()  # per member dim: the index of a device pack loop
+    element_lower_vars: tuple[str, ...] = ()  # per member dim: one element's own lower bound, taken on the host
+    element_upper_vars: tuple[str, ...] = ()
 
 
 def _aos_lead(a: FrozenArg) -> int:
@@ -1625,15 +1633,20 @@ def _aos_loop_pieces(a: FrozenArg) -> AosLoopPieces:
     its = [f"aos_{base}_i{k}" for k in range(_aos_lead(a))]
     lowers = [f"aos_{base}_l{j}" for j in range(member_rank)]
     uppers = [f"aos_{base}_u{j}" for j in range(member_rank)]
+    device = (
+        tuple(f"aos_{base}_m{j}" for j in range(member_rank)),
+        tuple(f"aos_{base}_el{j}" for j in range(member_rank)),
+        tuple(f"aos_{base}_eu{j}" for j in range(member_rank)),
+    )
     if a.aos_root_rank:
         root, segment = _aos_root_and_segment(a)
         roots, segs = its[: a.aos_root_rank], its[a.aos_root_rank :]
         elem = f"{root}({', '.join(roots)})%{segment}({', '.join(segs)})%{a.aos_member_path}"
         caps = [f"aos_{base}_n{k}" for k in range(len(segs))]
-        return AosLoopPieces(its, lowers, uppers, member_rank, elem, caps)
+        return AosLoopPieces(its, lowers, uppers, member_rank, elem, caps, *device)
     # member_path is %-joined (k / x / a%b): becxx(i0)%k / p_diag%p_vn_dual(i0,i1,i2)%x
     elem = f"{a.aos_origin_struct}({', '.join(its)})%{a.aos_member_path}"
-    return AosLoopPieces(its, lowers, uppers, member_rank, elem, [])
+    return AosLoopPieces(its, lowers, uppers, member_rank, elem, [], *device)
 
 
 class AosLoops(NamedTuple):
@@ -1692,13 +1705,34 @@ def _aos_member_is_static(a: FrozenArg) -> bool:
     return bool(member_dims) and all(str(d).isdigit() for d in member_dims)
 
 
-def _render_aos_copy_in(a: FrozenArg) -> list[str]:
+def _device_member_loop(pieces: AosLoopPieces, assign: str) -> list[str]:
+    """An OpenACC loop nest over one present element's deferred-shape member, running ``assign`` per element of it,
+    with the member's own subscripts (the buffer is laid out with the members' own bounds).  The bounds are taken
+    on the host into scalars first: as loop bounds, ``lbound(<record>(i)%<member>, k)`` gives nvfortran a garbage
+    launch geometry."""
+    elem, rank = pieces.accessor, pieces.member_rank
+    lines = [f"          {lo} = lbound({elem}, {k})" for k, lo in enumerate(pieces.element_lower_vars, start=1)]
+    lines += [f"          {hi} = ubound({elem}, {k})" for k, hi in enumerate(pieces.element_upper_vars, start=1)]
+    lines.append(f"          !$acc parallel loop collapse({rank}) default(present)")
+    dims = list(zip(pieces.member_loop_vars, pieces.element_lower_vars, pieces.element_upper_vars, strict=True))
+    for depth, (m, lo, hi) in enumerate(reversed(dims)):
+        lines.append("  " * depth + f"          do {m} = {lo}, {hi}")
+    lines.append("  " * rank + "          " + assign)
+    lines.extend("  " * depth + "          end do" for depth in reversed(range(rank)))
+    return lines
+
+
+def _render_aos_copy_in(a: FrozenArg, device: bool = False) -> list[str]:
     """Allocate the SoA buffer + pack the host AoS component in. A deferred-shape
     member keeps its own bounds: per member dim the buffer spans the lowest lower
     to the highest upper bound over the elements, and each element fills its own
     index range -- the offsets the SDFG reads off the buffer are the members'.
     Skips the data copy when global_alloc_inside (kernel allocates the component
-    itself; host has no data yet)."""
+    itself; host has no data yet).
+
+    ``device``: the members live on the device (a device-resident caller) and the SDFG reads the buffer there: the
+    buffer gets a device copy and the packing runs as OpenACC loops over the members' device copies; the host copy
+    is only allocated.  Only a deferred-shape member takes this lane (a fixed-shape value member is host data)."""
     pieces = _aos_loop_pieces(a)
     its, lowers, uppers, mrank, elem = pieces[:5]
     if _aos_lead(a) == 0:
@@ -1794,21 +1828,36 @@ def _render_aos_copy_in(a: FrozenArg) -> list[str]:
     out.append("    else")
     out.append(f"      allocate({a.sdfg_name}({one_dims}, {bound_dims}))")
     out.append("    end if")
-    out.append(f"    {a.sdfg_name} = {zero}")
+    if device:
+        out[0] = out[0].replace("copy-in:", "copy-in on the device:")
+        out.append(f"    !$acc enter data create({a.sdfg_name})")
+        out.append("    !$acc kernels default(present)")
+        out.append(f"    {a.sdfg_name} = {zero}")
+        out.append("    !$acc end kernels")
+    else:
+        out.append(f"    {a.sdfg_name} = {zero}")
     if not a.global_alloc_inside:
-        slc = _own_bounds(elem, mrank)
         out.append(f"    if ({sp}) then")
         out += do_open
-        out.append(f"        if ({mp}) &")
-        out.append(f"          {a.sdfg_name}({idx}, {slc}) = {elem}")
+        if device:
+            member_idx = ", ".join(pieces.member_loop_vars)
+            out.append(f"        if ({mp}) then")
+            out += _device_member_loop(pieces, f"{a.sdfg_name}({idx}, {member_idx}) = {elem}({member_idx})")
+            out.append("        end if")
+        else:
+            slc = _own_bounds(elem, mrank)
+            out.append(f"        if ({mp}) &")
+            out.append(f"          {a.sdfg_name}({idx}, {slc}) = {elem}")
         out += do_close
         out.append("    end if")
     return out
 
 
-def _render_aos_copy_out(a: FrozenArg) -> list[str]:
+def _render_aos_copy_out(a: FrozenArg, device: bool = False) -> list[str]:
     """Pack the SoA buffer back into the host AoS component (only when the arg
-    is WRITTEN), allocating each component first if the kernel created it."""
+    is WRITTEN), allocating each component first if the kernel created it.
+    ``device`` mirrors :func:`_render_aos_copy_in`: OpenACC loops into the members' device copies, then the buffer's
+    device copy is deleted."""
     pieces = _aos_loop_pieces(a)
     its, _lowers, _uppers, mrank, elem = pieces[:5]
     if _aos_lead(a) == 0:
@@ -1853,20 +1902,31 @@ def _render_aos_copy_out(a: FrozenArg) -> list[str]:
         out.append(f"    deallocate({a.sdfg_name})")
         return out
     mp = _present(elem, a.aos_member_pointer)
-    out = [f"    ! ----- SoA->AoS copy-out: {struct}(:)%{a.aos_member_path} <- {a.sdfg_name} -----"]
+    where = " on the device" if device else ""
+    out = [f"    ! ----- SoA->AoS copy-out{where}: {struct}(:)%{a.aos_member_path} <- {a.sdfg_name} -----"]
     out.append(f"    if ({sp}) then")
     out += do_open
     if a.global_alloc_inside:
+        if device:
+            raise ValueError(f"{a.sdfg_name}: a member the kernel allocates cannot be unpacked on the device")
         alloc_dims = ", ".join(
             f"lbound({a.sdfg_name}, {k}):ubound({a.sdfg_name}, {k})"
             for k in range(_aos_lead(a) + 1, _aos_lead(a) + mrank + 1)
         )
         out.append(f"        if (.not. {mp}) allocate({elem}({alloc_dims}))")
-    slc = _own_bounds(elem, mrank)
-    out.append(f"        if ({mp}) &")
-    out.append(f"          {elem} = {a.sdfg_name}({idx}, {slc})")
+    if device:
+        member_idx = ", ".join(pieces.member_loop_vars)
+        out.append(f"        if ({mp}) then")
+        out += _device_member_loop(pieces, f"{elem}({member_idx}) = {a.sdfg_name}({idx}, {member_idx})")
+        out.append("        end if")
+    else:
+        slc = _own_bounds(elem, mrank)
+        out.append(f"        if ({mp}) &")
+        out.append(f"          {elem} = {a.sdfg_name}({idx}, {slc})")
     out += do_close
     out.append("    end if")
+    if device:
+        out.append(f"    !$acc exit data delete({a.sdfg_name})")
     out.append(f"    deallocate({a.sdfg_name})")
     return out
 

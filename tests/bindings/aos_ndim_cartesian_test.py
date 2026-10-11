@@ -100,3 +100,30 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_deferred_member_image_packs_on_the_device():
+    """On a device-resident caller the image of a deferred-shape member is filled by OpenACC loops over the
+    members' device copies, from a buffer with a device copy; the host buffer is only allocated."""
+    src = "\n".join(_render_aos_copy_in(_becxx_member_arg(), device=True))
+    assert "!$acc enter data create(becxx_k)" in src
+    assert "!$acc kernels default(present)" in src  # the padding is zeroed on the device
+    assert "!$acc parallel loop collapse(2) default(present)" in src
+    # One element's own bounds are taken on the host before its loop nest.
+    assert "aos_becxx_k_el0 = lbound(becxx(aos_becxx_k_i0)%k, 1)" in src
+    assert "do aos_becxx_k_m1 = aos_becxx_k_el1, aos_becxx_k_eu1" in src
+    assert "becxx_k(aos_becxx_k_i0, aos_becxx_k_m0, aos_becxx_k_m1) = becxx(aos_becxx_k_i0)%k(aos_becxx_k_m0, aos_becxx_k_m1)" in src
+    assert "= becxx(aos_becxx_k_i0)%k\n" not in src  # no host array assignment
+    assert "becxx_k = 0\n    !$acc end kernels" in src
+
+
+def test_deferred_member_image_unpacks_on_the_device_and_frees_its_device_copy():
+    src = "\n".join(_render_aos_copy_out(_becxx_member_arg(), device=True))
+    assert "!$acc parallel loop collapse(2) default(present)" in src
+    assert "becxx(aos_becxx_k_i0)%k(aos_becxx_k_m0, aos_becxx_k_m1) = becxx_k(aos_becxx_k_i0, aos_becxx_k_m0, aos_becxx_k_m1)" in src
+    assert src.rstrip().endswith("!$acc exit data delete(becxx_k)\n    deallocate(becxx_k)")
+
+
+def test_static_member_image_stays_on_the_host():
+    """A fixed-shape value member is host data: the device flag changes nothing for it."""
+    assert _render_aos_copy_in(_cartesian_member_arg(), device=True) == _render_aos_copy_in(_cartesian_member_arg())

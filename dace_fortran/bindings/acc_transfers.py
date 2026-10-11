@@ -437,7 +437,8 @@ def plan_device_resident_caller(sdfg: dace.SDFG, frozen: FrozenSignature, iface,
     * a dummy, or the alias of a record member: its device address, through ``HOST_DATA USE_DEVICE``;
     * a module-origin array: the device address of the caller's module variable, through ``acc_deviceptr``
       (``deviceptr``);
-    * the packed companion of an array of records: packed on the device (``device_pack``);
+    * the packed companion of an array of records, or the image of a deferred-shape member of a module array of
+      records: packed on the device (``device_pack``);
     * a buffer the wrapper itself fills on the host (a deep copy of a record member, the image of a module
       array of records, a lifted member read): staged through a ``DATA`` region, by intent;
     * the alias of a member that may be absent: as any alias, plus a device copy of the scratch the absent
@@ -448,6 +449,8 @@ def plan_device_resident_caller(sdfg: dace.SDFG, frozen: FrozenSignature, iface,
     is which of the above.
     """
     from dace_fortran.bindings.block_builders import (
+        _aos_lead,
+        _aos_member_is_static,
         _aos_module_args,
         _orphan_module_args,
         _presence_scratch_name,
@@ -460,6 +463,13 @@ def plan_device_resident_caller(sdfg: dace.SDFG, frozen: FrozenSignature, iface,
     synthetic = {s.sdfg_name for s in plan.synthetic_globals}
     orphan = {a.sdfg_name for a, _mod, _member in _orphan_module_args(frozen, iface, plan)} - synthetic
     aos_image = {a.sdfg_name for a in _aos_module_args(frozen)} | synthetic
+    # The image of a deferred-shape member of a module array of records: the members are the caller's device data,
+    # so the image is packed on the device.  A fixed-shape value member stays host data, staged as a buffer.
+    aos_device_image = {
+        a.sdfg_name
+        for a in _aos_module_args(frozen)
+        if a.rank > _aos_lead(a) > 0 and not _aos_member_is_static(a) and not a.global_alloc_inside
+    }
     recipes = {flat: entry.recipe for entry in live_entries(frozen, plan) for flat in entry.recipe.flat_names}
     use_device, deviceptr, device_pack, create = [], [], [], []
     by_clause = {"copyin": [], "copyout": [], "copy": []}
@@ -477,7 +487,7 @@ def plan_device_resident_caller(sdfg: dace.SDFG, frozen: FrozenSignature, iface,
         if name in orphan:
             deviceptr.append(name)
             continue
-        if recipe is not None and recipe.aos_alloc:
+        if (recipe is not None and recipe.aos_alloc) or name in aos_device_image:
             device_pack.append(name)
         elif name in aos_image or (recipe is not None and not recipe.aliasable):
             by_clause[_host_buffer_clause(arg)].append(name)
