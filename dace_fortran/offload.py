@@ -256,6 +256,50 @@ def count_gpu(sdfg):
     return n_gpu, n_dev
 
 
+def _gpu_boundary_node(pn):
+    """A map Entry/Exit of a GPU-scheduled map -- the point a memlet leaves/enters device code."""
+    return (isinstance(pn, (nodes.EntryNode, nodes.ExitNode)) and getattr(pn, 'map', None) is not None
+            and pn.map.schedule in dace.dtypes.GPU_SCHEDULES)
+
+
+def _transient_needs_device_global(sdfg, name) -> bool:
+    """Does transient `name` have to live in DEVICE GLOBAL memory rather than host heap?
+
+    A transient is normally host scratch and the offload leaves it alone.  But when some of its
+    accesses are inside a GPU-scheduled map while the container's AccessNode sits OUTSIDE every
+    such map -- so those accesses cross the map boundary -- codegen has no legal register<->host
+    copy for it: `cuda.py` registers `CPU_Heap <-> Register` at a GPU schedule to `IllegalCopy`,
+    and the bake dies with `'IllegalCopy' object has no attribute 'define_out_memlet'`.  Such a
+    container must be promoted to `GPU_Global` exactly like a signature array.
+
+    ONLY containers that genuinely SPAN the boundary qualify.  A transient whose every access is
+    inside ONE device map -- e.g. DaCe's own map-fusion private temporary -- is deliberately
+    excluded: it is per-map private (map fusion nests it), and promoting it to global would make a
+    parallel map's threads share it (a race).  The signature that separates the two is: a
+    NON-device-scoped AccessNode (the container is placed outside the map) AND an edge crossing a
+    GPU map boundary (it is genuinely touched by device code).  Both are required; a host-only
+    transient has the first but not the second and is left untouched.
+    """
+    from dace.sdfg.scope import is_devicelevel_gpu
+    outside_scope = False
+    crosses = False
+    for st in sdfg.all_states():
+        if not isinstance(st, SDFGState):
+            continue
+        for nd in st.nodes():
+            if not (isinstance(nd, nodes.AccessNode) and nd.data == name):
+                continue
+            if not is_devicelevel_gpu(sdfg, st, nd):
+                outside_scope = True
+            for e in st.all_edges(nd):
+                if any(_gpu_boundary_node(p.src) or _gpu_boundary_node(p.dst)
+                       for p in st.memlet_path(e)):
+                    crosses = True
+            if outside_scope and crosses:
+                return True
+    return False
+
+
 def _reroute_host_scalar_accesses(sdfg, culprit):
     """Give every host-side scalar access of a device-resident container a host mirror.
 
@@ -550,9 +594,14 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     n_dev = 0
     promoted = []
     for name, arr in sdfg.arrays.items():
-        if arr.transient:
-            continue
         if isinstance(arr, dace.data.Scalar):
+            continue
+        if arr.transient and not _transient_needs_device_global(sdfg, name):
+            # Host-only transient scratch: leave it host-resident.  A transient that SPANS a GPU
+            # map boundary (see `_transient_needs_device_global`) is promoted below like a
+            # signature array -- otherwise codegen has no legal register<->host copy and the bake
+            # dies with IllegalCopy.  Host uses of such a container are handled by the
+            # demote/reroute oracle below (a scalar host read gets a host mirror).
             continue
         try:
             is_len1 = all(int(s) == 1 for s in arr.shape)

@@ -67,7 +67,32 @@ def _state_access(state: SDFGState, name: str) -> Tuple[bool, bool]:
     return uncovered_read, writes
 
 
-def _block_exit(block, name: str, sdfg: SDFG, entry: bool) -> Tuple[bool, bool]:
+def _block_exit(block, name: str, sdfg: SDFG, entry: bool,
+                cache=None) -> Tuple[bool, bool]:
+    """Memoised ``_block_exit_uncached``, keyed on ``(id(block), entry)``.
+
+    The analysis is a pure function of ``(block, name, sdfg, entry)`` and ``name``/``sdfg`` are
+    fixed for a whole scan -- but the recursion re-visits the same block at the same entry value
+    an exponential number of times: a nested ``LoopRegion`` re-``_scan``s its entire subtree once
+    per fixpoint round, and every ``ConditionalBlock`` branch repeats that below it.  On a deeply
+    nested slice that is depth-many factors of ``_FIXPOINT_ROUNDS`` and the bake never returns
+    (measured on sfclayrev_prod: >50 min at 100 % CPU, vs ~1 min once memoised).  Memoising makes
+    the walk polynomial; the result is unchanged, because the function is deterministic and does
+    not close over mutable state.
+    """
+    if cache is None:
+        return _block_exit_uncached(block, name, sdfg, entry, None)
+    key = (id(block), entry)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    res = _block_exit_uncached(block, name, sdfg, entry, cache)
+    cache[key] = res
+    return res
+
+
+def _block_exit_uncached(block, name: str, sdfg: SDFG, entry: bool,
+                         cache) -> Tuple[bool, bool]:
     """``(ok, defined_at_exit)`` for one block, given whether ``name`` is defined on entry.
 
     ``ok`` is False when the block reads ``name`` without it being defined.
@@ -83,7 +108,7 @@ def _block_exit(block, name: str, sdfg: SDFG, entry: bool) -> Tuple[bool, bool]:
         for cond, body in block.branches:
             if cond is None:
                 has_else = True
-            ok_b, exit_b = _scan(body, name, sdfg, entry)
+            ok_b, exit_b = _scan(body, name, sdfg, entry, cache)
             ok = ok and ok_b
             exits.append(exit_b)
         # Without an else the fall-through path writes nothing and keeps the entry value.
@@ -104,7 +129,7 @@ def _block_exit(block, name: str, sdfg: SDFG, entry: bool) -> Tuple[bool, bool]:
         ok = True
         exit_v = entry
         for _ in range(_FIXPOINT_ROUNDS):
-            ok_i, exit_i = _scan(block, name, sdfg, seen_entry)
+            ok_i, exit_i = _scan(block, name, sdfg, seen_entry, cache)
             ok = ok_i
             exit_v = entry or exit_i
             nxt = entry or exit_i
@@ -118,7 +143,21 @@ def _block_exit(block, name: str, sdfg: SDFG, entry: bool) -> Tuple[bool, bool]:
 
 
 def _scan(region: ControlFlowRegion, name: str, sdfg: SDFG,
-          entry_defined: bool) -> Tuple[bool, bool]:
+          entry_defined: bool, cache=None) -> Tuple[bool, bool]:
+    """Memoised ``_scan_uncached``, keyed on ``(id(region), entry_defined)`` (see ``_block_exit``)."""
+    if cache is None:
+        return _scan_uncached(region, name, sdfg, entry_defined, None)
+    key = (id(region), entry_defined)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    res = _scan_uncached(region, name, sdfg, entry_defined, cache)
+    cache[key] = res
+    return res
+
+
+def _scan_uncached(region: ControlFlowRegion, name: str, sdfg: SDFG,
+                   entry_defined: bool, cache) -> Tuple[bool, bool]:
     """``(ok, defined_at_exit)`` for a whole control-flow region."""
     blocks = list(region.nodes())
     if not blocks:
@@ -133,7 +172,7 @@ def _scan(region: ControlFlowRegion, name: str, sdfg: SDFG,
     for _ in range(_FIXPOINT_ROUNDS):
         changed = False
         for b in blocks:
-            _, nv = _block_exit(b, name, sdfg, entry_of(b, out))
+            _, nv = _block_exit(b, name, sdfg, entry_of(b, out), cache)
             if nv != out[b]:
                 out[b] = nv
                 changed = True
@@ -142,7 +181,7 @@ def _scan(region: ControlFlowRegion, name: str, sdfg: SDFG,
 
     ok = True
     for b in blocks:
-        ok_b, _ = _block_exit(b, name, sdfg, entry_of(b, out))
+        ok_b, _ = _block_exit(b, name, sdfg, entry_of(b, out), cache)
         ok = ok and ok_b
 
     # An interstate edge that READS the scalar needs it defined where the edge leaves.  Nothing
@@ -328,12 +367,16 @@ def fission_loop_local_scalars(sdfg: SDFG, verbose: bool = False) -> List[str]:
             continue
 
         # Every group must prove the scalar is dead on entry; one failure disqualifies the scalar.
+        # One cache per scalar (the scan is keyed only on block identity and the entry value, and
+        # `name` is fixed here) -- without it the walk is exponential in the nesting depth; see
+        # `_block_exit`.
+        cache: Dict = {}
         safe = True
         for loop in groups:
             if _mentions(loop, name):
                 safe = False
                 break
-            ok, _ = _scan(loop, name, sdfg, False)
+            ok, _ = _scan(loop, name, sdfg, False, cache)
             if not ok:
                 safe = False
                 break

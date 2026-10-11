@@ -121,3 +121,37 @@ def test_scalar_written_before_the_loop_is_refused():
     sdfg.add_edge(start, loop, InterstateEdge())
 
     assert not fission_loop_local_scalars(sdfg)
+
+
+def test_deeply_nested_loops_terminate():
+    """REGRESSION: the must-defined walk is MEMOISED, so its cost is polynomial, not exponential.
+
+    `_block_exit` re-entered a nested `LoopRegion`'s entire subtree once per fixpoint round and each
+    `ConditionalBlock` branch repeated that below it, so a region nested d deep cost ~8**d
+    `_state_access` calls (`_FIXPOINT_ROUNDS = 8`).  A real slice (sfclayrev_prod, 112 params) is
+    deep enough that the bake ran >50 min at 100 % CPU and never returned; without the memo this
+    test does not finish either.  Depth must not change the verdict, so the same assert pins both
+    the termination and the answer.
+    """
+    import time
+
+    def build(depth):
+        sdfg = _base()
+        start = sdfg.add_state("start", is_start_block=True)
+        parent = sdfg
+        first = None
+        for d in range(depth):
+            loop = LoopRegion(f"L{d}", "i = 0", "i < 8", "i = i + 1")
+            parent.add_node(loop)
+            if first is None:
+                first = loop
+            parent = loop
+        body = parent.add_state("body")
+        node = _write(body, "x", "src", "i")
+        _read(body, "x", "dst", "i", node=node)
+        sdfg.add_edge(start, first, InterstateEdge())
+        return sdfg
+
+    t0 = time.time()
+    assert fission_loop_local_scalars(build(24)), "a nested iteration-local scalar must still split"
+    assert time.time() - t0 < 20, "the must-defined walk has gone exponential again"
