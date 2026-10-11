@@ -2019,6 +2019,16 @@ def _build_symbol_assigns(
     for a in frozen.args:
         if a.kind is FrozenArgKind.ARRAY and a.sdfg_name in _module_sources and not a.global_alloc_inside:
             module_array_extents.setdefault(a.sdfg_name, (_module_value_expr(a.sdfg_name, _synth_members), ""))
+    # An array the SDFG allocates itself in a module array's place (scratch the routine fills and consumes within
+    # one call) keeps that module array's lower-bound and extent symbols, which the kernel's subscripts still take:
+    # read them from the module variable, which the wrapper reaches as for any module-sourced symbol.
+    arg_names = {a.sdfg_name for a in frozen.args}
+    for sym in frozen.free_symbols:
+        m = _OFFSET_SYM_RE.match(sym) or _EXTENT_SYM_RE.match(sym)
+        if m and m.group(1) not in arg_names and m.group(1) in _module_sources:
+            alias = _module_value_expr(m.group(1), _synth_members)
+            module_array_hosts.setdefault(m.group(1), (alias, ""))
+            module_array_extents.setdefault(m.group(1), (alias, ""))
     # Cap and lower-bound symbols of aos_alloc recipes are populated by pack-in code
     # before the call -- skip here to avoid a stray TODO or duplicate assignment.
     aos_pack_syms = {
