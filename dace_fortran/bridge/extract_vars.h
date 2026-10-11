@@ -25,6 +25,10 @@ struct VarInfo {
   bool is_written = false;
   std::vector<std::string> shape_symbols;
   std::vector<std::string> lower_bounds;
+  /// Per dim, the smallest literal subscript the code uses on an array whose lower bound only the caller knows
+  /// (lower_bounds "?"), or "" -- a floor the bound must be at or below, not the bound itself: the builder takes it
+  /// as the default of the free offset for a direct call, a binding passes the real bound.
+  std::vector<std::string> lower_bound_floors;
   std::string role;
   /// Compile-time constant data for the read-only pool (Flang's ``_QQro.<shape>x<dtype>.<counter>`` globals); non-empty
   /// triggers an SDFG init state. Row-major doubles, one per element; Python narrows to actual dtype, booleans as

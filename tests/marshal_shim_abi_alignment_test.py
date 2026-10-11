@@ -198,14 +198,14 @@ def test_outer_marshal_leaf_order_equals_inner_shim_slot_order(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Regression: concrete-NEGATIVE folded _lb slot for a callback member
-# (commit 9bf289a -- ICON end_block(-10) refinement-control pattern).
+# Regression: the _lb slot of a callback member read at a literal negative index
+# (ICON end_block(-10) refinement-control pattern).
 # ---------------------------------------------------------------------------
-# A deferred-shape ALLOCATABLE member accessed at a literal negative index has its lower
-# bound STATICALLY INFERRED to that literal (inferLowerBoundsFromLiteralAccesses), folding
-# offset_<member>_d0 to -10. The inner shim still mints one <flat>_lb<i> slot per dim
-# regardless, so the marshal MUST forward the folded literal -- else the outer emits one
-# fewer slot than the inner reads (925 vs 921 desync). Build + string-inspect, no run.
+# A deferred-shape ALLOCATABLE member accessed at a literal negative index keeps a FREE lower
+# bound (the literal is only a floor the caller's allocation must respect; the bridge records it
+# as the direct-call default of offset_<member>_d0). The inner shim mints one <flat>_lb<i> slot
+# per dim, so the marshal MUST forward the free offset -- else the outer emits one fewer slot
+# than the inner reads (925 vs 921 desync). Build + string-inspect, no run.
 
 _NEG_LB_TYPES = """
   type :: t_edges
@@ -250,8 +250,8 @@ contains
         real(c_double), intent(out) :: o(*)
       end subroutine
     end interface
-    ! The OUTER's own literal-negative access folds end_block's dim-1 lower
-    ! bound to -10 in the outer builder, so the marshal sees offset<1.
+    ! The OUTER's own literal-negative access leaves end_block's dim-1 lower
+    ! bound free in the outer builder (floor -10), so the marshal sees a free offset.
     acc(1) = real(p % edges % end_block(-10, jb), c_double) + real(p % nblks_e, c_double)
     call velo(p, je, jb, acc)
   end subroutine
@@ -296,20 +296,23 @@ def _neg_lb_outer_marshal_args(tmp_path):
         clear_external_registry()
 
 
-def test_neg_lbound_member_lb_slot_marshalled_with_folded_literal(tmp_path):
-    """A neg-folded member lower bound is marshalled as its ``_lb`` slot. ``end_block(-10,
-    jb)`` folds ``offset_p_edges_end_block_d0`` to literal ``-10`` (commit 9bf289a). Two
-    facets: LITERAL -- the marshal forwards the folded lb as ``(int)(-10)`` (pre-fix skipped
-    non-free offsets); COUNT PARITY -- with it forwarded, outer arg count == inner slot
-    count (a dropped ``_lb`` reproduces the capstone's 925-vs-921 desync at toy scale)."""
+def test_neg_lbound_member_lb_slot_marshalled_as_free_offset(tmp_path):
+    """A member read at a literal negative index keeps a free lower bound that is marshalled as its ``_lb``
+    slot. ``end_block(-10, jb)`` leaves ``offset_p_edges_end_block_d0`` free with floor -10. Two facets: SYMBOL --
+    the marshal forwards the free offset (a literal -10 would be wrong for an allocation ``(-12:)``); COUNT PARITY
+    -- with it forwarded, outer arg count == inner slot count (a dropped ``_lb`` reproduces the capstone's
+    925-vs-921 desync at toy scale)."""
     inner_slots = _neg_lb_inner_shim_slots(tmp_path)
     outer_args = _neg_lb_outer_marshal_args(tmp_path)
 
     # Precondition: inner shim mints a dim-0 _lb slot for the dynamic end_block member.
     assert "p_edges_end_block_lb0" in inner_slots, f"inner shim did not mint end_block dim-0 lb slot:\n{inner_slots}"
 
-    # LITERAL: the folded -10 lower bound rides as the member's dim-0 _lb slot.
-    assert "(int)(-10)" in outer_args, f"neg-folded end_block lower bound not marshalled as an _lb slot:\n{outer_args}"
+    # SYMBOL: the free lower bound rides as the member's dim-0 _lb slot, not a literal guessed from the access.
+    assert any("offset_p_edges_end_block_d0" in a for a in outer_args), (
+        f"end_block's free lower bound not marshalled as an _lb slot:\n{outer_args}"
+    )
+    assert "(int)(-10)" not in outer_args, f"a literal subscript was taken for the lower bound:\n{outer_args}"
 
     # COUNT PARITY: outer marshal lines up slot-for-slot with the inner shim.
     assert len(outer_args) == len(inner_slots), (
