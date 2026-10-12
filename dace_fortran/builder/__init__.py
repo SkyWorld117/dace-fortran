@@ -93,6 +93,7 @@ from dace_fortran.builder.emit_tasklet import add_whole_array_fill, emit_scalar_
 from dace_fortran.builder.records import NodeLike, VarLike
 from dace_fortran.dace_types import connectors
 from dace_fortran.entry_names import split_qualified_entry
+from dace_fortran.symbol_use_sites import find_symbol_use_sites
 
 # Default bridge pass pipeline.  Order matters  --  see ``README.md``.
 DEFAULT_PIPELINE = (
@@ -2025,10 +2026,6 @@ class SDFGBuilder:
         :raises RuntimeError: If any actually-used symbol is neither
             registered on the SDFG nor a dace-internal name.
         """
-        import re
-
-        from dace.sdfg.nodes import NestedSDFG, Tasklet
-
         unresolved = sorted(
             k for k in needed if k not in sdfg.symbols and k not in sdfg.arrays and not k.startswith("__dace")
         )
@@ -2036,36 +2033,11 @@ class SDFGBuilder:
             return
         # Find up to three representative use sites for the first symbol so
         # the user sees the exact tasklet / memlet that's referencing the
-        # bare name.  Word-boundary match to avoid substring noise (e.g. a
-        # symbol ``p_patch`` would otherwise match ``p_patch_nlev``).
+        # bare name.  A tasklet that reads the name through a wired
+        # connector is not one: only a tasklet using it with no edge behind
+        # it makes the symbol free.
         target = unresolved[0]
-        pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(target)}(?![A-Za-z0-9_])")
-        examples: list = []
-        for state in sdfg.all_states():
-            for edge in state.edges():
-                m = edge.data
-                if m is None or not m.data:
-                    continue
-                subset_str = f"{m.subset}"
-                if pat.search(subset_str):
-                    examples.append(f"memlet[{state.label}] data={m.data} subset={subset_str[:160]}")
-                    if len(examples) >= 3:
-                        break
-            if len(examples) >= 3:
-                break
-            for n in state.nodes():
-                if isinstance(n, Tasklet) and pat.search(n.code.as_string):
-                    examples.append(f"tasklet[{state.label}::{n.label}] code={n.code.as_string[:160]}")
-                    if len(examples) >= 3:
-                        break
-                if isinstance(n, NestedSDFG):
-                    for k, v in n.symbol_mapping.items():
-                        if pat.search(str(v)):
-                            examples.append(f"nsdfg[{state.label}::{n.label}] symbol_mapping[{k}]={v}")
-                            if len(examples) >= 3:
-                                break
-            if len(examples) >= 3:
-                break
+        examples = find_symbol_use_sites(sdfg, target)
         hint = (
             "Most likely cause: the bridge collapsed an unflattened struct-"
             "member access chain (e.g. ``s%X(...)%Y``) to the bare struct "
