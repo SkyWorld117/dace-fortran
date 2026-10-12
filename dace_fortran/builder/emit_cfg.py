@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Container, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import dace
@@ -643,6 +643,54 @@ def _hoist_hazard_targets(hoisted_pairs: Sequence[tuple[str, str]], later_target
             return hazardous
 
 
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _assign_read_names(a: NodeLike) -> set[str]:
+    """Every name assign ``a`` mentions in its value or in a subscript -- the written element's included.
+
+    Over-approximate (it also yields array names and casts such as ``float64``): callers intersect it with symbol
+    names.  ``v(k) = w(j)`` mentions ``k`` and ``j``.
+    """
+    names = set(_IDENT_RE.findall(a.expr or ""))
+    for ac in a.accesses:
+        for e in (*(ac.index_exprs or ()), *(ac.index_vars or ())):
+            names.update(_IDENT_RE.findall(str(e)))
+    return names
+
+
+def _overwritten_after_read(assigns: Sequence[NodeLike], symbols: Container[str]) -> set[str]:
+    """Symbol targets in ``assigns`` assigned after a compute statement that reads them.
+
+    The flat batch path lifts every symbol assignment onto the pre-``body`` interstate edge, ahead of every compute.
+    A compute that precedes the assignment in source order then reads the NEW value: ``v(k) = x; k = k + 1`` in a
+    loop writes ``v(k + 1)``, so a counter that advances after each store shifts every value by one position and the
+    last store lands past the end.  The read-after-write counterpart is :func:`_hoist_hazard_targets`.
+    """
+    read: set[str] = set()
+    out: set[str] = set()
+    for a in assigns:
+        if a.target in symbols:
+            if a.target in read:
+                out.add(a.target)
+        else:
+            read |= _assign_read_names(a)
+    return out
+
+
+def _conflicts_with_edge(edge: InterstateEdge, tgt: str, rhs: str) -> bool:
+    """Whether ``tgt = rhs`` must not join ``edge``'s assignments.
+
+    DaCe gives assignments on one edge no order, so a new one may not read a name another one there writes, nor
+    write a name another one there reads or writes: ``j = k`` followed by ``k = k + 1`` needs two edges.
+    """
+    if not edge.assignments:
+        return False
+    if tgt in edge.assignments or _rhs_free_symbols(rhs) & edge.assignments.keys():
+        return True
+    return any(tgt in _rhs_free_symbols(str(r)) for r in edge.assignments.values())
+
+
 def _scalar_reassign_in_state(state: SDFGState, a: NodeLike, builder: SDFGBuilder) -> bool:
     """True if emitting assign ``a`` would RE-WRITE a scalar whose prior
     value is still live (already read or written) in ``state``.
@@ -877,10 +925,14 @@ def emit_loop(
         # clears only the computes.
         hazardous = _hoist_hazard_targets(symbol_assign_pairs, compute_targets)
         hazardous |= _hoist_hazard_targets(per_sym_assigns, compute_targets | {t for t, _ in symbol_assign_pairs})
+        # And group 2 must not overwrite a symbol a compute it skips past still reads (indirect
+        # symbols are fresh per occurrence, so nothing reads them before their definition).
+        hazardous |= _overwritten_after_read(child_assigns, builder.symbols)
 
         if hazardous:
-            # At least one hoisted assignment reads a value something it skips past defines, so the
-            # hoist would rotate it by an iteration (see ``_hoist_hazard_targets``).  Emit the batch
+            # At least one hoisted assignment reads a value something it skips past defines, or
+            # overwrites a value something it skips past reads, so the hoist would rotate it by an
+            # iteration (see ``_hoist_hazard_targets`` / ``_overwritten_after_read``).  Emit the batch
             # statement by statement in SOURCE order instead: computes land in the current state,
             # each symbol assignment rides the interstate edge that opens the next one, and each
             # statement's indirect symbols are defined immediately before it.  Costs extra states --
@@ -890,7 +942,6 @@ def emit_loop(
             materialize_indirect_view_sources(builder, pre, indirect_syms)
             cur = pre
             edge = InterstateEdge()
-            batch_lhs: set[str] = set()
             emitted_syms: set[str] = set()
             sym_i = compute_i = 0
             for a in child_assigns:
@@ -907,7 +958,7 @@ def emit_loop(
                         # symbol may read has to close onto its own state first.
                         nxt = loop.add_state(f"sym_chain_{builder.nid()}")
                         loop.add_edge(cur, nxt, edge)
-                        cur, edge, batch_lhs = nxt, InterstateEdge(), set()
+                        cur, edge = nxt, InterstateEdge()
                     nxt = loop.add_state(f"sym_{sym}_{builder.nid()}")
                     loop.add_edge(cur, nxt, InterstateEdge(assignments={sym: sym_rhs[sym]}))
                     cur = nxt
@@ -915,19 +966,18 @@ def emit_loop(
                     # ``symbol_assigns`` filtered ``child_assigns`` in order, so the pairs line up.
                     tgt, rhs = symbol_assign_pairs[sym_i]
                     sym_i += 1
-                    if edge.assignments and (_rhs_free_symbols(rhs) & batch_lhs):
+                    if _conflicts_with_edge(edge, tgt, rhs):
                         nxt = loop.add_state(f"sym_chain_{builder.nid()}")
                         loop.add_edge(cur, nxt, edge)
-                        cur, edge, batch_lhs = nxt, InterstateEdge(), set()
+                        cur, edge = nxt, InterstateEdge()
                     edge.assignments[tgt] = rhs
-                    batch_lhs.add(tgt)
                     continue
                 # A pending symbol edge -- or a sibling array/scalar hazard -- closes the state
                 # first; the first compute always opens one so nothing lands in ``pre``.
                 if compute_i == 0 or edge.assignments or serialise or _scalar_reassign_in_state(cur, a, builder):
                     nxt = loop.add_state(f"body_{builder.nid()}")
                     loop.add_edge(cur, nxt, edge)
-                    cur, edge, batch_lhs = nxt, InterstateEdge(), set()
+                    cur, edge = nxt, InterstateEdge()
                 _emit_one(cur, a, compute_i)
                 compute_i += 1
             if edge.assignments:  # trailing symbol assignments still need a state to land on
@@ -954,20 +1004,19 @@ def emit_loop(
             # CHAIN (``qvan2_i1 = qvan2_i0 + 1`` right after ``qvan2_i0 =
             # int32(qm) + 1``).  DaCe forbids an interstate assignment
             # whose RHS reads a name written on the SAME edge (no defined
-            # order), so a pair whose RHS references a target written
-            # EARLIER in the current batch must open a NEW edge (the prior
-            # batch then sits on the preceding edge).  Dependency detected
-            # via the RHS's SYMBOLIC free-symbols (robust to substrings /
-            # the ``int32(...)`` typecast function, which is not a symbol).
+            # order), so a pair that depends on the current batch either
+            # way (see ``_conflicts_with_edge``) must open a NEW edge (the
+            # prior batch then sits on the preceding edge).  Dependency
+            # detected via the RHS's SYMBOLIC free-symbols (robust to
+            # substrings / the ``int32(...)`` typecast function, which is
+            # not a symbol).
             edge = InterstateEdge()
-            batch_lhs = set()
             for tgt, rhs in symbol_assign_pairs:
-                if edge.assignments and (_rhs_free_symbols(rhs) & batch_lhs):
+                if _conflicts_with_edge(edge, tgt, rhs):
                     nxt = loop.add_state(f"sym_chain_{builder.nid()}")
                     loop.add_edge(cur, nxt, edge)
-                    cur, edge, batch_lhs = nxt, InterstateEdge(), set()
+                    cur, edge = nxt, InterstateEdge()
                 edge.assignments[tgt] = rhs
-                batch_lhs.add(tgt)
             body = loop.add_state("body")
             loop.add_edge(cur, body, edge)
         else:
