@@ -742,6 +742,60 @@ end module ra_element_member_into_dummy_from_zero
         out="out(1:8*n) = reshape(res, [8*n])",
         nout=8,
     ),
+    # A fixed-size module array of records passed whole down two levels of assumed-shape dummies; only the innermost
+    # callee subscripts an element's pointer member, which points at an array with a lower bound other than 1.
+    "module_array_through_dummies": dict(
+        src=f"""
+module ra_module_array_through_dummies
+  implicit none
+{_TYPES_RANK3}
+  type(scalar_field), dimension(1) :: g
+contains
+  subroutine leaf(v, side, k, l)
+    type(scalar_field), dimension(1:), intent(inout) :: v
+    integer, intent(in) :: side, k, l
+    if (side == 1) then
+      v(1)%sf(k, -1, l) = v(1)%sf(k, 1, l)
+    else
+      v(1)%sf(k, 2, l) = v(1)%sf(k, 0, l)
+    end if
+  end subroutine leaf
+
+  subroutine mid(v, n)
+    type(scalar_field), dimension(1:), intent(inout) :: v
+    integer, intent(in) :: n
+    integer :: k, l
+    do l = 1, 2
+      do k = 1, n
+        call leaf(v, 1, k, l)
+        call leaf(v, 2, k, l)
+      end do
+    end do
+  end subroutine mid
+
+  subroutine kern(n)
+    integer, intent(in) :: n
+    call mid(g, n)
+  end subroutine kern
+end module ra_module_array_through_dummies
+""",
+        local="real(8), allocatable, target, save :: t(:, :, :)",
+        setup="""
+  if (allocated(t)) deallocate(t)
+  allocate(t(n, -1:2, 2))
+  do l = 1, 2
+    do m = -1, 2
+      do j = 1, n
+        t(j, m, l) = 100*l + 10*m + j
+      end do
+    end do
+  end do
+  g(1)%sf => t
+""",
+        call="kern(n)",
+        out="out(1:8*n) = reshape(t, [8*n])",
+        nout=8,
+    ),
 }
 
 _DRIVER = """
