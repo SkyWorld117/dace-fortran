@@ -378,11 +378,14 @@ _OUT_OF_BOUNDS_RE = re.compile(
 _LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?(\d+)\s+"([^"]+)"')
 
 
-def _origin_lines(source: str) -> dict[tuple[str, int], int]:
-    """Map ``(file, line)`` as the line markers of ``source`` name it to the index of the line in ``source``."""
+def _origin_lines(source: str, path: str | None = None) -> dict[tuple[str, int], int]:
+    """Map ``(file, line)`` as the line markers of ``source`` name it -- and, for ``path``, the file ``source`` is
+    compiled from, its own line numbers -- to the index of the line in ``source``."""
     origin: dict[tuple[str, int], int] = {}
     current: tuple[str, int] | None = None
     for index, text in enumerate(source.splitlines()):
+        if path is not None:
+            origin[(path, index + 1)] = index
         marker = _LINE_MARKER_RE.match(text)
         if marker:
             current = (marker.group(2), int(marker.group(1)))
@@ -420,14 +423,15 @@ def _clamp_subscript(text: str, column: int, dim: int, value: int, bound: int) -
     return f"{text[:a]}{bound}{text[b:]}"
 
 
-def clamp_out_of_bounds_constant_subscripts(source: str, flang_errors: str) -> tuple[str, int]:
+def clamp_out_of_bounds_constant_subscripts(source: str, flang_errors: str, path: str | None = None) -> tuple[str, int]:
     """Clamp each constant subscript flang reports as outside its array's constant bounds to that bound.
 
     Such a reference is undefined behaviour if it ever executes, so no valid execution runs it -- it sits in code a
     constant condition rules out -- and any in-bounds value keeps every valid execution's meaning, while flang-21
-    rejects the source as it stands.  Returns the patched source and the number of subscripts clamped.
+    rejects the source as it stands.  ``path``: the file flang compiled ``source`` from, for positions it reports in
+    that file itself.  Returns the patched source and the number of subscripts clamped.
     """
-    origin = _origin_lines(source)
+    origin = _origin_lines(source, path)
     lines = source.splitlines(keepends=True)
     clamped = 0
     for m in _OUT_OF_BOUNDS_RE.finditer(flang_errors):
@@ -658,7 +662,7 @@ def emit_hlfir_from_codebase(
                                text=True)
         if check.returncode == 0:
             break
-        tu_source, clamped = clamp_out_of_bounds_constant_subscripts(tu_source, check.stderr + check.stdout)
+        tu_source, clamped = clamp_out_of_bounds_constant_subscripts(tu_source, check.stderr + check.stdout, str(tu_path))
         if not clamped:
             break
         tu_path.write_text(tu_source)
