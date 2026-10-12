@@ -122,17 +122,24 @@ def _parse_reduce_identity(s: str) -> bool | int | float:
 
 def add_copy_node(builder: SDFGBuilder, ctx: Ctx, state: SDFGState, src_name: str, tgt_name: str) -> None:
     """Add a ``CopyLibraryNode`` copying the whole array ``src_name`` into ``tgt_name`` in ``state``. Connector
-    names come from the node class so this stays correct across libnode renames."""
+    names come from the node class so this stays correct across libnode renames.
+
+    A copy of a container onto exactly itself (``a = a``, or a record assigned from a dummy the caller
+    associated with that record, once the inlined dummy's members resolve onto the record's own) moves no data
+    and is dropped.  Any other copy writes into a fresh access node when the target's live node in ``state`` is
+    the source's or already has readers: writing into it would close a cycle through the copy or let those
+    earlier reads see the new value."""
     from dace.libraries.standard.nodes import CopyLibraryNode
 
+    from dace_fortran.builder.emit_tasklet import ensure_view_writeback_link
+
+    if src_name == tgt_name:
+        return
     src_desc = ctx.sdfg.arrays[src_name]
     tgt_desc = ctx.sdfg.arrays[tgt_name]
 
-    cp = CopyLibraryNode(name=f"copy_{tgt_name}_{builder.nid()}")
-    state.add_node(cp)
-
     src_access = acc(builder, state, src_name)
-    tgt_access = acc(builder, state, tgt_name)
+    src_memlet = Memlet.from_array(src_name, src_desc)
     # An allocatable transient can carry its own symbolic ALLOCATE extent, distinct from the
     # source's; drive the dest memlet off the source's shape when they differ (same rank) so
     # both subsets align -- conformance keeps the dest subset in bounds.
@@ -140,7 +147,19 @@ def add_copy_node(builder: SDFGBuilder, ctx: Ctx, state: SDFGState, src_name: st
     tgt_memlet = (
         Memlet.from_array(tgt_name, src_desc) if same_rank_diff_shape else Memlet.from_array(tgt_name, tgt_desc)
     )
-    state.add_edge(src_access, None, cp, input_connector(CopyLibraryNode), Memlet.from_array(src_name, src_desc))
+
+    cache = builder.access_caches[state]  # ``acc`` above created it
+    live = cache.get(tgt_name)
+    if live is not None and (live is src_access or state.out_degree(live) > 0):
+        tgt_access = state.add_access(tgt_name)
+        cache[tgt_name] = tgt_access
+        ensure_view_writeback_link(builder, state, tgt_access, tgt_name)
+    else:
+        tgt_access = acc(builder, state, tgt_name)
+
+    cp = CopyLibraryNode(name=f"copy_{tgt_name}_{builder.nid()}")
+    state.add_node(cp)
+    state.add_edge(src_access, None, cp, input_connector(CopyLibraryNode), src_memlet)
     state.add_edge(cp, output_connector(CopyLibraryNode), tgt_access, None, tgt_memlet)
 
 
