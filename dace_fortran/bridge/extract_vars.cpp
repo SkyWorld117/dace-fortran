@@ -4050,8 +4050,8 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
   // in both a tasklet body and a memlet subset).
   {
     // Walk a designate's memref back through the reinterpret hops to its root: a struct-typed DUMMY (a declare with a
-    // dummy scope), a module-global record or array of records (``st % comp(i) % data``, ``field(id) % comp(i) % data``, ``st`` and
-    // ``fl`` module variables), or neither.
+    // dummy scope), a module-global record or array of records (``st % comp(i) % data``, ``field(id) % comp(i) %
+    // data``, ``st`` and ``field`` module variables), or neither.
     enum class StructRoot { None, Dummy, ModuleGlobal };
     auto structRootOf = [](hlfir::DesignateOp dg) -> StructRoot {
       mlir::Value v = dg.getMemref();
