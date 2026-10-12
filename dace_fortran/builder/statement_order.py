@@ -133,15 +133,21 @@ def order_state(state: SDFGState) -> list[SkippedEdge]:
 
         for index, earlier in enumerate(ordered):
             for later in ordered[index + 1 :]:
-                if later in reach[id(earlier)] or earlier in reach[id(later)]:
+                if earlier in reach[id(later)]:
                     continue
                 earlier_writes = state.in_degree(earlier) > 0
                 later_writes = state.in_degree(later) > 0
                 if not earlier_writes and not later_writes:
                     continue
                 if later_writes:
+                    # A path from ``earlier`` to ``later`` orders only the readers on it: in ``w = p * q`` /
+                    # ``p = p * 2`` the update reads the node the first statement read, so ``p`` (read) reaches
+                    # ``p`` (written) through the update while the first statement's read stays unordered against
+                    # the store.  Every reader is checked; the ones already ordered are skipped below.
                     sources = load_anchors(state, earlier)
                     targets = store_anchors(state, later)
+                elif later in reach[id(earlier)]:
+                    continue
                 else:
                     sources = [earlier]
                     targets = [later]
