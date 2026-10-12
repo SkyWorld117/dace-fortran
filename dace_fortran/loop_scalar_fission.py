@@ -332,11 +332,36 @@ def _rename_in_region(region: ControlFlowRegion, old: str, new: str) -> None:
                 _rewrite_codeblock(cond, old, new)
 
 
-def fission_loop_local_scalars(sdfg: SDFG, verbose: bool = False) -> List[str]:
+#: State-name prefixes the length-one-array conversion uses for the ABI staging copies
+#: (``ConvertLengthOneArraysToScalars``; see ``dace/transformation/passes/
+#: length_one_array_scalar_conversion.py``).  Mirrored, not imported, so this module stays free of a
+#: pass-name coupling that a rename there would silently break.
+_STAGE_STATE_PREFIXES = ('stage_copyin', 'stage_copyout')
+
+
+def _is_staging_state(state: SDFGState) -> bool:
+    return any(str(getattr(state, 'label', '')).startswith(p) for p in _STAGE_STATE_PREFIXES)
+
+
+def fission_loop_local_scalars(sdfg: SDFG, verbose: bool = False,
+                               allow_abi_staged: bool = False) -> List[str]:
     """Mint a per-loop copy of every size-1 transient that a loop writes, when it is provably safe.
 
     Returns the names of the containers created.  Scalars that fail the liveness check, or that are
     touched outside any loop, are left exactly as they were.
+
+    ``allow_abi_staged`` (default OFF) extends the pass to a size-1 transient whose ONLY accesses
+    outside its loops are the length-one-array ABI staging copies (``stage_copyin``/``stage_copyout``).
+    That case is refused by default because the staging read is a live-OUT: the base container's
+    value after the loop is what the ABI returns, and a per-loop copy cannot put the last
+    iteration's value back into it.  With the flag on, the copies are still minted (so the nest can
+    map) but the BASE container is LEFT IN PLACE, so the staging state reads the copy-in value --
+    a DETERMINISTIC but NOT Fortran-faithful ABI output for the scalar.  It is therefore a
+    PER-KERNEL opt-in, exactly like ``offload``'s ``force_inline``/``split_siblings``/
+    ``permissive_ltm``, and must be paid for by that kernel's differential (or by the scalar being
+    provably a scratch whose out value no caller reads).  The within-loop liveness check -- the
+    silent-miscompile shape this pass exists to avoid -- still applies unchanged: a scalar that is
+    read before written inside an iteration is never split.
     """
     made: List[str] = []
     for name in list(sdfg.arrays):
@@ -352,18 +377,32 @@ def fission_loop_local_scalars(sdfg: SDFG, verbose: bool = False) -> List[str]:
             continue
 
         groups: Dict[LoopRegion, List[SDFGState]] = {}
-        outside = False
+        outside_states: List[SDFGState] = []
+        outside_edges = False
         for site in states + edge_regions:
             loop = _outermost_loop(site, sdfg)
             if loop is None:
-                outside = True
-                break
+                if isinstance(site, SDFGState):
+                    outside_states.append(site)
+                else:
+                    outside_edges = True
+                continue
             groups.setdefault(loop, [])
             if isinstance(site, SDFGState):
                 groups[loop].append(site)
-        if outside or not groups:
-            # Touched at top level: the loop's value would have to reach back out, which a copy
-            # cannot do.  Leave it whole; a read-only scalar here does not refuse the check anyway.
+
+        if edge_regions and outside_edges:
+            # A top-level EDGE reads the scalar (a branch/loop condition outside any loop): the
+            # staging arm is about the ABI copy states only, never about a computed condition.
+            continue
+        abi_staged = False
+        if outside_states:
+            if not allow_abi_staged or not all(_is_staging_state(s) for s in outside_states):
+                # Touched at top level: the loop's value would have to reach back out, which a copy
+                # cannot do.  Leave it whole; a read-only scalar here does not refuse the check.
+                continue
+            abi_staged = True
+        if not groups:
             continue
 
         # Every group must prove the scalar is dead on entry; one failure disqualifies the scalar.
@@ -396,9 +435,12 @@ def fission_loop_local_scalars(sdfg: SDFG, verbose: bool = False) -> List[str]:
             made.append(new)
         # Nothing reads or writes the base any more; drop it rather than carry a dead container.
         # Edges count: `_touched_states` alone would call a condition-only scalar dead.
-        if not _touched_states(sdfg, name) and not _touched_edges(sdfg, name):
+        # Under `abi_staged` the base is KEPT: the staging states still reference it (that is the
+        # whole reason this arm is opt-in -- the ABI output becomes the copy-in value).
+        if not abi_staged and not _touched_states(sdfg, name) and not _touched_edges(sdfg, name):
             del sdfg.arrays[name]
         if verbose:
-            print(f"[loop_scalar_fission] {name}: {len(groups)} loop-local copy(ies)")
+            print(f"[loop_scalar_fission] {name}: {len(groups)} loop-local copy(ies)"
+                  + (" (abi-staged, base kept)" if abi_staged else ""))
 
     return made

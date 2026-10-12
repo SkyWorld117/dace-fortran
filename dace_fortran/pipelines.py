@@ -151,7 +151,8 @@ def optimize(sdfg: SDFG,
              gpu_block_size=None,
              force_inline: bool = False,
              split_siblings: bool = False,
-             permissive_ltm: bool = False) -> SDFG:
+             permissive_ltm: bool = False,
+             allow_abi_scalar_fission: bool = False) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
 
     :param sdfg: the SDFG to optimize (mutated in place).
@@ -178,6 +179,14 @@ def optimize(sdfg: SDFG,
                 (W9-localise).  Enabled per kernel, paid for by that kernel's bit-exact differential.
                 Off, a kernel the conservative check refuses fails loudly rather than being silently
                 restructured (see :mod:`dace_fortran.offload`).
+    :param allow_abi_scalar_fission: let ``fission_loop_local_scalars`` split a size-1 ABI-STAGED
+                transient (one whose only out-of-loop accesses are the ``stage_copyin``/
+                ``stage_copyout`` copies), so a nest that writes it can map.  Default OFF: the
+                staging read is a live-OUT, so the split makes the scalar's ABI return value the
+                copy-in value instead of the last iteration's -- deterministic but not
+                Fortran-faithful.  Enabled per kernel, paid for by that kernel's differential (or by
+                the scalar being provably a caller-ignored scratch).  See
+                :func:`dace_fortran.loop_scalar_fission.fission_loop_local_scalars`.
     :param verify_inputs: call arguments to check numerics with once the pipeline is done. The
                           pre-optimization SDFG is snapshotted and both are run on these inputs,
                           requiring bit-identical results (:func:`verify_numerics`). Costs a
@@ -221,7 +230,7 @@ def optimize(sdfg: SDFG,
     # in `other_access_nodes`.  Only scalars whose value is provably dead on entry are split; see
     # the module docstring for the liveness condition and why it is checked rather than assumed.
     from dace_fortran.loop_scalar_fission import fission_loop_local_scalars
-    _fissioned = fission_loop_local_scalars(sdfg)
+    _fissioned = fission_loop_local_scalars(sdfg, allow_abi_staged=allow_abi_scalar_fission)
     if _fissioned:
         print(f"[dace_fortran.optimize] loop-local scalar fission: {len(_fissioned)} container(s)")
 

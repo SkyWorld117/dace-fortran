@@ -155,3 +155,36 @@ def test_deeply_nested_loops_terminate():
     t0 = time.time()
     assert fission_loop_local_scalars(build(24)), "a nested iteration-local scalar must still split"
     assert time.time() - t0 < 20, "the must-defined walk has gone exponential again"
+
+
+def _abi_staged():
+    """An iteration-local scalar that is ALSO the target of the length-one-array ABI staging copies:
+    a top-level ``stage_copyout`` reads it.  Default refuses (the staging read is a live-OUT);
+    ``allow_abi_staged=True`` splits the loop and KEEPS the base container."""
+    sdfg = _base()
+    sdfg.add_array("ab", [1], dace.float32)  # the ABI length-1 array the scalar stages to
+    start = sdfg.add_state("stage_copyin", is_start_block=True)
+    _write(start, "x", "ab", 0)  # ABI array -> staged scalar (the copy-in counterpart)
+    loop = LoopRegion("L", "i = 0", "i < 8", "i = i + 1")
+    sdfg.add_node(loop)
+    body = loop.add_state("body")
+    node = _write(body, "x", "src", "i")
+    _read(body, "x", "dst", "i", node=node)
+    out = sdfg.add_state("stage_copyout")
+    _read(out, "x", "ab", 0)
+    sdfg.add_edge(start, loop, InterstateEdge())
+    sdfg.add_edge(loop, out, InterstateEdge())
+    return sdfg
+
+
+def test_abi_staged_scalar_refused_by_default():
+    sdfg = _abi_staged()
+    assert not fission_loop_local_scalars(sdfg), "default must not split an ABI-staged scalar"
+
+
+def test_abi_staged_scalar_split_when_opted_in():
+    sdfg = _abi_staged()
+    made = fission_loop_local_scalars(sdfg, allow_abi_staged=True)
+    assert made, "the opt-in arm must split the scalar so the nest can map"
+    assert "x" in sdfg.arrays, "the base container must be KEPT for the staging state"
+    sdfg.validate()
