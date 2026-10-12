@@ -18,7 +18,8 @@
 //     ``hlfir.specialized_globals``: ``"module::name"`` or a mangled symbol ->
 //     value; ``"module::name%component"`` for a scalar component of a record
 //     variable, ``"module::name(k)%component"`` for one of element ``k`` of a
-//     fixed-size array of records).  For every named scalar the remaining module only ever reads,
+//     fixed-size array of records, ``"module::name(k)"`` for element ``k`` of a
+//     fixed-size array of scalars).  For every named scalar the remaining module only ever reads,
 //     each ``fir.load`` of it becomes the constant; a ``fir.if`` whose
 //     condition then folds to a constant is replaced by the branch it takes,
 //     and a ``cf.cond_br`` (a lowered ``select case``) by a branch to its
@@ -29,9 +30,10 @@
 //     go too, or the bridge would still take those variables as inputs.
 //
 // Candidates:
-//     Every non-constant integer, real or logical module scalar, and scalar
+//     Every non-constant integer, real or logical module scalar, scalar
 //     component of a module record or of an element of a module array of
-//     records read at a constant subscript, the module reads and never writes --
+//     records read at a constant subscript, and element of a module array of
+//     such scalars read at a constant subscript, the module reads and never writes --
 //     whatever the configuration of a run could fix -- is recorded first, before any value is applied, as the module
 //     attribute ``hlfir.configuration_candidates`` (``"module::name"`` ->
 //     Fortran type), so a caller can find out which values to fix.
@@ -137,7 +139,7 @@ std::optional<int64_t> constantIndex(mlir::Value v) {
   return std::nullopt;
 }
 
-/// ``array(k)`` with one scalar subscript: an element of a rank-1 array of records.
+/// ``array(k)`` with one scalar subscript: an element of a rank-1 array (of records or of scalars).
 std::optional<int64_t> constantElement(hlfir::DesignateOp d) {
   if (d.getComponent().has_value() || d.getIndices().size() != 1 || !d.getSubstring().empty() ||
       d.getComplexPart().has_value())
@@ -147,14 +149,58 @@ std::optional<int64_t> constantElement(hlfir::DesignateOp d) {
   return constantIndex(d.getIndices()[0]);
 }
 
-/// A scalar inside a module variable: the variable itself, its ``component`` (a record), or the ``component`` of its
-/// element ``element`` (a fixed-size array of records, ``bounds(1)%lo``).
+/// The lower bound a declare gives a rank-1 array: 1 for a plain shape, the literal of a shift; nullopt otherwise.
+std::optional<int64_t> declaredLowerBound(hlfir::DeclareOp decl) {
+  mlir::Value const shape = decl.getShape();
+  if (!shape) return std::nullopt;
+  if (auto plain = shape.getDefiningOp<fir::ShapeOp>()) {
+    if (plain.getExtents().size() == 1) return 1;
+  } else if (auto shift = shape.getDefiningOp<fir::ShapeShiftOp>()) {
+    if (shift.getOrigins().size() == 1) return constantIndex(shift.getOrigins().front());
+  }
+  return std::nullopt;
+}
+
+/// How the subscripts of a rank-1 array at some value relate to those of the module variable: its own declare fixes
+/// them; the declare of a dummy an inlined call bound the whole array to numbers the same elements from the dummy's
+/// lower bound (``s(1)`` of ``s(3)`` bound to ``a(0:2)`` is ``a(0)``). A declare whose lower bound is no literal, or of
+/// another rank, leaves them unknown.
+struct Subscripts {
+  std::optional<int64_t> lower;     // of the subscripts here; unset before the variable's own declare
+  std::optional<int64_t> variable;  // the variable's own lower bound, once known
+  int64_t shift = 0;                // variable subscript = subscript here + shift
+  bool known = true;
+
+  Subscripts below(hlfir::DeclareOp decl) const {
+    Subscripts out;
+    std::optional<int64_t> const lb = declaredLowerBound(decl);
+    if (!known || !lb) {
+      out.known = false;
+      return out;
+    }
+    out.lower = lb;
+    out.variable = lower ? variable : lb;
+    out.shift = lower ? shift + *lower - *lb : 0;
+    return out;
+  }
+
+  /// The variable's subscript of the literal subscript ``k`` here; nullopt when it cannot be told.
+  std::optional<int64_t> of(std::optional<int64_t> k) const {
+    if (!k || !known || !lower) return std::nullopt;
+    return *k + shift;
+  }
+};
+
+/// A scalar inside a module variable: the variable itself, its ``component`` (a record), the ``component`` of its
+/// element ``element`` (a fixed-size array of records, ``bounds(1)%lo``), or its element ``element`` itself (a
+/// fixed-size array of scalars, ``flags(1)``).
 struct ScalarPath {
   std::optional<int64_t> element;
   std::string component;
 };
 
-/// Parses the part of a key after the variable's name: "", ``%component`` or ``(k)%component``; nullopt otherwise.
+/// Parses the part of a key after the variable's name: "", ``%component``, ``(k)%component`` or ``(k)``; nullopt
+/// otherwise.
 std::optional<ScalarPath> parseScalarPath(llvm::StringRef rest) {
   ScalarPath path;
   if (rest.consume_front("(")) {
@@ -163,7 +209,6 @@ std::optional<ScalarPath> parseScalarPath(llvm::StringRef rest) {
     if (number.trim().getAsInteger(10, k) || after.size() == rest.size()) return std::nullopt;
     path.element = k;
     rest = after;
-    if (!rest.starts_with("%")) return std::nullopt;  // an element of an array of records has no scalar value
   }
   if (rest.consume_front("%")) {
     if (rest.empty()) return std::nullopt;
@@ -200,24 +245,30 @@ bool onlyReads(mlir::Value v, int depth = 0) {
 
 /// Every load of the scalar ``path`` names in ``global``, through the declares and converts on the way; false (and
 /// no loads) if anything may change it: a user of its address other than a load or the source of an assignment, of
-/// its record or element other than designators of other components, or a non-reading use of an element at a runtime
-/// subscript (which may be the same).
+/// its record or element other than designators of other components, of its array other than designators of other
+/// literal elements, or a non-reading use of an element at a runtime subscript (which may be the same).
 bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, ScalarPath const& path = {},
                 mlir::Operation** blocker = nullptr) {
   auto blocked = [&](mlir::Operation* op) {
     if (blocker) *blocker = op;
     return false;
   };
-  // How far a value has come along ``path``: at the variable, at its element, or at the scalar itself.
+  // How far a value has come along ``path``: at the variable, at its element (a record), or at the scalar itself --
+  // which an element of an array of scalars already is.
   enum Stage { Variable, Element, Target };
   auto next = [&](Stage stage) {
-    if (stage == Variable && path.element) return Element;
+    if (stage == Variable && path.element && !path.component.empty()) return Element;
     return Target;
   };
   Stage const first = (!path.element && path.component.empty()) ? Target : Variable;
-  llvm::SmallVector<std::pair<mlir::Value, Stage>, 4> work{{addr.getResult(), first}};
+  struct Item {
+    mlir::Value value;
+    Stage stage;
+    Subscripts subscripts;
+  };
+  llvm::SmallVector<Item, 4> work{{addr.getResult(), first, {}}};
   while (!work.empty()) {
-    auto [v, stage] = work.pop_back_val();
+    auto [v, stage, subscripts] = work.pop_back_val();
     for (mlir::OpOperand& use : v.getUses()) {
       mlir::Operation* user = use.getOwner();
       auto designate = mlir::dyn_cast<hlfir::DesignateOp>(user);
@@ -227,18 +278,20 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, S
       } else if (isAssignedFrom(use)) {
         // Copied whole (``lim = bounds(1)``): read, not changed; the copy keeps reading memory.
       } else if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(user)) {
-        for (mlir::Value r : decl->getResults()) work.push_back({r, stage});
+        Subscripts const below = stage == Variable ? subscripts.below(decl) : subscripts;
+        for (mlir::Value r : decl->getResults()) work.push_back({r, stage, below});
       } else if (auto conv = mlir::dyn_cast<fir::ConvertOp>(user)) {
-        work.push_back({conv.getResult(), stage});
+        work.push_back({conv.getResult(), stage, subscripts});
       } else if (designate && stage == Variable && path.element) {
-        // Another literal element is other storage; an element at a runtime subscript may be this one.
-        std::optional<int64_t> const element = constantElement(designate);
+        // Another literal element is other storage; an element at a runtime subscript, or at one that cannot be
+        // related to the variable's, may be this one.
+        std::optional<int64_t> const element = subscripts.of(constantElement(designate));
         if (element == path.element)
-          work.push_back({designate.getResult(), next(stage)});
+          work.push_back({designate.getResult(), next(stage), {}});
         else if (!element && !onlyReads(designate.getResult()))
           return blocked(user);
       } else if (designate && stage != Target && isScalarComponent(designate)) {
-        if (*designate.getComponent() == path.component) work.push_back({designate.getResult(), Target});
+        if (*designate.getComponent() == path.component) work.push_back({designate.getResult(), Target, {}});
       } else {
         return blocked(user);
       }
@@ -247,18 +300,24 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, S
   return true;
 }
 
-/// The distinct literal subscripts ``global`` (a rank-1 array) is designated at, through declares and converts.
-llvm::SmallVector<int64_t, 4> constantElements(llvm::ArrayRef<fir::AddrOfOp> addrs) {
+/// The distinct subscripts of the variable (a rank-1 array of ``extent`` elements) whose elements the module designates
+/// at a literal subscript, through declares and converts, in the variable's own numbering; those outside its bounds
+/// (in code a configuration never runs) are left out.
+llvm::SmallVector<int64_t, 4> constantElements(llvm::ArrayRef<fir::AddrOfOp> addrs, int64_t extent) {
   llvm::SmallVector<int64_t, 4> elements;
-  llvm::SmallVector<mlir::Value, 8> work;
-  for (fir::AddrOfOp addr : addrs) work.push_back(addr.getResult());
+  llvm::SmallVector<std::pair<mlir::Value, Subscripts>, 8> work;
+  for (fir::AddrOfOp addr : addrs) work.push_back({addr.getResult(), {}});
   while (!work.empty()) {
-    mlir::Value v = work.pop_back_val();
+    auto [v, subscripts] = work.pop_back_val();
     for (mlir::Operation* user : v.getUsers()) {
-      if (mlir::isa<hlfir::DeclareOp, fir::ConvertOp>(user)) {
-        for (mlir::Value r : user->getResults()) work.push_back(r);
-      } else if (auto d = mlir::dyn_cast<hlfir::DesignateOp>(user)) {
-        if (auto k = constantElement(d); k && !llvm::is_contained(elements, *k)) elements.push_back(*k);
+      if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(user)) {
+        for (mlir::Value r : decl->getResults()) work.push_back({r, subscripts.below(decl)});
+      } else if (mlir::isa<fir::ConvertOp>(user)) {
+        work.push_back({user->getResult(0), subscripts});
+      } else if (auto d = mlir::dyn_cast<hlfir::DesignateOp>(user); d && d.getMemref() == v) {
+        std::optional<int64_t> const k = subscripts.of(constantElement(d));
+        bool const inside = k && *k >= *subscripts.variable && *k < *subscripts.variable + extent;
+        if (inside && !llvm::is_contained(elements, *k)) elements.push_back(*k);
       }
     }
   }
@@ -276,8 +335,27 @@ std::string scalarTypeName(mlir::Type type) {
   return "";
 }
 
+/// The type of the scalar ``path`` names inside a module variable of type ``type``: null when it names none (an
+/// element of something no rank-1 array, a component of something no record, a record element taken whole).
+mlir::Type scalarTypeAt(mlir::Type type, ScalarPath const& path) {
+  if (path.element) {
+    auto seq = mlir::dyn_cast<fir::SequenceType>(type);
+    if (!seq || seq.getDimension() != 1) return nullptr;
+    type = seq.getEleTy();
+  }
+  if (!path.component.empty()) {
+    auto record = mlir::dyn_cast<fir::RecordType>(type);
+    if (!record) return nullptr;
+    auto const& components = record.getTypeList();
+    auto it = llvm::find_if(components, [&](auto const& c) { return c.first == path.component; });
+    if (it == components.end()) return nullptr;
+    type = it->second;
+  }
+  return scalarTypeName(type).empty() ? nullptr : type;
+}
+
 /// Every non-constant integer, real or logical module scalar ``module`` reads and never writes (``"module::name"``,
-/// ``"module::name%component"`` or ``"module::name(k)%component"`` -> Fortran type).
+/// ``"module::name%component"``, ``"module::name(k)%component"`` or ``"module::name(k)"`` -> Fortran type).
 llvm::SmallVector<mlir::NamedAttribute, 64> collectCandidates(mlir::ModuleOp module) {
   llvm::StringMap<llvm::SmallVector<fir::AddrOfOp, 4>> addresses;
   module.walk([&](fir::AddrOfOp addr) { addresses[addr.getSymbol().getRootReference().getValue()].push_back(addr); });
@@ -288,8 +366,9 @@ llvm::SmallVector<mlir::NamedAttribute, 64> collectCandidates(mlir::ModuleOp mod
     if (!global || (global.getConstant().has_value() && *global.getConstant())) continue;
     auto [mod, name] = decodeModuleGlobalSymbol(sym.str());
     if (mod.empty()) continue;
-    // The variable itself when it is a scalar, each scalar component of a record, and each scalar component of every
-    // element of a fixed-size rank-1 array of records read at a literal subscript.
+    // The variable itself when it is a scalar, each scalar component of a record, each scalar component of every
+    // element of a fixed-size rank-1 array of records read at a literal subscript, and every such element of a
+    // fixed-size rank-1 array of scalars.
     llvm::SmallVector<std::pair<ScalarPath, std::string>, 8> scalars;  // (path, Fortran type)
     mlir::Type type = global.getType();
     llvm::SmallVector<std::optional<int64_t>, 4> elements{std::nullopt};
@@ -297,15 +376,15 @@ llvm::SmallVector<mlir::NamedAttribute, 64> collectCandidates(mlir::ModuleOp mod
                                                           seq.getShape()[0] != fir::SequenceType::getUnknownExtent()) {
       type = seq.getEleTy();
       elements.clear();
-      for (int64_t k : constantElements(addrs)) elements.push_back(k);
+      for (int64_t k : constantElements(addrs, seq.getShape()[0])) elements.push_back(k);
     }
     if (auto record = mlir::dyn_cast<fir::RecordType>(type)) {
       for (std::optional<int64_t> element : elements)
         for (auto& [component, componentType] : record.getTypeList())
           if (std::string t = scalarTypeName(componentType); !t.empty())
             scalars.push_back({ScalarPath{element, component}, t});
-    } else if (std::string t = scalarTypeName(type); !t.empty() && elements.front() == std::nullopt) {
-      scalars.push_back({ScalarPath{}, t});
+    } else if (std::string t = scalarTypeName(type); !t.empty()) {
+      for (std::optional<int64_t> element : elements) scalars.push_back({ScalarPath{element, ""}, t});
     }
     for (auto& [path, scalarType] : scalars) {
       llvm::SmallVector<fir::LoadOp, 8> loads;
@@ -319,6 +398,22 @@ llvm::SmallVector<mlir::NamedAttribute, 64> collectCandidates(mlir::ModuleOp mod
     }
   }
   return candidates;
+}
+
+/// True when ``v`` is the address of a module variable: a ``fir.address_of``, through declares (the variable's own and
+/// those of the dummies an inlined call bound it to) and converts.
+bool addressesGlobal(mlir::Value v) {
+  for (int i = 0; i < 16 && v; ++i) {
+    mlir::Operation* def = v.getDefiningOp();
+    if (mlir::isa_and_nonnull<fir::AddrOfOp>(def)) return true;
+    if (auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(def))
+      v = decl.getMemref();
+    else if (auto conv = mlir::dyn_cast_or_null<fir::ConvertOp>(def))
+      v = conv.getValue();
+    else
+      return false;
+  }
+  return false;
 }
 
 /// The value of an ``i1`` condition that folds to a literal, through ``fir.convert``s.
@@ -484,6 +579,11 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
           heldBack.erase(key);
           continue;
         }
+        if (auto global = module.lookupSymbol<fir::GlobalOp>(sym); global && !scalarTypeAt(global.getType(), *path)) {
+          heldBack[key] = "not a scalar of a module variable";
+          done.insert(key);
+          continue;
+        }
         llvm::SmallVector<fir::LoadOp, 8> loads;
         bool readOnly = true;
         mlir::Operation* blocker = nullptr;
@@ -528,21 +628,27 @@ struct SpecializeGlobalsPass : public mlir::PassWrapper<SpecializeGlobalsPass, m
     addCandidates(module, builder);
 
     // Flang declares every variable of a used module in each procedure; the declares nothing reads any more -- the
-    // specialised variables', and those only a dead branch used -- would still count as the entry's inputs.
-    llvm::SmallVector<hlfir::DeclareOp, 16> unused;
-    module.walk([&](hlfir::DeclareOp decl) {
-      if (decl->use_empty() && mlir::isa_and_nonnull<fir::AddrOfOp>(decl.getMemref().getDefiningOp()))
-        unused.push_back(decl);
-    });
-    for (hlfir::DeclareOp decl : unused) {
-      llvm::SmallVector<mlir::Operation*, 4> feeding;
-      for (mlir::Value operand : decl->getOperands())
-        if (mlir::Operation* def = operand.getDefiningOp()) feeding.push_back(def);
-      decl.erase();
-      for (mlir::Operation* def : feeding)
-        if (mlir::isOpTriviallyDead(def)) def->erase();
+    // specialised variables', and those only a dead branch used -- would still count as the entry's inputs. After
+    // inlining, the declare of a dummy a module variable was passed to sits in between: once it goes, the variable's
+    // own declare may be unused too.
+    unsigned erased = 0;
+    for (bool again = true; again;) {
+      llvm::SmallVector<hlfir::DeclareOp, 16> unused;
+      module.walk([&](hlfir::DeclareOp decl) {
+        if (decl->use_empty() && addressesGlobal(decl.getMemref())) unused.push_back(decl);
+      });
+      again = !unused.empty();
+      for (hlfir::DeclareOp decl : unused) {
+        llvm::SmallVector<mlir::Operation*, 4> feeding;
+        for (mlir::Value operand : decl->getOperands())
+          if (mlir::Operation* def = operand.getDefiningOp()) feeding.push_back(def);
+        decl.erase();
+        ++erased;
+        for (mlir::Operation* def : feeding)
+          if (mlir::isOpTriviallyDead(def)) def->erase();
+      }
     }
-    llvm::errs() << "hlfir-specialize-globals: " << folded << " branch(es) folded, " << unused.size()
+    llvm::errs() << "hlfir-specialize-globals: " << folded << " branch(es) folded, " << erased
                  << " unused module variable declaration(s) erased.\n";
     llvm::errs().flush();
   }
