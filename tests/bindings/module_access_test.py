@@ -35,22 +35,22 @@ module owner
     private; public :: s_init, n_public
     integer, parameter :: nmax = 4
     integer :: n_public = 0
-    type(vector_field) :: q_cons, q_prim  !< state at the quadrature points
-    type(vector_field), allocatable, dimension(:) :: flux_n, flux_src_n
-    real(8), allocatable, dimension(:, :, :, :) :: ql_rsx, &
-        qr_rsx
+    type(vector_field) :: state_a, state_b  !< state at the quadrature points
+    type(vector_field), allocatable, dimension(:) :: states, sources
+    real(8), allocatable, dimension(:, :, :, :) :: left, &
+        right
     real(8), pointer :: view(:) => null()
 contains
     subroutine s_init(n)
         integer, intent(in) :: n
         integer :: i
-        allocate(q_prim%vf(2), flux_n(3))
+        allocate(state_b%vf(2), states(3))
         do i = 1, 2
-            allocate(q_prim%vf(i)%sf(-3:n, 0:n, 0:n))
-            q_prim%vf(i)%sf = 10 * i
+            allocate(state_b%vf(i)%sf(-3:n, 0:n, 0:n))
+            state_b%vf(i)%sf = 10 * i
         end do
-        allocate(ql_rsx(n, n, n, 2))
-        ql_rsx = 7
+        allocate(left(n, n, n, 2))
+        left = 7
         n_public = n
     end subroutine s_init
 end module owner
@@ -58,21 +58,21 @@ end module owner
 
 
 def test_accessors_are_appended_and_the_declarations_kept():
-    copy, exposed = expose_module_variables(_OWNER, "owner", ["q_prim", "flux_n", "QR_RSX", "view"])
+    copy, exposed = expose_module_variables(_OWNER, "owner", ["state_b", "states", "RIGHT", "view"])
     for line in _OWNER.splitlines():
         assert line in copy.splitlines()  # nothing of the original changes
-    assert "    target :: q_prim, flux_n, qr_rsx" in copy  # the pointer needs no target attribute
-    assert "    public :: dace_access_q_prim, dace_access_flux_n, dace_access_qr_rsx, dace_access_view" in copy
-    assert copy.index("public :: dace_access_q_prim") < copy.index("contains")
-    assert (exposed["q_prim"].type_spec, exposed["q_prim"].rank, exposed["q_prim"].allocatable) == (
+    assert "    target :: state_b, states, right" in copy  # the pointer needs no target attribute
+    assert "    public :: dace_access_state_b, dace_access_states, dace_access_right, dace_access_view" in copy
+    assert copy.index("public :: dace_access_state_b") < copy.index("contains")
+    assert (exposed["state_b"].type_spec, exposed["state_b"].rank, exposed["state_b"].allocatable) == (
         "type(vector_field)",
         0,
         False,
     )
-    assert (exposed["qr_rsx"].type_spec, exposed["qr_rsx"].rank) == ("real(8)", 4)
+    assert (exposed["right"].type_spec, exposed["right"].rank) == ("real(8)", 4)
     assert exposed["view"].pointer and exposed["view"].rank == 1
     assert "real(8), pointer :: p(:, :, :, :)" in copy
-    assert "if (allocated(flux_n)) then" in copy
+    assert "if (allocated(states)) then" in copy
 
 
 def test_public_variables_follow_the_default_lists_and_attributes():
@@ -89,12 +89,12 @@ def test_constants_unknown_names_and_taken_accessor_names_are_refused():
     with pytest.raises(ModuleAccessError, match="no variable"):
         expose_module_variables(_OWNER, "owner", ["q_missing"])
     taken = _OWNER.replace(
-        "    integer :: n_public = 0\n", "    integer :: n_public = 0\n    integer :: dace_access_q_prim\n"
+        "    integer :: n_public = 0\n", "    integer :: n_public = 0\n    integer :: dace_access_state_b\n"
     )
     with pytest.raises(ModuleAccessError, match="already declares"):
-        expose_module_variables(taken, "owner", ["q_prim"])
+        expose_module_variables(taken, "owner", ["state_b"])
     with pytest.raises(ModuleAccessError, match="no module"):
-        expose_module_variables(_OWNER, "other", ["q_prim"])
+        expose_module_variables(_OWNER, "other", ["state_b"])
 
 
 _USER = """
@@ -110,7 +110,7 @@ end subroutine user_report
 _BINDING = """
 program binding
     use fields, only: vector_field
-    use owner, only: s_init, dace_access_q_prim, dace_access_ql_rsx
+    use owner, only: s_init, dace_access_state_b, dace_access_left
     implicit none
     interface
         subroutine user_report(n) bind(c, name="user_report")
@@ -121,9 +121,9 @@ program binding
     real(8), pointer :: ql(:, :, :, :)
     integer :: n
     call s_init(4)
-    q => dace_access_q_prim()
+    q => dace_access_state_b()
     print '(3i4, f8.1)', lbound(q%vf(2)%sf), q%vf(2)%sf(-3, 0, 0)
-    ql => dace_access_ql_rsx()
+    ql => dace_access_left()
     call user_report(n)
     print '(f8.1, i4)', ql(4, 4, 4, 2), n
 end program binding
@@ -146,7 +146,7 @@ def test_the_copy_links_in_place_of_the_original_object(tmp_path: Path):
     _compile("gfortran", orig / "owner.f90", orig / "owner.o", orig)
     _compile("gfortran", orig / "user.f90", orig / "user.o", orig)  # another object, built against the original
 
-    source, _ = expose_module_variables(_OWNER, "owner", ["q_prim", "ql_rsx"])
+    source, _ = expose_module_variables(_OWNER, "owner", ["state_b", "left"])
     (copy / "owner.f90").write_text(source)
     (copy / "binding.f90").write_text(_BINDING)
     _compile("gfortran", copy / "owner.f90", copy / "owner.o", copy)

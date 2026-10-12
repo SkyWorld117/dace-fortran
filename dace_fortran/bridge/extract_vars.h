@@ -73,10 +73,11 @@ struct VarInfo {
   std::string aos_origin_struct;
   std::string aos_member_path;
   int aos_outer_rank = 0;
-  /// Subscripts of a module root that is itself an array of records (``flux_n(id) % vf(i) % sf``: 1); the companion's
-  /// leading dims, ahead of the ``aos_outer_rank`` record dims of the member segment. 0 for a scalar record root.
+  /// Subscripts of a module root that is itself an array of records (``field(id) % comp(i) % data``: 1); the
+  /// companion's leading dims, ahead of the ``aos_outer_rank`` record dims of the member segment. 0 for a scalar
+  /// record root.
   int aos_root_rank = 0;
-  /// The record array at the root of the AoS path has a fixed size (``idwbuff(1:3)``): always present, so the binding
+  /// The record array at the root of the AoS path has a fixed size (``bounds(1:3)``): always present, so the binding
   /// guards it with neither ``allocated`` nor ``associated``.
   bool aos_struct_static = false;
   bool global_alloc_inside = false;

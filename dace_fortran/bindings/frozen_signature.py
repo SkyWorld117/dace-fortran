@@ -86,7 +86,7 @@ class FrozenArg:
     #   aos_member_path       -- '%'-joined component path.
     #   aos_outer_rank        -- leading record-array (element) dim count.
     #   aos_root_rank         -- dims of a root that is itself an array of
-    #                            records (``flux_n(j) % vf(i) % sf``), ahead
+    #                            records (``field(j) % comp(i) % data``), ahead
     #                            of the aos_outer_rank ones.
     #   global_alloc_inside   -- kernel ALLOCATEs the component: binding
     #                            allocates the host global, skips copy-in.

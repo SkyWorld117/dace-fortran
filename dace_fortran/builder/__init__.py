@@ -180,7 +180,7 @@ DEFAULT_PIPELINE = (
     "hlfir-strip-character-runtime,"
     "hlfir-inline-all,"
     # Specialise again: a configuration value passed to a callee's ``intent(in)`` dummy (a halo routine's
-    # ``bc_bounds``, a solver's ``idwbuff(1)``) is a plain load of the module variable only now.
+    # ``halo_bounds``, a solver's ``bounds(1)``) is a plain load of the module variable only now.
     "hlfir-specialize-globals,"
     # Unwrap ``hlfir.eval_in_mem`` blocks into ``fir.alloca`` + body +
     # reads.  flang's HLFIR wraps any array-valued expression that

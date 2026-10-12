@@ -148,7 +148,7 @@ std::optional<int64_t> constantElement(hlfir::DesignateOp d) {
 }
 
 /// A scalar inside a module variable: the variable itself, its ``component`` (a record), or the ``component`` of its
-/// element ``element`` (a fixed-size array of records, ``idwbuff(1)%beg``).
+/// element ``element`` (a fixed-size array of records, ``bounds(1)%lo``).
 struct ScalarPath {
   std::optional<int64_t> element;
   std::string component;
@@ -174,7 +174,7 @@ std::optional<ScalarPath> parseScalarPath(llvm::StringRef rest) {
   return path;
 }
 
-/// True when ``use`` reads the value it addresses whole: the source of an assignment (``is1 = idwbuff(1)``).
+/// True when ``use`` reads the value it addresses whole: the source of an assignment (``lim = bounds(1)``).
 bool isAssignedFrom(mlir::OpOperand& use) {
   auto assign = mlir::dyn_cast<hlfir::AssignOp>(use.getOwner());
   return assign && use.get() == assign.getRhs() && use.get() != assign.getLhs();
@@ -225,7 +225,7 @@ bool onlyLoaded(fir::AddrOfOp addr, llvm::SmallVectorImpl<fir::LoadOp>& loads, S
       if (auto load = mlir::dyn_cast<fir::LoadOp>(user)) {
         if (stage == Target) loads.push_back(load);
       } else if (isAssignedFrom(use)) {
-        // Copied whole (``is1 = idwbuff(1)``): read, not changed; the copy keeps reading memory.
+        // Copied whole (``lim = bounds(1)``): read, not changed; the copy keeps reading memory.
       } else if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(user)) {
         for (mlir::Value r : decl->getResults()) work.push_back({r, stage});
       } else if (auto conv = mlir::dyn_cast<fir::ConvertOp>(user)) {

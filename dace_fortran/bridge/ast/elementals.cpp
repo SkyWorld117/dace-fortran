@@ -243,7 +243,7 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
   };
   mlir::Value parent_val = innermost.getMemref();
   // Set once the walk hopped from an inlined dummy into the struct-member actual it is bound to: the actual reaches the
-  // caller's chain through box reinterprets (``box_addr(load(flux_n(id) % vf))``), which the walk must step through or
+  // caller's chain through box reinterprets (``box_addr(load(field(id) % comp))``), which the walk must step through or
   // the caller's record subscripts (``id``) are dropped.
   bool viaComponentDummy = false;
   for (int level = 0; level < limits::kAliasMemrefWalkDepth; ++level) {

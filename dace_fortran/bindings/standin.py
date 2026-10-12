@@ -41,7 +41,7 @@ class RecordedValue:
 
 
 def _variable(name: str) -> str:
-    """The module variable of a recorded scalar: ``bc_x`` of ``bc_x%beg``, ``idwbuff`` of ``idwbuff(1)%beg``."""
+    """The module variable of a recorded scalar: ``domain`` of ``domain%lo``, ``bounds`` of ``bounds(1)%lo``."""
     return re.split(r"[(%]", name, maxsplit=1)[0]
 
 

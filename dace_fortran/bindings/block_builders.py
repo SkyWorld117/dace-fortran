@@ -1613,13 +1613,13 @@ class AosLoopPieces(NamedTuple):
 
 
 def _aos_lead(a: FrozenArg) -> int:
-    """The SoA buffer's leading record dims: a root array of records' own (``flux_n(j)`` of ``flux_n(j) % vf(i) % sf``),
-    then the record segment's."""
+    """The SoA buffer's leading record dims: a root array of records' own (``field(j)`` of
+    ``field(j) % comp(i) % data``), then the record segment's."""
     return a.aos_root_rank + a.aos_outer_rank
 
 
 def _aos_root_and_segment(a: FrozenArg) -> tuple[str, str]:
-    """``flux_n`` and ``vf`` of ``aos_origin_struct`` ``flux_n % vf`` (a root that is itself an array of records)."""
+    """``field`` and ``comp`` of ``aos_origin_struct`` ``field % comp`` (a root that is itself an array of records)."""
     root, _, segment = a.aos_origin_struct.partition("%")
     return root.strip(), segment.strip()
 
