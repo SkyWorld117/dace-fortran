@@ -123,11 +123,14 @@ def _interface(tmp_path: Path):
 
 
 def _run(tmp_path: Path, sources: list[Path], standin_symbol: str | None) -> str:
-    """Compile ``sources`` in order and link them, with the stand-in in place of kern::step when given."""
+    """Compile ``sources`` in order and link them, with the stand-in in place of kern::step when given. gfortran runs
+    in ``tmp_path``: it looks for module files in its working directory first, where flang, run by other tests in the
+    repository root, leaves its own of the same names."""
     objects = []
     for src in sources:
         obj = src.with_suffix(".o")
-        subprocess.run(["gfortran", "-c", str(src), "-o", str(obj), f"-J{tmp_path}", f"-I{tmp_path}"], check=True)
+        flags = [f"-J{tmp_path}", f"-I{tmp_path}"]
+        subprocess.run(["gfortran", "-c", str(src), "-o", str(obj), *flags], check=True, cwd=tmp_path)
         objects.append(str(obj))
     wrap = []
     if standin_symbol:
@@ -248,9 +251,10 @@ _PRIVATE = ["flags", "tol", "spans", "whole"]
 
 
 def _compile(src: Path, mod_dir: Path, *include: Path) -> Path:
+    """``src`` compiled to an object beside it, its module files in ``mod_dir`` (gfortran runs there, see ``_run``)."""
     obj = src.with_suffix(".o")
     flags = [f"-J{mod_dir}", f"-I{mod_dir}", *(f"-I{d}" for d in include)]
-    subprocess.run(["gfortran", "-c", str(src), "-o", str(obj), *flags], check=True)
+    subprocess.run(["gfortran", "-c", str(src), "-o", str(obj), *flags], check=True, cwd=mod_dir)
     return obj
 
 
