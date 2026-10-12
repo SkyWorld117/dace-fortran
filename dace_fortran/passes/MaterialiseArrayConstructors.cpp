@@ -1,14 +1,25 @@
 // ============================================================================
-// ExpandRuntimeArrayConstructors.cpp  --  replace flang's runtime array
-// constructor protocol with explicit element assignments into a local temp.
+// MaterialiseArrayConstructors.cpp  --  build every array constructor in a
+// named local array the bridge can see.
 // ============================================================================
 //
-// Flang builds an array constructor whose items include an array-valued
-// expression (``u = [s, s*w(1:3), z(2:3), t]``) through the Fortran runtime
-// instead of inline element stores:
+// Flang builds an array constructor in a heap temp named ``.tmp.arrayctor``
+// and hands the value on with ``hlfir.as_expr %temp move %true``.  It fills
+// the temp in one of two ways:
+//
+// * Inline stores, when every item is a scalar (``b = [x, q(j, i), q(j, i + 1)]``)
+//   or an implied-do of known extent:
 //
 //     %t    = fir.allocmem !fir.array<NxT> {bindc_name = ".tmp.arrayctor"}
 //     %td:2 = hlfir.declare %t(%shape) {uniq_name = ".tmp.arrayctor"}
+//     hlfir.assign %v1 to (hlfir.designate %td#0 (%c1))
+//     ...
+//     %e    = hlfir.as_expr %td#0 move %true
+//     hlfir.assign %e to %dst
+//
+// * Through the Fortran runtime, when an item is array-valued
+//   (``u = [s, s*w(1:3), z(2:3), t]``):
+//
 //     %bx   = fir.embox %td#1(%shape)
 //     fir.store %bx to %boxref
 //     fir.call @_FortranAInitArrayConstructorVector(%state, %boxref', ...)
@@ -16,32 +27,38 @@
 //     fir.call @_FortranAPushArrayConstructorSimpleScalar(%state, %scratch')
 //     %b    = fir.embox %var(%vshape)                // array item
 //     fir.call @_FortranAPushArrayConstructorValue(%state, %b')
-//     ...
-//     %e    = hlfir.as_expr %td#0 move %true
-//     hlfir.assign %e to %dst
-//     hlfir.destroy %e
 //
-// The calls are opaque to the bridge: the temp is filled by the runtime, so
-// AST extraction sees ``dst = <as_expr of a buffer nothing writes>`` and the
-// operand renders as ``?``.
+// The bridge cannot model either temp: the runtime calls are opaque (the
+// assignment then reads a buffer nothing visibly writes, and its operand
+// renders as ``?``), and an inline-store temp was only special-cased by
+// retargeting its element stores at ``dst`` -- without their reads, at the
+// wrong elements of a section ``dst`` and wrongly when an item reads ``dst``.
 //
-// Rewrite (static constructor extent N, trivial element type) to:
+// This pass gives both forms a named local array instead
+// (static constructor extent N, trivial element type):
 //
 //     %a    = fir.alloca !fir.array<NxT>
 //     %ad:2 = hlfir.declare %a(%shape) {uniq_name = "_QF<encl>Earray_ctor_<n>"}
-//     hlfir.assign %v to (hlfir.designate %ad#0 (pos))          // scalar item
-//     fir.do_loop %k = 1 to extent {                             // array item
+//     <element stores into %ad>
+//     hlfir.assign %ad#0 to %dst
+//
+// An inline-store temp keeps its element stores, now into ``%ad``.  The
+// runtime protocol is replaced, at each push, by one assignment per scalar
+// item and one loop nest per array item (array element order):
+//
+//     fir.do_loop %k = 1 to extent {
 //       %x = fir.load (hlfir.designate %var (%k + lb - 1))
 //       hlfir.assign %x to (hlfir.designate %ad#0 (pos + %k - 1))
 //     }
-//     hlfir.assign %ad#0 to %dst
 //
-// The array item's elements are read through ``hlfir.designate`` of the
-// pushed variable, the same element-of-section form flang emits inside an
+// An array item's elements are read through ``hlfir.designate`` of the
+// pushed variable, the element-of-section form flang emits inside an
 // ``hlfir.elemental``, so record members, sections and lower bounds resolve
-// through the bridge's existing designate handling.  The temp is a real local
-// array rather than a retargeted write into ``dst``, so an item that reads
-// ``dst`` itself (``w = [w(3:4), w(1:2)]``) still sees the old values.
+// through the bridge's existing designate handling.  Consumers of the value
+// read ``%ad``: the assignment copies it, ``hlfir.apply`` becomes an element
+// load, ``hlfir.destroy`` goes.  Because the temp is a real array, an item
+// that reads ``dst`` itself (``w = [w(3:4), w(1:2)]``) still sees the old
+// values.
 //
 // Runs after ``hlfir-expand-vector-subscript-gather``, which has already
 // materialised every elemental item (``s*w(1:3)``) into a named local array,
@@ -50,9 +67,9 @@
 // section, an assumed-shape dummy; extents then come from its shape or from
 // ``fir.box_dims``).
 //
-// A constructor outside this scope (runtime extent, implied-do loop pushing
-// inside a nested region, derived-type or character elements, a sliced embox
-// or a rebox as item, an ``hlfir.as_expr`` consumer other than an assignment,
+// A constructor outside this scope (runtime extent, runtime pushes from an
+// implied-do, derived-type or character elements, a sliced embox or a rebox
+// as item, an ``hlfir.as_expr`` consumer other than an assignment,
 // ``hlfir.apply`` or ``hlfir.destroy``) is left untouched.
 // ============================================================================
 
@@ -137,6 +154,101 @@ mlir::Value storedBefore(fir::CallOp push, fir::CallOp init, mlir::Value slot) {
   for (mlir::Operation* op = push->getPrevNode(); op && op != init.getOperation(); op = op->getPrevNode())
     if (auto st = mlir::dyn_cast<fir::StoreOp>(op); st && st.getMemref() == slot) return st.getValue();
   return {};
+}
+
+/// The heap temp flang declares for an array constructor.
+bool isCtorTemp(hlfir::DeclareOp decl) { return decl.getUniqName().str().find(".tmp.arrayctor") != std::string::npos; }
+
+/// The consumers of a constructor's value this pass can point at the local temp.
+bool supportedConsumers(hlfir::AsExprOp ae) {
+  for (mlir::Operation* u : ae.getResult().getUsers()) {
+    if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u); as && as.getRhs() == ae.getResult()) continue;
+    if (mlir::isa<hlfir::DestroyOp>(u)) continue;
+    if (auto ap = mlir::dyn_cast<hlfir::ApplyOp>(u); ap && ap.getTypeparams().empty()) continue;
+    return false;
+  }
+  return true;
+}
+
+/// The static rank-1 trivial-element type of a constructor's heap temp, or null.
+fir::SequenceType tempType(fir::AllocMemOp alloc) {
+  auto seqTy = mlir::dyn_cast<fir::SequenceType>(alloc.getInType());
+  if (!seqTy || seqTy.getDimension() != 1 || seqTy.hasDynamicExtents() || !fir::isa_trivial(seqTy.getEleTy()))
+    return {};
+  return seqTy;
+}
+
+/// A named local array in place of the heap temp ``tmpDecl`` declares (where it is declared: its shape dominates
+/// there).
+hlfir::DeclareOp makeLocalTemp(hlfir::DeclareOp tmpDecl, fir::AllocMemOp tmpAlloc, fir::SequenceType seqTy,
+                               unsigned id) {
+  mlir::OpBuilder b(tmpDecl);
+  auto alloca = b.create<fir::AllocaOp>(tmpAlloc.getLoc(), seqTy);
+  std::string const uniqName = "_QF" + enclosingName(tmpDecl) + "Earray_ctor_" + std::to_string(id);
+  return b.create<hlfir::DeclareOp>(tmpDecl.getLoc(), alloca.getResult(), uniqName, tmpDecl.getShape());
+}
+
+/// Point the consumers of the constructor's value at the local temp and drop the expressions.
+void readFromTemp(llvm::ArrayRef<hlfir::AsExprOp> exprs, mlir::Value temp, mlir::Type eleTy) {
+  mlir::Type const eleRefTy = fir::ReferenceType::get(eleTy);
+  for (auto ae : exprs) {
+    for (mlir::Operation* u : llvm::make_early_inc_range(ae.getResult().getUsers())) {
+      if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u)) {
+        as->setOperand(0, temp);
+      } else if (auto ap = mlir::dyn_cast<hlfir::ApplyOp>(u)) {
+        mlir::OpBuilder b(ap);
+        auto el = b.create<hlfir::DesignateOp>(ap.getLoc(), eleRefTy, temp, ap.getIndices());
+        auto ld = b.create<fir::LoadOp>(ap.getLoc(), el.getResult());
+        ap.getResult().replaceAllUsesWith(ld.getResult());
+        ap.erase();
+      } else {
+        u->erase();  // hlfir.destroy
+      }
+    }
+    ae.erase();
+  }
+}
+
+/// Erase the heap temp once nothing but ``fir.freemem`` uses it.
+void eraseHeapTemp(hlfir::DeclareOp tmpDecl, fir::AllocMemOp tmpAlloc) {
+  for (mlir::Value r : tmpDecl->getResults())
+    for (mlir::Operation* u : llvm::make_early_inc_range(r.getUsers())) u->erase();  // fir.freemem
+  tmpDecl.erase();
+  for (mlir::Operation* u : llvm::make_early_inc_range(tmpAlloc->getUsers())) u->erase();
+  tmpAlloc.erase();
+}
+
+/// A constructor filled by inline element stores: its temp is only designated, handed on and freed.
+struct InlineCtor {
+  hlfir::DeclareOp tmpDecl;
+  fir::AllocMemOp tmpAlloc;
+  fir::SequenceType seqTy;
+  llvm::SmallVector<hlfir::AsExprOp, 2> exprs;
+};
+
+std::optional<InlineCtor> analyseInline(hlfir::DeclareOp decl) {
+  if (!isCtorTemp(decl) || !decl.getShape()) return std::nullopt;
+  InlineCtor c;
+  c.tmpDecl = decl;
+  c.tmpAlloc = decl.getMemref().getDefiningOp<fir::AllocMemOp>();
+  if (!c.tmpAlloc) return std::nullopt;
+  c.seqTy = tempType(c.tmpAlloc);
+  if (!c.seqTy) return std::nullopt;
+  for (mlir::Value r : decl->getResults())
+    for (mlir::OpOperand& use : r.getUses()) {
+      mlir::Operation* u = use.getOwner();
+      if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(u); dg && use.getOperandNumber() == 0) continue;
+      if (auto ae = mlir::dyn_cast<hlfir::AsExprOp>(u)) {
+        if (!supportedConsumers(ae)) return std::nullopt;
+        c.exprs.push_back(ae);
+        continue;
+      }
+      if (mlir::isa<fir::FreeMemOp>(u)) continue;
+      return std::nullopt;  // e.g. the runtime protocol's descriptor
+    }
+  for (mlir::Operation* u : c.tmpAlloc->getUsers())
+    if (u != decl.getOperation() && !mlir::isa<fir::FreeMemOp>(u)) return std::nullopt;
+  return c;
 }
 
 mlir::Type peelRefBox(mlir::Type t) {
@@ -253,9 +365,8 @@ std::optional<Ctor> analyse(fir::CallOp init) {
   if (!c.tmpDecl || !c.tmpDecl.getShape()) return std::nullopt;
   c.tmpAlloc = c.tmpDecl.getMemref().getDefiningOp<fir::AllocMemOp>();
   if (!c.tmpAlloc) return std::nullopt;
-  c.seqTy = mlir::dyn_cast<fir::SequenceType>(c.tmpAlloc.getInType());
-  if (!c.seqTy || c.seqTy.getDimension() != 1 || c.seqTy.hasDynamicExtents() || !fir::isa_trivial(c.seqTy.getEleTy()))
-    return std::nullopt;
+  c.seqTy = tempType(c.tmpAlloc);
+  if (!c.seqTy) return std::nullopt;
   // The runtime may reallocate a descriptor it can read back; a load of the slot means the result is taken from it.
   for (mlir::Operation* u : boxRef.getUsers())
     if (mlir::isa<fir::LoadOp>(u)) return std::nullopt;
@@ -296,12 +407,7 @@ std::optional<Ctor> analyse(fir::CallOp init) {
     for (mlir::Operation* u : r.getUsers()) {
       if (u == c.tmpBox.getOperation()) continue;
       if (auto ae = mlir::dyn_cast<hlfir::AsExprOp>(u)) {
-        for (mlir::Operation* eu : ae.getResult().getUsers()) {
-          if (auto as = mlir::dyn_cast<hlfir::AssignOp>(eu); as && as.getRhs() == ae.getResult()) continue;
-          if (mlir::isa<hlfir::DestroyOp>(eu)) continue;
-          if (auto ap = mlir::dyn_cast<hlfir::ApplyOp>(eu); ap && ap.getTypeparams().empty()) continue;
-          return std::nullopt;
-        }
+        if (!supportedConsumers(ae)) return std::nullopt;
         c.exprs.push_back(ae);
         continue;
       }
@@ -315,28 +421,35 @@ std::optional<Ctor> analyse(fir::CallOp init) {
   return c;
 }
 
-struct ExpandRuntimeArrayConstructorsPass
-    : public mlir::PassWrapper<ExpandRuntimeArrayConstructorsPass, mlir::OperationPass<mlir::ModuleOp>> {
+struct MaterialiseArrayConstructorsPass
+    : public mlir::PassWrapper<MaterialiseArrayConstructorsPass, mlir::OperationPass<mlir::ModuleOp>> {
   // NOLINTNEXTLINE(misc-const-correctness): 'id' is defined by the LLVM MLIR_DEFINE_*_TYPE_ID macro.
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ExpandRuntimeArrayConstructorsPass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterialiseArrayConstructorsPass)
 
-  llvm::StringRef getArgument() const final { return "hlfir-expand-runtime-array-constructors"; }
+  llvm::StringRef getArgument() const final { return "hlfir-materialise-array-constructors"; }
   llvm::StringRef getDescription() const final {
-    return "Replace an array constructor built through the Fortran runtime "
-           "(_FortranAInitArrayConstructorVector / _FortranAPushArrayConstructor*) "
-           "with explicit element assignments into a named local temp.";
+    return "Build each array constructor in a named local array: keep inline element stores, replace the Fortran "
+           "runtime protocol (_FortranAInitArrayConstructorVector / _FortranAPushArrayConstructor*) with explicit "
+           "element assignments, and point the constructor's consumers at the local array.";
   }
 
   void runOnOperation() override {
+    unsigned counter = 0;
     llvm::SmallVector<fir::CallOp, 8> inits;
     getOperation().walk([&](fir::CallOp call) {
       if (calls(call, kInit)) inits.push_back(call);
     });
-    unsigned counter = 0;
     llvm::SetVector<mlir::Operation*> slots;  // scratch / descriptor / state allocas to sweep
     for (auto init : inits)
       if (auto c = analyse(init)) rewrite(*c, counter++, slots);
     sweep(slots);
+
+    llvm::SmallVector<hlfir::DeclareOp, 8> temps;
+    getOperation().walk([&](hlfir::DeclareOp decl) {
+      if (isCtorTemp(decl)) temps.push_back(decl);
+    });
+    for (auto decl : temps)
+      if (auto c = analyseInline(decl)) rewriteInline(*c, counter++);
   }
 
  private:
@@ -345,12 +458,9 @@ struct ExpandRuntimeArrayConstructorsPass
     mlir::Type const eleTy = c.seqTy.getEleTy();
     mlir::Type const eleRefTy = fir::ReferenceType::get(eleTy);
 
-    // 1) The named local temp, where the heap temp was declared (its shape dominates there).
-    mlir::OpBuilder b(c.tmpDecl);
-    auto alloca = b.create<fir::AllocaOp>(c.tmpAlloc.getLoc(), c.seqTy);
-    std::string const uniqName = "_QF" + enclosingName(c.init) + "Earray_ctor_" + std::to_string(id);
-    auto decl = b.create<hlfir::DeclareOp>(c.tmpDecl.getLoc(), alloca.getResult(), uniqName, c.tmpDecl.getShape());
-    mlir::Value const temp = decl.getResult(0);
+    // 1) The named local temp.
+    mlir::Value const temp = makeLocalTemp(c.tmpDecl, c.tmpAlloc, c.seqTy, id).getResult(0);
+    mlir::OpBuilder b(c.init);
 
     auto index = [&](int64_t v) -> mlir::Value {
       return b.create<mlir::arith::ConstantOp>(loc, b.getIndexAttr(v)).getResult();
@@ -445,22 +555,7 @@ struct ExpandRuntimeArrayConstructorsPass
     }
 
     // 3) Consumers of the constructor's value read the local temp instead.
-    for (auto ae : c.exprs) {
-      for (mlir::Operation* u : llvm::make_early_inc_range(ae.getResult().getUsers())) {
-        if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u)) {
-          as->setOperand(0, temp);
-        } else if (auto ap = mlir::dyn_cast<hlfir::ApplyOp>(u)) {
-          b.setInsertionPoint(ap);
-          auto el = b.create<hlfir::DesignateOp>(ap.getLoc(), eleRefTy, temp, ap.getIndices());
-          auto ld = b.create<fir::LoadOp>(ap.getLoc(), el.getResult());
-          ap.getResult().replaceAllUsesWith(ld.getResult());
-          ap.erase();
-        } else {
-          u->erase();  // hlfir.destroy
-        }
-      }
-      ae.erase();
-    }
+    readFromTemp(c.exprs, temp, eleTy);
 
     // 4) Drop the runtime protocol and the heap temp.
     // Ops feeding only the calls about to go, collected while the calls still hold them.
@@ -475,11 +570,7 @@ struct ExpandRuntimeArrayConstructorsPass
     c.init.erase();
     c.boxStore.erase();
     c.tmpBox.erase();
-    for (mlir::Value r : c.tmpDecl->getResults())
-      for (mlir::Operation* u : llvm::make_early_inc_range(r.getUsers())) u->erase();  // fir.freemem
-    c.tmpDecl.erase();
-    for (mlir::Operation* u : llvm::make_early_inc_range(c.tmpAlloc->getUsers())) u->erase();
-    c.tmpAlloc.erase();
+    eraseHeapTemp(c.tmpDecl, c.tmpAlloc);
     // Converts / embox / address_of left without users by the erased calls; remember the slots they addressed.
     llvm::DenseSet<mlir::Operation*> erased;
     while (!work.empty()) {
@@ -497,6 +588,16 @@ struct ExpandRuntimeArrayConstructorsPass
     }
   }
 
+  /// Inline element stores: the same stores, into the local temp.
+  static void rewriteInline(InlineCtor& c, unsigned id) {
+    hlfir::DeclareOp local = makeLocalTemp(c.tmpDecl, c.tmpAlloc, c.seqTy, id);
+    readFromTemp(c.exprs, local.getResult(0), c.seqTy.getEleTy());
+    for (unsigned r = 0; r < c.tmpDecl->getNumResults(); ++r)
+      for (mlir::OpOperand& use : llvm::make_early_inc_range(c.tmpDecl->getResult(r).getUses()))
+        if (mlir::isa<hlfir::DesignateOp>(use.getOwner())) use.set(local->getResult(r));
+    eraseHeapTemp(c.tmpDecl, c.tmpAlloc);
+  }
+
   /// Erase a scratch slot nothing reads any more: every remaining user is a store into it.
   static void sweep(llvm::SetVector<mlir::Operation*>& slots) {
     for (mlir::Operation* slot : slots) {
@@ -512,8 +613,8 @@ struct ExpandRuntimeArrayConstructorsPass
 
 }  // namespace
 
-std::unique_ptr<mlir::Pass> createExpandRuntimeArrayConstructorsPass() {
-  return std::make_unique<ExpandRuntimeArrayConstructorsPass>();
+std::unique_ptr<mlir::Pass> createMaterialiseArrayConstructorsPass() {
+  return std::make_unique<MaterialiseArrayConstructorsPass>();
 }
 
 }  // namespace hlfir_bridge

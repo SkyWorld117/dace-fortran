@@ -210,12 +210,13 @@ DEFAULT_PIPELINE = (
     # carries an ``hlfir.elemental_addr`` (Fortran ``d(cols) = source``)
     # into an explicit DO loop of per-element scalar assigns.
     "hlfir-expand-vector-subscript-scatter,"
-    # An array constructor with an array-valued item (``u = [s, s*w(1:3), t]``)
-    # is built through the Fortran runtime (``_FortranAPushArrayConstructor*``),
-    # whose writes into the temp the bridge cannot see; replace the protocol
-    # with element assignments into a named local temp.  After the gather
-    # expansion, which turns every elemental item into a named local array.
-    "hlfir-expand-runtime-array-constructors,"
+    # Build every array constructor in a named local array: flang fills a
+    # heap ``.tmp.arrayctor`` either with inline element stores or, when an
+    # item is array-valued (``u = [s, s*w(1:3), t]``), through the Fortran
+    # runtime (``_FortranAPushArrayConstructor*``), whose writes the bridge
+    # cannot see.  After the gather expansion, which turns every elemental
+    # item into a named local array.
+    "hlfir-materialise-array-constructors,"
     # Drop private callee bodies once inlined  --  otherwise their
     # declares leak into extract_vars as stray scalars.
     "symbol-dce,"

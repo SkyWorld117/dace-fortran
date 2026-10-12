@@ -34,7 +34,7 @@ std::unique_ptr<mlir::Pass> createFoldCopyInOutPass();
 std::unique_ptr<mlir::Pass> createDropStubCallsPass();
 std::unique_ptr<mlir::Pass> createExpandVectorSubscriptGatherPass();
 std::unique_ptr<mlir::Pass> createExpandVectorSubscriptScatterPass();
-std::unique_ptr<mlir::Pass> createExpandRuntimeArrayConstructorsPass();
+std::unique_ptr<mlir::Pass> createMaterialiseArrayConstructorsPass();
 std::unique_ptr<mlir::Pass> createRejectPolymorphismPass();
 std::unique_ptr<mlir::Pass> createRewritePointerAssignsPass();
 std::unique_ptr<mlir::Pass> createRewriteSequenceAssociationPass();
