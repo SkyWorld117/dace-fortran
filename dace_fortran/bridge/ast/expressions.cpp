@@ -330,6 +330,16 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
         }
       }
       auto idxOps = parentDg.getIndices();
+      // A strided section ``w(lo:hi:st)``: position ``i`` of the view is base subscript ``lo + (i - 1) * st``.
+      // The start-only rebase below would read ``w(lo + i - 1)``, the contiguous elements from ``lo``.
+      auto const stride = found && cursor + 2 < idxOps.size() ? traceConstInt(idxOps[cursor + 2]) : std::nullopt;
+      if (found && cursor + 2 < idxOps.size() && (!stride || *stride != 1)) {
+        auto const lo = traceConstInt(idxOps[cursor]);
+        std::string const loExpr = lo ? std::to_string(*lo) : buildIndexExpr(idxOps[cursor], depth + 1);
+        std::string const stExpr = stride ? std::to_string(*stride) : buildIndexExpr(idxOps[cursor + 2], depth + 1);
+        if (loExpr.empty() || loExpr == "?" || stExpr.empty() || stExpr == "?") return "?";
+        return "(" + loExpr + " + (" + raw + " - 1) * " + stExpr + ")";
+      }
       if (found && cursor < idxOps.size()) {
         if (auto lo = traceConstInt(idxOps[cursor])) {
           int64_t const adjust = *lo - 1;
