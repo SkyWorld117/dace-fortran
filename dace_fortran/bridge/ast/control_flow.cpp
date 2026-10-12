@@ -379,11 +379,10 @@ std::vector<ASTNode> buildElementalAssign(hlfir::AssignOp assign, hlfir::Element
   }
   // Prepend any libcall-result materialisations so the transient is declared and populated before the elemental body
   // reads it.
-  if (!preNodes.empty()) {
-    preNodes.push_back(std::move(current));
-    return preNodes;
-  }
-  return {current};
+  for (auto& n :
+       evaluateBeforeAssigning(std::move(current), mlir::cast<hlfir::ExprType>(elem.getType()).getElementType()))
+    preNodes.push_back(std::move(n));
+  return preNodes;
 }
 
 /// Render an arith::cmpi predicate as a Python comparison operator; empty string for signed/unsigned variants not wired

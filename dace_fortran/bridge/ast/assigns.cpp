@@ -1,5 +1,6 @@
 // Translation-unit headers.  ``ast_helpers.h`` carries the cross-TU
 // API + thread-local state shared with the other ``ast/*.cpp`` files.
+#include <algorithm>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -844,6 +845,12 @@ mlir::Type peelWrappers(mlir::Type t) {
   return t;
 }
 
+// Element type of an array-typed value (``ref`` / ``box`` / ``heap`` / ``pointer`` around a ``fir.array``).
+static mlir::Type arrayElementType(mlir::Type ty) {
+  auto seq = mlir::dyn_cast<fir::SequenceType>(peelWrappers(ty));
+  return seq ? seq.getEleTy() : ty;
+}
+
 /// True iff the MLIR type peels to a ``fir.array<...>`` OR is an
 /// ``!hlfir.expr<...>`` value with a non-empty shape.  The latter is
 /// what every ``hlfir.elemental`` / ``hlfir.matmul`` / ``hlfir.transpose``
@@ -1160,7 +1167,7 @@ std::vector<ASTNode> buildSectionScalarAssign(hlfir::AssignOp assign, hlfir::Des
       current = wrap;
     }
   }
-  return {current};
+  return evaluateBeforeAssigning(std::move(current), arrayElementType(dst.getResult().getType()));
 }
 
 /// ``<section> = <other_section>`` where both sides are
@@ -1489,7 +1496,7 @@ std::vector<ASTNode> buildSectionToSectionAssign(hlfir::AssignOp assign, mlir::V
       current = wrap;
     }
   }
-  return {current};
+  return evaluateBeforeAssigning(std::move(current), arrayElementType(dst.getType()));
 }
 
 /// ``hlfir.assign %scalar to %arr_decl`` where the destination is the bare
@@ -1588,7 +1595,7 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
     wrap.children.push_back(current);
     current = wrap;
   }
-  return {current};
+  return evaluateBeforeAssigning(std::move(current), arrayElementType(decl.getResult(0).getType()));
 }
 
 ASTNode buildMemsetNode(hlfir::AssignOp assign) {
@@ -2020,6 +2027,111 @@ std::vector<ASTNode> buildSectionReduceAssign(hlfir::AssignOp assign, hlfir::Des
   }
 
   return {init, current};
+}
+
+// An index expression without its spaces and enclosing parentheses, so ``(ei0)`` and ``ei0`` compare equal.
+static std::string canonicalIndex(std::string s) {
+  s.erase(std::remove(s.begin(), s.end(), ' '), s.end());
+  while (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+    int depth = 0;
+    bool wraps = true;
+    for (size_t i = 0; i + 1 < s.size(); ++i) {
+      depth += s[i] == '(' ? 1 : (s[i] == ')' ? -1 : 0);
+      if (depth == 0) {
+        wraps = false;
+        break;
+      }
+    }
+    if (!wraps) break;
+    s = s.substr(1, s.size() - 2);
+  }
+  return s;
+}
+
+std::vector<ASTNode> evaluateBeforeAssigning(ASTNode nest, mlir::Type elementType) {
+  // The nest: loop nodes with one child each, down to the assign.
+  std::vector<ASTNode*> loops;
+  ASTNode* node = &nest;
+  while (node->kind == "loop" && node->children.size() == 1 && node->else_children.empty()) {
+    loops.push_back(node);
+    node = &node->children.front();
+  }
+  if (node->kind != "assign" || !node->target_is_array || loops.empty()) return {std::move(nest)};
+  ASTNode& inner = *node;
+  auto write = std::find_if(inner.accesses.begin(), inner.accesses.end(),
+                            [&](const AccessInfo& a) { return a.is_write && a.array_name == inner.target; });
+  if (write == inner.accesses.end()) return {std::move(nest)};
+  bool overlaps = false;
+  for (const auto& read : inner.accesses) {
+    if (!read.is_read || read.array_name != write->array_name) continue;
+    if (read.index_exprs.size() != write->index_exprs.size()) {
+      overlaps = true;
+      break;
+    }
+    for (size_t d = 0; d < read.index_exprs.size() && !overlaps; ++d)
+      overlaps = canonicalIndex(read.index_exprs[d]) != canonicalIndex(write->index_exprs[d]);
+    if (overlaps) break;
+  }
+  if (!overlaps) return {std::move(nest)};
+
+  // Every element of the right-hand side lands in a transient over the same iteration space first, then the transient
+  // is assigned to the target.
+  std::string const dtype = dtypeName(elementType);
+  std::string const tmp = "_rhs_" + std::to_string(kSynthTransientCounter++);
+  if (dtype.empty())
+    throw UnsupportedConstruct("assignment to \"" + inner.target +
+                               "\" reads its own target elsewhere than at the element written, and its element type "
+                               "has no transient dtype to evaluate the right-hand side into first");
+  std::vector<std::string> iters;
+  std::vector<std::string> extents;
+  std::vector<std::string> positions;
+  for (ASTNode* loop : loops) {
+    if (!loop->loop_step_expr.empty() || loop->loop_step != 1 ||
+        (loop->loop_lower < 0 && loop->loop_lower_expr.empty()))
+      throw UnsupportedConstruct("assignment to \"" + inner.target +
+                                 "\" reads its own target elsewhere than at the element written, over a loop the "
+                                 "right-hand side cannot be evaluated into a transient for first");
+    std::string const lower = loop->loop_lower_expr.empty() ? std::to_string(loop->loop_lower) : loop->loop_lower_expr;
+    iters.push_back(loop->loop_iter);
+    if (canonicalIndex(lower) == "1") {
+      extents.push_back(loop->loop_bound);
+      positions.push_back(loop->loop_iter);
+    } else {
+      extents.push_back("((" + loop->loop_bound + ") - (" + lower + ") + 1)");
+      positions.push_back("((" + loop->loop_iter + ") - (" + lower + ") + 1)");
+    }
+  }
+  auto tmpAccess = [&](bool isWrite) {
+    AccessInfo a;
+    a.array_name = tmp;
+    a.is_write = isWrite;
+    a.is_read = !isWrite;
+    a.index_vars = iters;
+    a.index_exprs = positions;
+    return a;
+  };
+
+  ASTNode decl;
+  decl.kind = "declare_transient";
+  decl.target = tmp;
+  decl.expr = dtype;
+  decl.target_is_array = true;
+  AccessInfo shape;
+  shape.array_name = tmp;
+  shape.index_exprs = extents;
+  decl.accesses.push_back(std::move(shape));
+
+  ASTNode store = nest;  // copy before the target assign below rewrites ``inner``
+  AccessInfo const targetWrite = *write;
+  inner.expr = tmp;
+  inner.accesses = {targetWrite, tmpAccess(false)};
+
+  ASTNode* storeInner = &store;
+  while (storeInner->kind == "loop") storeInner = &storeInner->children.front();
+  storeInner->target = tmp;
+  for (auto& a : storeInner->accesses)
+    if (a.is_write && a.array_name == targetWrite.array_name) a = tmpAccess(true);
+  return {std::move(decl), std::move(store), std::move(nest)};
 }
 
 }  // namespace hlfir_bridge
