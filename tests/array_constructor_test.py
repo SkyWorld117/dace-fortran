@@ -12,7 +12,8 @@ inline stores were retargeted at the destination without their reads (``_out_b =
 Runtime path: scalar and array items from record members and their sections (also inside a loop), whole arrays with a
 lower bound other than 1, a rank-2 item (array element order), a strided section, items reading the destination, a
 constructor inside an elementwise expression.  Inline path: element reads of arrays with their own lower bounds into
-record members inside a loop, a section destination, items reading the destination."""
+record members inside a loop, a section destination, items reading the destination, implied-do items (also nested and
+inside a loop), whose positions come from a counter flang advances before the store at the old position."""
 
 import numpy as np
 
@@ -175,3 +176,64 @@ def test_scalar_items_into_a_section_and_reading_the_destination(tmp_path):
     sdfg(a=0.5, w=w, x=x)
     np.testing.assert_array_equal(x, [10.0, 0.5, 1.0, 3.0, 14.0, 15.0])
     np.testing.assert_array_equal(w, [2.0, 1.0, 3.5])
+
+
+_IMPLIED_DO_SRC = """
+subroutine implied_do_items(a, v)
+  real(8), intent(in) :: a
+  real(8), intent(out) :: v(5)
+  integer :: i
+  v = [-1d0, (i * a, i = 1, 3), 2d0]
+end subroutine implied_do_items
+"""
+
+_NESTED_IMPLIED_DO_SRC = """
+subroutine nested_implied_do(a, v)
+  real(8), intent(in) :: a
+  real(8), intent(out) :: v(6)
+  integer :: i, j
+  v = [((i * a + 10 * j, i = 1, 2), j = 1, 3)]
+end subroutine nested_implied_do
+"""
+
+_IMPLIED_DO_IN_LOOP_SRC = """
+subroutine implied_do_columns(n, a, m)
+  integer, intent(in) :: n
+  real(8), intent(in) :: a
+  real(8), intent(out) :: m(4, n)
+  integer :: i, j
+  do j = 1, n
+    m(:, j) = [real(j, 8), (i * a * j, i = 1, 3)]
+  end do
+end subroutine implied_do_columns
+"""
+
+
+def test_implied_do_items(tmp_path):
+    """The implied-do's positions come from a counter flang advances before the store at the old position."""
+    sdfg = build_sdfg(_IMPLIED_DO_SRC, tmp_path, name="implied_do_items").build()
+    sdfg.validate()
+    v = np.zeros(5)
+    sdfg(a=0.5, v=v)
+    np.testing.assert_array_equal(v, [-1.0, 0.5, 1.0, 1.5, 2.0])
+
+
+def test_nested_implied_do(tmp_path):
+    sdfg = build_sdfg(_NESTED_IMPLIED_DO_SRC, tmp_path, name="nested_implied_do").build()
+    sdfg.validate()
+    a = 0.25
+    v = np.zeros(6)
+    sdfg(a=a, v=v)
+    expected = [i * a + 10 * j for j in range(1, 4) for i in range(1, 3)]
+    np.testing.assert_array_equal(v, expected)
+
+
+def test_implied_do_inside_a_loop(tmp_path):
+    sdfg = build_sdfg(_IMPLIED_DO_IN_LOOP_SRC, tmp_path, name="implied_do_columns").build()
+    sdfg.validate()
+    n, a = 3, 0.5
+    m = np.zeros((4, n), order="F")
+    sdfg(n=n, a=a, m=m)
+    j = np.arange(1, n + 1)
+    expected = np.vstack([j, *(i * a * j for i in range(1, 4))])
+    np.testing.assert_array_equal(m, expected)

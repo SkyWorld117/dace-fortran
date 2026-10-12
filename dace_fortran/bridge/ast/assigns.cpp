@@ -13,6 +13,8 @@
 #include "bridge/ast/ast_internal.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -88,6 +90,34 @@ static bool assignedInItsFunction(mlir::Value v) {
     return mlir::WalkResult::advance();
   });
   return assigned;
+}
+
+/// Whether a value computed from ``ld`` is used, in ``ld``'s block, after a later store to the memory it loads: a
+/// name for the load would read the stored value there, not the loaded one.
+static bool loadOutlivedByStore(fir::LoadOp ld) {
+  mlir::Block* block = ld->getBlock();
+  mlir::Value mem = ld.getMemref();
+  mlir::Operation* store = nullptr;
+  for (mlir::Operation* user : mem.getUsers()) {
+    auto st = mlir::dyn_cast<fir::StoreOp>(user);
+    if (!st || st.getMemref() != mem) continue;
+    mlir::Operation* top = block->findAncestorOpInBlock(*user);
+    if (top && ld->isBeforeInBlock(top) && (!store || top->isBeforeInBlock(store))) store = top;
+  }
+  if (!store) return false;
+  llvm::SmallVector<mlir::Value> work{ld.getResult()};
+  llvm::DenseSet<mlir::Operation*> seen;
+  while (!work.empty()) {
+    mlir::Value v = work.pop_back_val();
+    for (mlir::Operation* user : v.getUsers()) {
+      mlir::Operation* top = block->findAncestorOpInBlock(*user);
+      if (top == store && user == store) continue;  // the store itself writes a value computed from the load
+      if (!top || !top->isBeforeInBlock(store)) return true;
+      if (seen.insert(top).second)
+        for (mlir::Value r : top->getResults()) work.push_back(r);
+    }
+  }
+  return false;
 }
 
 std::string buildIndexExpr(mlir::Value v, int d) {
@@ -316,6 +346,12 @@ std::string buildIndexExpr(mlir::Value v, int d) {
     }
     auto n = traceToDecl(mem);
     if (!n.empty()) return n;
+    // A bare ``fir.alloca`` scratch counter (the position an implied-do array constructor stores at) reads as its
+    // synthetic name, as in ``buildExpr`` -- unless the loaded value is still used after a later store to the counter:
+    // the name would then read the advanced value.  ``hlfir-sink-scalar-stores`` moves such stores below those uses
+    // wherever nothing else accesses the counter in between.
+    if (auto* md = mem.getDefiningOp())
+      if (mlir::isa<fir::AllocaOp>(md)) return loadOutlivedByStore(ld) ? "?" : allocaSynthName(mem);
     // Last resort: maybe the load memref is the elemental's block arg
     // indirectly (unlikely, but guard).
     return "?";

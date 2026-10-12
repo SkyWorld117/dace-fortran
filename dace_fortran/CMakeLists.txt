@@ -391,6 +391,7 @@ add_library(hlfir_bridge_passes STATIC
     passes/ExpandVectorSubscriptGather.cpp
     passes/ExpandVectorSubscriptScatter.cpp
     passes/MaterialiseArrayConstructors.cpp
+    passes/SinkScalarStores.cpp
     passes/RejectPolymorphism.cpp
     passes/RewritePointerAssigns.cpp
     passes/RewriteSequenceAssociation.cpp

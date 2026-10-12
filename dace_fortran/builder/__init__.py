@@ -218,6 +218,11 @@ DEFAULT_PIPELINE = (
     # cannot see.  After the gather expansion, which turns every elemental
     # item into a named local array.
     "hlfir-materialise-array-constructors,"
+    # An implied-do item fills its constructor at positions kept in an
+    # anonymous counter, which flang advances BEFORE the element store that
+    # uses the old position.  Move such stores below the uses of the value
+    # they overwrite, so a load names what the memory still holds.
+    "hlfir-sink-scalar-stores,"
     # Drop private callee bodies once inlined  --  otherwise their
     # declares leak into extract_vars as stray scalars.
     "symbol-dce,"
