@@ -8,7 +8,7 @@ Real work lives in sibling modules (``flatten_plan.py`` data model,
 ``assemble_module``); this file is pure orchestration.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
 from dace_fortran.bindings.acc_transfers import AccTransferPlan, Directive
@@ -21,6 +21,7 @@ from dace_fortran.bindings.block_builders import (
     build_wrapper_head,
     build_wrapper_tail,
     check_init_symbols,
+    keepable,
     passed_symbols,
     splice_acc_staging,
 )
@@ -54,6 +55,7 @@ def emit_bindings(
     record_only: bool = False,
     private_access: Mapping[str, Mapping[str, ExposedVariable]] | None = None,
     private_imports: Sequence[str] = (),
+    kept_images: Collection[str] = (),
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -104,10 +106,21 @@ def emit_bindings(
     (:mod:`dace_fortran.bindings.storage_guard`).
     ``private_access`` / ``private_imports``: module variables their modules keep private, reached through the
     accessors of the modules' copies, and the ``use`` lines their declarations need (see :func:`assemble_module`).
+    ``kept_images``: arguments of the SDFG that are buffers of module arrays of records only the routine uses (nothing
+    else reads or writes their members between its calls): the wrapper packs such a buffer once, keeps it (and its
+    device copy) for the next call and never copies it back, so the routine's state lives in the buffer instead of the
+    members.  A call that finds the members reallocated to another shape packs the buffer afresh.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
     check_init_symbols(frozen, init_symbols, dace_arglist)
+    kept = frozenset(kept_images)
+    eligible = {a.sdfg_name for a in frozen.args if keepable(a)}
+    if kept - eligible:
+        raise ValueError(
+            "kept_images: not buffers of deferred-shape members of module arrays of records the SDFG "
+            f"takes: {sorted(kept - eligible)}"
+        )
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     enum_maps = enum_maps or {}
@@ -125,6 +138,7 @@ def emit_bindings(
             module_allocatables_are_targets=module_allocatables_are_targets,
             acc_residency=acc_residency,
             declinable=specialization is not None,
+            kept=kept,
         ),
         "wrapper_body": build_wrapper_body(
             frozen,
@@ -135,6 +149,7 @@ def emit_bindings(
             acc_residency=acc_residency,
             declinable=specialization is not None,
             passed=passed_symbols(frozen, dace_arglist, init_symbols),
+            kept=kept,
         ),
         "wrapper_tail": build_wrapper_tail(
             frozen,
@@ -145,6 +160,7 @@ def emit_bindings(
             init_symbols=init_symbols,
             module_allocatables_are_targets=module_allocatables_are_targets,
             acc_residency=acc_residency,
+            kept=kept,
         ),
         "finalize": build_finalize(iface),
     }

@@ -413,6 +413,7 @@ def build_wrapper_head(
     module_allocatables_are_targets: bool = True,
     acc_residency: AccTransferPlan | None = None,
     declinable: bool = False,
+    kept: Container[str] = frozenset(),
 ) -> str:
     """Render the <entry>_dace subroutine header + declaration section
     (template: templates/wrapper_head.f90.in). Walks plan.entries: aliasable
@@ -423,7 +424,9 @@ def build_wrapper_head(
     a companion packed on the device needs the loop indices and the padding flag of its OpenACC pack loops.
 
     ``declinable``: the wrapper of a specialised SDFG takes an optional ``dace_declined`` flag, set when the call's
-    values are not the ones the SDFG was specialised to (see :mod:`dace_fortran.bindings.specialization`)."""
+    values are not the ones the SDFG was specialised to (see :mod:`dace_fortran.bindings.specialization`).
+
+    ``kept``: buffers of arrays of records the wrapper keeps between calls (see :func:`emit_bindings`): saved."""
     deviceptr, device_pack = _device_lane(acc_residency)
     tpl = _load("wrapper_head.f90.in")
     outer_dummy_names = [a.name for a in iface.args]
@@ -577,7 +580,11 @@ def build_wrapper_head(
     for a in _aos_module_args(frozen):
         ftype = fortran_c_type(a.dtype)
         spec = "(" + ", ".join(":" for _ in range(a.rank)) + ")" if a.rank else ""
-        scratch_lines.append(f"    {ftype}, allocatable, target :: {a.sdfg_name}{spec}")
+        if a.sdfg_name in kept:
+            scratch_lines.append(f"    {ftype}, allocatable, target, save :: {a.sdfg_name}{spec}")
+            scratch_lines.append(f"    logical :: {_kept_unchanged_local(a.sdfg_name)}")
+        else:
+            scratch_lines.append(f"    {ftype}, allocatable, target :: {a.sdfg_name}{spec}")
         pieces = _aos_loop_pieces(a)
         # scalar-struct (outer_rank 0): no loop vars
         int_names = pieces.loop_vars + pieces.lower_vars + pieces.upper_vars + pieces.segment_caps
@@ -699,6 +706,7 @@ def build_wrapper_body(
     acc_residency: AccTransferPlan | None = None,
     declinable: bool = False,
     passed: Container[str] | None = None,
+    kept: Container[str] = frozenset(),
 ) -> str:
     """Render the between-declaration-and-SDFG-call block: for each FlattenEntry
     either alias it (zero-copy) or allocate + copy in, then populate SDFG free
@@ -707,7 +715,9 @@ def build_wrapper_body(
     ``declinable``: an array of records split per element whose members do not all have the shape the SDFG takes is
     declined through the wrapper's ``dace_declined`` flag rather than stopped on.
     ``passed``: the free symbols the wrapper hands the SDFG (:func:`passed_symbols`); one of them it has no source
-    for raises :class:`UnsourcedSymbolError`."""
+    for raises :class:`UnsourcedSymbolError`.
+    ``kept``: buffers of arrays of records the wrapper keeps between calls, packed only by a call that finds none of
+    the members' shape (see :func:`emit_bindings`)."""
     deviceptr, device_pack = _device_lane(acc_residency)
     outer_dummy_set = {a.name for a in iface.args}
     enum_args = _enum_args(iface, enum_maps or {})
@@ -866,7 +876,7 @@ def build_wrapper_body(
         body.append("")
         body.append("    ! ----- Module-global AoS-struct components (AoS->SoA) -----")
         for a in aos_args:
-            body.extend(_render_aos_copy_in(a, device=a.sdfg_name in device_pack))
+            body.extend(_render_aos_copy_in(a, device=a.sdfg_name in device_pack, kept=a.sdfg_name in kept))
 
     unsourced = _unsourced_array_args(frozen, iface, plan)
     if unsourced:
@@ -954,11 +964,13 @@ def build_wrapper_tail(
     init_symbols: Sequence[str] | None = None,
     module_allocatables_are_targets: bool = True,
     acc_residency: AccTransferPlan | None = None,
+    kept: Container[str] = frozenset(),
 ) -> str:
     """Render the wrapper tail: init-count bump + call dace_program_<entry> +
     copy-back for every non-aliased writeable entry, then deallocate + close.
     Template templates/wrapper_call.f90.in supplies the skeleton; we splice the
-    copy-back block in before its end marker."""
+    copy-back block in before its end marker.  A buffer in ``kept`` stays as it is for the next call: no copy-back,
+    no release (see :func:`emit_bindings`)."""
     tpl = _load("wrapper_call.f90.in")
     deviceptr, device_pack = _device_lane(acc_residency)
 
@@ -1054,6 +1066,8 @@ def build_wrapper_tail(
     aos_out_lines: list[str] = []
     for a in _aos_module_args(frozen):
         device = a.sdfg_name in device_pack
+        if a.sdfg_name in kept:
+            continue
         if a.is_written:
             aos_out_lines.extend(_render_aos_copy_out(a, device=device))
         else:
@@ -1806,7 +1820,70 @@ def _device_member_loop(pieces: AosLoopPieces, assign: str) -> list[str]:
     return lines
 
 
-def _render_aos_copy_in(a: FrozenArg, device: bool = False) -> list[str]:
+def _kept_unchanged_local(sdfg_name: str) -> str:
+    """Wrapper local: the kept buffer of ``sdfg_name`` still has the shape the members take."""
+    return f"{sdfg_name}__kept"
+
+
+def _top_level_items(spec: str) -> list[str]:
+    """The comma-separated items of an allocate spec, commas inside parentheses left alone."""
+    items, depth, start = [], 0, 0
+    for i, ch in enumerate(spec):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(spec[start:i].strip())
+            start = i + 1
+    items.append(spec[start:].strip())
+    return [s for s in items if s]
+
+
+def _render_kept_release(
+    a: FrozenArg, loops: AosLoops, lowers: Sequence[str], uppers: Sequence[str], device: bool
+) -> list[str]:
+    """Drop a kept buffer whose shape the members no longer take (reallocated since it was packed): the call then
+    packs it afresh."""
+    buf, same = a.sdfg_name, _kept_unchanged_local(a.sdfg_name)
+    lead = _aos_lead(a)
+
+    def extents(spec: str) -> str:
+        return " .and. ".join(f"size({buf}, {k + 1}) == {e}" for k, e in enumerate(_top_level_items(spec)))
+
+    out = [
+        f"    if (allocated({buf})) then",
+        f"      if ({loops.present}) then",
+        f"        {same} = {extents(loops.outer_dims)}",
+        "      else",
+        f"        {same} = {extents(loops.one_dims)}",
+        "      end if",
+    ]
+    for j, (lo, hi) in enumerate(zip(lowers, uppers, strict=True)):
+        out.append(f"      {same} = {same} .and. lbound({buf}, {lead + j + 1}) == {lo} .and. &")
+        out.append(f"        ubound({buf}, {lead + j + 1}) == {hi}")
+    out.append(f"      if (.not. {same}) then")
+    if device:
+        out.append(f"        !$acc exit data delete({buf})")
+    out += [f"        deallocate({buf})", "      end if", "    end if"]
+    return out
+
+
+def keepable(a: FrozenArg) -> bool:
+    """Whether the buffer ``a`` can be kept between calls (``emit_bindings(kept_images=...)``): a deferred-shape
+    member of a module array of records, which the binding packs itself."""
+    return bool(
+        a.aos_origin_struct
+        and a.aos_origin_mod
+        and a.rank > 0
+        and _aos_lead(a) > 0
+        and a.rank > _aos_lead(a)
+        and not _aos_member_is_static(a)
+        and not a.global_alloc_inside
+    )
+
+
+def _render_aos_copy_in(a: FrozenArg, device: bool = False, kept: bool = False) -> list[str]:
     """Allocate the SoA buffer + pack the host AoS component in. A deferred-shape
     member keeps its own bounds: per member dim the buffer spans the lowest lower
     to the highest upper bound over the elements, and each element fills its own
@@ -1816,8 +1893,16 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False) -> list[str]:
 
     ``device``: the members live on the device (a device-resident caller) and the SDFG reads the buffer there: the
     buffer gets a device copy and the packing runs as OpenACC loops over the members' device copies; the host copy
-    is only allocated.  Only a deferred-shape member takes this lane (a fixed-shape value member is host data)."""
+    is only allocated.  Only a deferred-shape member takes this lane (a fixed-shape value member is host data).
+
+    ``kept``: the buffer is the routine's own copy of the members, kept between calls (saved, never copied back):
+    packed only while it is unallocated, and again whenever the members' shape no longer matches it.  Only a
+    deferred-shape member of a module array of records takes this lane."""
     pieces = _aos_loop_pieces(a)
+    if kept and not keepable(a):
+        raise ValueError(
+            f"{a.sdfg_name}: only a deferred-shape member of a module array of records can be kept between calls"
+        )
     its, lowers, uppers, mrank, elem = pieces[:5]
     if _aos_lead(a) == 0:
         # SCALAR struct global member, POINTER/ALLOCATABLE, may be undefined on
@@ -1907,6 +1992,13 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False) -> list[str]:
         out.append(f"    if ({lo} > {hi}) {lo} = 1")
         out.append(f"    {hi} = max({hi}, {lo})")
     bound_dims = ", ".join(f"{lo}:{hi}" for lo, hi in zip(lowers, uppers, strict=True))
+    start = len(out)
+    if kept:
+        out[0] = out[0].replace("copy-in", "copy-in, kept between calls")
+        out += _render_kept_release(a, _aos_loops(a, pieces), lowers, uppers, device)
+        # What follows allocates and packs: only for a buffer the call does not find.
+        out.append(f"    if (.not. allocated({a.sdfg_name})) then")
+        start = len(out)
     out.append(f"    if ({sp}) then")
     out.append(f"      allocate({a.sdfg_name}({outer_dims}, {bound_dims}))")
     out.append("    else")
@@ -1933,6 +2025,9 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False) -> list[str]:
             out.append(f"        if ({mp}) &")
             out.append(f"          {a.sdfg_name}({idx}, {slc}) = {elem}")
         out += do_close
+        out.append("    end if")
+    if kept:
+        out[start:] = ["  " + line for line in out[start:]]
         out.append("    end if")
     return out
 
