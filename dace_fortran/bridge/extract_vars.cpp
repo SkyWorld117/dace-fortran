@@ -4050,7 +4050,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
   // in both a tasklet body and a memlet subset).
   {
     // Walk a designate's memref back through the reinterpret hops to its root: a struct-typed DUMMY (a declare with a
-    // dummy scope), a module-global record or array of records (``qp % vf(i) % sf``, ``fl(id) % vf(i) % sf``, ``qp`` and
+    // dummy scope), a module-global record or array of records (``st % comp(i) % data``, ``field(id) % comp(i) % data``, ``st`` and
     // ``fl`` module variables), or neither.
     enum class StructRoot { None, Dummy, ModuleGlobal };
     auto structRootOf = [](hlfir::DesignateOp dg) -> StructRoot {
@@ -4160,7 +4160,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       // varying record dims (``dual_cart_normal(je,jb) % x``).
       std::vector<bool> record_const;
       int outer_rank = 0;
-      // Subscripts of a module-global root that is itself an array of records (``fl(id) % vf(i) % sf``: 1); they
+      // Subscripts of a module-global root that is itself an array of records (``field(id) % comp(i) % data``: 1); they
       // lead the companion's dims, ahead of every segment's.
       int root_dims = 0;
       // The module-global root has a fixed size (no descriptor: neither allocatable nor pointer).
