@@ -21,6 +21,7 @@ from dace_fortran.bindings.block_builders import (
     build_wrapper_head,
     build_wrapper_tail,
     check_init_symbols,
+    passed_symbols,
     splice_acc_staging,
 )
 from dace_fortran.bindings.flatten_plan import FlattenPlan
@@ -68,6 +69,7 @@ def emit_bindings(
     :func:`dace_fortran.bindings.build_fortran_library.compiled_init_symbols`; ``None`` assumes every free symbol.
     A list that cannot be this SDFG's (read from the header of another build of an SDFG with the same name) raises
     :class:`~dace_fortran.bindings.frozen_signature.SignatureDriftError`, see :func:`block_builders.check_init_symbols`.
+    A free symbol the wrapper passes but has no value for raises :class:`block_builders.UnsourcedSymbolError`.
 
     ``acc_residency`` (optional) is an
     :class:`dace_fortran.bindings.acc_transfers.AccTransferPlan` -- the sidecar
@@ -132,6 +134,7 @@ def emit_bindings(
             module_allocatables_are_targets=module_allocatables_are_targets,
             acc_residency=acc_residency,
             declinable=specialization is not None,
+            passed=passed_symbols(frozen, dace_arglist, init_symbols),
         ),
         "wrapper_tail": build_wrapper_tail(
             frozen,

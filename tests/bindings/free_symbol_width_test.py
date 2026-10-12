@@ -22,13 +22,13 @@ from dace_fortran.bindings import (
 )
 from dace_fortran.bindings.frozen_signature import FrozenArgKind, symbol_dtypes_of
 
-_NARROW = "integer(c_int), value :: n_d2"
-_WIDE = "integer(c_int64_t), value :: n_d2"
-_WIDE_LOCAL = "integer(c_int64_t) :: n_d2"
+_NARROW = "integer(c_int), value :: out_d1"
+_WIDE = "integer(c_int64_t), value :: out_d1"
+_WIDE_LOCAL = "integer(c_int64_t) :: out_d1"
 
 
 def _frozen(symbol_dtypes: dict[str, str]) -> FrozenSignature:
-    """``out(n, m)`` is the only argument; ``n_d2`` is a free symbol no argument carries."""
+    """``out(n, m)`` is the only argument; ``out_d1`` is a free symbol no argument carries, an extent DaCe inferred."""
     out = FrozenArg(
         fortran_name="out",
         sdfg_name="out",
@@ -42,7 +42,7 @@ def _frozen(symbol_dtypes: dict[str, str]) -> FrozenSignature:
         entry="kernel",
         mangled="_QPkernel",
         args=(out,),
-        free_symbols=("m", "n", "n_d2"),
+        free_symbols=("m", "n", "out_d1"),
         symbol_dtypes=symbol_dtypes,
     )
 
@@ -66,8 +66,8 @@ def _emit(frozen: FrozenSignature, tmp_path: Path) -> str:
         _iface(),
         FlattenPlan(entries=()),
         str(out),
-        dace_arglist=("out", "m", "n", "n_d2"),
-        init_symbols=("m", "n", "n_d2"),
+        dace_arglist=("out", "m", "n", "out_d1"),
+        init_symbols=("m", "n", "out_d1"),
     )
     return out.read_text()
 
@@ -81,7 +81,7 @@ def _between(src: str, start: str, end: str) -> list[str]:
 
 
 def test_a_shape_only_symbol_is_declared_in_the_width_the_snapshot_records(tmp_path: Path):
-    src = _emit(_frozen({"m": "int32", "n": "int32", "n_d2": "int64"}), tmp_path)
+    src = _emit(_frozen({"m": "int32", "n": "int32", "out_d1": "int64"}), tmp_path)
     program = _between(src, "subroutine dace_program_kernel", "end subroutine")
     init = _between(src, "function dace_init_kernel", "end function")
     assert _WIDE in program
@@ -98,7 +98,7 @@ def test_a_snapshot_without_widths_keeps_the_default_integer(tmp_path: Path):
     src = _emit(_frozen({}), tmp_path)
     assert _between(src, "subroutine dace_program_kernel", "end subroutine").count(_NARROW) == 1
     assert _between(src, "function dace_init_kernel", "end function").count(_NARROW) == 1
-    assert "integer(c_int) :: n_d2" in src
+    assert "integer(c_int) :: out_d1" in src
     assert "c_int64_t" not in src
 
 
@@ -113,7 +113,7 @@ def test_symbol_dtypes_come_from_the_sdfgs_argument_list_and_do_not_affect_equal
     assert symbol_dtypes_of(sdfg, ["n_d1", "n_d2"]) == {"n_d1": "int32", "n_d2": "int64"}
 
     # The field is derived from the SDFG, so a snapshot that lacks it is the same snapshot.
-    with_widths = _frozen({"n_d2": "int64"})
+    with_widths = _frozen({"out_d1": "int64"})
     without = replace(with_widths, symbol_dtypes={})
     assert with_widths == without
     assert with_widths.symbol_dtypes != without.symbol_dtypes

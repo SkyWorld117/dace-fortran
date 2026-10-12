@@ -263,6 +263,29 @@ def check_init_symbols(
         )
 
 
+class UnsourcedSymbolError(ValueError):
+    """The wrapper would hand the SDFG free symbols it has no value for."""
+
+    def __init__(self, entry: str, symbols: Sequence[str]):
+        self.symbols = list(symbols)
+        super().__init__(
+            f"the binding of {entry!r} has no source for the free symbols {self.symbols} it passes to the SDFG: no "
+            "argument, flatten-plan entry, module variable or record member gives their value before the call, so "
+            "the wrapper would pass uninitialised values.  A value the routine computes itself (such as the extent "
+            "of a section whose bounds it sets) must be expressed inside the SDFG, not taken as an input."
+        )
+
+
+def passed_symbols(
+    frozen: FrozenSignature, dace_arglist: Sequence[str] = (), init_symbols: Sequence[str] | None = None
+) -> set[str]:
+    """The free symbols the wrapper hands the SDFG: those ``__program`` takes (all of them without ``dace_arglist``,
+    as :func:`_dace_call_order` then passes every free symbol) and the parameters of ``__dace_init``."""
+    symbols = set(frozen.free_symbols)
+    program = {n for n in dace_arglist if n in symbols} if dace_arglist else symbols
+    return program | set(_init_sym_names(frozen, init_symbols))
+
+
 def _dace_call_order(frozen: FrozenSignature, dace_arglist: Sequence[str]) -> list[FrozenArg | str]:
     """The exact __program_<entry> argument order DaCe codegen emitted
     (dace_arglist = CompiledSDFG._sig). Each name resolves to its FrozenArg;
@@ -675,13 +698,16 @@ def build_wrapper_body(
     module_allocatables_are_targets: bool = True,
     acc_residency: AccTransferPlan | None = None,
     declinable: bool = False,
+    passed: Container[str] | None = None,
 ) -> str:
     """Render the between-declaration-and-SDFG-call block: for each FlattenEntry
     either alias it (zero-copy) or allocate + copy in, then populate SDFG free
     symbols from size(...) on the outer storage.
 
     ``declinable``: an array of records split per element whose members do not all have the shape the SDFG takes is
-    declined through the wrapper's ``dace_declined`` flag rather than stopped on."""
+    declined through the wrapper's ``dace_declined`` flag rather than stopped on.
+    ``passed``: the free symbols the wrapper hands the SDFG (:func:`passed_symbols`); one of them it has no source
+    for raises :class:`UnsourcedSymbolError`."""
     deviceptr, device_pack = _device_lane(acc_residency)
     outer_dummy_set = {a.name for a in iface.args}
     enum_args = _enum_args(iface, enum_maps or {})
@@ -758,7 +784,7 @@ def build_wrapper_body(
     # Symbol population is SPLIT by data dependency: a shape sym from a module
     # global/dummy/constant must be assigned BEFORE the allocates below, while a
     # buffer-EXTENT sym (size of a buffer we allocate) can only be assigned AFTER.
-    sym_lines = _build_symbol_assigns(frozen, plan, outer_dummy_set, iface)
+    sym_lines = _build_symbol_assigns(frozen, plan, outer_dummy_set, iface, passed)
     extra_syms = _extra_local_symbols(frozen, iface, plan)
     _buffer_names = buffer_local_names(frozen, iface, plan)
 
@@ -2031,12 +2057,20 @@ def _struct_member_symbol_sources(iface: OriginalInterface) -> MemberSymbolSourc
 
 
 def _build_symbol_assigns(
-    frozen: FrozenSignature, plan: FlattenPlan, outer_dummy_set: set, iface: OriginalInterface
+    frozen: FrozenSignature,
+    plan: FlattenPlan,
+    outer_dummy_set: set,
+    iface: OriginalInterface,
+    passed: Container[str] | None = None,
 ) -> list[str]:
     """Emit one assignment per free SDFG symbol from the caller's actual storage:
     offset_<arr>_d<i> -> lbound, <arr>_d<i> -> extent/size. Flatten-plan expr
     preferred when available; falls back to lbound/size on the arg's own Fortran
-    expr for plain assumed-shape / non-default lower-bound dummies."""
+    expr for plain assumed-shape / non-default lower-bound dummies.
+
+    A symbol nothing gives a value gets a ``TODO`` comment and no assignment.  That is harmless only for one the
+    wrapper does not hand the SDFG: one in ``passed`` (when given) raises :class:`UnsourcedSymbolError` instead of
+    passing an uninitialised local."""
     _module_sources = effective_module_sources(frozen, iface, plan)
     _synth_members = _synthetic_members(plan)
     # Struct-member free symbols with no FlattenEntry (used only as a loop bound /
@@ -2143,6 +2177,7 @@ def _build_symbol_assigns(
         return _entry_presence_guard(iface, path) if path else ""
 
     out: list[str] = []
+    unsourced: list[str] = []
     for sym in frozen.free_symbols:
         if sym in outer_dummy_set:
             continue
@@ -2292,5 +2327,10 @@ def _build_symbol_assigns(
         if sym in _struct_member_sources:
             out.extend(_guarded_assign(sym, _struct_member_sources[sym], _member_sym_guard(sym)))
             continue
+        if passed is not None and sym in passed:
+            unsourced.append(sym)
+            continue
         out.append(f"    ! TODO: no plan entry gives size for free symbol {sym!r}")
+    if unsourced:
+        raise UnsourcedSymbolError(frozen.entry, unsourced)
     return out
