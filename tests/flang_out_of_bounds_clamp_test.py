@@ -52,3 +52,27 @@ def test_flang_lowers_a_module_with_a_dead_out_of_bounds_subscript(tmp_path: Pat
     out = dace_fortran.emit_hlfir_from_codebase(entry_source=entry, out_path=tmp_path / "tu.hlfir", flang_program=flang)
     text = Path(out).read_text()
     assert "neighbours" in text
+
+
+def test_a_line_expanded_more_than_once_is_clamped_where_the_subscript_is():
+    """A preprocessor loop repeats a source line with different literals; the error names the source line, the clamp
+    patches the expansion that holds the reported subscript."""
+    source = (
+        '# 1 "/src/m_dirs.f90"\n'
+        "module m_dirs\n"
+        "  implicit none\n"
+        "contains\n"
+        "  subroutine pick(c, out)\n"
+        "    real(8), intent(in) :: c(0:0, 2)\n"
+        "    real(8), intent(out) :: out(2)\n"
+        '# 7 "/src/m_dirs.f90"\n'
+        "    out(1) = c(0, 1)\n"
+        '# 7 "/src/m_dirs.f90"\n'
+        "    out(2) = c(1, 2)\n"
+        "  end subroutine pick\n"
+        "end module m_dirs\n"
+    )
+    errors = "/src/m_dirs.f90:7:14: error: subscript 1 is greater than upper bound 0 for dimension 1 of array\n"
+    patched, clamped = clamp_out_of_bounds_constant_subscripts(source, errors)
+    assert clamped == 1
+    assert "out(1) = c(0, 1)" in patched and "out(2) = c(0, 2)" in patched

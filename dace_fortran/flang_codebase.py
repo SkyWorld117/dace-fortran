@@ -378,20 +378,21 @@ _OUT_OF_BOUNDS_RE = re.compile(
 _LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?(\d+)\s+"([^"]+)"')
 
 
-def _origin_lines(source: str, path: str | None = None) -> dict[tuple[str, int], int]:
+def _origin_lines(source: str, path: str | None = None) -> dict[tuple[str, int], list[int]]:
     """Map ``(file, line)`` as the line markers of ``source`` name it -- and, for ``path``, the file ``source`` is
-    compiled from, its own line numbers -- to the index of the line in ``source``."""
-    origin: dict[tuple[str, int], int] = {}
+    compiled from, its own line numbers -- to the indices of the lines in ``source`` it stands for: several when a
+    preprocessor expanded that line more than once (a loop over directions, say)."""
+    origin: dict[tuple[str, int], list[int]] = {}
     current: tuple[str, int] | None = None
     for index, text in enumerate(source.splitlines()):
         if path is not None:
-            origin[(path, index + 1)] = index
+            origin.setdefault((path, index + 1), []).append(index)
         marker = _LINE_MARKER_RE.match(text)
         if marker:
             current = (marker.group(2), int(marker.group(1)))
             continue
         if current is not None:
-            origin.setdefault(current, index)
+            origin.setdefault(current, []).append(index)
             current = (current[0], current[1] + 1)
     return origin
 
@@ -435,14 +436,14 @@ def clamp_out_of_bounds_constant_subscripts(source: str, flang_errors: str, path
     lines = source.splitlines(keepends=True)
     clamped = 0
     for m in _OUT_OF_BOUNDS_RE.finditer(flang_errors):
-        index = origin.get((m.group("file"), int(m.group("line"))))
-        if index is None:
-            continue
-        patched = _clamp_subscript(lines[index], int(m.group("col")), int(m.group("dim")), int(m.group("value")),
-                                   int(m.group("bound")))
-        if patched is not None and patched != lines[index]:
-            lines[index] = patched
-            clamped += 1
+        # The first of the lines it may stand for whose reference at that column has that literal subscript.
+        for index in origin.get((m.group("file"), int(m.group("line"))), []):
+            patched = _clamp_subscript(lines[index], int(m.group("col")), int(m.group("dim")), int(m.group("value")),
+                                       int(m.group("bound")))
+            if patched is not None and patched != lines[index]:
+                lines[index] = patched
+                clamped += 1
+                break
     return "".join(lines), clamped
 
 
