@@ -1196,8 +1196,9 @@ def build_finalize(iface: OriginalInterface) -> str:
 FORTRAN_LINE_LIMIT = 132
 
 
-def _last_comma_outside_strings(line: str, end: int) -> int | None:
-    """Index of the last ``,`` before ``end`` that is outside a string literal and before an inline comment."""
+def _last_comma_outside_strings(line: str, end: int, chars: str = ",") -> int | None:
+    """Index of the last of ``chars`` (a ``,`` by default) before ``end`` that is outside a string literal and
+    before an inline comment."""
     quote = None
     last = None
     for i, ch in enumerate(line[:end]):
@@ -1208,22 +1209,26 @@ def _last_comma_outside_strings(line: str, end: int) -> int | None:
             quote = ch
         elif ch == "!":
             break
-        elif ch == ",":
+        elif ch in chars:
             last = i
     return last
 
 
 def fold_long_lines(src: str, limit: int = FORTRAN_LINE_LIMIT) -> str:
     """Continue every line longer than ``limit`` with ``&`` after a comma outside string literals (Fortran allows a
-    continuation between any two tokens).  A line with no such comma is left as it is."""
+    continuation between any two tokens); where no comma fits (a long designator, ``a(i)%b(j)%c(lbound(...``),
+    after an opening parenthesis or bracket or at a blank instead.  A line with none of them is left as it is."""
     out: list[str] = []
     for line in src.split("\n"):
         continuation = " " * (len(line) - len(line.lstrip()) + 4)
         while len(line) > limit:
+            lead = len(line) - len(line.lstrip())  # a break in the indentation would not shorten the line
             cut = _last_comma_outside_strings(line, limit - 2)
-            if cut is None:
+            if cut is None or cut <= lead:
+                cut = _last_comma_outside_strings(line, limit - 2, "([ ")
+            if cut is None or cut <= lead:
                 break
-            out.append(line[: cut + 1] + " &")
+            out.append(line[: cut + 1].rstrip() + " &")
             line = continuation + line[cut + 1 :].lstrip()
         out.append(line)
     return "\n".join(out)
