@@ -28,7 +28,13 @@ from dace_fortran.bindings.fortran_interface import (
     OriginalInterface,
     fortran_c_type,
 )
-from dace_fortran.bindings.frozen_signature import FrozenArg, FrozenArgKind, FrozenSignature, ModuleOrigin
+from dace_fortran.bindings.frozen_signature import (
+    FrozenArg,
+    FrozenArgKind,
+    FrozenSignature,
+    ModuleOrigin,
+    SignatureDriftError,
+)
 from dace_fortran.bindings.loop_copy import (
     aos_bounds_locals,
     aos_pack_extent_locals,
@@ -215,6 +221,46 @@ def _init_sym_names(frozen: FrozenSignature, init_symbols: Sequence[str] | None 
     if init_symbols is not None:
         return list(init_symbols)
     return sorted(s for s in frozen.free_symbols if not s.startswith("__dace"))
+
+
+def check_init_symbols(
+    frozen: FrozenSignature, init_symbols: Sequence[str] | None, dace_arglist: Sequence[str] = ()
+) -> None:
+    """Refuse an ``__dace_init`` parameter list that does not belong to this SDFG.
+
+    DaCe's code generator declares ``__dace_init_<name>`` with the free symbols the generated code uses, sorted by
+    name, and ``__program_<name>`` takes the same symbols (``dace_arglist``, from the live ``CompiledSDFG``).  The init
+    list is read from the header DaCe writes into the build folder, so a compilation of another SDFG with the same
+    name into that folder -- a concurrent build of another specialisation of the routine -- replaces it.  That
+    header names symbols this SDFG lacks (the binding declares no local for them and does not compile), or omits
+    some of its symbols and binds the rest in the wrong positions; and the library beside it is not this SDFG's
+    either.  So the list must name only free symbols of ``frozen`` and, given ``dace_arglist``, be exactly the
+    symbols ``__program`` takes, in DaCe's order.
+    """
+    if init_symbols is None:
+        return
+    init = list(init_symbols)
+    symbols = set(frozen.free_symbols)
+    problems = []
+    foreign = [s for s in init if s not in symbols]
+    if foreign:
+        problems.append(f"takes {foreign}, which are not symbols of this SDFG")
+    if dace_arglist:
+        expected = sorted(n for n in dace_arglist if n in symbols and not n.startswith("__dace"))
+        unpassed = [s for s in init if s in symbols and s not in expected]
+        missing = [s for s in expected if s not in init]
+        if unpassed:
+            problems.append(f"takes {unpassed}, which __program does not take")
+        if missing:
+            problems.append(f"lacks {missing}, which __program takes")
+        if not problems and init != expected:
+            problems.append(f"takes its symbols in another order than DaCe declares them ({expected})")
+    if problems:
+        raise SignatureDriftError(
+            f"__dace_init of the compiled library for {frozen.entry!r} " + "; ".join(problems) + ". The header it "
+            "was read from belongs to another compilation of an SDFG with this name (a build folder shared with a "
+            "concurrent or later build): give each build a DaCe build folder of its own."
+        )
 
 
 def _dace_call_order(frozen: FrozenSignature, dace_arglist: Sequence[str]) -> list[FrozenArg | str]:

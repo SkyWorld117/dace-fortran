@@ -20,6 +20,7 @@ from dace_fortran.bindings.block_builders import (
     build_wrapper_body,
     build_wrapper_head,
     build_wrapper_tail,
+    check_init_symbols,
     splice_acc_staging,
 )
 from dace_fortran.bindings.flatten_plan import FlattenPlan
@@ -64,6 +65,8 @@ def emit_bindings(
 
     ``init_symbols`` (optional) is the parameter list the compiled ``__dace_init`` declares, from
     :func:`dace_fortran.bindings.build_fortran_library.compiled_init_symbols`; ``None`` assumes every free symbol.
+    A list that cannot be this SDFG's (read from the header of another build of an SDFG with the same name) raises
+    :class:`~dace_fortran.bindings.frozen_signature.SignatureDriftError`, see :func:`block_builders.check_init_symbols`.
 
     ``acc_residency`` (optional) is an
     :class:`dace_fortran.bindings.acc_transfers.AccTransferPlan` -- the sidecar
@@ -98,6 +101,7 @@ def emit_bindings(
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
+    check_init_symbols(frozen, init_symbols, dace_arglist)
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     enum_maps = enum_maps or {}
