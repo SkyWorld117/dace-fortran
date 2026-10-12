@@ -34,6 +34,7 @@ from dace_fortran.bindings.specialization import (
     guard_module_sources,
     render_symbol_record,
 )
+from dace_fortran.bindings.storage_guard import STORAGE_GUARD_HELPERS, build_storage_guard
 
 
 def emit_bindings(
@@ -96,6 +97,9 @@ def emit_bindings(
     to, the input of :func:`dace_fortran.bindings.specialization.recorded_invariants`.
     ``record_only`` (with ``record_symbols_to`` and ``specialization``): the wrapper declines every call once it has
     recorded it, so the caller runs its own code -- a sizing run that never executes the general SDFG.
+    Unless ``record_only``, a wrapper handing the SDFG members of records apart from them first checks that none of
+    them shares storage with another array it takes, and declines the call (or stops) otherwise
+    (:mod:`dace_fortran.bindings.storage_guard`).
     ``private_access`` / ``private_imports``: module variables their modules keep private, reached through the
     accessors of the modules' copies, and the ``use`` lines their declarations need (see :func:`assemble_module`).
     """
@@ -142,6 +146,11 @@ def emit_bindings(
         "finalize": build_finalize(iface),
     }
     blocks = splice_acc_staging(blocks, iface.entry, acc_residency, directive)
+    # A sizing run declines every call once it has recorded it: the SDFG never runs, whatever the members share.
+    storage = [] if record_only else build_storage_guard(frozen, iface, plan, declinable=specialization is not None)
+    if storage:
+        blocks["wrapper_body"] = "\n".join([*storage, "", blocks["wrapper_body"]])
+        blocks["helpers"] = STORAGE_GUARD_HELPERS
     if specialization is not None:
         guard = build_specialization_guard(specialization, iface, plan)
         blocks["wrapper_body"] = "\n".join([*guard, "", blocks["wrapper_body"]])

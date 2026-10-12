@@ -1297,7 +1297,8 @@ def assemble_module(
         c_interface=blocks["c_interface"],
         handle_state=handle_state,
         wrapper_body=wrapper_body,
-        finalize_body=blocks["finalize"],
+        # Module procedures the wrapper calls (the storage guard's), after the finalizer.
+        finalize_body="\n\n".join([blocks["finalize"], *([blocks["helpers"]] if blocks.get("helpers") else [])]),
     )
     # A private variable is a pointer here: ``associated`` asks what ``allocated`` asks of the variable (its accessor
     # returns a null pointer for an unallocated allocatable).
