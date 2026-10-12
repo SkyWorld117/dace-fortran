@@ -25,7 +25,8 @@ void setManglingOverride(const std::string& mangled, const std::string& shortNam
 }
 
 // Inlined-callee alias declare uniq_name -> its root declare's uniq_name (see buildCollisionSet); ``extractName``
-// names an alias by its root, resolved at lookup time so later renames of the root carry over.
+// names an alias by its root, resolved at lookup time so later renames of the root carry over. The key stands for one
+// root only because runMultiCallsiteDisambiguation renames inlined alias copies bound to different variables.
 static thread_local std::unordered_map<std::string, std::string> kAliasRoot;
 
 void setAliasRoot(const std::string& aliasMangled, const std::string& rootMangled) {

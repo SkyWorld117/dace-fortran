@@ -1681,6 +1681,37 @@ void runMultiCallsiteDisambiguation(mlir::ModuleOp module) {
       renameAllocSitesOf(op, renamed);
     }
   }
+
+  // A dummy bound to the whole of a caller variable (``asAssumedShapeAlias``: assumed- or explicit-shape array, or
+  // scalar) is that variable, and ``extractName`` names it by looking its uniq_name up in the alias-root map
+  // (``buildCollisionSet``). Every inlined copy of the dummy carries the callee's uniq_name, so with the copies bound
+  // to different variables one key stands for several roots and the last copy recorded names them all: a statement
+  // whose target is named from the declare (a whole-array assignment, a copy, an elemental) writes another call site's
+  // actual, and its own actual never sees the write. A declare of another kind sharing the name (a section dummy, a
+  // local) is renamed to that root the same way. Give each alias copy a key of its own, unless every declare of the
+  // name is an alias of one and the same variable. Private functions count too: their copies enter the same map.
+  auto aliasRootOf = [](hlfir::DeclareOp op) -> mlir::Operation* {
+    hlfir::DeclareOp root = asAssumedShapeAlias(op);
+    if (!root) return nullptr;
+    while (auto outer = asAssumedShapeAlias(root)) root = outer;
+    return root.getOperation();
+  };
+  llvm::StringMap<llvm::SmallVector<hlfir::DeclareOp, 4>> declsByUniq;
+  module.walk([&](hlfir::DeclareOp op) { declsByUniq[op.getUniqName()].push_back(op); });
+  for (auto& kv : declsByUniq) {
+    auto& group = kv.second;
+    if (group.size() < 2) continue;
+    llvm::SmallPtrSet<mlir::Operation*, 4> roots;
+    for (auto op : group) roots.insert(aliasRootOf(op));  // a declare that is no alias adds nullptr
+    if (roots.size() < 2) continue;                       // no alias, or aliases of one variable only
+    unsigned idx = 0;
+    for (auto op : group) {
+      if (!aliasRootOf(op)) continue;
+      auto renamed = op.getUniqName().str() + "_alias" + std::to_string(idx++);
+      op->setAttr("uniq_name", mlir::StringAttr::get(op.getContext(), renamed));
+      renameAllocSitesOf(op, renamed);
+    }
+  }
 }
 
 // Build the collision set fed to ``extractName``.  Walks BOTH
