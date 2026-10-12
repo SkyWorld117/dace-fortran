@@ -708,6 +708,37 @@ std::string traceExtentExpr(mlir::Value v) {
   return traceExtentExprMemo(v, memo);
 }
 
+std::string boxExtentExpr(mlir::Value box, int64_t dim) {
+  mlir::Value v = box;
+  for (int i = 0; i < limits::kConvertChainDepth && v; ++i) {
+    auto* d = v.getDefiningOp();
+    if (!d) break;
+    if (auto cv = mlir::dyn_cast<fir::ConvertOp>(d)) {
+      v = cv.getValue();
+      continue;
+    }
+    if (auto eb = mlir::dyn_cast<fir::EmboxOp>(d)) {
+      mlir::Value extent;
+      if (mlir::Value const shp = eb.getShape()) {
+        auto* sd = shp.getDefiningOp();
+        if (auto so = mlir::dyn_cast_or_null<fir::ShapeOp>(sd)) {
+          if (dim < static_cast<int64_t>(so.getExtents().size())) extent = so.getExtents()[dim];
+        } else if (auto sso = mlir::dyn_cast_or_null<fir::ShapeShiftOp>(sd)) {
+          auto pairs = sso.getPairs();
+          if (2 * dim + 1 < static_cast<int64_t>(pairs.size())) extent = pairs[2 * dim + 1];
+        }
+      }
+      if (extent) {
+        std::string ext = traceExtentExpr(extent);
+        if (!ext.empty()) return ext;
+      }
+    }
+    break;
+  }
+  std::string const base = traceToDecl(box);
+  return base.empty() ? std::string() : base + "_d" + std::to_string(dim);
+}
+
 // Extent expressions form a DAG; without a visited set the operand recursion re-explores shared subtrees (exponential).
 // visited marks each defining op once so the walk is linear; the public entry seeds a fresh set.
 static void collectExtentExprScalarsRec(mlir::Value v, std::set<std::string>& out,

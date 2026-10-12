@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "flang/Optimizer/Dialect/FIROps.h"
+#include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "mlir/IR/BuiltinOps.h"
 
 namespace hlfir_bridge {
@@ -191,6 +192,21 @@ using AllocSitesIndex = std::map<std::string, std::vector<fir::AllocMemOp>>;
 
 /// One module walk: every fir.allocmem keyed by uniq_name.
 AllocSitesIndex buildAllocSitesIndex(mlir::ModuleOp module);
+
+/// An allocation the Fortran runtime sizes from another array: ``ALLOCATE(x, SOURCE=y)`` lowers to
+/// ``_FortranAAllocatableAllocateSource(x_box, y_box, ...)`` and ``MOLD=y`` to ``_FortranAAllocatableApplyMold(x_box,
+/// y_box, rank)`` instead of a fir.allocmem; ``x`` takes the extents of ``y``.
+struct RuntimeShapedAllocation {
+  hlfir::DeclareOp target;    ///< the allocatable's declare
+  mlir::Value shape;          ///< the box of the SOURCE / MOLD array
+  bool copiesValues = false;  ///< SOURCE= (also copies the values), not MOLD= (only the shape)
+};
+
+/// The runtime-shaped allocation a call performs, if it is one (null ``target`` otherwise).
+RuntimeShapedAllocation runtimeShapedAllocation(fir::CallOp call);
+
+/// One module walk: the uniq_names of the allocatables some runtime-shaped allocation sizes.
+std::set<std::string> buildRuntimeShapedIndex(mlir::ModuleOp module);
 
 /// One module walk: the short names with an ALLOCATED()/ASSOCIATED() reader (a fir.box_addr of their box).
 std::set<std::string> buildAllocatedReaderNames(mlir::ModuleOp module);

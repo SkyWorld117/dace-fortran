@@ -237,6 +237,34 @@ AllocSitesIndex buildAllocSitesIndex(mlir::ModuleOp module) {
   return idx;
 }
 
+RuntimeShapedAllocation runtimeShapedAllocation(fir::CallOp call) {
+  auto callee = call.getCallee();
+  if (!callee || call.getArgs().size() < 2) return {};
+  llvm::StringRef const name = callee->getRootReference().getValue();
+  if (name != "_FortranAAllocatableAllocateSource" && name != "_FortranAAllocatableApplyMold") return {};
+  mlir::Value v = call.getArgs()[0];
+  for (int i = 0; i < limits::kConvertChainDepth && v; ++i) {
+    auto* d = v.getDefiningOp();
+    if (!d) return {};
+    if (auto cv = mlir::dyn_cast<fir::ConvertOp>(d)) {
+      v = cv.getValue();
+      continue;
+    }
+    if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(d))
+      return {decl, call.getArgs()[1], name == "_FortranAAllocatableAllocateSource"};
+    return {};
+  }
+  return {};
+}
+
+std::set<std::string> buildRuntimeShapedIndex(mlir::ModuleOp module) {
+  std::set<std::string> names;
+  module.walk([&](fir::CallOp call) {
+    if (auto alloc = runtimeShapedAllocation(call); alloc.target) names.insert(alloc.target.getUniqName().str());
+  });
+  return names;
+}
+
 /// Collect every ``fir.allocmem`` whose ``uniq_name`` matches
 /// ``<declUniqName>.alloc``, in IR walk order.  Multiple matches indicate
 /// that the user wrote more than one ``ALLOCATE`` for the variable
@@ -1953,6 +1981,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
   // a fully-inlined whole-program entry.  Extraction does not mutate the IR, so
   // these stay valid for every lookup below.
   const AllocSitesIndex allocIdx = buildAllocSitesIndex(module);
+  const std::set<std::string> runtimeShapedIdx = buildRuntimeShapedIndex(module);
   const std::set<std::string> writtenGlobals = buildWrittenGlobals(module);
   const std::set<std::string> allocatedReaderNames = buildAllocatedReaderNames(module);
 
@@ -3485,6 +3514,14 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
       baseExtentSyms.reserve(v.rank);
       for (int d = 0; d < v.rank; ++d) baseExtentSyms.push_back(v.fortran_name + "_d" + std::to_string(d));
       registerExtentSyms(baseExtentSyms);
+    } else if (isAllocatable && v.rank > 0 && runtimeShapedIdx.count(v.mangled_name)) {
+      // ``ALLOCATE(a, SOURCE=b)`` / ``MOLD=b``: no fir.allocmem, the runtime sizes ``a`` from ``b``, and the AST
+      // builder binds ``<name>_d<i>`` to ``b``'s extents there.  Register the symbols so they resolve off-signature
+      // instead of leaking as free program arguments the caller cannot supply.
+      std::vector<std::string> runtimeExtentSyms;
+      runtimeExtentSyms.reserve(v.rank);
+      for (int d = 0; d < v.rank; ++d) runtimeExtentSyms.push_back(v.fortran_name + "_d" + std::to_string(d));
+      registerExtentSyms(runtimeExtentSyms);
     }
 
     // Register one synthetic transient per NON-base buffer class

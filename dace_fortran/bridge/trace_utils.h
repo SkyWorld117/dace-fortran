@@ -133,6 +133,11 @@ mlir::Value matchAssociatedStatusBoxRef(mlir::arith::CmpIOp cmp, bool* negated =
 /// synthetic-symbol path.
 std::string traceExtentExpr(mlir::Value v);
 
+/// The extent of dimension ``dim`` of a box as traceExtentExpr renders it: the shape operand of the fir.embox that
+/// built it (a dummy or local with an explicit shape), else the ``<name>_d<dim>`` symbol of the array it boxes; empty
+/// if neither resolves.
+std::string boxExtentExpr(mlir::Value box, int64_t dim);
+
 /// Walk the same SSA chain traceExtentExpr recognises, appending every leaf scalar-declare name to out; used by
 /// extract_vars Pass 2 to promote those scalars so traceExtentExpr's expression string doesn't reference undeclared
 /// SDFG names.

@@ -2354,6 +2354,39 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
       emitAllocStateChange(allocName, 1);
       continue;
     }
+    // ``ALLOCATE(a, SOURCE=b)`` / ``MOLD=b`` sizes ``a`` through the runtime from ``b`` (runtimeShapedAllocation): bind
+    // ``a``'s extent symbols ``<name>_d<i>`` to ``b``'s extents here, as bindAllocSite does from a fir.allocmem's shape
+    // (extract_vars registers the symbols).
+    if (auto call = mlir::dyn_cast<fir::CallOp>(&op)) {
+      if (auto alloc = runtimeShapedAllocation(call); alloc.target) {
+        std::string const name = traceToDecl(alloc.target.getResult(0));
+        // ``!fir.ref<!fir.box<!fir.heap<!fir.array<?x?xT>>>>`` -> the array's rank.
+        int64_t rank = 0;
+        mlir::Type ty = fir::unwrapRefType(alloc.target.getResult(0).getType());
+        if (auto boxTy = mlir::dyn_cast<fir::BaseBoxType>(ty)) ty = fir::unwrapRefType(boxTy.getEleTy());
+        if (auto seq = mlir::dyn_cast<fir::SequenceType>(ty)) rank = static_cast<int64_t>(seq.getDimension());
+        for (int64_t d = 0; d < rank && !name.empty(); ++d) {
+          std::string const ext = boxExtentExpr(alloc.shape, d);
+          if (ext.empty()) continue;
+          ASTNode an;
+          an.kind = "assign";
+          an.target = name + "_d" + std::to_string(d);
+          an.target_is_array = false;
+          an.expr = ext;
+          nodes.push_back(std::move(an));
+        }
+        // SOURCE= also gives the new array the source's values (MOLD= only its shape): a whole-array copy, which the
+        // runtime call performs and nothing else in the IR does.
+        if (std::string const src = traceToDecl(alloc.shape); alloc.copiesValues && !name.empty() && !src.empty()) {
+          ASTNode cp;
+          cp.kind = "copy";
+          cp.target = name;
+          cp.target_is_array = true;
+          cp.reduce_src = src;
+          nodes.push_back(std::move(cp));
+        }
+      }
+    }
 
     // Standalone fir.freemem -- Flang's top-level DEALLOCATE expansion (the trailing fir.if(alloc_status != 0){...} is
     // the implicit end-of-scope cleanup, handled separately as isAllocCleanup). Traces to the underlying hlfir.declare
