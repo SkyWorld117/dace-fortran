@@ -67,6 +67,25 @@ program main
 end program main
 """
 
+# A binding that always takes the call and does nothing.
+_BINDING_TAKES = """
+module step_dace_bindings
+    use fields, only: scalar_field
+    implicit none
+contains
+    subroutine step_dace(q, n, x, y, k, t, dace_declined)
+        integer, intent(in) :: n
+        type(scalar_field), dimension(2), intent(inout) :: q
+        real(8), dimension(0:), intent(in) :: x
+        real(8), dimension(n), intent(inout) :: y
+        integer, value :: k
+        real(8), optional, intent(in) :: t
+        logical, optional, intent(out) :: dace_declined
+        if (present(dace_declined)) dace_declined = .false.
+    end subroutine step_dace
+end module step_dace_bindings
+"""
+
 # A binding that always declines, counting its calls.
 _BINDING = """
 module step_dace_bindings
@@ -153,3 +172,38 @@ def test_a_declining_binding_leaves_the_call_to_the_original(tmp_path: Path):
     entry = emit_substitute_entry(iface, "step_dace_bindings", "step_dace", tmp_path / "sub_step.f90")
     sources = [tmp_path / "modules.f90", tmp_path / "binding.f90", entry, tmp_path / "main.f90"]
     assert _run(tmp_path, sources, "dace_sub_step") == plain
+
+
+def _with_baked(tmp_path: Path, baked) -> tuple[str, str]:
+    """The output of the plain program and of the one whose step goes through a substitute entry that checks
+    ``baked`` in front of a binding that takes every call and does nothing."""
+    iface = _interface(tmp_path)
+    (tmp_path / "modules.f90").write_text(_MODULES)
+    (tmp_path / "main.f90").write_text(_MAIN)
+    (tmp_path / "binding.f90").write_text(_BINDING_TAKES)
+    plain = _run(tmp_path, [tmp_path / "modules.f90", tmp_path / "main.f90"], None)
+    entry = emit_substitute_entry(iface, "step_dace_bindings", "step_dace", tmp_path / "sub_step.f90", baked)
+    sources = [tmp_path / "modules.f90", tmp_path / "binding.f90", entry, tmp_path / "main.f90"]
+    return plain, _run(tmp_path, sources, "dace_sub_step")
+
+
+_BAKED = [
+    (RecordedValue("cfg", "use_extra", "logical(4)"), 0),
+    (RecordedValue("cfg", "nsweeps", "integer(4)"), 2),
+    (RecordedValue("cfg", "scale", "real(8)"), 1.5),
+]
+
+
+def test_baked_values_that_hold_let_the_binding_take_the_call(tmp_path: Path):
+    plain, substituted = _with_baked(tmp_path, _BAKED)
+    assert substituted != plain  # the binding ran (and did nothing)
+
+
+def test_a_baked_value_that_differs_sends_the_call_to_the_original(tmp_path: Path):
+    for i, value in ((0, 1), (1, 3), (2, 1.5000000000000002)):
+        baked = list(_BAKED)
+        baked[i] = (baked[i][0], value)
+        sub = tmp_path / f"case{i}"
+        sub.mkdir()
+        plain, substituted = _with_baked(sub, baked)
+        assert substituted == plain, baked[i]

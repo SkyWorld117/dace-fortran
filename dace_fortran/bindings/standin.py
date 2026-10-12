@@ -17,6 +17,7 @@ value. That needs how each dummy is passed (``OriginalArg.passing``, from the br
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -184,21 +185,56 @@ def emit_recording_standin(
     return out
 
 
-def emit_substitute_entry(iface: OriginalInterface, binding_module: str, wrapper: str, out_path: str | Path) -> Path:
+def _literal(value: int | float, ftype: str) -> str:
+    """``value`` as a Fortran literal to compare a variable of type ``ftype`` with, exactly."""
+    if ftype.startswith("logical"):
+        return ".true." if value else ".false."
+    if ftype.startswith("real"):
+        if not math.isfinite(value):
+            raise ValueError(f"cannot check a baked value against a non-finite one: {value}")
+        text = repr(float(value))  # the shortest decimal that reads back as the same double
+        return text.replace("e", "d") if "e" in text else f"{text}d0"
+    return str(int(value))
+
+
+def _differs(expr: str, value: int | float, ftype: str) -> str:
+    """A Fortran condition true unless ``expr`` (of type ``ftype``) holds ``value``."""
+    op = ".neqv." if ftype.startswith("logical") else "/="
+    return f"{expr} {op} {_literal(value, ftype)}"
+
+
+def emit_substitute_entry(
+    iface: OriginalInterface,
+    binding_module: str,
+    wrapper: str,
+    out_path: str | Path,
+    baked: Sequence[tuple[RecordedValue, int | float]] = (),
+) -> Path:
     """Write ``dace_sub_<entry>``: calls the binding's ``wrapper`` and, when it declines the call (``dace_declined``),
-    the original instead."""
+    the original instead.
+
+    ``baked``: module variables the SDFG was specialised to before it was built (``SDFGBuilder``'s
+    ``specialized_globals``), with their values. Their reads are gone from the SDFG, so the binding cannot check them;
+    the entry does, before anything else, and calls the original when any of them differs."""
     args = [a.name for a in iface.args]
-    body = [
+    original = standin_name("original", iface.entry)
+    uses = [f"use {binding_module}, only: {wrapper}"]
+    body: list[str] = []
+    if baked:
+        uses += [f"use {v.module}, only: dace_baked_{i} => {_variable(v.name)}" for i, (v, _) in enumerate(baked)]
+        checks = [
+            _differs(f"dace_baked_{i}{v.name[len(_variable(v.name)):]}", value, v.fortran_type)
+            for i, (v, value) in enumerate(baked)
+        ]
+        body += ["declined = .false."]
+        body += [f"if ({c}) declined = .true." for c in checks]
+        body += ["if (declined) then", *(f"    {ln}" for ln in _with_arguments(f"call {original}", args)), "    return",
+                 "end if"]
+    body += [
         *_with_arguments(f"call {wrapper}", [*args, "dace_declined=declined"]),
-        *_with_arguments(f"if (declined) call {standin_name('original', iface.entry)}", args),
+        *_with_arguments(f"if (declined) call {original}", args),
     ]
-    lines = _subroutine(
-        standin_name("sub", iface.entry),
-        iface,
-        body,
-        [f"use {binding_module}, only: {wrapper}"],
-        ["logical :: declined"],
-    )
+    lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, ["logical :: declined"])
     out = Path(out_path)
     out.write_text("\n".join(lines) + "\n")
     return out
