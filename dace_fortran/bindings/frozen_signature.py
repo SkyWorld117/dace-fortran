@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import dace
@@ -170,6 +171,11 @@ class FrozenSignature:
     # MPI_Comm_size) into __user_comm/__user_comm_size at dace_init_<entry>
     # time.  None if no runtime MPI comm.
     user_comm_source: str | None = None
+    # The dtype (as :func:`dtype_string` renders it) DaCe gives each free symbol it passes by value: the
+    # C entry takes a shape-only symbol in the width of the SDFG's symbol table (int64 for an inferred
+    # extent), and a wrapper declaring another width hands it a half-written register. Derived from the SDFG
+    # (filled in from it when a snapshot lacks it), so it takes no part in comparing snapshots.
+    symbol_dtypes: dict[str, str] = field(default_factory=dict, compare=False)
 
     # ----- I/O ---------------------------------------------------------
 
@@ -186,6 +192,7 @@ class FrozenSignature:
             "schema_version": self.schema_version,
             "module_symbol_origins": {k: list(v) for k, v in self.module_symbol_origins.items()},
             "user_comm_source": self.user_comm_source,
+            "symbol_dtypes": dict(self.symbol_dtypes),
         }
 
     @classmethod
@@ -199,6 +206,7 @@ class FrozenSignature:
             schema_version=d.get("schema_version", 1),
             module_symbol_origins={k: ModuleOrigin(*v) for k, v in d.get("module_symbol_origins", {}).items()},
             user_comm_source=d.get("user_comm_source"),
+            symbol_dtypes=dict(d.get("symbol_dtypes", {})),
         )
 
     def to_json(self, path: str) -> None:
@@ -279,8 +287,24 @@ def get_frozen_signature(sdfg: SDFG) -> FrozenSignature | None:
     if cached is not None and cached[0] is raw:
         return cached[1]
     frozen = FrozenSignature.from_dict(raw)
+    if frozen.free_symbols and not frozen.symbol_dtypes:
+        # A snapshot taken before the widths were recorded: read them from the live SDFG.
+        frozen = replace(frozen, symbol_dtypes=symbol_dtypes_of(sdfg, frozen.free_symbols))
     vars(sdfg)[_CACHE_ATTR] = (raw, frozen)
     return frozen
+
+
+def symbol_dtypes_of(sdfg: SDFG, names: Iterable[str]) -> dict[str, str]:
+    """The dtype DaCe passes each of the free symbols ``names`` with: its argument list's, which is the symbol
+    table's entry or DaCe's default for an undeclared symbol."""
+    arglist = sdfg.arglist()
+    out: dict[str, str] = {}
+    for name in names:
+        if name in arglist:
+            out[name] = dtype_string(arglist[name])
+        elif name in sdfg.symbols:
+            out[name] = str(sdfg.symbols[name])
+    return out
 
 
 def _metadata(sdfg: SDFG) -> dict[str, Any]:
@@ -406,10 +430,12 @@ def refreeze(sdfg: SDFG) -> FrozenSignature:
         name = live.storage.name if live is not None else ""
         return replace(a, device_storage=name if name.startswith(DEVICE_STORAGE_PREFIX) else "")
 
+    kept_symbols = tuple(s for s in frozen.free_symbols if s in live_fs)
     new = replace(
         frozen,
         args=tuple(_relocate(a) for a in frozen.args if _survives(a)),
-        free_symbols=tuple(s for s in frozen.free_symbols if s in live_fs),
+        free_symbols=kept_symbols,
+        symbol_dtypes=symbol_dtypes_of(sdfg, kept_symbols),
     )
     # Full re-validation (arg partition, per-arg dtypes, symbol set) against the live SDFG.
     new.verify_against(sdfg)

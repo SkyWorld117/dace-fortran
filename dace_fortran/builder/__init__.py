@@ -1718,6 +1718,7 @@ class SDFGBuilder:
             FrozenSignature,
             attach_to_sdfg,
             dtype_string,
+            symbol_dtypes_of,
         )
 
         # Auto-detected Fortran module-global provenance, keyed by the
@@ -1868,6 +1869,7 @@ class SDFGBuilder:
             args=tuple(args_list),
             free_symbols=free_syms,
             module_symbol_origins=module_symbol_origins,
+            symbol_dtypes=symbol_dtypes_of(sdfg, free_syms),
         )
         attach_to_sdfg(sdfg, fs)
 

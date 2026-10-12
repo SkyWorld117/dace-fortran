@@ -163,6 +163,9 @@ def _init_symbol_decl(sym: str, frozen: FrozenSignature | None = None) -> str:
         for a in frozen.args:
             if a.sdfg_name == sym and a.kind in (FrozenArgKind.SYMBOL, FrozenArgKind.SCALAR):
                 return f"{fortran_c_type(a.dtype)}, value"
+        if sym in frozen.symbol_dtypes:
+            # A shape-only free symbol: DaCe passes it in its symbol table's width.
+            return f"{fortran_c_type(frozen.symbol_dtypes[sym])}, value"
     return "integer(c_int), value"
 
 
@@ -433,7 +436,10 @@ def build_wrapper_head(
 
     # A free symbol that's also a frozen arg must use that arg's C type (e.g.
     # int64 extents) -- a hardcoded integer(c_int) local mismatches the bind(c) dummy.
-    sym_dtype = {a.sdfg_name: a.dtype for a in frozen.args if a.kind in (FrozenArgKind.SCALAR, FrozenArgKind.SYMBOL)}
+    sym_dtype = {
+        **frozen.symbol_dtypes,
+        **{a.sdfg_name: a.dtype for a in frozen.args if a.kind in (FrozenArgKind.SCALAR, FrozenArgKind.SYMBOL)},
+    }
     # A rank-0 struct member is BOTH a flat companion and a free symbol wanted by
     # value -- skip re-declaring it here (duplicate "already has basic type" error).
     # LIVE entries only: a dead entry declares no companion, so a same-named free
