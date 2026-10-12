@@ -122,7 +122,6 @@ end module ra_two_levels
         call="kern(n)",
         out=_OUT_TWO_LEVEL,
         nout=4,
-        xfail=(KeyError, "two record levels of a module variable are not registered"),
     ),
     # A constant outer subscript over a varying inner one: fl(1)%vf(i) and fl(2)%vf(i) must stay apart.
     "constant_over_varying": dict(
@@ -147,7 +146,6 @@ end module ra_constant_over_varying
         call="kern(n)",
         out=_OUT_TWO_LEVEL,
         nout=4,
-        xfail=(KeyError, "two record levels of a module variable are not registered"),
     ),
     # The same with a dummy root.
     "constant_over_varying_dummy": dict(
