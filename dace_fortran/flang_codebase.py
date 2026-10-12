@@ -368,6 +368,80 @@ def patch_mpi_sizeof(source: str) -> str:
     return _MPI_SIZEOF_RE.sub(_replace, source)
 
 
+# A constant subscript outside an array's constant bounds, which flang-21 rejects even in code a constant condition
+# makes dead (``if (num_dims > 2) x(3) = ...`` with ``x(num_dims)`` and ``num_dims = 2``).
+_OUT_OF_BOUNDS_RE = re.compile(
+    r"^(?P<file>[^\n:]+):(?P<line>\d+):(?P<col>\d+): error: subscript (?P<value>-?\d+) is "
+    r"(?:greater than upper|less than lower) bound (?P<bound>-?\d+) for dimension (?P<dim>\d+) of array",
+    re.MULTILINE,
+)
+_LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?(\d+)\s+"([^"]+)"')
+
+
+def _origin_lines(source: str) -> dict[tuple[str, int], int]:
+    """Map ``(file, line)`` as the line markers of ``source`` name it to the index of the line in ``source``."""
+    origin: dict[tuple[str, int], int] = {}
+    current: tuple[str, int] | None = None
+    for index, text in enumerate(source.splitlines()):
+        marker = _LINE_MARKER_RE.match(text)
+        if marker:
+            current = (marker.group(2), int(marker.group(1)))
+            continue
+        if current is not None:
+            origin.setdefault(current, index)
+            current = (current[0], current[1] + 1)
+    return origin
+
+
+def _clamp_subscript(text: str, column: int, dim: int, value: int, bound: int) -> str | None:
+    """``text`` with the ``dim``-th subscript of the array reference starting at ``column`` (1-based) replaced by
+    ``bound`` when it is the integer literal ``value``; None when the reference does not look like that."""
+    start = column - 1
+    paren = text.find("(", start)
+    if paren < 0 or not re.fullmatch(r"[A-Za-z_][\w%]*\s*", text[start:paren]):
+        return None
+    depth, pieces, last = 0, [], paren + 1
+    for i in range(paren, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                pieces.append((last, i))
+                break
+        elif text[i] == "," and depth == 1:
+            pieces.append((last, i))
+            last = i + 1
+    if len(pieces) < dim:
+        return None
+    a, b = pieces[dim - 1]
+    if text[a:b].strip() != str(value):
+        return None
+    return f"{text[:a]}{bound}{text[b:]}"
+
+
+def clamp_out_of_bounds_constant_subscripts(source: str, flang_errors: str) -> tuple[str, int]:
+    """Clamp each constant subscript flang reports as outside its array's constant bounds to that bound.
+
+    Such a reference is undefined behaviour if it ever executes, so no valid execution runs it -- it sits in code a
+    constant condition rules out -- and any in-bounds value keeps every valid execution's meaning, while flang-21
+    rejects the source as it stands.  Returns the patched source and the number of subscripts clamped.
+    """
+    origin = _origin_lines(source)
+    lines = source.splitlines(keepends=True)
+    clamped = 0
+    for m in _OUT_OF_BOUNDS_RE.finditer(flang_errors):
+        index = origin.get((m.group("file"), int(m.group("line"))))
+        if index is None:
+            continue
+        patched = _clamp_subscript(lines[index], int(m.group("col")), int(m.group("dim")), int(m.group("value")),
+                                   int(m.group("bound")))
+        if patched is not None and patched != lines[index]:
+            lines[index] = patched
+            clamped += 1
+    return "".join(lines), clamped
+
+
 # Patch registry: name -> source-to-source transform.
 FLANG_BUG_PATCHES: dict[str, Callable[[str], str]] = {
     "mpi_sizeof": patch_mpi_sizeof,
@@ -576,6 +650,18 @@ def emit_hlfir_from_codebase(
     )
     tu_path = out_path.with_suffix(".F90")
     tu_path.write_text(tu_source)
+    base = [flang_program or require_flang(), "-fc1", "-cpp", "-U_OPENMP", "-U_OPENACC", *flang_flags, *extra_flang_flags]
+    # Constant subscripts outside constant bounds in dead code: clamp them and check again (a few rounds: flang stops
+    # reporting after the first errors of a scope).
+    for _ in range(8):
+        check = subprocess.run([*base, "-fsyntax-only", str(tu_path)], cwd=str(out_path.parent), capture_output=True,
+                               text=True)
+        if check.returncode == 0:
+            break
+        tu_source, clamped = clamp_out_of_bounds_constant_subscripts(tu_source, check.stderr + check.stdout)
+        if not clamped:
+            break
+        tu_path.write_text(tu_source)
     # Run flang with ``cwd = out_path.parent`` so its default module
     # search (which includes ".") doesn't pick up stale gfortran-format
     # ``.mod`` files left in the caller's working directory from prior
