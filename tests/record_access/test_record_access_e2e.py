@@ -35,6 +35,31 @@ _FILL_TWO_LEVEL = """
     end do
   end do
 """
+_TYPES_RANK3 = """
+  type scalar_field
+    real(8), pointer :: sf(:, :, :) => null()
+  end type
+  type vector_field
+    type(scalar_field), allocatable :: vf(:)
+  end type
+"""
+
+# Fills a module `fl(2)%vf(4)%sf(n, 2, 2)` with distinct values.
+_FILL_RANK3 = """
+  do i = 1, 2
+    allocate(fl(i)%vf(4))
+    do k = 1, 4
+      allocate(fl(i)%vf(k)%sf(n, 2, 2))
+      do l = 1, 2
+        do m = 1, 2
+          do j = 1, n
+            fl(i)%vf(k)%sf(j, m, l) = 10000*i + 1000*k + 100*m + 10*l + j
+          end do
+        end do
+      end do
+    end do
+  end do
+"""
 _OUT_TWO_LEVEL = "do i = 1, 2; do k = 1, 2; out((2*(i-1)+k-1)*n+1:(2*(i-1)+k)*n) = fl(i)%vf(k)%sf; end do; end do"
 
 _KERNELS = {
@@ -494,6 +519,230 @@ end module ra_member_section_argument
         call="kern(q, n)",
         out="do i = 1, 2; out((i-1)*n+1:i*n) = q(i)%sf; end do",
         nout=2,
+    ),
+    # The member array of an element of a module array of records, passed on as a section by an inlined callee to a
+    # callee that reads a rank-3 member of its elements: the element subscript and the section start both reach the
+    # flat access.
+    "element_member_section_through_callees": dict(
+        src=f"""
+module ra_element_member_section_through_callees
+  implicit none
+{_TYPES_RANK3}
+  type(vector_field), allocatable :: fl(:)
+  integer :: lo = 2, hi = 3
+contains
+  subroutine leaf(w, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), dimension(2), intent(in) :: w
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    integer :: i, j
+    do j = 1, n
+      do i = 1, 2
+        res(j, i, k) = 0.5d0 * (w(i)%sf(j, 1, 2) + w(i)%sf(j, 2, 1))
+      end do
+    end do
+  end subroutine leaf
+
+  subroutine mid(v, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), allocatable, dimension(:), intent(inout) :: v
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    call leaf(v(lo:hi), res, k, n)
+  end subroutine mid
+
+  subroutine kern(res, n)
+    integer, intent(in) :: n
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    integer :: k
+    do k = 1, 2
+      call mid(fl(k)%vf, res, k, n)
+    end do
+  end subroutine kern
+end module ra_element_member_section_through_callees
+""",
+        local="real(8) :: res(n, 2, 2)",
+        setup="  if (allocated(fl)) deallocate(fl)\n  allocate(fl(2))\n" + _FILL_RANK3,
+        call="kern(res, n)",
+        out="out(1:4*n) = reshape(res, [4*n])",
+        nout=4,
+    ),
+    # The same through two inlined callees on each side of the section, the reading ones declaring explicit shapes.
+    "element_member_section_through_deep_callees": dict(
+        src=f"""
+module ra_element_member_section_through_deep_callees
+  implicit none
+{_TYPES_RANK3}
+  type(vector_field), allocatable :: fl(:)
+  integer :: lo = 2, hi = 3
+contains
+  subroutine leaf(w, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), dimension(2), intent(in) :: w
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    integer :: i, j
+    do j = 1, n
+      do i = 1, 2
+        res(j, i, k) = 0.5d0 * (w(i)%sf(j, 1, 2) + w(i)%sf(j, 2, 1))
+      end do
+    end do
+  end subroutine leaf
+
+  subroutine pass_on(w, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), dimension(2), intent(in) :: w
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    call leaf(w, res, k, n)
+  end subroutine pass_on
+
+  subroutine mid(v, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), allocatable, dimension(:), intent(inout) :: v
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    call pass_on(v(lo:hi), res, k, n)
+  end subroutine mid
+
+  subroutine outer(v, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), allocatable, dimension(:), intent(inout) :: v
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    call mid(v, res, k, n)
+  end subroutine outer
+
+  subroutine kern(res, n)
+    integer, intent(in) :: n
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    integer :: k
+    do k = 1, 2
+      call outer(fl(k)%vf, res, k, n)
+    end do
+  end subroutine kern
+end module ra_element_member_section_through_deep_callees
+""",
+        local="real(8) :: res(n, 2, 2)",
+        setup="  if (allocated(fl)) deallocate(fl)\n  allocate(fl(2))\n" + _FILL_RANK3,
+        call="kern(res, n)",
+        out="out(1:4*n) = reshape(res, [4*n])",
+        nout=4,
+    ),
+    # The same section written through: the writes land in the elements of the section.
+    "element_member_section_written": dict(
+        src=f"""
+module ra_element_member_section_written
+  implicit none
+{_TYPES_RANK3}
+  type(vector_field), allocatable :: fl(:)
+  integer :: lo = 2, hi = 3
+contains
+  subroutine leaf(w, n)
+    integer, intent(in) :: n
+    type(scalar_field), dimension(2), intent(inout) :: w
+    integer :: i, j
+    do j = 1, n
+      do i = 1, 2
+        w(i)%sf(j, 2, 1) = w(i)%sf(j, 1, 2) + 10 * i
+      end do
+    end do
+  end subroutine leaf
+
+  subroutine mid(v, n)
+    integer, intent(in) :: n
+    type(scalar_field), allocatable, dimension(:), intent(inout) :: v
+    call leaf(v(lo:hi), n)
+  end subroutine mid
+
+  subroutine kern(n)
+    integer, intent(in) :: n
+    integer :: k
+    do k = 1, 2
+      call mid(fl(k)%vf, n)
+    end do
+  end subroutine kern
+end module ra_element_member_section_written
+""",
+        setup="  if (allocated(fl)) deallocate(fl)\n  allocate(fl(2))\n" + _FILL_RANK3,
+        call="kern(n)",
+        out="""l = 0
+  do i = 1, 2; do k = 1, 4; out(l*4*n+1:(l+1)*4*n) = reshape(fl(i)%vf(k)%sf, [4*n]); l = l + 1; end do; end do""",
+        nout=32,
+    ),
+    # A strided section of the member array passed to a dummy declared from 0: element i is comp(2 + 2*i).
+    "element_member_strided_section_from_zero": dict(
+        src=f"""
+module ra_element_member_strided_section_from_zero
+  implicit none
+{_TYPES_RANK3}
+  type(vector_field), allocatable :: fl(:)
+contains
+  subroutine leaf(w, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), dimension(0:1), intent(in) :: w
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    integer :: i, j
+    do j = 1, n
+      do i = 0, 1
+        res(j, i + 1, k) = w(i)%sf(j, 2, 1) - 3 * w(i)%sf(j, 1, 1)
+      end do
+    end do
+  end subroutine leaf
+
+  subroutine mid(v, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), allocatable, dimension(:), intent(inout) :: v
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    call leaf(v(2:4:2), res, k, n)
+  end subroutine mid
+
+  subroutine kern(res, n)
+    integer, intent(in) :: n
+    real(8), dimension(n, 2, 2), intent(inout) :: res
+    integer :: k
+    do k = 1, 2
+      call mid(fl(k)%vf, res, k, n)
+    end do
+  end subroutine kern
+end module ra_element_member_strided_section_from_zero
+""",
+        local="real(8) :: res(n, 2, 2)",
+        setup="  if (allocated(fl)) deallocate(fl)\n  allocate(fl(2))\n" + _FILL_RANK3,
+        call="kern(res, n)",
+        out="out(1:4*n) = reshape(res, [4*n])",
+        nout=4,
+    ),
+    # The whole member array passed to an assumed-shape dummy declared from 0: element i is comp(i + 1).
+    "element_member_into_dummy_from_zero": dict(
+        src=f"""
+module ra_element_member_into_dummy_from_zero
+  implicit none
+{_TYPES_RANK3}
+  type(vector_field), allocatable :: fl(:)
+contains
+  subroutine leaf(w, res, k, n)
+    integer, intent(in) :: k, n
+    type(scalar_field), dimension(0:), intent(in) :: w
+    real(8), dimension(n, 4, 2), intent(inout) :: res
+    integer :: i, j
+    do j = 1, n
+      do i = 0, 3
+        res(j, i + 1, k) = w(i)%sf(j, 1, 2) + 7 * w(i)%sf(j, 2, 2)
+      end do
+    end do
+  end subroutine leaf
+
+  subroutine kern(res, n)
+    integer, intent(in) :: n
+    real(8), dimension(n, 4, 2), intent(inout) :: res
+    integer :: k
+    do k = 1, 2
+      call leaf(fl(k)%vf, res, k, n)
+    end do
+  end subroutine kern
+end module ra_element_member_into_dummy_from_zero
+""",
+        local="real(8) :: res(n, 4, 2)",
+        setup="  if (allocated(fl)) deallocate(fl)\n  allocate(fl(2))\n" + _FILL_RANK3,
+        call="kern(res, n)",
+        out="out(1:8*n) = reshape(res, [8*n])",
+        nout=8,
     ),
 }
 
