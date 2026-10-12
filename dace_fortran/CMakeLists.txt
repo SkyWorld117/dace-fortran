@@ -390,6 +390,7 @@ add_library(hlfir_bridge_passes STATIC
     passes/FoldCopyInOut.cpp
     passes/ExpandVectorSubscriptGather.cpp
     passes/ExpandVectorSubscriptScatter.cpp
+    passes/ExpandRuntimeArrayConstructors.cpp
     passes/RejectPolymorphism.cpp
     passes/RewritePointerAssigns.cpp
     passes/RewriteSequenceAssociation.cpp
