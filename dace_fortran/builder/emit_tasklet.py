@@ -385,6 +385,12 @@ def emit_scalar_assign(builder: SDFGBuilder, state: SDFGState, target: str, valu
     ``icidx => p_patch%edges%cell_idx``) -- emit a whole-array copy memlet
     instead of a scalar tasklet with the wrong subset."""
     value = str(value)
+    # No-op self-assignment (``x = x``): an inlined callee assigning a record dummy to the record it is bound to
+    # (``m = m_in`` called with ``m`` itself) does so member by member.  It moves no value, but as a tasklet it
+    # reads a transient member before anything writes it, and once DaCe promotes the scalar to a symbol, the
+    # read becomes a free symbol nothing can supply.  The symbol path in ``emit_assign`` drops these too.
+    if value.strip().strip("()").strip() == target:
+        return
     # Phantom object-alias scalar members (``p_pat_fn1_comm``) resolve to real
     # SDFG symbols (``p_patch_comm_pat_e_comm``).  Rewrite them before the
     # scalar-read classification so the tasklet body references a registered
