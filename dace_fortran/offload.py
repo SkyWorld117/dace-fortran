@@ -447,8 +447,16 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
 
 
 def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False,
-                            permissive_ltm=False):
+                            permissive_ltm=False, device_libnodes=False):
     """Schedule + storage assignment for device-resident offload. In place.
+
+    `device_libnodes` is OFF by default and turned on PER FRONTEND (WRF), because it changes the
+    schedule and the storage of a top-level compute library node whose inputs are device-resident
+    (see the 2b/2c steps below), and therefore the SDFG an existing frontend bakes.  It is a no-op on
+    any SDFG with no such node, and it can only move a node that was previously in an ILLEGAL
+    configuration -- host-scheduled while reading a GPU_Global array -- so it cannot change a kernel
+    that validated before; but the change to the demotion decision (the array is no longer demoted to
+    host) is observable, so it stays opt-in and MFC's bake is byte-identical at the default.
 
     `force_inline` is OFF by default and must be turned on PER KERNEL, because it is not generally
     sound: applied to the whole library set it made the default dispatch path produce NaN at step 1
@@ -646,6 +654,70 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
         raise RuntimeError("offload: could not reach a valid graph by demoting containers")
     if demoted:
         print(f"[dace_fortran.offload] demoted {len(demoted)} array(s) to host storage: {demoted}")
+
+    # 2b/2c. Device schedule for top-level compute library nodes whose data is device-resident.
+    #
+    # The bridge pins EVERY compute library node Sequential by contract (single-threaded origin), and
+    # step 1 above only re-schedules MAPS.  A library node left Sequential while reading a GPU_Global
+    # array is not merely slow: its CPU expansion dereferences device memory.  For a nested node the
+    # nesting map carries the device scope, so this only concerns a TOP-LEVEL node (one not inside a
+    # GPU map).  Measured on the standard.Reduce the whole-array MAXVAL lowering emits: left
+    # Sequential, ExpandReduceAuto picks the sequential CPU accumulator and validation fails with
+    # `Data container "_in" is stored as StorageType.GPU_Global but accessed on host`; with validation
+    # suppressed it emits a host kernel reading a device pointer.  Re-scheduling the node to the device
+    # makes its own expansion pick the GPU arm (Reduce -> ExpandReduceGPUAuto).  Only a node whose
+    # array INPUTS are ALL device-resident is touched -- a node that also reads host arrays keeps its
+    # current handling, and no node that validated before can regress (a host-scheduled node reading a
+    # device array never validated in the first place).  OPT-IN (see the `device_libnodes` doc), so the
+    # default bake -- MFC included -- is byte-identical.
+    lib_resched = []
+    if device_libnodes:
+        for state in all_states:
+            scope = state.scope_dict()
+            for node in state.nodes():
+                if scope.get(node) is not None:  # nested inside a map -> per-thread, stays Sequential
+                    continue
+                if getattr(node, 'schedule', None) in dace.dtypes.GPU_SCHEDULES:
+                    continue
+                if not isinstance(node, nodes.LibraryNode):
+                    continue
+                inputs = [e for e in state.in_edges(node)]
+                if not inputs:
+                    continue
+                dev_inputs = 0
+                for e in inputs:
+                    src = e.src
+                    if isinstance(src, nodes.AccessNode) and src.data in sdfg.arrays:
+                        if sdfg.arrays[src.data].storage in (dace.dtypes.StorageType.GPU_Global,
+                                                              dace.dtypes.StorageType.GPU_Shared):
+                            dev_inputs += 1
+                if dev_inputs == len(inputs):
+                    node.schedule = dace.dtypes.ScheduleType.GPU_Device
+                    lib_resched.append(node.label if getattr(node, 'label', None) else type(node).__name__)
+    if lib_resched:
+        print(f"[dace_fortran.offload] device-scheduled {len(lib_resched)} top-level library node(s) "
+              f"reading device arrays: {lib_resched}")
+
+        # 2c. A GPU-scheduled library node's OUTPUT must be device-resident too.  Reduce's GPU
+        # expansion stages a host output through a device transient, and the edge out of that
+        # transient lowers to a device->host copy in the host .cpp -- a mid-program copy the
+        # residency contract forbids.  Promote the output containers of any GPU-scheduled library
+        # node, INCLUDING length-1 arrays (the step-2 `is_len1` skip otherwise leaves a reduced scalar
+        # host-resident).  Only for nodes step 2b scheduled as GPU, i.e. nodes whose inputs are all
+        # device-resident.
+        for state in all_states:
+            for node in state.nodes():
+                if not isinstance(node, nodes.LibraryNode):
+                    continue
+                if getattr(node, 'schedule', None) not in dace.dtypes.GPU_SCHEDULES:
+                    continue
+                for e in state.out_edges(node):
+                    if not isinstance(e.dst, nodes.AccessNode):
+                        continue
+                    desc = sdfg.arrays.get(e.dst.data)
+                    if desc is not None and desc.storage not in (dace.dtypes.StorageType.GPU_Global,
+                                                                 dace.dtypes.StorageType.GPU_Shared):
+                        desc.storage = dace.dtypes.StorageType.GPU_Global
 
     # 3. Scheduling validation: at least one GPU map, all GPU maps have device arrays.
     n_gpu = sum(1 for st in sdfg.all_states() for nd in st.nodes()

@@ -152,6 +152,7 @@ def optimize(sdfg: SDFG,
              force_inline: bool = False,
              split_siblings: bool = False,
              permissive_ltm: bool = False,
+             device_libnodes: bool = False,
              allow_abi_scalar_fission: bool = False) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
 
@@ -254,7 +255,8 @@ def optimize(sdfg: SDFG,
         sdfg, n_gpu, n_dev = offload_device_resident(sdfg, block_size=gpu_block_size,
                                                      force_inline=force_inline,
                                                      split_siblings=split_siblings,
-                                                     permissive_ltm=permissive_ltm)
+                                                     permissive_ltm=permissive_ltm,
+                                                     device_libnodes=device_libnodes)
         print(f"[dace_fortran.optimize] gpu offload: {n_gpu} device map(s), {n_dev} device array(s)")
 
     if validate:
