@@ -181,7 +181,10 @@ def test_velocity_full_numerical(tmp_path: Path):
         nproma=scalar_or_arr("nproma", nproma, np.int32),
     )
     # Deferred-shape pointer/allocatable companions need <arr>_d<i> extent + offset_<arr>_d<i>
-    # lower-bound symbols per unresolved dim. All arrays here are 1-based, so offset=1.
+    # lower-bound symbols per unresolved dim.  The SDFG subscripts each array in the frame the reference
+    # allocates it in: velocity_full_caller.f90 allocates the refinement-control arrays
+    # (``*_{start,end}_{index,block}``, read at negative literals) with bounds (-16:16); every other array is 1-based.
+    refinement_control = ("_start_index", "_end_index", "_start_block", "_end_block")
     for nm, arr in list(sdfg_kw.items()):
         if not hasattr(arr, "shape"):
             continue
@@ -191,7 +194,7 @@ def test_velocity_full_numerical(tmp_path: Path):
             if extent_sym in arglist:
                 sdfg_kw.setdefault(extent_sym, np.int64(arr.shape[d]))
             if offset_sym in arglist:
-                sdfg_kw.setdefault(offset_sym, np.int64(1))
+                sdfg_kw.setdefault(offset_sym, np.int64(-16 if nm.endswith(refinement_control) else 1))
     # The SDFG works on the caller's LOGICAL(4) storage; ctypes/owner_mask is int8.
     sdfg_kw["p_patch_cells_decomp_info_owner_mask"] = sdfg_kw["p_patch_cells_decomp_info_owner_mask"].astype(
         np.uint32, order="F"

@@ -4,11 +4,13 @@ Pinpointed in ``velocity_full`` bisection: ICON passes a literal (e.g. ``-5``)
 to an inlined callee, which stashes it into a local and indexes through it.
 After ``hlfir-inline-all`` + ``hlfir-flatten-structs`` the designate index
 becomes ``fir.load %local_decl`` rather than ``arith.constant -5``, so
-``inferLowerBoundsFromLiteralAccesses`` misses it, the bridge defaults
-``offset_arr_d0 = 1``, and ``arr(-5)`` lowers to ``arr[-6]`` -> runtime segfault.
+``inferLowerBoundsFromLiteralAccesses`` misses it, the free ``offset_arr_d0``
+keeps the default 1 on a direct call, and ``arr(-5)`` lowers to ``arr[-6]`` ->
+runtime segfault.
 
-Pins the inference to follow the inline-callee load/store chain.  Currently
-only matches a direct ``arith.constant``; documents the gap as a regression gate.
+Pins the inference to follow the inline-callee load/store chain: the bound stays
+the caller's (free, bound from ``lbound`` by a binding), the literal is its floor,
+the default a direct call takes.
 """
 
 from pathlib import Path
@@ -52,13 +54,13 @@ def test_inlined_callee_propagates_negative_literal(tmp_path: Path):
     sdfg = build_sdfg(_SRC, sdfg_dir, name="outer", entry="outer_mod::outer").build()
     sdfg.validate()
 
-    inferred_offset = dict(getattr(sdfg, "_fortran_offset_values", sdfg.constants)).get("offset_arr_d0")
-    assert inferred_offset == -5, (
-        f"expected offset_arr_d0 == -5 (literal propagated through "
-        f"inlined subroutine + load/store chain); got {inferred_offset}.  "
-        f"This is the bridge gap identified in velocity_full bisection."
+    assert "offset_arr_d0" not in dict(getattr(sdfg, "_fortran_offset_values", sdfg.constants)), "bound not free"
+    assert sdfg._fortran_offset_floors.get("offset_arr_d0") == -5, (
+        f"expected floor offset_arr_d0 == -5 (literal propagated through "
+        f"inlined subroutine + load/store chain); got {sdfg._fortran_offset_floors}"
     )
 
+    # The direct call passes no bound: the free offset defaults to the floor.
     arr = np.asfortranarray(np.array([100, 200, 300, 400, 500], dtype=np.int32))  # 5 elements
     out = np.zeros(1, dtype=np.int32, order="F")
     sdfg(arr=arr, out=out, arr_d0=np.int64(5))

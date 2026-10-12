@@ -2052,6 +2052,9 @@ def _build_symbol_assigns(
     # Presence guard of each flat's SOURCE member ('' for plain members): extents
     # read the member's descriptor, undefined while absent -- guard, fall back to 0.
     flat_guard: dict = {}
+    # The member an aliased flat is a ``c_f_pointer`` view of: the view starts at the member's first element, so its
+    # own lbound is 1 whatever the member's, while the SDFG subscripts in the member's frame.
+    flat_alias_base: dict = {}
     for entry in plan.entries:
         r = entry.recipe
         is_ptr_local = r.aliasable
@@ -2060,6 +2063,9 @@ def _build_symbol_assigns(
             flat_shapes[flat] = r.shape_exprs
             arg_is_pointer_local[flat] = is_ptr_local
             flat_guard[flat] = guard
+        if r.aliasable and r.rank > 0:
+            for flat, read_expr in zip(r.flat_names, r.read_exprs, strict=False):
+                flat_alias_base[flat] = strip_index_args(read_expr)
         if r.rank == 0 and len(r.flat_names) == 1 and r.read_exprs:
             scalar_member[r.flat_names[0]] = strip_index_args(r.read_exprs[0])
 
@@ -2108,11 +2114,18 @@ def _build_symbol_assigns(
             # Absent member -> neutral lower bound 1 (never evaluated on the absent branch).
             out.extend(_guarded_assign(sym, _struct_member_sources[sym], _member_sym_guard(sym), absent="1"))
             continue
+        off_m = _OFFSET_SYM_RE.match(sym)
+        # The same for a member the plan aliases, when the interface carries no member layout to rebuild the path
+        # from: the flat companion's lbound (the intrinsic fallback below) is the view's 1, not the member's bound.
+        if off_m and off_m.group(1) in flat_alias_base:
+            base = off_m.group(1)
+            rhs = f"lbound({flat_alias_base[base]}, dim={int(off_m.group(2)) + 1})"
+            out.extend(_guarded_assign(sym, rhs, flat_guard.get(base, ""), absent="1"))
+            continue
         # A deferred-shape MODULE global's lower bound must come from the HOST
         # import, not the wrapper's copy: the copy is an allocatable assigned from
         # the alias, so its own lbound is always 1 while the SDFG indexes in the
         # host's frame (QE's eigts1(-nr:nr, nat), allocated by pw.x).
-        off_m = _OFFSET_SYM_RE.match(sym)
         if off_m and off_m.group(1) in module_array_hosts:
             alias, guard = module_array_hosts[off_m.group(1)]
             out.extend(_guarded_assign(sym, f"lbound({alias}, dim={int(off_m.group(2)) + 1})", guard, absent="1"))
