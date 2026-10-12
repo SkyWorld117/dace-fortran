@@ -42,12 +42,13 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import gc
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
-from dace import SDFG, InterstateEdge, SDFGState, config
+from dace import SDFG, InterstateEdge, SDFGState, config, symbolic
 from dace.data import Data
 from dace.frontend.python import astutils
 from dace.properties import CodeBlock
@@ -476,6 +477,22 @@ RESERVED_DACE_NAMES = frozenset({"test", "doctest", "im", "re", "ln", "limit"}) 
 DACE_NAME_PREFIX = "program_"
 
 
+@functools.cache
+def misread_by_symbolic_parser(name: str) -> bool:
+    """Whether DaCe's symbolic parser reads the identifier ``name`` as anything but a symbol of that name.
+
+    It parses with SymPy's namespace in scope, so every name SymPy defines is a hazard, not only the ones listed in
+    ``RESERVED_DACE_NAMES``: a variable called ``denom`` (SymPy's ``denom()``), ``sign``, ``exp`` or ``field`` evaluates
+    to that function, class or module, and ``denom[0] > 0.0`` fails with "cannot sympify object of type function";
+    ``nan`` or ``oo`` would silently become a number.
+    """
+    try:
+        expr = symbolic.pystr_to_symbolic(f"{name} + 1")
+    except Exception:
+        return True
+    return name not in {str(s) for s in expr.free_symbols}
+
+
 def global_is_baked_constant(v: VarLike) -> bool:
     """Mirror of the ``hlfir-preserve-mutable-globals`` rule on the
     Python side.  A module-level Fortran global is "baked" (becomes a
@@ -598,9 +615,14 @@ def _rename_reserved_collisions(sdfg: SDFG) -> dict:
     in lockstep).  Returns ``{user_fortran_name: dace_name}`` for the
     binding emitter; empty dict when nothing collided.
     """
+    # Names the caller never sees -- transients and the symbols the SDFG assigns itself -- are renamed whenever
+    # DaCe's parser misreads them; the arguments and free symbols only when listed, as the binding and the callers of
+    # the SDFG name them.
+    free = {str(s) for s in sdfg.free_symbols}
     renames = {}
     for name in list(sdfg.arrays.keys()) + list(sdfg.symbols.keys()):
-        if name in RESERVED_DACE_NAMES:
+        internal = sdfg.arrays[name].transient if name in sdfg.arrays else name not in free
+        if name in RESERVED_DACE_NAMES or (internal and misread_by_symbolic_parser(name)):
             renames[name] = DACE_NAME_PREFIX + name
     for old, new in renames.items():
         sdfg.replace(old, new)

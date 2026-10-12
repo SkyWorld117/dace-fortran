@@ -232,3 +232,44 @@ end subroutine main
     frozen = sdfg._frozen_signature
     arg = next(a for a in frozen.args if a.sdfg_name == "program_input")
     assert arg.fortran_name == "input"
+
+
+def test_sympy_function_name_as_local_survives_simplify(tmp_path: Path):
+    """A local called ``denom`` (SymPy's ``denom()``) that an IF tests: the condition is an interstate-edge expression,
+    which DaCe's parser read as SymPy's function ("cannot sympify object of type function") while only the listed
+    names were renamed.  A local is renamed whenever the parser misreads it; the caller never sees its name."""
+    src = """
+subroutine main(n, a, b)
+  implicit none
+  integer, intent(in) :: n
+  real(8), intent(in) :: a(n)
+  real(8), intent(out) :: b(n)
+  real(8) :: denom
+  integer :: j
+  do j = 1, n
+    denom = a(j) - 1.0d0
+    if (denom > 0.0d0) then
+      b(j) = 1.0d0 / denom
+    else
+      b(j) = 0.0d0
+    end if
+  end do
+end subroutine main
+"""
+    sdfg = _build(src, tmp_path)
+    sdfg.simplify()
+    a = np.array([0.5, 2.0, 3.0, 1.0])
+    b = np.zeros(4)
+    sdfg(n=4, a=a, b=b)
+    np.testing.assert_allclose(b, [0.0, 1.0, 0.5, 0.0])
+    assert "denom" not in sdfg.arrays and "denom" not in sdfg.symbols
+
+
+def test_names_the_symbolic_parser_misreads():
+    """SymPy's functions, classes and constants and Python's builtins are misread; plain identifiers are not."""
+    from dace_fortran.builder import misread_by_symbolic_parser
+
+    for name in ("denom", "sign", "exp", "field", "nan", "test", "iter"):
+        assert misread_by_symbolic_parser(name), name
+    for name in ("q_cons_vf", "i", "n", "x1", "program_denom", "_loop_it_3"):
+        assert not misread_by_symbolic_parser(name), name
