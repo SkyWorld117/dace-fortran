@@ -214,6 +214,34 @@ def aos_pack_offset_locals(recipe: FlattenRecipe) -> tuple[str, ...]:
     return tuple(f"{recipe.flat_names[0]}_off{k}" for k in range(1, len(recipe.cap_symbols) + 1))
 
 
+def aos_kept_layout_locals(recipe: FlattenRecipe) -> tuple[str, str, str, str]:
+    """Names around a device image kept across calls (see :func:`render_aos_alloc_pack_in`): the saved layout it was
+    set up for, the current layout, a running index into it, and whether the image is set up anew in this call."""
+    flat = recipe.flat_names[0]
+    return f"{flat}_layout", f"{flat}_layout_now", f"{flat}_layout_k", f"{flat}_fresh"
+
+
+def _kept_layout(recipe: FlattenRecipe, outer_expr: str, member_at_i: str, present: str) -> list[str]:
+    """Write the current layout of the image into ``<flat>_layout_now``: the extents of the array of records, the caps,
+    the common lower bounds, then per element whether its member is present and its bounds per dim. Two calls with the
+    same layout fill the same elements of the image, and its padding stays as the setup left it."""
+    saved, now, k, _fresh = aos_kept_layout_locals(recipe)
+    extents = _aos_alloc_extents(recipe, outer_expr)
+    rank = len(recipe.cap_symbols)
+    head = [*extents, *recipe.cap_symbols, *recipe.lb_symbols]
+    per_element = 1 + 2 * rank
+    count = " * ".join(f"({e})" for e in extents) or "1"
+    lines = [f"    allocate({now}({len(head)} + {count} * {per_element}))"]
+    lines += [f"    {now}({j}) = {value}" for j, value in enumerate(head, start=1)]
+    lines.append(f"    {k} = {len(head)}")
+    body = [f"      {now}({k} + 1:{k} + {per_element}) = 0", f"      if ({present}) then", f"        {now}({k} + 1) = 1"]
+    for d in range(1, rank + 1):
+        body.append(f"        {now}({k} + {2 * d}) = lbound({member_at_i}, {d})")
+        body.append(f"        {now}({k} + {2 * d + 1}) = ubound({member_at_i}, {d})")
+    body += ["      end if", f"      {k} = {k} + {per_element}"]
+    return lines + _over_elements(recipe, outer_expr, body)
+
+
 def _device_pack_loop(recipe: FlattenRecipe, member_at_i: str, assign: str) -> list[str]:
     """An OpenACC loop nest over one present element's member, running ``assign`` per element of it: the buffer
     index of member dim ``k`` is ``i<R+k>`` (``i1 ... iR`` are the element indices), the member's own subscript its
@@ -267,7 +295,10 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
     ``device``: the elements' members are present on the device and the SDFG reads the buffer there, so the buffer
     gets a device copy (``enter data create``) and the packing runs as OpenACC loops; the host copy is only
     allocated.  The buffer is zeroed on the device only when some element is smaller than the cap (its padding
-    would otherwise be uninitialised).
+    would otherwise be uninitialised).  The buffer and its device copy are kept from one call to the next (a saved
+    allocatable): they are set up again (allocated, created, zeroed) only when the layout changes, the array of
+    records, the caps, the common lower bounds or an element's presence or bounds; every call packs the members.
+    The padding is never written after the setup, so a kept image holds what a fresh one would.
     """
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_pack_in called on non-aos_alloc recipe")
@@ -285,7 +316,12 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
             f"size({member_at_i}, {k}) < {cap} .or. lbound({member_at_i}, {k}) /= {lb}"
             for k, cap, lb in zip(dims, caps, recipe.lb_symbols, strict=True)
         )
-        fill = [
+        saved, now, _k, fresh = aos_kept_layout_locals(recipe)
+        setup = [
+            f"    if (allocated({flat})) then",
+            f"      !$acc exit data delete({flat})",
+            f"      deallocate({flat})",
+            "    end if",
             f"    allocate({flat}({shape}))",
             f"    !$acc enter data create({flat})",
             f"    {flat}_padded = .false.",
@@ -299,6 +335,19 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
             f"      {flat} = 0",
             "      !$acc end kernels",
             "    end if",
+            f"    if (allocated({saved})) deallocate({saved})",
+            f"    allocate({saved}(size({now})))",
+            f"    {saved} = {now}",
+        ]
+        fill = [
+            *_kept_layout(recipe, outer_expr, member_at_i, present),
+            f"    {fresh} = .not. allocated({saved})",
+            f"    if (.not. {fresh}) {fresh} = size({saved}) /= size({now})",
+            f"    if (.not. {fresh}) {fresh} = any({saved} /= {now})",
+            f"    if ({fresh}) then",
+            *("  " + line for line in setup),
+            "    end if",
+            f"    deallocate({now})",
             *_over_elements(
                 recipe,
                 outer_expr,
@@ -320,7 +369,8 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
             ),
         ]
     return [
-        f"    ! ----- AoS pack-in: {outer_expr} -> {flat} (cap = {', '.join(caps)}){' on the device' if device else ''} -----",
+        f"    ! ----- AoS pack-in: {outer_expr} -> {flat} (cap = {', '.join(caps)})"
+        f"{' on the device, kept across calls' if device else ''} -----",
         *_aos_alloc_bounds(recipe, outer_expr, spread=True),
         *fill,
     ]
@@ -460,7 +510,7 @@ def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str, device: bo
     """Copy each present element's live region back from the buffer, free
     the scratch.  No reallocation -- 5c-B kernels don't change
     per-instance sizes (reserved for 5c-C).  ``device`` mirrors
-    :func:`render_aos_alloc_pack_in`: OpenACC loops, then the device copy is deleted."""
+    :func:`render_aos_alloc_pack_in`: OpenACC loops; the buffer and its device copy stay for the next call."""
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_pack_out called on non-aos_alloc recipe")
     flat = recipe.flat_names[0]
@@ -481,6 +531,8 @@ def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str, device: bo
 
 
 def render_aos_alloc_release(recipe: FlattenRecipe, device: bool = False) -> list[str]:
-    """Free the pack-in's buffer, device copy first."""
+    """Free the pack-in's buffer; a device image is kept for the next call (see :func:`render_aos_alloc_pack_in`)."""
     flat = recipe.flat_names[0]
-    return [*([f"    !$acc exit data delete({flat})"] if device else []), f"    deallocate({flat})"]
+    if device:
+        return [f"    ! {flat} and its device copy stay allocated for the next call"]
+    return [f"    deallocate({flat})"]

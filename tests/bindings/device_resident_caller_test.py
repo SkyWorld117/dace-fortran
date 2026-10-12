@@ -62,11 +62,112 @@ def test_device_pack_in_runs_openacc_loops_over_present_members():
     assert "= q(i1)%sf\n" not in text
 
 
-def test_device_pack_out_mirrors_the_pack_in_and_frees_the_device_copy():
+def test_device_pack_out_mirrors_the_pack_in_and_keeps_the_device_copy():
     text = "\n".join(render_aos_alloc_pack_out(_rank3_pointer_member(), "q", device=True))
     assert ("q(i1)%sf(lb_q_sf_d0 + q_sf_off1 + i2 - 1, lb_q_sf_d1 + q_sf_off2 + i3 - 1, lb_q_sf_d2 + q_sf_off3 + i4 - 1)"
             " = q_sf(i1, q_sf_off1 + i2, q_sf_off2 + i3, q_sf_off3 + i4)") in text
-    assert text.index("!$acc exit data delete(q_sf)") < text.index("deallocate(q_sf)")
+    assert "exit data delete" not in text and "deallocate(q_sf)" not in text
+
+
+def test_device_pack_in_sets_the_image_up_only_when_its_layout_changes():
+    """The image and its device copy are kept from one call to the next: allocation, device creation and zeroing
+    sit in a branch taken when the saved layout differs from the current one; the packing runs on every call."""
+    text = "\n".join(render_aos_alloc_pack_in(_rank3_pointer_member(), "q", device=True))
+    setup = text[text.index("if (q_sf_fresh) then") : text.index("deallocate(q_sf_layout_now)")]
+    for line in ("allocate(q_sf(size(q, dim=1), cap_q_sf_d0, cap_q_sf_d1, cap_q_sf_d2))",
+                 "!$acc enter data create(q_sf)", "q_sf = 0", "!$acc exit data delete(q_sf)", "q_sf_layout = q_sf_layout_now"):
+        assert line in setup, line
+    assert "q_sf_layout_now(q_sf_layout_k + 2) = lbound(q(i1)%sf, 1)" in text
+    assert "q_sf_layout_now(q_sf_layout_k + 7) = ubound(q(i1)%sf, 3)" in text
+    assert text.index("deallocate(q_sf_layout_now)") < text.index("!$acc parallel loop collapse(3)")
+
+
+_KEPT_IMAGE_HARNESS = """module kept_image
+  use iso_c_binding
+  implicit none
+  type :: rec
+    real(c_double), pointer :: sf(:, :) => null()
+  end type
+contains
+  subroutine pack(q, probe)
+    type(rec), intent(in) :: q(:)
+    real(c_double), intent(out) :: probe(3)
+    real(c_double), allocatable, target, save :: q_sf(:, :, :)
+    integer(c_int64_t), allocatable, save :: q_sf_layout(:)
+    integer(c_int64_t), allocatable :: q_sf_layout_now(:)
+    integer(c_int64_t) :: q_sf_layout_k
+    logical :: q_sf_fresh, q_sf_lb_taken, q_sf_padded
+    integer(c_int64_t) :: q_sf_ext1, q_sf_ext2, q_sf_off1, q_sf_off2
+    integer(c_int64_t) :: cap_q_sf_d0, cap_q_sf_d1, lb_q_sf_d0, lb_q_sf_d1
+    integer :: i1, i2, i3
+{body}
+    ! the corner of element 2, padding as long as its member is the smaller one; a value of element 1
+    probe(1) = q_sf(2, cap_q_sf_d0, cap_q_sf_d1)
+    probe(2) = q_sf(1, 1, 1)
+    probe(3) = merge(1.0_c_double, 0.0_c_double, q_sf_fresh)
+    ! mark the padding: a kept image must still hold the mark in the next call
+    q_sf(2, cap_q_sf_d0, cap_q_sf_d1) = -7.0_c_double
+  end subroutine
+end module
+
+program main
+  use kept_image
+  implicit none
+  type(rec) :: q(2)
+  real(c_double) :: p(3)
+  allocate(q(1)%sf(4, 3), q(2)%sf(2, 3))
+  q(1)%sf = 1.0_c_double
+  q(2)%sf = 2.0_c_double
+  call pack(q, p)
+  print '(3f6.1)', p
+  q(1)%sf = 5.0_c_double
+  call pack(q, p)
+  print '(3f6.1)', p
+  deallocate(q(2)%sf)
+  allocate(q(2)%sf(3, 3))
+  q(2)%sf = 2.0_c_double
+  call pack(q, p)
+  print '(3f6.1)', p
+end program
+"""
+
+
+def _gfortran_compiles_openacc() -> bool:
+    """gfortran accepts OpenACC directives (they run on the host without an offload target)."""
+    if shutil.which("gfortran") is None:
+        return False
+    probe = subprocess.run(
+        ["gfortran", "-fopenacc", "-fsyntax-only", "-x", "f95", "-"],
+        check=False,
+        input="program p\n!$acc kernels\nprint *, 1\n!$acc end kernels\nend program p\n",
+        capture_output=True,
+        text=True,
+    )
+    return probe.returncode == 0
+
+
+def test_a_kept_image_is_repacked_and_set_up_again_only_on_a_new_layout(tmp_path: Path):
+    """Compiled and run (OpenACC on the host): the first call sets the image up (padding zero), the second packs the
+    new values into the kept image (the mark left in the padding survives), the third sees an element's member
+    grow and sets the image up again (padding zeroed, the mark gone)."""
+    if not _gfortran_compiles_openacc():
+        pytest.skip("needs gfortran with OpenACC directives (-fopenacc)")
+    recipe = FlattenRecipe(
+        flat_names=("q_sf",),
+        read_exprs=("q($i1)%sf($i2, $i3)",),
+        rank=3,
+        shape_exprs=("size(q, dim=1)", "cap_q_sf_d0", "cap_q_sf_d1"),
+        aos_alloc=True,
+        cap_symbols=("cap_q_sf_d0", "cap_q_sf_d1"),
+        lb_symbols=("lb_q_sf_d0", "lb_q_sf_d1"),
+        member_pointer=True,
+    )
+    body = "\n".join(render_aos_alloc_pack_in(recipe, "q", device=True))
+    (tmp_path / "kept.f90").write_text(_KEPT_IMAGE_HARNESS.format(body=body))
+    subprocess.run(["gfortran", "-fopenacc", "-ffree-line-length-none", "kept.f90", "-o", "kept"], cwd=tmp_path,
+                   check=True, capture_output=True, text=True)
+    out = subprocess.run(["./kept"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.split()
+    assert [float(x) for x in out] == [0.0, 1.0, 1.0, -7.0, 5.0, 0.0, 0.0, 5.0, 1.0]
 
 
 def test_host_pack_is_unchanged():
