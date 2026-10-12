@@ -298,13 +298,8 @@ def symbol_dtypes_of(sdfg: SDFG, names: Iterable[str]) -> dict[str, str]:
     """The dtype DaCe passes each of the free symbols ``names`` with: its argument list's, which is the symbol
     table's entry or DaCe's default for an undeclared symbol."""
     arglist = sdfg.arglist()
-    out: dict[str, str] = {}
-    for name in names:
-        if name in arglist:
-            out[name] = dtype_string(arglist[name])
-        elif name in sdfg.symbols:
-            out[name] = str(sdfg.symbols[name])
-    return out
+    # A symbol that only shapes an array no state touches is not passed at all: no entry for it.
+    return {name: dtype_string(arglist[name]) for name in names if name in arglist}
 
 
 def _metadata(sdfg: SDFG) -> dict[str, Any]:
