@@ -1187,6 +1187,18 @@ class SDFGBuilder:
             f for e in (_plan_raw.get("entries") or []) for f in (e.get("recipe", {}).get("flat_names") or [])
         }
         prune_unused_arrays(sdfg, binding_names=_binding_keep)
+        # A section view's extent the bridge could not trace is a placeholder symbol nothing outside the SDFG can
+        # supply: define it from the section the view is linked to, before the snapshot lists it as an input.
+        from dace_fortran.builder.view_extents import define_section_view_extents
+
+        define_section_view_extents(
+            sdfg,
+            {
+                name: (v.view_source, list(v.view_subset))
+                for name, v in self.arrays.items()
+                if v.role == "view_alias" and list(v.view_subset) != [""] and name not in self.complex_component_aliases
+            },
+        )
         self._attach_frozen_signature(sdfg)
         # Stash the pre-flatten caller interface + the post-flatten plan so
         # the binding emitter can auto-derive both an ``OriginalInterface``
