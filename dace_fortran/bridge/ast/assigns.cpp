@@ -1499,6 +1499,10 @@ std::vector<ASTNode> buildSectionToSectionAssign(hlfir::AssignOp assign, mlir::V
 /// element.  Mirrors ``buildSectionScalarAssign``'s shape but iterates
 /// from 1 to the declare's extent for each dim instead of ``lo:hi``.
 ///
+/// A declare without extents of its own -- an assumed-shape dummy (no shape, or a ``fir.shift`` of lower bounds only),
+/// an allocatable -- takes them from the variable an inlined copy of it is bound to, else from the ``<name>_d<i>``
+/// extent symbols that ``SIZE`` reads too (``fir.box_dims`` in ``buildIndexExpr``).
+///
 /// Returns an empty vector when the destination's shape can't be
 /// resolved  --  caller falls back to the default assign handler.
 std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
@@ -1507,24 +1511,26 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
   if (!dDef) return {};
   auto decl = mlir::dyn_cast<hlfir::DeclareOp>(dDef);
   if (!decl) return {};
-  auto shape = decl.getShape();
-  if (!shape) return {};
-  auto* shDef = shape.getDefiningOp();
-  if (!shDef) return {};
 
   // Collect per-dim extent operands.  ``fir.shape`` lists them flat;
   // ``fir.shape_shift`` interleaves (lb, ext) pairs  --  pick out the
   // extents (odd indices).
-  std::vector<mlir::Value> extents;
-  if (auto sh = mlir::dyn_cast<fir::ShapeOp>(shDef)) {
-    for (auto e : sh.getExtents()) extents.push_back(e);
-  } else if (auto ss = mlir::dyn_cast<fir::ShapeShiftOp>(shDef)) {
-    auto ops = ss->getOperands();
-    for (unsigned i = 1; i < ops.size(); i += 2) extents.push_back(ops[i]);
-  } else {
-    return {};
-  }
-  unsigned const rank = extents.size();
+  auto extentsOf = [](hlfir::DeclareOp d) {
+    std::vector<mlir::Value> out;
+    auto* shDef = d.getShape() ? d.getShape().getDefiningOp() : nullptr;
+    if (auto sh = mlir::dyn_cast_or_null<fir::ShapeOp>(shDef)) {
+      for (auto e : sh.getExtents()) out.push_back(e);
+    } else if (auto ss = mlir::dyn_cast_or_null<fir::ShapeShiftOp>(shDef)) {
+      auto ops = ss->getOperands();
+      for (unsigned i = 1; i < ops.size(); i += 2) out.push_back(ops[i]);
+    }
+    return out;
+  };
+  std::vector<mlir::Value> extents = extentsOf(decl);
+  for (hlfir::DeclareOp outer = decl; extents.empty() && (outer = asAssumedShapeAlias(outer));)
+    extents = extentsOf(outer);
+  auto seq = mlir::dyn_cast<fir::SequenceType>(peelWrappers(decl.getResult(0).getType()));
+  unsigned const rank = extents.empty() ? (seq ? seq.getDimension() : 0) : extents.size();
   if (rank == 0) return {};
 
   auto extentString = [](mlir::Value ext) -> std::string {
@@ -1541,8 +1547,10 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
 
   std::vector<std::string> bounds;
   bounds.reserve(rank);
+  std::string const boxName = extents.empty() ? traceToDecl(dst) : std::string{};
   for (unsigned i = 0; i < rank; ++i) {
-    auto s = extentString(extents[i]);
+    auto s = extents.empty() ? (boxName.empty() ? std::string{} : boxName + "_d" + std::to_string(i))
+                             : extentString(extents[i]);
     if (s.empty()) return {};
     bounds.push_back(std::move(s));
   }
@@ -1567,6 +1575,8 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
     wa.index_exprs.push_back(bounded ? fortranIndexAt(iter_names[i], declaredLowerBound(decl, i), 0) : iter_names[i]);
   }
   inner.accesses.push_back(std::move(wa));
+  // The value may read array elements (``v = s(1) * 2``): each needs its read access, or its connector dangles.
+  collectReadAccesses(assign.getOperand(0), inner.accesses, 0);
 
   ASTNode current = inner;
   for (int i = (int)rank - 1; i >= 0; --i) {

@@ -18,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tests._helpers import xfail
 from tests._util import build_sdfg
 
 _NF = 3
@@ -189,20 +188,8 @@ def _check(tmp_path: Path, actuals: str, shape: str, body: str) -> None:
         np.testing.assert_allclose(args[name], value, rtol=1e-13, atol=1e-13, err_msg=f"{name} ({body}, {shape})")
 
 
-_WHOLE_CASES = [
-    pytest.param(
-        body,
-        shape,
-        marks=[xfail("a scalar variable assigned to a whole assumed-shape dummy is written to its first element only")]
-        if (body, shape) == ("broadcast_scalar", "assumed")
-        else [],
-    )
-    for body in sorted(_BODIES)
-    for shape in sorted(_SHAPES)
-]
-
-
-@pytest.mark.parametrize(("body", "shape"), _WHOLE_CASES)
+@pytest.mark.parametrize("shape", sorted(_SHAPES))
+@pytest.mark.parametrize("body", sorted(_BODIES))
 def test_write_through_inlined_dummy_reaches_its_own_actual(tmp_path: Path, body: str, shape: str):
     _check(tmp_path, "whole", shape, body)
 
