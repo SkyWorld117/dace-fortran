@@ -197,6 +197,72 @@ std::string resolveExtent(mlir::Value shape, unsigned d) {
   return "?";
 }
 
+/// True when ``lo``, the start of a section triplet in dim ``dim`` of ``base``, is the base's own lower bound: the
+/// ``fir.box_dims`` Flang reads for a whole-dimension ``:`` of a descriptor.
+static bool isOwnLowerBound(mlir::Value lo, unsigned dim, mlir::Value base) {
+  for (int i = 0; i < limits::kConvertChainDepth && lo; ++i) {
+    auto* d = lo.getDefiningOp();
+    if (!d) return false;
+    if (auto cv = mlir::dyn_cast<fir::ConvertOp>(d)) {
+      lo = cv.getValue();
+      continue;
+    }
+    if (d->getName().getStringRef() != "fir.box_dims" || d->getNumOperands() < 2) return false;
+    if (mlir::cast<mlir::OpResult>(lo).getResultNumber() != 0) return false;
+    auto const c = traceConstInt(d->getOperand(1));
+    return c && *c == static_cast<int64_t>(dim) && peelBoxReinterpret(d->getOperand(0)) == peelBoxReinterpret(base);
+  }
+  return false;
+}
+
+/// The subscript of a section's base that subscript ``u`` of a view of the section selects in a triplet dim with start
+/// ``lo`` and stride ``st``: ``lo + (u - viewLb) * st``, ``viewLb`` the lower bound of the view ``u`` indexes (null: 1,
+/// as for the section itself or a dummy declared from 1). A null ``lo`` is the base's own lower bound, which a record
+/// dim counts from 1 (the binding packs record elements from 1). "?" when a bound cannot be rendered.
+static std::string sectionBaseSubscript(const std::string& u, mlir::Value viewLb, mlir::Value lo, mlir::Value st) {
+  auto render = [](mlir::Value v, int64_t dflt) -> std::pair<std::optional<int64_t>, std::string> {
+    if (!v) return {dflt, std::to_string(dflt)};
+    if (auto c = traceConstInt(v)) return {*c, std::to_string(*c)};
+    return {std::nullopt, buildIndexExpr(v, 1)};
+  };
+  auto const [lbC, lbS] = render(viewLb, 1);
+  auto const [loC, loS] = render(lo, 1);
+  auto const [stC, stS] = render(st, 1);
+  if (lbS.empty() || lbS == "?" || loS.empty() || loS == "?" || stS.empty() || stS == "?") return "?";
+  if (stC && *stC == 1) {
+    if (lbC && loC) {
+      int64_t const adjust = *loC - *lbC;
+      if (adjust == 0) return u;
+      return "(" + u + (adjust > 0 ? " + " : " - ") + std::to_string(adjust > 0 ? adjust : -adjust) + ")";
+    }
+    return "(" + u + " + " + loS + " - " + lbS + ")";
+  }
+  return "(" + loS + " + (" + u + " - " + lbS + ") * " + stS + ")";
+}
+
+/// The lower bounds ``decl`` declares, one per dim (its ``fir.shape_shift`` / ``fir.shift`` origins); empty when every
+/// dim starts at 1 by default.
+static std::vector<mlir::Value> declaredLowerBounds(hlfir::DeclareOp decl) {
+  std::vector<mlir::Value> lbs;
+  mlir::Value const shape = decl.getShape();
+  if (!shape) return lbs;
+  if (auto shapeShift = shape.getDefiningOp<fir::ShapeShiftOp>())
+    for (mlir::Value const o : shapeShift.getOrigins()) lbs.push_back(o);
+  else if (auto shift = shape.getDefiningOp<fir::ShiftOp>())
+    for (mlir::Value const o : shift.getOrigins()) lbs.push_back(o);
+  return lbs;
+}
+
+/// True when inlined dummy ``dc``, possibly through the whole-array inlined dummies it aliases, is bound to a record
+/// member or to a section of one.
+static bool aliasReachesRecordMember(hlfir::DeclareOp dc) {
+  for (int i = 0; i < limits::kAliasMemrefWalkDepth && dc && dc.getDummyScope(); ++i) {
+    if (asInlinedSectionOverComponent(dc) || dummyChainLeadsToComponent(dc)) return true;
+    dc = asAssumedShapeAlias(dc);
+  }
+  return false;
+}
+
 /// Walks the designate parent chain to a (var, expr) list keyed to the underlying array's rank, not the innermost
 /// designate's rank -- Flang's intermediate fixed-shape designates otherwise drop the parent's scalar dims.
 std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::DesignateOp innermost) {
@@ -213,8 +279,11 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
   // traceToDecl on the innermost RESULT instead.
   bool sawComponentParent = false;
   // Per-block AoR section hop (e.g. ``vec_in(jc, jk) % x(k)`` over ``p_vn(:, :, blockno)``): composes the section
-  // positionally into [jc, jk, blockno, k]. Do NOT use the generic triplet loop below -- it drops the member tail.
-  auto applySectionHop = [](hlfir::DesignateOp sec, std::vector<DimEntry>& entries) {
+  // into [jc, jk, blockno, k], each triplet dim taking the section's start and stride (``v(lo:hi)``: ``lo + (i - 1)``),
+  // the head subscripts counted from ``viewLbs`` (the lower bounds of the view they index; empty: 1). Do NOT use the
+  // generic triplet loop below -- it drops the member tail.
+  auto applySectionHop = [](hlfir::DesignateOp sec, std::vector<DimEntry>& entries,
+                            const std::vector<mlir::Value>& viewLbs) {
     auto trips = sec.getIsTriplet();
     unsigned T = 0;
     for (bool const t : trips)
@@ -222,14 +291,23 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
     size_t const split = std::min<size_t>(T, entries.size());
     std::vector<DimEntry> head(entries.begin(), entries.begin() + split);
     std::vector<DimEntry> tail(entries.begin() + split, entries.end());
+    // Lower bounds of a view of another rank (sequence association) do not map onto the triplets.
+    bool const useLbs = viewLbs.size() == T;
     std::vector<DimEntry> newRec;
     size_t hi = 0;
     size_t cur = 0;
+    unsigned dim = 0;
     auto sidx = sec.getIndices();
     for (bool const trip : trips) {
       if (trip) {
-        newRec.push_back(hi < head.size() ? head[hi] : DimEntry{"?", "?"});
+        DimEntry e = hi < head.size() ? head[hi] : DimEntry{"?", "?"};
+        if (e.expr != "?" && cur + 2 < sidx.size()) {
+          mlir::Value const lo = isOwnLowerBound(sidx[cur], dim, sec.getMemref()) ? mlir::Value{} : sidx[cur];
+          e.expr = sectionBaseSubscript(e.expr, useLbs ? viewLbs[hi] : mlir::Value{}, lo, sidx[cur + 2]);
+        }
+        newRec.push_back(std::move(e));
         ++hi;
+        ++dim;
         cur += 3;  // triplet subscript = (lo, hi, step)
       } else {
         mlir::Value const s = cur < sidx.size() ? sidx[cur] : mlir::Value{};
@@ -246,6 +324,15 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
   // caller's chain through box reinterprets (``box_addr(load(field(id) % comp))``), which the walk must step through or
   // the caller's record subscripts (``id``) are dropped.
   bool viaComponentDummy = false;
+  // Lower bounds of the view the leading record subscripts index (empty: 1 in every dim): the inlined dummy declare the
+  // last element designate or section selects from. ``headFresh`` marks subscripts just taken, whose view is the next
+  // declare the walk reaches; an alias of that declare passes the same positions on.
+  std::vector<mlir::Value> headLbs;
+  bool headFresh = false;
+  auto takeHead = [&] {
+    headLbs.clear();
+    headFresh = true;
+  };
   for (int level = 0; level < limits::kAliasMemrefWalkDepth; ++level) {
     if (!parent_val) break;
     auto* def = parent_val.getDefiningOp();
@@ -257,19 +344,38 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
     // Inlined AoR-section dummy parent (``vec_in``, a copy_in declare): the parent-walk would otherwise BREAK at this
     // DeclareOp and drop ``blockno`` -- fire the section hop and continue root-ward.
     if (auto dc = mlir::dyn_cast<hlfir::DeclareOp>(def)) {
+      if (headFresh) {
+        headLbs = declaredLowerBounds(dc);
+        headFresh = false;
+      }
       if (auto sec = asInlinedSectionOverComponent(dc)) {
-        applySectionHop(sec, entries);
+        applySectionHop(sec, entries, headLbs);
+        takeHead();
         parent_val = sec.getMemref();
         continue;
       }
-      // Inlined-call dummy on a struct-member actual (gate #12), possibly through the inlined dummies it is passed on as:
-      // traceToDecl/walkMemberChain hop through to the caller chain, so the parent-walk must hop too or the record
-      // subscript is dropped and the memlet under-ranks.
+      // Inlined-call dummy on a struct-member actual (gate #12), possibly through the inlined dummies it is passed on
+      // as: traceToDecl/walkMemberChain hop through to the caller chain, so the parent-walk must hop too or the record
+      // subscript is dropped and the memlet under-ranks. The member counts its elements from 1, the dummy from its own
+      // lower bounds.
       if (dc.getDummyScope() && dummyChainLeadsToComponent(dc)) {
+        for (size_t d = 0; d < headLbs.size() && d < entries.size(); ++d)
+          if (entries[d].expr != "?")
+            entries[d].expr = sectionBaseSubscript(entries[d].expr, headLbs[d], mlir::Value{}, mlir::Value{});
+        headLbs.clear();
         parent_val = dc.getMemref();
         viaComponentDummy = true;
         continue;
       }
+      // Inlined dummy bound to the whole of another inlined dummy of the same rank, which reaches a record member as
+      // above or through a section of it (``call leaf(v)`` in a callee given ``comp(lo:hi)``): hop to that dummy, as
+      // traceToDecl/walkMemberChain do, or the walk stops here and drops the section's start and the record subscripts
+      // of the caller.
+      if (innermost.getComponentAttr() || sawComponentParent)
+        if (auto outer = asAssumedShapeAlias(dc); outer && dc.getDummyScope() && aliasReachesRecordMember(outer)) {
+          parent_val = outer.getResult(0);
+          continue;
+        }
       break;
     }
     if (viaComponentDummy) {
@@ -293,7 +399,8 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
     // Direct AoR section parent (fully inlined, no ``vec_in`` declare): same positional compose as the copy_in-declare
     // case above; the generic triplet loop below would drop the member tail.
     if (auto sec = asSectionOverComponent(parent.getResult())) {
-      applySectionHop(sec, entries);
+      applySectionHop(sec, entries, headLbs);
+      takeHead();
       parent_val = sec.getMemref();
       continue;
     }
@@ -314,6 +421,7 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
         std::vector<DimEntry> combined = std::move(parent_entries);
         for (auto& e : entries) combined.push_back(std::move(e));
         entries = std::move(combined);
+        takeHead();
       } else {
         entries = std::move(parent_entries);
       }
@@ -356,6 +464,7 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
       std::vector<DimEntry> combined = std::move(new_entries);
       for (auto& e : entries) combined.push_back(std::move(e));
       entries = std::move(combined);
+      takeHead();
     } else {
       entries = std::move(new_entries);
     }
