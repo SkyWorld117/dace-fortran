@@ -402,18 +402,30 @@ std::vector<std::vector<fir::AllocMemOp>> groupAllocSites(const std::string& dec
 /// declare's shape  --  trace each size operand to its host declare
 /// (preferred), fall back to a constant literal, then to ``?``.
 /// Inlined-callee alias declares of ``v`` (a declare taking ``v`` as its memref), transitively through
-/// alias-of-alias chains, bounded like the other SSA back-walks.
+/// alias-of-alias chains, bounded like the other SSA back-walks.  A declare reached through the reinterprets inlining
+/// puts between a whole array and an assumed-shape dummy (``fir.convert(fir.embox(v))``, ``fir.rebox``) counts too
+/// when ``asAssumedShapeAlias`` collapses it onto the declare it came from: the access naming (``traceToDecl``)
+/// names its designates after that declare, so they must be discovered with it.
 static std::vector<hlfir::DeclareOp> aliasDeclaresOf(mlir::Value v) {
   std::vector<hlfir::DeclareOp> out;
-  std::vector<mlir::Value> frontier{v};
+  // Each value carries whether it was reached through a reinterpret since the last declare.
+  std::vector<std::pair<mlir::Value, bool>> frontier{{v, false}};
   for (int depth = 0; depth < limits::kSsaBackWalkDepth && !frontier.empty(); ++depth) {
-    std::vector<mlir::Value> next;
-    for (mlir::Value f : frontier)
-      for (auto* u : f.getUsers())
+    std::vector<std::pair<mlir::Value, bool>> next;
+    for (auto [f, reinterpreted] : frontier)
+      for (auto* u : f.getUsers()) {
         if (auto ad = mlir::dyn_cast<hlfir::DeclareOp>(u); ad && ad.getMemref() == f) {
+          if (reinterpreted && !asAssumedShapeAlias(ad)) continue;
           out.push_back(ad);
-          next.push_back(ad.getResult(0));
+          next.emplace_back(ad.getResult(0), false);
+        } else if (auto eb = mlir::dyn_cast<fir::EmboxOp>(u); eb && eb.getMemref() == f) {
+          next.emplace_back(eb.getResult(), true);
+        } else if (auto cv = mlir::dyn_cast<fir::ConvertOp>(u)) {
+          next.emplace_back(cv.getResult(), true);
+        } else if (auto rb = mlir::dyn_cast<fir::ReboxOp>(u); rb && rb.getBox() == f) {
+          next.emplace_back(rb.getResult(), true);
         }
+      }
     frontier = std::move(next);
   }
   return out;
@@ -2412,50 +2424,54 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
               llvm::SmallVector<mlir::Value, 4> scanRoots;
               scanRoots.push_back(designateResult);
               for (auto ad : aliasDeclaresOf(designateResult)) scanRoots.push_back(ad.getResult(0));
-              for (auto* u : designateResult.getUsers()) {
-                // Pointer / allocatable AoR module-level case
-                // (QE's ``tabxx(ia) % box(ir)`` -- ``tabxx`` is
-                // ``type(t), pointer :: tabxx(:)`` at module scope).
-                // Access chain is ``fir.load %declare ; designate
-                // %loaded (ia) ; designate %elem {"box"}``.  Walk
-                // through the load -- then through any non-component
-                // (element) designate -- to find the component
-                // designates that name the actual struct fields.
-                if (auto ld = mlir::dyn_cast_or_null<fir::LoadOp>(u)) {
-                  scanRoots.push_back(ld.getResult());
-                  for (auto* lu : ld.getResult().getUsers())
-                    if (auto edg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(lu))
-                      if (!edg.getComponentAttr()) scanRoots.push_back(edg.getResult());
-                }
-                // Static array of records at module scope (``type(t) :: tab(3)``): the element designate hangs off
-                // the declare itself, with no load between.  Its component designates name the fields -- and so do
-                // those of an inlined callee's dummy declared on the element (``call f(tab(2))``).
-                if (auto edg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(u)) {
-                  if (!edg.getComponentAttr()) {
-                    scanRoots.push_back(edg.getResult());
-                    for (auto ad : aliasDeclaresOf(edg.getResult())) scanRoots.push_back(ad.getResult(0));
+              // Scan the users of the aliases as well as the record's own: a whole array of records passed to
+              // an assumed-shape dummy is subscripted on the dummy, so its element designates hang off the alias.
+              llvm::SmallVector<mlir::Value, 4> const storageRoots(scanRoots);
+              for (mlir::Value base : storageRoots)
+                for (auto* u : base.getUsers()) {
+                  // Pointer / allocatable AoR module-level case
+                  // (QE's ``tabxx(ia) % box(ir)`` -- ``tabxx`` is
+                  // ``type(t), pointer :: tabxx(:)`` at module scope).
+                  // Access chain is ``fir.load %declare ; designate
+                  // %loaded (ia) ; designate %elem {"box"}``.  Walk
+                  // through the load -- then through any non-component
+                  // (element) designate -- to find the component
+                  // designates that name the actual struct fields.
+                  if (auto ld = mlir::dyn_cast_or_null<fir::LoadOp>(u)) {
+                    scanRoots.push_back(ld.getResult());
+                    for (auto* lu : ld.getResult().getUsers())
+                      if (auto edg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(lu))
+                        if (!edg.getComponentAttr()) scanRoots.push_back(edg.getResult());
+                  }
+                  // Static array of records at module scope (``type(t) :: tab(3)``): the element designate hangs off
+                  // the declare itself, with no load between.  Its component designates name the fields -- and so do
+                  // those of an inlined callee's dummy declared on the element (``call f(tab(2))``).
+                  if (auto edg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(u)) {
+                    if (!edg.getComponentAttr()) {
+                      scanRoots.push_back(edg.getResult());
+                      for (auto ad : aliasDeclaresOf(edg.getResult())) scanRoots.push_back(ad.getResult(0));
+                    }
+                  }
+                  // Whole-record POINTER rebind re-root (RewritePointerAssigns
+                  // ``params_oce => v_params``): the re-rooted member reads/writes
+                  // root on a ``fir.convert %declare : (ref<record>) -> ptr<record>``
+                  // reinterpret (the ``box_addr`` retag), not the declare result
+                  // directly.  Follow the convert so its component designates are
+                  // discovered and each accessed field gets a VarInfo -- else the
+                  // access NAME is minted (``traceToDecl`` peels the convert) but no
+                  // DESCRIPTOR is registered, and the SDFG build fails with a
+                  // KeyError on ``<base>_<member>``.
+                  if (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(u)) {
+                    mlir::Type inner = cv.getResult().getType();
+                    if (auto r = mlir::dyn_cast<fir::ReferenceType>(inner))
+                      inner = r.getEleTy();
+                    else if (auto p = mlir::dyn_cast<fir::PointerType>(inner))
+                      inner = p.getElementType();
+                    else if (auto h = mlir::dyn_cast<fir::HeapType>(inner))
+                      inner = h.getElementType();
+                    if (mlir::isa<fir::RecordType>(inner)) scanRoots.push_back(cv.getResult());
                   }
                 }
-                // Whole-record POINTER rebind re-root (RewritePointerAssigns
-                // ``params_oce => v_params``): the re-rooted member reads/writes
-                // root on a ``fir.convert %declare : (ref<record>) -> ptr<record>``
-                // reinterpret (the ``box_addr`` retag), not the declare result
-                // directly.  Follow the convert so its component designates are
-                // discovered and each accessed field gets a VarInfo -- else the
-                // access NAME is minted (``traceToDecl`` peels the convert) but no
-                // DESCRIPTOR is registered, and the SDFG build fails with a
-                // KeyError on ``<base>_<member>``.
-                if (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(u)) {
-                  mlir::Type inner = cv.getResult().getType();
-                  if (auto r = mlir::dyn_cast<fir::ReferenceType>(inner))
-                    inner = r.getEleTy();
-                  else if (auto p = mlir::dyn_cast<fir::PointerType>(inner))
-                    inner = p.getElementType();
-                  else if (auto h = mlir::dyn_cast<fir::HeapType>(inner))
-                    inner = h.getElementType();
-                  if (mlir::isa<fir::RecordType>(inner)) scanRoots.push_back(cv.getResult());
-                }
-              }
               for (auto root : scanRoots)
                 for (auto* u : root.getUsers()) {
                   auto childDg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(u);
