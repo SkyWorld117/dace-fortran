@@ -9,6 +9,11 @@ original procedure as ``dace_original_<entry>`` (``--defsym=dace_original_<entry
   (:func:`dace_fortran.bindings.specialization.recorded_invariants` reads the file).
 * :func:`emit_substitute_entry` calls the binding of a built SDFG and runs the original when the binding declines.
 
+Both read module variables. A public one is imported (``use <module>, only: ...``); one its module keeps private is
+reached through the ``bind(c)`` accessor of a copy of the module linked in place of the original
+(:func:`dace_fortran.bindings.module_access.expose_module_variables`), as a binding reaches it: a pointer of the
+variable's type is pointed at it with ``c_f_pointer``. The stand-in compiles against the original module files.
+
 The dummies are declared so that the caller's arguments arrive and leave unchanged (:func:`render_dummies`): a dummy
 the caller passes by address (a scalar, an explicit-shape or assumed-size array) as a scalar or an assumed-size
 array, one passed by descriptor as an assumed-shape, allocatable or pointer array of the same rank, a VALUE dummy by
@@ -19,11 +24,12 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from dace_fortran.bindings.fortran_interface import OriginalArg, OriginalInterface
+from dace_fortran.bindings.module_access import ExposedVariable, c_accessor_association, c_accessor_interface
 
 
 class UnsupportedStandinError(ValueError):
@@ -33,7 +39,8 @@ class UnsupportedStandinError(ValueError):
 @dataclass(frozen=True, slots=True)
 class RecordedValue:
     """A module variable a recording stand-in writes: ``module::name`` (``name%component`` for a scalar component of a
-    record variable, ``name(k)%component`` for one of an element of an array of records) and its Fortran type (``logical(4)``, ``integer(4)``, ``real(8)``), as
+    record variable, ``name(k)%component`` for one of an element of an array of records, ``name(k)`` for an element of
+    an array of scalars) and its Fortran type (``logical(4)``, ``integer(4)``, ``real(8)``), as
     ``SDFGBuilder.configuration_candidates`` lists them."""
 
     module: str
@@ -42,8 +49,71 @@ class RecordedValue:
 
 
 def _variable(name: str) -> str:
-    """The module variable of a recorded scalar: ``domain`` of ``domain%lo``, ``bounds`` of ``bounds(1)%lo``."""
+    """The module variable of a recorded scalar: ``domain`` of ``domain%lo``, ``bounds`` of ``bounds(1)%lo``, ``flags``
+    of ``flags(1)``."""
     return re.split(r"[(%]", name, maxsplit=1)[0]
+
+
+#: Per module, the variables it keeps private that a stand-in reaches through accessors (module -> name -> variable).
+PrivateAccess = Mapping[str, Mapping[str, ExposedVariable]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ValueReads:
+    """How a stand-in reads module values: its ``use`` lines, declarations, the statements that point the pointers to
+    private variables at them (first in the body), and an expression per value."""
+
+    uses: list[str]
+    declarations: list[str]
+    statements: list[str]
+    expressions: list[str]
+
+
+def _value_reads(
+    values: Sequence[RecordedValue], prefix: str, private_access: PrivateAccess | None, private_imports: Sequence[str]
+) -> _ValueReads:
+    """Read ``values``: each public variable imported as ``<prefix>_<i>``; each variable ``private_access`` lists
+    through its ``bind(c)`` accessor (declared as ``<prefix>_acc_<j>``) and a pointer ``<prefix>_ptr_<j>`` of its type,
+    one per variable however many of its values are read. ``private_imports``: the ``use`` lines the pointers'
+    declarations need (the kinds and types their type specs name).
+
+    :raises UnsupportedStandinError: a private variable is allocatable or a pointer: its storage may not exist, and a
+        configuration value never lives in such a variable.
+    """
+    private = {m.lower(): {n.lower(): v for n, v in vs.items()} for m, vs in (private_access or {}).items()}
+    uses: list[str] = []
+    declarations: list[str] = []
+    statements: list[str] = []
+    expressions: list[str] = []
+    pointers: dict[tuple[str, str], str] = {}  # (module, variable) -> pointer
+    for i, v in enumerate(values):
+        var = _variable(v.name)
+        path = v.name[len(var) :]
+        exposed = private.get(v.module.lower(), {}).get(var.lower())
+        if exposed is None:
+            uses.append(f"use {v.module}, only: {prefix}_{i} => {var}")
+            expressions.append(f"{prefix}_{i}{path}")
+            continue
+        if exposed.allocatable or exposed.pointer:
+            raise UnsupportedStandinError(f"{v.module}::{var} is allocatable or a pointer; its storage may not exist")
+        key = (v.module.lower(), exposed.name)
+        if key not in pointers:
+            j = len(pointers)
+            pointers[key] = f"{prefix}_ptr_{j}"
+            shape = "(" + ", ".join([":"] * exposed.rank) + ")" if exposed.rank else ""
+            declarations.append(f"{exposed.type_spec}, pointer :: {pointers[key]}{shape}")
+            declarations += c_accessor_interface(exposed, f"{prefix}_acc_{j}")
+            statements += c_accessor_association(exposed, f"{prefix}_acc_{j}", pointers[key])
+        expressions.append(f"{pointers[key]}{path}")
+    if pointers:
+        rank = max([private[mod][name].rank for mod, name in pointers] + [1])
+        declarations += [
+            "type(c_ptr) :: dace_addr",
+            f"integer(c_int64_t) :: dace_lb({rank}), dace_ub({rank})",
+            "integer(c_int) :: dace_present",
+        ]
+        uses += [line.strip() for line in private_imports]
+    return _ValueReads(uses, declarations, statements, expressions)
 
 
 def standin_name(kind: str, entry: str) -> str:
@@ -162,24 +232,38 @@ def _write(value: str, ftype: str, label: str) -> str:
 
 
 def emit_recording_standin(
-    iface: OriginalInterface, values: Sequence[RecordedValue], record_path: str | Path, out_path: str | Path
+    iface: OriginalInterface,
+    values: Sequence[RecordedValue],
+    record_path: str | Path,
+    out_path: str | Path,
+    private_access: PrivateAccess | None = None,
+    private_imports: Sequence[str] = (),
 ) -> Path:
     """Write ``dace_record_<entry>``: on every call it appends ``module::name value`` for each of ``values`` and an
-    empty line to ``record_path``, then calls the original with the arguments unchanged. The variables must be public
-    in their modules."""
-    uses = [f"use {v.module}, only: dace_value_{i} => {_variable(v.name)}" for i, v in enumerate(values)]
+    empty line to ``record_path``, then calls the original with the arguments unchanged.
+
+    A value's variable is imported from its module unless ``private_access`` lists it (per module, the private
+    variables of a copy of the module made with
+    :func:`~dace_fortran.bindings.module_access.expose_module_variables`): then the stand-in reads it through the
+    copy's ``bind(c)`` accessor, and the copy must be linked in place of the module's object. ``private_imports``: the
+    ``use`` lines the declarations of those variables need
+    (:func:`~dace_fortran.bindings.module_access.declaration_imports`)."""
+    reads = _value_reads(values, "dace_value", private_access, private_imports)
     local = ["integer :: dace_record_unit", *_character_constant("dace_record_path", str(record_path))]
     for i, v in enumerate(values):
         local += _character_constant(f"dace_label_{i}", f"{v.module}::{v.name}")
     body = [
+        *reads.statements,
         "open(newunit=dace_record_unit, file=dace_record_path, position='append', action='write')",
-        *(_write(f"dace_value_{i}{v.name[len(_variable(v.name)):]}", v.fortran_type, f"dace_label_{i}")
-          for i, v in enumerate(values)),
+        *(
+            _write(e, v.fortran_type, f"dace_label_{i}")
+            for i, (v, e) in enumerate(zip(values, reads.expressions, strict=True))
+        ),
         "write(dace_record_unit, '(a)') ''",
         "close(dace_record_unit)",
         *_with_arguments(f"call {standin_name('original', iface.entry)}", [a.name for a in iface.args]),
     ]
-    lines = _subroutine(standin_name("record", iface.entry), iface, body, uses, local)
+    lines = _subroutine(standin_name("record", iface.entry), iface, body, reads.uses, [*local, *reads.declarations])
     out = Path(out_path)
     out.write_text("\n".join(lines) + "\n")
     return out
@@ -209,24 +293,29 @@ def emit_substitute_entry(
     wrapper: str,
     out_path: str | Path,
     baked: Sequence[tuple[RecordedValue, int | float]] = (),
+    private_access: PrivateAccess | None = None,
+    private_imports: Sequence[str] = (),
 ) -> Path:
     """Write ``dace_sub_<entry>``: calls the binding's ``wrapper`` and, when it declines the call (``dace_declined``),
     the original instead.
 
     ``baked``: module variables the SDFG was specialised to before it was built (``SDFGBuilder``'s
     ``specialized_globals``), with their values. Their reads are gone from the SDFG, so the binding cannot check them;
-    the entry does, before anything else, and calls the original when any of them differs."""
+    the entry does, before anything else, and calls the original when any of them differs. ``private_access`` and
+    ``private_imports``: as for :func:`emit_recording_standin`, for baked variables their modules keep private."""
     args = [a.name for a in iface.args]
     original = standin_name("original", iface.entry)
     uses = [f"use {binding_module}, only: {wrapper}"]
+    local = ["logical :: declined"]
     body: list[str] = []
     if baked:
-        uses += [f"use {v.module}, only: dace_baked_{i} => {_variable(v.name)}" for i, (v, _) in enumerate(baked)]
+        reads = _value_reads([v for v, _ in baked], "dace_baked", private_access, private_imports)
+        uses += reads.uses
+        local += reads.declarations
         checks = [
-            _differs(f"dace_baked_{i}{v.name[len(_variable(v.name)):]}", value, v.fortran_type)
-            for i, (v, value) in enumerate(baked)
+            _differs(expr, value, v.fortran_type) for (v, value), expr in zip(baked, reads.expressions, strict=True)
         ]
-        body += ["declined = .false."]
+        body += [*reads.statements, "declined = .false."]
         body += [f"if ({c}) declined = .true." for c in checks]
         body += ["if (declined) then", *(f"    {ln}" for ln in _with_arguments(f"call {original}", args)), "    return",
                  "end if"]
@@ -234,7 +323,7 @@ def emit_substitute_entry(
         *_with_arguments(f"call {wrapper}", [*args, "dace_declined=declined"]),
         *_with_arguments(f"if (declined) call {original}", args),
     ]
-    lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, ["logical :: declined"])
+    lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, local)
     out = Path(out_path)
     out.write_text("\n".join(lines) + "\n")
     return out

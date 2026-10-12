@@ -3,11 +3,20 @@ stand-in that writes module variables on every call, and a substitute entry that
 binding declines."""
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from dace_fortran.bindings.fortran_interface import build_auto_interface
+from dace_fortran.bindings.module_access import declaration_imports, expose_module_variables
 from dace_fortran.bindings.specialization import recorded_invariants
-from dace_fortran.bindings.standin import RecordedValue, emit_recording_standin, emit_substitute_entry
+from dace_fortran.bindings.standin import (
+    RecordedValue,
+    UnsupportedStandinError,
+    emit_recording_standin,
+    emit_substitute_entry,
+)
 from tests._util import build_sdfg
 
 _MODULES = """
@@ -207,3 +216,154 @@ def test_a_baked_value_that_differs_sends_the_call_to_the_original(tmp_path: Pat
         sub.mkdir()
         plain, substituted = _with_baked(sub, baked)
         assert substituted == plain, baked[i]
+
+
+# Configuration a module keeps private: an array of flags, a real of a kind from another module, an array of records and
+# a record of a type from another module; one public variable beside them.
+_OPTS_KINDS = """
+module opts_kinds
+    implicit none
+    integer, parameter :: rk = 8
+    type span
+        integer :: lo, hi
+    end type span
+end module opts_kinds
+"""
+
+_OPTS = """
+module opts
+    use opts_kinds
+    implicit none
+    private
+    public :: n_steps
+    integer :: n_steps = 3
+    logical :: flags(3) = [.true., .false., .true.]
+    real(rk) :: tol = 0.25_rk
+    type(span) :: spans(2) = [span(1, 4), span(-2, 7)]
+    type(span) :: whole = span(5, 6)
+end module opts
+"""
+
+_PRIVATE = ["flags", "tol", "spans", "whole"]
+
+
+def _compile(src: Path, mod_dir: Path, *include: Path) -> Path:
+    obj = src.with_suffix(".o")
+    flags = [f"-J{mod_dir}", f"-I{mod_dir}", *(f"-I{d}" for d in include)]
+    subprocess.run(["gfortran", "-c", str(src), "-o", str(obj), *flags], check=True)
+    return obj
+
+
+def _link_and_run(exe: Path, objects: list[Path], standin_symbol: str | None) -> str:
+    wrap = []
+    if standin_symbol:
+        sym = "__kern_MOD_step"
+        wrap = [
+            f"-Wl,--wrap={sym}",
+            f"-Wl,--defsym=__wrap_{sym}={standin_symbol}_",
+            f"-Wl,--defsym=dace_original_step_=__real_{sym}",
+        ]
+    subprocess.run(["gfortran", *map(str, objects), *wrap, "-o", str(exe)], check=True)
+    return subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
+
+
+class _PrivateProgram:
+    """The program of ``_MAIN`` with the modules of ``_OPTS`` beside it, compiled against the original modules, and a
+    copy of ``opts`` with accessors to its private variables, compiled with its module file aside (as a stand-in never
+    sees it) to link in place of the original object."""
+
+    def __init__(self, tmp_path: Path):
+        self.dir = tmp_path
+        for name, text in (("kinds", _OPTS_KINDS), ("opts", _OPTS), ("modules", _MODULES), ("main", _MAIN)):
+            (tmp_path / f"{name}.f90").write_text(text)
+        self.kinds, self.opts, self.modules, self.main = (
+            _compile(tmp_path / f"{name}.f90", tmp_path) for name in ("kinds", "opts", "modules", "main")
+        )
+        copy_dir = tmp_path / "copy"
+        copy_dir.mkdir()
+        source, self.exposed = expose_module_variables(_OPTS, "opts", _PRIVATE)
+        (copy_dir / "opts.f90").write_text(source)
+        self.copy = _compile(copy_dir / "opts.f90", copy_dir, tmp_path)
+        self.imports = declaration_imports(
+            list(self.exposed.values()), "opts", {"opts": _OPTS, "opts_kinds": _OPTS_KINDS}
+        )
+        self.plain = _link_and_run(tmp_path / "run_plain", [self.kinds, self.opts, self.modules, self.main], None)
+
+    def run(self, standin: Path, symbol: str, *extra: Path) -> str:
+        """Output of the program with ``standin`` (compiled against the original modules) in place of kern::step and
+        the copy in place of opts."""
+        objects = [self.kinds, self.copy, self.modules, *(_compile(e, self.dir) for e in extra)]
+        objects += [_compile(standin, self.dir), self.main]
+        return _link_and_run(self.dir / f"run_{standin.stem}", objects, symbol)
+
+
+_OPTS_VALUES = [
+    RecordedValue("opts", "n_steps", "integer(4)"),
+    RecordedValue("opts", "flags(1)", "logical(4)"),
+    RecordedValue("opts", "flags(2)", "logical(4)"),
+    RecordedValue("opts", "tol", "real(8)"),
+    RecordedValue("opts", "spans(2)%hi", "integer(4)"),
+    RecordedValue("opts", "whole%lo", "integer(4)"),
+]
+
+
+def test_private_variables_are_recorded_through_the_accessors_of_a_copy(tmp_path: Path):
+    iface = _interface(tmp_path)
+    program = _PrivateProgram(tmp_path)
+    assert program.imports == ["use opts_kinds, only: rk, span"]
+    record = tmp_path / "calls.record"
+    standin = emit_recording_standin(
+        iface, _OPTS_VALUES, record, tmp_path / "record_step.f90", {"opts": program.exposed}, program.imports
+    )
+    text = standin.read_text()
+    assert "use opts, only: dace_value_0 => n_steps" in text  # public: imported as before
+    assert "use opts, only: dace_value_1" not in text  # private: no import, which would not compile
+    assert program.run(standin, "dace_record_step") == program.plain
+    assert recorded_invariants(record) == {
+        "opts::n_steps": 3,
+        "opts::flags(1)": 1,
+        "opts::flags(2)": 0,
+        "opts::tol": 0.25,
+        "opts::spans(2)%hi": 7,
+        "opts::whole%lo": 5,
+    }
+
+
+_OPTS_BAKED = [
+    (RecordedValue("opts", "flags(2)", "logical(4)"), 0),
+    (RecordedValue("opts", "spans(2)%hi", "integer(4)"), 7),
+    (RecordedValue("opts", "tol", "real(8)"), 0.25),
+    (RecordedValue("opts", "n_steps", "integer(4)"), 3),
+]
+
+
+def test_baked_private_values_are_checked_through_the_accessors_of_a_copy(tmp_path: Path):
+    iface = _interface(tmp_path)
+    program = _PrivateProgram(tmp_path)
+    (tmp_path / "binding.f90").write_text(_BINDING_TAKES)
+    for i, value in ((None, None), (0, 1), (1, 4), (2, 0.5), (3, 2)):
+        baked = list(_OPTS_BAKED)
+        if i is not None:
+            baked[i] = (baked[i][0], value)
+        entry = emit_substitute_entry(
+            iface,
+            "step_dace_bindings",
+            "step_dace",
+            tmp_path / f"sub_step_{i}.f90",
+            baked,
+            {"opts": program.exposed},
+            program.imports,
+        )
+        substituted = program.run(entry, "dace_sub_step", tmp_path / "binding.f90")
+        if i is None:
+            assert substituted != program.plain  # every value holds: the binding ran (and did nothing)
+        else:
+            assert substituted == program.plain, baked[i]
+
+
+def test_a_private_allocatable_is_refused(tmp_path: Path):
+    iface = _interface(tmp_path)
+    _, exposed = expose_module_variables(_OPTS, "opts", ["flags"])
+    allocatable = {"opts": {"flags": replace(exposed["flags"], allocatable=True)}}
+    with pytest.raises(UnsupportedStandinError, match="allocatable"):
+        emit_recording_standin(iface, _OPTS_VALUES[1:2], tmp_path / "r", tmp_path / "s.f90", allocatable)
