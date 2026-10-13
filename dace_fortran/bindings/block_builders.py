@@ -485,12 +485,12 @@ def build_wrapper_head(
             if r.rank > 0:
                 max_loop_rank = max(max_loop_rank, r.rank)
             # A device image of an array of records is kept from one call to the next (render_aos_alloc_pack_in).
-            kept = r.aos_alloc and r.flat_names[0] in device_pack
+            kept_image = r.aos_alloc and r.flat_names[0] in device_pack
             for flat in r.flat_names:
-                scratch_lines.append(f"    {ftype}, allocatable, target{', save' if kept else ''} :: {flat}{shape_dims}")
+                scratch_lines.append(f"    {ftype}, allocatable, target{', save' if kept_image else ''} :: {flat}{shape_dims}")
             if r.aos_alloc:
                 scratch_lines.append(f"    logical :: {', '.join(aos_bounds_locals(r))}")
-            if kept:
+            if kept_image:
                 saved, now, k, fresh = aos_kept_layout_locals(r)
                 int64 = fortran_c_type("int64")
                 scratch_lines.append(f"    {int64}, allocatable, save :: {saved}(:)")
