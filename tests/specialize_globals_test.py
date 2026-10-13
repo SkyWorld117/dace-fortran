@@ -210,10 +210,13 @@ def test_elements_of_a_scalar_array_read_at_literal_subscripts_are_candidates(tm
         "opts::weights(1)": "real(8)",
         "opts::weights(2)": "real(8)",
     }
-    # A read at a runtime subscript changes no element (flags(2) stays one); a write at one may change any (no element
-    # of counts is); a write at another literal subscript is other storage (levels(1) stays, levels(2) goes).
+    # A read at a runtime subscript changes no element, and makes every element of a small array a candidate
+    # (flags(d): all three, for a caller to fold once d is known); a write at one may change any (no element of counts
+    # is); a write at another literal subscript is other storage (levels(1) stays, levels(2) goes).
     assert SDFGBuilder(str(hlfir), entry="recon::tally").configuration_candidates == {
+        "opts::flags(1)": "logical(4)",
         "opts::flags(2)": "logical(4)",
+        "opts::flags(3)": "logical(4)",
         "opts::levels(1)": "integer(4)",
     }
 
@@ -262,3 +265,20 @@ def test_an_inlined_dummy_numbers_the_elements_from_its_own_lower_bound(tmp_path
     y = np.arange(4, dtype=np.float64)
     sdfg(y=y)
     np.testing.assert_array_equal(y, 30 * np.arange(4) + 10)
+
+
+def test_every_element_of_a_small_array_read_at_a_runtime_subscript_is_a_candidate(tmp_path):
+    """``flags(d)`` names no element until ``d`` is known: the candidates are all of them, so a caller can record the
+    array and fold the read once the subscript is fixed. Values given for them leave the runtime read as it is."""
+    hlfir = compile_to_hlfir(_ELEMENTS_SRC, tmp_path / "hlfir", name="recon")
+    candidates = SDFGBuilder(str(hlfir), entry="recon::tally").configuration_candidates
+    assert {f"opts::flags({k})" for k in (1, 2, 3)} <= set(candidates)
+    assert not any(c.startswith("opts::counts(") for c in candidates)  # written at a runtime subscript
+    sdfg = _elements_build(tmp_path, "recon::tally", {f"opts::flags({k})": k != 2 for k in (1, 2, 3)})
+    assert "flags" in sdfg.arrays  # still read at d
+    x, y = np.arange(4, dtype=np.float64), np.ones(4)
+    flags = np.array([1, 0, 1], dtype=sdfg.arrays["flags"].dtype.type)
+    counts = np.array([0, 0, 0], dtype=np.int32)
+    sdfg(x=x, y=y, d=3, flags=flags, counts=counts, levels=np.array([1, 2], dtype=np.int32))
+    np.testing.assert_array_equal(y, [1 + 0 + 0, 2, 3, 4])
+    assert counts.tolist() == [0, 0, 1]

@@ -33,7 +33,8 @@
 //     Every non-constant integer, real or logical module scalar, scalar
 //     component of a module record or of an element of a module array of
 //     records read at a constant subscript, and element of a module array of
-//     such scalars read at a constant subscript, the module reads and never writes --
+//     such scalars read at a constant subscript (every element of a small array of integers or logicals read at a
+//     runtime subscript, which a caller can fold once that subscript is known), the module reads and never writes --
 //     whatever the configuration of a run could fix -- is recorded first, before any value is applied, as the module
 //     attribute ``hlfir.configuration_candidates`` (``"module::name"`` ->
 //     Fortran type), so a caller can find out which values to fix.
@@ -325,6 +326,33 @@ llvm::SmallVector<int64_t, 4> constantElements(llvm::ArrayRef<fir::AddrOfOp> add
   return elements;
 }
 
+/// The largest fixed-size rank-1 array of integers or logicals whose elements are all candidates when it is read at a
+/// runtime subscript (a flag per direction read as ``flags(dir)``).
+constexpr int64_t kSmallArrayExtent = 16;
+
+/// The variable's lower bound when the module reads an element of it (a rank-1 array) at a subscript that is no
+/// literal (``flags(dir)``, ``dir`` a dummy or a loop index a caller fixes later), through declares and converts, and
+/// that element only ever read; nullopt when there is no such read or its numbering cannot be told.
+std::optional<int64_t> runtimeReadLowerBound(llvm::ArrayRef<fir::AddrOfOp> addrs) {
+  std::optional<int64_t> lower;
+  llvm::SmallVector<std::pair<mlir::Value, Subscripts>, 8> work;
+  for (fir::AddrOfOp addr : addrs) work.push_back({addr.getResult(), {}});
+  while (!work.empty()) {
+    auto [v, subscripts] = work.pop_back_val();
+    for (mlir::Operation* user : v.getUsers()) {
+      if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(user)) {
+        for (mlir::Value r : decl->getResults()) work.push_back({r, subscripts.below(decl)});
+      } else if (mlir::isa<fir::ConvertOp>(user)) {
+        work.push_back({user->getResult(0), subscripts});
+      } else if (auto d = mlir::dyn_cast<hlfir::DesignateOp>(user); d && d.getMemref() == v) {
+        if (!subscripts.known || !subscripts.variable) return std::nullopt;
+        if (!constantElement(d) && d.getIndices().size() == 1 && onlyReads(d.getResult())) lower = subscripts.variable;
+      }
+    }
+  }
+  return lower;
+}
+
 /// The Fortran type of an integer, real or logical scalar (``integer(4)``, ``real(8)``, ``logical(4)``), or "".
 std::string scalarTypeName(mlir::Type type) {
   if (auto logical = mlir::dyn_cast<fir::LogicalType>(type))
@@ -372,11 +400,21 @@ llvm::SmallVector<mlir::NamedAttribute, 64> collectCandidates(mlir::ModuleOp mod
     llvm::SmallVector<std::pair<ScalarPath, std::string>, 8> scalars;  // (path, Fortran type)
     mlir::Type type = global.getType();
     llvm::SmallVector<std::optional<int64_t>, 4> elements{std::nullopt};
+    bool readAtRuntime = false;
     if (auto seq = mlir::dyn_cast<fir::SequenceType>(type); seq && seq.getDimension() == 1 &&
                                                           seq.getShape()[0] != fir::SequenceType::getUnknownExtent()) {
       type = seq.getEleTy();
       elements.clear();
       for (int64_t k : constantElements(addrs, seq.getShape()[0])) elements.push_back(k);
+      // A small array of integers or logicals read at a runtime subscript (per-direction flags, per-phase counts):
+      // every element, so a caller can record them all and fold a branch or a loop bound on the read once the
+      // subscript is known, after the loop that sets it is unrolled. Real data read element by element stays open.
+      if (mlir::isa<mlir::IntegerType, fir::LogicalType>(type) && seq.getShape()[0] <= kSmallArrayExtent)
+        if (std::optional<int64_t> const lb = runtimeReadLowerBound(addrs)) {
+          elements.clear();
+          for (int64_t k = *lb; k < *lb + seq.getShape()[0]; ++k) elements.push_back(k);
+          readAtRuntime = true;
+        }
     }
     if (auto record = mlir::dyn_cast<fir::RecordType>(type)) {
       for (std::optional<int64_t> element : elements)
@@ -390,7 +428,8 @@ llvm::SmallVector<mlir::NamedAttribute, 64> collectCandidates(mlir::ModuleOp mod
       llvm::SmallVector<fir::LoadOp, 8> loads;
       bool readOnly = true;
       for (fir::AddrOfOp addr : addrs) readOnly = readOnly && onlyLoaded(addr, loads, path);
-      if (!readOnly || loads.empty()) continue;
+      // An element only read at runtime subscripts has no load of its own; it is still read.
+      if (!readOnly || (loads.empty() && !readAtRuntime)) continue;
       std::string key = mod + "::" + name;
       if (path.element) key += "(" + std::to_string(*path.element) + ")";
       if (!path.component.empty()) key += "%" + path.component;
