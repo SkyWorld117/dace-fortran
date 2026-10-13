@@ -1485,7 +1485,17 @@ std::string buildExpr(mlir::Value val, int d) {
   // we mint for scf.if results already hold 0 / 1, and Python handles
   // ``0 != 0`` as False / ``1 != 0`` as True uniformly.
   if (nm == "arith.trunci" || nm == "arith.extui" || nm == "arith.extsi") {
-    if (def->getNumOperands() == 1) return buildExpr(def->getOperand(0), d + 1);
+    if (def->getNumOperands() == 1) {
+      mlir::Value const src = def->getOperand(0);
+      // A boolean widened to an integer -- what ``merge(1, 0, c)`` (``arith.select %c, 1, 0``) canonicalises to once
+      // its operands are constants -- is that integer, not the boolean: Python compares ``(i == 1) > 0`` either way,
+      // but a symbolic expression of it (an interstate condition, a loop bound) does not, and ``extsi`` makes true -1.
+      if (nm != "arith.trunci" && src.getType().isInteger(1)) {
+        std::string const b = buildBoolExpr(src, d + 1);
+        if (b != "?") return "(" + std::string(nm == "arith.extsi" ? "-1" : "1") + " if " + b + " else 0)";
+      }
+      return buildExpr(src, d + 1);
+    }
   }
 
   // ``fir.is_present``  --  Fortran's ``present(x)`` on an OPTIONAL dummy.
