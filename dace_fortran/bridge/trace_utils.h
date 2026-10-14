@@ -210,6 +210,14 @@ hlfir::DesignateOp asInlinedSectionOverComponent(hlfir::DeclareOp decl);
 /// pins. vec_in over p_vn(:,:,blockno) -> 1.
 unsigned countScalarSectionDims(hlfir::DesignateOp sec);
 
+/// The rank of a declare's own view (its array type), 0 for a scalar.
+unsigned declaredRank(hlfir::DeclareOp decl);
+
+/// An ELEMENT actual (every subscript scalar, no triplet) bound to a RANK-1 dummy: sequence association,
+/// ``call recon(q%vf(e), ...)`` with ``v_vf(lb:ub)`` -- the dummy's subscript counts from that element on, so the
+/// element's last subscript composes with it instead of standing beside it as a record dimension of its own.
+bool isElementActualOfRank1Dummy(hlfir::DeclareOp decl, hlfir::DesignateOp sec);
+
 /// If decl is a LOCAL pointer to a whole derived-type object rebound once via ptr => <source>, return the source value
 /// (peeled to its declare/component designate); null if not a local record-object pointer, rebind is ambiguous, or
 /// pointee is scalar/array (a view, handled by view_alias). traceToDecl/rootedAtStructDummy/walkMemberChain follow this

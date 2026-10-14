@@ -282,27 +282,14 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
   // into [jc, jk, blockno, k], each triplet dim taking the section's start and stride (``v(lo:hi)``: ``lo + (i - 1)``),
   // the head subscripts counted from ``viewLbs`` (the lower bounds of the view they index; empty: 1). Do NOT use the
   // generic triplet loop below -- it drops the member tail.
-  // The rank of an inlined dummy's own view (its declare's array type), 0 for a scalar.
-  auto rankOfDecl = [](hlfir::DeclareOp dc) -> unsigned {
-    mlir::Type t = dc.getResult(0).getType();
-    for (int hop = 0; hop < 6; ++hop) {
-      if (auto rt = mlir::dyn_cast<fir::ReferenceType>(t)) { t = rt.getEleTy(); continue; }
-      if (auto bt = mlir::dyn_cast<fir::BoxType>(t)) { t = bt.getEleTy(); continue; }
-      if (auto ht = mlir::dyn_cast<fir::HeapType>(t)) { t = ht.getEleTy(); continue; }
-      if (auto pt = mlir::dyn_cast<fir::PointerType>(t)) { t = pt.getEleTy(); continue; }
-      break;
-    }
-    if (auto seq = mlir::dyn_cast<fir::SequenceType>(t)) return seq.getDimension();
-    return 0;
-  };
   auto applySectionHop = [](hlfir::DesignateOp sec, std::vector<DimEntry>& entries,
-                            const std::vector<mlir::Value>& viewLbs, unsigned dummyRank) {
+                            const std::vector<mlir::Value>& viewLbs, bool elementOfRank1Dummy) {
     auto trips = sec.getIsTriplet();
     unsigned T = 0;
     for (bool const t : trips)
       if (t) ++T;
     auto sidx = sec.getIndices();
-    if (T == 0 && !sidx.empty() && dummyRank == 1 && !entries.empty()) {
+    if (elementOfRank1Dummy && T == 0 && !sidx.empty() && !entries.empty()) {
       // An ELEMENT actual bound to a rank-1 dummy (sequence association, MFC's
       // ``s_reconstruct...(q_prim_qp%vf(e), ...)`` with ``v_vf(iv%beg:iv%end)``): the dummy's subscript counts
       // from that element on -- ``v_vf(i)`` is element ``e + (i - lb)`` -- so it composes with the element's
@@ -382,7 +369,7 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
         headFresh = false;
       }
       if (auto sec = asInlinedSectionOverComponent(dc)) {
-        applySectionHop(sec, entries, headLbs, rankOfDecl(dc));
+        applySectionHop(sec, entries, headLbs, isElementActualOfRank1Dummy(dc, sec));
         takeHead();
         parent_val = sec.getMemref();
         continue;
@@ -432,7 +419,7 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
     // Direct AoR section parent (fully inlined, no ``vec_in`` declare): same positional compose as the copy_in-declare
     // case above; the generic triplet loop below would drop the member tail.
     if (auto sec = asSectionOverComponent(parent.getResult())) {
-      applySectionHop(sec, entries, headLbs, 0);
+      applySectionHop(sec, entries, headLbs, false);
       takeHead();
       parent_val = sec.getMemref();
       continue;

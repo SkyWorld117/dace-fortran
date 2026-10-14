@@ -263,6 +263,27 @@ unsigned countScalarSectionDims(hlfir::DesignateOp sec) {
   return n;
 }
 
+unsigned declaredRank(hlfir::DeclareOp decl) {
+  mlir::Type t = decl.getResult(0).getType();
+  for (int hop = 0; hop < 8; ++hop) {
+    if (auto rt = mlir::dyn_cast<fir::ReferenceType>(t)) { t = rt.getEleTy(); continue; }
+    if (auto bt = mlir::dyn_cast<fir::BoxType>(t)) { t = bt.getEleTy(); continue; }
+    if (auto ht = mlir::dyn_cast<fir::HeapType>(t)) { t = ht.getEleTy(); continue; }
+    if (auto pt = mlir::dyn_cast<fir::PointerType>(t)) { t = pt.getEleTy(); continue; }
+    break;
+  }
+  if (auto seq = mlir::dyn_cast<fir::SequenceType>(t)) return seq.getDimension();
+  return 0;
+}
+
+bool isElementActualOfRank1Dummy(hlfir::DeclareOp decl, hlfir::DesignateOp sec) {
+  if (!decl || !sec || !decl.getDummyScope()) return false;
+  if (sec.getIndices().empty()) return false;
+  for (bool const t : sec.getIsTriplet())
+    if (t) return false;
+  return declaredRank(decl) == 1;
+}
+
 mlir::Value traceLocalPointerRebindSource(hlfir::DeclareOp decl) {
   // Gate 1: a LOCAL Fortran POINTER (pointer attribute set, no dummy scope -- an entry/inlined-callee pointer dummy is
   // bound by its caller, not rebound here).

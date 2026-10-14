@@ -4341,7 +4341,10 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
           // +1 scalar -> pendingRec == 3 flushes onto the ``p_vn`` segment
           // (record_dims=[.., 3, ..], outer_rank 3).
           if (auto sec = asInlinedSectionOverComponent(dc)) {
-            pendingRec += static_cast<int>(countScalarSectionDims(sec));
+            // An ELEMENT actual bound to a rank-1 dummy (sequence association): the element's last subscript
+            // composes with the dummy's own, which the element read already counted -- one record dim fewer.
+            int const composed = isElementActualOfRank1Dummy(dc, sec) ? 1 : 0;
+            pendingRec += static_cast<int>(countScalarSectionDims(sec)) - composed;
             pendingConst = pendingConst && sectionScalarsAllConst(sec);
             v = sec.getMemref();
             continue;
