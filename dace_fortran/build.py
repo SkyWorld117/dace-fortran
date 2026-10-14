@@ -233,6 +233,7 @@ def make_builder(
     kind_map: dict | None = None,
     kind_passthrough: bool = False,
     merge_engine: MergeEngine = MergeEngine.REGEX,
+    specialized_globals: dict | None = None,
 ) -> SDFGBuilder:
     """Resolve the entry, lower ``source`` to HLFIR, and return a
     configured (not yet built) :class:`SDFGBuilder`.
@@ -271,7 +272,7 @@ def make_builder(
             kind_map=kind_map,
             kind_passthrough=kind_passthrough,
         )
-        builder = SDFGBuilder(str(hlfir), pipeline=pipeline, entry=fwd)
+        builder = SDFGBuilder(str(hlfir), pipeline=pipeline, entry=fwd, specialized_globals=specialized_globals)
     builder.fortran_source = source
     return builder
 

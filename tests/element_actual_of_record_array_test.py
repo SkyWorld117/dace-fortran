@@ -105,3 +105,14 @@ def test_section_bounded_by_a_record_member_keeps_the_images_rank(tmp_path):
     image = next(a for a in frozen.args if a.sdfg_name == "q_vf_sf")
     assert image.rank == 4
     assert not any(s.endswith("q_vf_sf_d4") for s in frozen.free_symbols)
+
+
+def test_section_bounded_by_a_baked_record_member_keeps_the_images_rank(tmp_path):
+    """The same, with ``c_idx`` baked to 4 as the recorded invariants bake it: the section bounds fold to constants
+    before the bridge runs."""
+    sdfg = build_sdfg(_SRC_BOUNDS, tmp_path / "sdfg", name="run", entry="m_recb::run",
+                      specialized_globals={"m_recb::c_idx": 4}).build()
+    frozen = get_frozen_signature(sdfg)
+    image = next(a for a in frozen.args if a.sdfg_name == "q_vf_sf")
+    assert image.rank == 4
+    assert not any(s.endswith("q_vf_sf_d4") for s in frozen.free_symbols)

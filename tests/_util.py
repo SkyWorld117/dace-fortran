@@ -231,12 +231,14 @@ def build_sdfg(
     entry: str | None = None,
     defines=(),
     merge_engine: MergeEngine = MergeEngine.REGEX,
+    specialized_globals: dict | None = None,
 ):
-    """Test funnel over :func:`dace_fortran.build.make_builder`: adds the per-test xdist-safe SDFG naming / dump-dir wrapper on top of the real builder.  ``entry=None`` auto-resolves from the single procedure in ``source``."""
+    """Test funnel over :func:`dace_fortran.build.make_builder`: adds the per-test xdist-safe SDFG naming / dump-dir wrapper on top of the real builder.  ``entry=None`` auto-resolves from the single procedure in ``source``.  ``specialized_globals`` (``"module::name"`` -> value) bakes module variables into the code, as the recorded invariants do."""
     from dace_fortran.build import make_builder
 
     builder = make_builder(
-        source, entry=entry, name=name, pipeline=pipeline, out_dir=out_dir, defines=defines, merge_engine=merge_engine
+        source, entry=entry, name=name, pipeline=pipeline, out_dir=out_dir, defines=defines, merge_engine=merge_engine,
+        specialized_globals=specialized_globals,
     )
     suffix = _per_test_suffix()
     dump = _dump_dir()
