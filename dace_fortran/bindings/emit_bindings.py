@@ -36,7 +36,7 @@ from dace_fortran.bindings.specialization import (
     guard_module_sources,
     render_symbol_record,
 )
-from dace_fortran.bindings.storage_guard import STORAGE_GUARD_HELPERS, build_storage_guard
+from dace_fortran.bindings.storage_guard import STORAGE_GUARD_HELPERS, build_alias_record, build_storage_guard
 
 
 def emit_bindings(
@@ -190,6 +190,12 @@ def emit_bindings(
     if record_symbols_to is not None:
         record = render_symbol_record(frozen, iface, plan, record_symbols_to)
         if record_only:
+            # The members of elements of module arrays of records that are another array of the SDFG: the substitute
+            # built from the record folds the two (its storage guard would decline them).
+            aliases = build_alias_record(frozen, iface, plan, record_symbols_to)
+            if aliases:
+                record = [*aliases, "", *record]
+                blocks["helpers"] = STORAGE_GUARD_HELPERS
             record += decline_after_record()
         blocks["wrapper_body"] = "\n".join([blocks["wrapper_body"], "", *record])
     extra = guard_module_sources(specialization, iface, plan) if specialization is not None else None

@@ -259,4 +259,41 @@ def test_without_members_apart_or_in_a_sizing_run_there_is_no_guard(tmp_path):
         record_symbols_to=tmp_path / "record",
         record_only=True,
     )
-    assert "dace_spans_overlap" not in sizing.read_text()
+    assert "if (dace_spans_overlap(" not in sizing.read_text()  # the alias record shares the helpers, not the guard
+
+
+def test_a_sizing_run_records_the_members_that_are_another_array(tmp_path):
+    """The sizing binding appends ``alias <image> <element> <array>`` to ``<record>.aliases`` for every member of an
+    element of a module array of records whose storage is exactly a module array's or a dummy's: the substitute
+    folds the two."""
+    from dace_fortran.bindings.emit_bindings import emit_bindings
+    from dace_fortran.bindings.storage_guard import MEMBER_READ, build_alias_record
+
+    frozen, iface = _signature_with_member()
+    lines = build_alias_record(frozen, iface, FlattenPlan(), tmp_path / "record")
+    text = "\n".join(lines)
+    assert f"call dace_span_add(dace_spans, dace_nspans, {MEMBER_READ}, storage_size(g(aos_g_sf_i0)%sf) / 8" in text
+    assert text.count(", aos_g_sf_i0)") == 1  # the element the member belongs to
+    assert "'g_sf'" in text and "'t'" in text and "'x'" in text  # the SDFG names the record uses
+    assert f"file='{tmp_path / 'record'}.aliases'" in text
+    assert "call dace_spans_aliases(dace_spans, dace_nspans, dace_alias_unit, dace_span_sdfg)" in text
+    sizing = emit_bindings(
+        frozen,
+        iface,
+        FlattenPlan(),
+        tmp_path / "kern_bindings.f90",
+        specialization=Specialization({}, frozen),
+        record_symbols_to=tmp_path / "record",
+        record_only=True,
+    ).read_text()
+    assert "dace_spans_aliases" in sizing and "subroutine dace_spans_aliases" in sizing
+    assert "if (dace_spans_overlap(" not in sizing  # no guard in a sizing run
+
+
+def test_recorded_aliases_are_those_of_every_call(tmp_path):
+    from dace_fortran.bindings.specialization import recorded_aliases
+
+    record = tmp_path / "record"
+    assert recorded_aliases(record) == []
+    (tmp_path / "record.aliases").write_text("alias g_sf 0 t\nalias g_sf 1 x\n\nalias g_sf 0 t\n\n")
+    assert recorded_aliases(record) == [("g_sf", 0, "t")]

@@ -123,6 +123,28 @@ def _parse(text: str) -> Value:
         return float(text.replace("D", "E"))
 
 
+def recorded_aliases(path: str | Path) -> list[tuple[str, int, str]]:
+    """The ``(image, element, array)`` aliases every call recorded at ``path`` reported (``<path>.aliases``, written
+    by the alias record of a sizing run: the member of ``element`` of the array of records ``image`` is the SDFG image
+    of IS the array ``array``); empty without the file."""
+    file = Path(f"{path}.aliases")
+    if not file.is_file():
+        return []
+    calls: list[set[tuple[str, int, str]]] = [set()]
+    for line in file.read_text().splitlines():
+        fields = line.split()
+        if not fields:
+            if calls[-1]:
+                calls.append(set())
+            continue
+        if len(fields) == 4 and fields[0] == "alias":
+            calls[-1].add((fields[1], int(fields[2]), fields[3]))
+    calls = [c for c in calls if c]
+    if not calls:
+        return []
+    return sorted(set.intersection(*calls))
+
+
 def recorded_invariants(path: str | Path) -> dict[str, Value]:
     """The values that stayed the same in every call recorded at ``path`` (see :func:`render_symbol_record`)."""
     seen: dict[str, set[Value]] = {}

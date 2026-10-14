@@ -37,21 +37,24 @@ MEMBER_READ, MEMBER_WRITTEN, IN_PLACE_READ, IN_PLACE_WRITTEN = 1, 2, 3, 4
 _SPANS, _COUNT = "dace_spans", "dace_nspans"
 
 #: The arrays whose ranges the guard being built appends, in order: a range's tag is its index here (1-based), and
-#: the decline message names the two arrays that overlap.
-_NAMES: list[str] = []
+#: the decline message names the two arrays that overlap.  Per range: the Fortran expression, the SDFG array it
+#: is (empty when the alias record does not take it), and the expression of its element index in an array of records.
+_NAMES: list[tuple[str, str, str]] = []
 _NAME_LEN = 96
 
 
-def _span_add(expr: str, rank: int, kind: int) -> str:
+def _span_add(expr: str, rank: int, kind: int, sdfg_name: str = "", elem: str = "0") -> str:
     """The statement appending the address range of the array ``expr`` (of rank ``rank``, defined) as ``kind``:
-    nothing when it has no elements.  ``rank`` 0 takes ``expr`` as one element, scalar or not."""
-    _NAMES.append(expr)
+    nothing when it has no elements.  ``rank`` 0 takes ``expr`` as one element, scalar or not.  ``sdfg_name`` and
+    ``elem`` (the 1-based index of the element of the array of records the member belongs to) name the range in the
+    alias record."""
+    _NAMES.append((expr, sdfg_name, elem))
     tag = len(_NAMES)
     bytes_ = f"storage_size({expr}) / 8"
     if rank == 0:
         return (
             f"call dace_span_add({_SPANS}, {_COUNT}, {kind}, {bytes_}, [int(loc({expr}), c_intptr_t)], "
-            f"[integer(c_intptr_t) ::], {tag})"
+            f"[integer(c_intptr_t) ::], {tag}, {elem})"
         )
     first = [f"lbound({expr}, {d})" for d in range(1, rank + 1)]
     corners = [f"loc({expr}({', '.join(first)}))"]
@@ -62,7 +65,7 @@ def _span_add(expr: str, rank: int, kind: int) -> str:
     extents = ", ".join(f"size({expr}, {d}, kind=c_intptr_t)" for d in range(1, rank + 1))
     return (
         f"if (size({expr}) > 0) call dace_span_add({_SPANS}, {_COUNT}, {kind}, {bytes_}, "
-        f"int([{', '.join(corners)}], c_intptr_t), [{extents}], {tag})"
+        f"int([{', '.join(corners)}], c_intptr_t), [{extents}], {tag}, {elem})"
     )
 
 
@@ -98,12 +101,16 @@ def _module_record_members(frozen: FrozenSignature) -> list[list[str]]:
         kind = MEMBER_WRITTEN if a.is_written else MEMBER_READ
         if _aos_lead(a) == 0:
             member = f"{a.aos_origin_struct}%{a.aos_member_path}"
-            out.append(_guarded([_present(member, a.aos_member_pointer)], [_span_add(member, member_rank, kind)]))
+            out.append(_guarded([_present(member, a.aos_member_pointer)],
+                                [_span_add(member, member_rank, kind, a.sdfg_name, "1")]))
             continue
         pieces = _aos_loop_pieces(a)
         loops = _aos_loops(a, pieces)
         member = pieces.accessor
-        inner = _guarded([_present(member, a.aos_member_pointer)], [_span_add(member, member_rank, kind)])
+        # The alias record names the element of a rank-1 array of records (the one case it folds).
+        elem = pieces.loop_vars[0] if _aos_lead(a) == 1 and not a.aos_root_rank else "0"
+        inner = _guarded([_present(member, a.aos_member_pointer)],
+                         [_span_add(member, member_rank, kind, a.sdfg_name if elem != "0" else "", elem)])
         # The element loops of the copy-in, without its prelude (that sizes the buffer).
         nest = [ln.strip() for ln in loops.do_open]
         depth = len(nest)
@@ -176,7 +183,7 @@ def _in_place_arrays(frozen: FrozenSignature, iface: OriginalInterface, plan: Fl
         host = _module_value_expr(oa.sdfg_name, members)
         kind = IN_PLACE_WRITTEN if oa.is_written else IN_PLACE_READ
         # A length-1 argument may be a scalar module variable lifted to an array: take it as one element.
-        span = _span_add(host, 0 if tuple(oa.shape) == ("1",) else oa.rank, kind)
+        span = _span_add(host, 0 if tuple(oa.shape) == ("1",) else oa.rank, kind, oa.sdfg_name)
         conditions = [_present(host, oa.module_origin_pointer)] if _module_arg_may_be_unallocated(oa) else []
         out.append(_guarded(conditions, [span]))
     dummies = {a.name.lower(): a for a in iface.args}
@@ -189,7 +196,7 @@ def _in_place_arrays(frozen: FrozenSignature, iface: OriginalInterface, plan: Fl
         conditions = [f"present({dummy.name})"] if dummy.optional else []
         if dummy.name in pointers:
             conditions.append(f"associated({dummy.name})")
-        out.append(_guarded(conditions, [_span_add(dummy.name, dummy.rank, kind)]))
+        out.append(_guarded(conditions, [_span_add(dummy.name, dummy.rank, kind, fa.sdfg_name)]))
     return out
 
 
@@ -207,7 +214,7 @@ def build_storage_guard(
     if not module_members and not dummy_members:
         return []
     groups = module_members + dummy_members + in_records + _in_place_arrays(frozen, iface, plan)
-    names = [n.replace("'", "''")[:_NAME_LEN] for n in _NAMES]
+    names = [n.replace("'", "''")[:_NAME_LEN] for n, _sdfg, _elem in _NAMES]
     lines = [
         f"{_INDENT}! ----- Storage guard: members handed over apart share no storage with another array -----",
         f"{_INDENT}block",
@@ -238,15 +245,53 @@ def build_storage_guard(
     return lines
 
 
+def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, path) -> list[str]:
+    """Wrapper lines of a sizing run appending, to ``<path>.aliases``, a line ``alias <image> <element> <array>`` for
+    every member of an element of a rank-1 module array of records (``<image>`` its SDFG image, ``<element>`` the
+    0-based element) whose storage is exactly that of a module array or array dummy the SDFG takes in place
+    (``<array>``), and an empty line that ends the call.  The substitute built from the record takes the two as one
+    array (``fold_aliases``), which the storage guard would otherwise decline.  Empty when the SDFG takes no such
+    member."""
+    from pathlib import Path
+
+    _NAMES.clear()
+    module_members = _module_record_members(frozen)
+    dummy_members, in_records = _dummy_record_members(frozen, iface, plan)
+    if not module_members:
+        return []
+    groups = module_members + dummy_members + in_records + _in_place_arrays(frozen, iface, plan)
+    sdfg_names = [n.replace("'", "''")[:_NAME_LEN] for _expr, n, _elem in _NAMES]
+    lines = [
+        f"{_INDENT}! ----- Alias record: members handed over apart that are another array of the SDFG -----",
+        f"{_INDENT}block",
+        f"{_INDENT}  integer(c_intptr_t), allocatable :: {_SPANS}(:, :)",
+        f"{_INDENT}  integer :: {_COUNT}, dace_alias_unit",
+        f"{_INDENT}  character(len={_NAME_LEN}), parameter :: dace_span_sdfg({len(sdfg_names)}) = "
+        f"[character(len={_NAME_LEN}) :: &",
+        *(f"{_INDENT}    '{n}'{',' if i + 1 < len(sdfg_names) else ''} &" for i, n in enumerate(sdfg_names)),
+        f"{_INDENT}    ]",
+        f"{_INDENT}  {_COUNT} = 0",
+    ]
+    lines += [f"{_INDENT}  {ln}" for group in groups for ln in group]
+    lines += [
+        f"{_INDENT}  open(newunit=dace_alias_unit, file='{Path(path)}.aliases', position='append', action='write')",
+        f"{_INDENT}  call dace_spans_aliases({_SPANS}, {_COUNT}, dace_alias_unit, dace_span_sdfg)",
+        f"{_INDENT}  write(dace_alias_unit, '(a)') ''",
+        f"{_INDENT}  close(dace_alias_unit)",
+        f"{_INDENT}end block",
+    ]
+    return lines
+
+
 #: The module procedures the guard calls.
 STORAGE_GUARD_HELPERS = """\
   ! Append the address range of an array with elements to spans(:, :n) as (start, end, kind): corners(1) is the
   ! address of its first element, corners(1 + d) that of the next element along dim d (the first again when that
   ! dim has one element), extents its extents.  Whatever the strides, the range spans every element.
-  subroutine dace_span_add(spans, n, kind, bytes, corners, extents, tag)
+  subroutine dace_span_add(spans, n, kind, bytes, corners, extents, tag, elem)
     integer(c_intptr_t), allocatable, intent(inout) :: spans(:, :)
     integer, intent(inout) :: n
-    integer, intent(in) :: kind, bytes, tag
+    integer, intent(in) :: kind, bytes, tag, elem
     integer(c_intptr_t), intent(in) :: corners(:), extents(:)
     integer(c_intptr_t), allocatable :: grown(:, :)
     integer(c_intptr_t) :: lo, hi, reach
@@ -258,15 +303,36 @@ STORAGE_GUARD_HELPERS = """\
       lo = lo + min(reach, 0_c_intptr_t)
       hi = hi + max(reach, 0_c_intptr_t)
     end do
-    if (.not. allocated(spans)) allocate(spans(4, 16))
+    if (.not. allocated(spans)) allocate(spans(5, 16))
     if (n == size(spans, 2)) then
-      allocate(grown(4, 2 * n))
+      allocate(grown(5, 2 * n))
       grown(:, :n) = spans(:, :n)
       call move_alloc(grown, spans)
     end if
     n = n + 1
-    spans(:, n) = [lo, hi + bytes - 1, int(kind, c_intptr_t), int(tag, c_intptr_t)]
+    spans(:, n) = [lo, hi + bytes - 1, int(kind, c_intptr_t), int(tag, c_intptr_t), int(elem, c_intptr_t)]
   end subroutine dace_span_add
+
+  ! Write ``alias <member image> <element> <array>`` for every member handed over apart (kind 1 or 2, of a named
+  ! element) whose range is exactly that of an array the SDFG takes in place (kind 3 or 4): the same storage.
+  subroutine dace_spans_aliases(spans, n, unit, names)
+    integer(c_intptr_t), allocatable, intent(in) :: spans(:, :)
+    integer, intent(in) :: n, unit
+    character(len=*), intent(in) :: names(:)
+    integer :: i, j
+    do i = 1, n
+      if (spans(3, i) > 2 .or. spans(5, i) < 1) cycle
+      if (len_trim(names(int(spans(4, i)))) == 0) cycle
+      do j = 1, n
+        if (spans(3, j) < 3) cycle
+        if (len_trim(names(int(spans(4, j)))) == 0) cycle
+        if (spans(1, i) == spans(1, j) .and. spans(2, i) == spans(2, j)) then
+          write(unit, '(a, 1x, a, 1x, i0, 1x, a)') 'alias', trim(names(int(spans(4, i)))), int(spans(5, i)) - 1, &
+            trim(names(int(spans(4, j))))
+        end if
+      end do
+    end do
+  end subroutine dace_spans_aliases
 
   ! Whether two of the ranges spans(:, :n) overlap where the SDFG would see stale or clobbered data: a member handed
   ! over apart from its record (kind 1, or 2 when written) and any other array, unless neither is written.  Two
@@ -280,7 +346,7 @@ STORAGE_GUARD_HELPERS = """\
     logical, parameter :: clash(4, 4) = reshape([.false., .true., .false., .true., .true., .true., .true., .true., &
                                                  .false., .true., .false., .false., .true., .true., .false., .false.], &
                                                 [4, 4])
-    integer(c_intptr_t) :: reach(4), held(4)
+    integer(c_intptr_t) :: reach(4), held(5)
     integer :: i, k, j, root, child, last, reach_tag(4)
     overlap = .false.
     tag_a = 0
