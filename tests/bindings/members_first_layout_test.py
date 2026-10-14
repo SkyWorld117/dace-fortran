@@ -142,7 +142,9 @@ def test_lay_out_members_first_leaves_a_buffer_with_an_odd_nested_descriptor(cap
 # first, kept between calls and copied back every call.
 
 
-def _build(tmp_path: Path, kept: tuple[str, ...]):
+def _build(tmp_path: Path, kept: tuple[str, ...], name: str):
+    """Build the SDFG (named ``name``: two builds in one process must not share a library), emit the binding with
+    the image laid out members first and kept when ``kept`` names it; returns ``(so_path, binding_path)``."""
     from dace_fortran.bindings import FlattenPlan, emit_bindings
     from tests.bindings.kept_record_buffer_test import _SRC
     from dace_fortran.bindings.fortran_interface import build_auto_interface
@@ -151,10 +153,10 @@ def _build(tmp_path: Path, kept: tuple[str, ...]):
 
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    builder = build_sdfg(_SRC, sdfg_dir, name="accumulate", entry="kept_state::accumulate")
+    builder = build_sdfg(_SRC, sdfg_dir, name=name, entry="kept_state::accumulate")
     plan = FlattenPlan.from_dict(builder.module.get_flatten_plan())
     sdfg = builder.build()
-    sdfg.name = "accumulate"
+    sdfg.name = name
     buffers = record_buffers(sdfg._frozen_signature)
     assert buffers == {"acc_vf_sf": 1}
     first = lay_out_members_first(sdfg, buffers)
@@ -162,7 +164,7 @@ def _build(tmp_path: Path, kept: tuple[str, ...]):
     compiled = sdfg.compile()
     so_path = Path(compiled._lib._library_filename)
     iface = build_auto_interface(sdfg._fortran_interface_raw, sdfg.name)
-    binding = tmp_path / "accumulate_bindings.f90"
+    binding = tmp_path / f"{name}_bindings.f90"
     emit_bindings(
         sdfg._frozen_signature,
         iface,
@@ -180,17 +182,18 @@ def test_members_first_image_matches_gfortran_e2e(tmp_path: Path, kept: tuple[st
     from tests.bindings.kept_record_buffer_test import _DRIVER, _SRC, _run
     from tests.bindings.module_global_aos_struct_test import _link_pair
 
-    so_path, binding = _build(tmp_path, kept)
+    name = "accumulate_kept" if kept else "accumulate_back"
+    so_path, binding = _build(tmp_path, kept, name)
     text = binding.read_text()
     assert "member dimensions first" in text
     assert "acc_vf_sf_d0 = int(size(acc_vf_sf, dim=4), c_int)" in text
     assert "acc_vf_sf_d1 = int(size(acc_vf_sf, dim=1), c_int)" in text
     assert "offset_acc_vf_sf_d1 = int(lbound(acc_vf_sf, dim=1), c_int)" in text
     driver = _DRIVER.format(
-        suffix="", use_callee="use accumulate_dace_bindings, only: accumulate_dace", call="accumulate_dace"
+        suffix="", use_callee=f"use {name}_dace_bindings, only: {name}_dace", call=f"{name}_dace"
     )
     reference = _DRIVER.format(suffix="_ref", use_callee="use kept_state, only: accumulate", call="accumulate")
-    sdfg_lib, ref_lib = _link_pair(_SRC, "accumulate", driver, reference, so_path, binding, tmp_path)
+    sdfg_lib, ref_lib = _link_pair(_SRC, name, driver, reference, so_path, binding, tmp_path)
 
     rng = np.random.default_rng(1)
     n, calls = 3, 4
@@ -221,9 +224,10 @@ def test_members_first_must_be_module_record_buffers(tmp_path: Path):
     from tests._util import build_sdfg
     from tests.bindings.kept_record_buffer_test import _SRC
 
-    builder = build_sdfg(_SRC, tmp_path / "sdfg", name="accumulate", entry="kept_state::accumulate")
+    builder = build_sdfg(_SRC, tmp_path / "sdfg", name="accumulate_wrong", entry="kept_state::accumulate")
     plan = FlattenPlan.from_dict(builder.module.get_flatten_plan())
     sdfg = builder.build()
+    sdfg.name = "accumulate_wrong"
     iface = build_auto_interface(sdfg._fortran_interface_raw, sdfg.name)
     with pytest.raises(ValueError, match="members_first"):
         emit_bindings(sdfg._frozen_signature, iface, plan, str(tmp_path / "b.f90"), (), members_first=("x",))
