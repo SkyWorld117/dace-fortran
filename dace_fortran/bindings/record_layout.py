@@ -33,7 +33,9 @@ def members_first_strides(shape, lead: int) -> list:
     for d in members_first_order(lead, len(shape)):
         strides[d] = stride
         stride = stride * shape[d]
-    return strides
+    # Spelled out and parsed again: the symbols then carry the assumptions a reloaded SDFG gives them, so a nested
+    # descriptor stays equivalent to its container after a save and load.
+    return [dace.symbolic.pystr_to_symbolic(str(x)) for x in strides]
 
 
 def record_buffers(frozen: FrozenSignature) -> dict[str, int]:

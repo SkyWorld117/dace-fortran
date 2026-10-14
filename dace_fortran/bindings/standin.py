@@ -306,8 +306,15 @@ def emit_substitute_entry(
     args = [a.name for a in iface.args]
     original = standin_name("original", iface.entry)
     uses = [f"use {binding_module}, only: {wrapper}"]
-    local = ["logical :: declined"]
+    local = ["logical :: declined", "character(len=120) :: dace_why", "logical, save :: dace_reported = .false."]
     body: list[str] = []
+    # The first call declined says why, once: a baked variable (the entry's own checks) or the binding's checks.
+    report = [
+        "if (declined .and. .not. dace_reported) then",
+        f"    write(*, '(3a)') '{iface.entry}: the substitute declined (', trim(dace_why), '); the original runs'",
+        "    dace_reported = .true.",
+        "end if",
+    ]
     if baked:
         reads = _value_reads([v for v, _ in baked], "dace_baked", private_access, private_imports)
         uses += reads.uses
@@ -315,12 +322,16 @@ def emit_substitute_entry(
         checks = [
             _differs(expr, value, v.fortran_type) for (v, value), expr in zip(baked, reads.expressions, strict=True)
         ]
-        body += [*reads.statements, "declined = .false."]
-        body += [f"if ({c}) declined = .true." for c in checks]
-        body += ["if (declined) then", *(f"    {ln}" for ln in _with_arguments(f"call {original}", args)), "    return",
-                 "end if"]
+        body += [*reads.statements, "declined = .false.", "dace_why = ''"]
+        for (v, _value), c in zip(baked, checks, strict=True):
+            body += [f"if ({c}) then", "    declined = .true.",
+                     f"    if (dace_why == '') dace_why = 'baked {v.module}::{v.name} differs'", "end if"]
+        body += ["if (declined) then", *(f"    {ln}" for ln in report),
+                 *(f"    {ln}" for ln in _with_arguments(f"call {original}", args)), "    return", "end if"]
     body += [
         *_with_arguments(f"call {wrapper}", [*args, "dace_declined=declined"]),
+        "dace_why = 'a check of the binding: members, storage or specialised extents'",
+        *report,
         *_with_arguments(f"if (declined) call {original}", args),
     ]
     lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, local)

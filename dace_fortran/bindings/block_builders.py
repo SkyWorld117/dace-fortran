@@ -2331,6 +2331,14 @@ def _build_symbol_assigns(
         path = _struct_member_paths.get(base)
         return _entry_presence_guard(iface, path) if path else ""
 
+    # An array the bridge renamed (``dir`` -> ``program_dir``, a name Python or the wrapper could not use) keeps its
+    # extent and lower-bound symbols under the Fortran name: they are read off the array's own source.
+    renamed = {
+        a.fortran_name: a.sdfg_name
+        for a in frozen.args
+        if a.kind is FrozenArgKind.ARRAY and a.fortran_name and a.fortran_name != a.sdfg_name
+        and a.fortran_name not in arg_names and not a.from_struct_member and not a.aos_origin_struct
+    }
     out: list[str] = []
     unsourced: list[str] = []
     for sym in frozen.free_symbols:
@@ -2339,6 +2347,15 @@ def _build_symbol_assigns(
         if sym in aos_pack_syms:
             continue
         m = _OFFSET_SYM_RE.match(sym) or _EXTENT_SYM_RE.match(sym)
+        if m and m.group(1) in renamed:
+            target, dim = renamed[m.group(1)], int(m.group(2)) + 1
+            if _OFFSET_SYM_RE.match(sym):
+                alias, guard = module_array_hosts.get(target, (target, ""))
+                out.extend(_guarded_assign(sym, f"lbound({alias}, dim={dim})", guard, absent="1"))
+            else:
+                alias, guard = module_array_extents.get(target, (target, ""))
+                out.extend(_guarded_assign(sym, f"size({alias}, dim={dim})", guard, absent="1"))
+            continue
         if m and m.group(1) in members_first:
             buf = arg_by_sdfg[m.group(1)]
             query = ExtentQuery.LBOUND if _OFFSET_SYM_RE.match(sym) else ExtentQuery.SIZE

@@ -238,7 +238,10 @@ class FrozenSignature:
         # models them separately, so validate as two partitions here.
         live_names = [k for k in live_arglist if k not in live_fs]
         snap_names = [a.sdfg_name for a in self.args if a.sdfg_name not in snap_fs]
-        if live_names != snap_names:
+        # Compared as sorted lists: the live arglist is in DaCe's (lexicographic) order while the snapshot lists the
+        # elements of a split array of records in element order (``x_2`` before ``x_10``); the C interface takes
+        # its order from the compiled signature, not from either.
+        if sorted(live_names) != sorted(snap_names):
             raise SignatureDriftError(
                 f"signature drift on {self.entry!r}: expected args {snap_names}, got {live_names}"
             )
