@@ -716,6 +716,7 @@ def build_wrapper_body(
     declinable: bool = False,
     passed: Container[str] | None = None,
     kept: Container[str] = frozenset(),
+    members_first: Container[str] = frozenset(),
 ) -> str:
     """Render the between-declaration-and-SDFG-call block: for each FlattenEntry
     either alias it (zero-copy) or allocate + copy in, then populate SDFG free
@@ -726,7 +727,9 @@ def build_wrapper_body(
     ``passed``: the free symbols the wrapper hands the SDFG (:func:`passed_symbols`); one of them it has no source
     for raises :class:`UnsourcedSymbolError`.
     ``kept``: buffers of arrays of records the wrapper keeps between calls, packed only by a call that finds none of
-    the members' shape (see :func:`emit_bindings`)."""
+    the members' shape (see :func:`emit_bindings`).
+    ``members_first``: buffers of arrays of records laid out with the member dimensions first (see
+    :func:`emit_bindings`)."""
     deviceptr, device_pack = _device_lane(acc_residency)
     outer_dummy_set = {a.name for a in iface.args}
     enum_args = _enum_args(iface, enum_maps or {})
@@ -803,7 +806,7 @@ def build_wrapper_body(
     # Symbol population is SPLIT by data dependency: a shape sym from a module
     # global/dummy/constant must be assigned BEFORE the allocates below, while a
     # buffer-EXTENT sym (size of a buffer we allocate) can only be assigned AFTER.
-    sym_lines = _build_symbol_assigns(frozen, plan, outer_dummy_set, iface, passed)
+    sym_lines = _build_symbol_assigns(frozen, plan, outer_dummy_set, iface, passed, members_first)
     extra_syms = _extra_local_symbols(frozen, iface, plan)
     _buffer_names = buffer_local_names(frozen, iface, plan)
 
@@ -885,7 +888,14 @@ def build_wrapper_body(
         body.append("")
         body.append("    ! ----- Module-global AoS-struct components (AoS->SoA) -----")
         for a in aos_args:
-            body.extend(_render_aos_copy_in(a, device=a.sdfg_name in device_pack, kept=a.sdfg_name in kept))
+            body.extend(
+                _render_aos_copy_in(
+                    a,
+                    device=a.sdfg_name in device_pack,
+                    kept=a.sdfg_name in kept,
+                    members_first=a.sdfg_name in members_first,
+                )
+            )
 
     unsourced = _unsourced_array_args(frozen, iface, plan)
     if unsourced:
@@ -974,12 +984,13 @@ def build_wrapper_tail(
     module_allocatables_are_targets: bool = True,
     acc_residency: AccTransferPlan | None = None,
     kept: Container[str] = frozenset(),
+    members_first: Container[str] = frozenset(),
 ) -> str:
     """Render the wrapper tail: init-count bump + call dace_program_<entry> +
     copy-back for every non-aliased writeable entry, then deallocate + close.
     Template templates/wrapper_call.f90.in supplies the skeleton; we splice the
     copy-back block in before its end marker.  A buffer in ``kept`` stays as it is for the next call: no copy-back,
-    no release (see :func:`emit_bindings`)."""
+    no release; one in ``members_first`` is unpacked in its permuted layout (see :func:`emit_bindings`)."""
     tpl = _load("wrapper_call.f90.in")
     deviceptr, device_pack = _device_lane(acc_residency)
 
@@ -1078,7 +1089,7 @@ def build_wrapper_tail(
         if a.sdfg_name in kept:
             continue
         if a.is_written:
-            aos_out_lines.extend(_render_aos_copy_out(a, device=device))
+            aos_out_lines.extend(_render_aos_copy_out(a, device=device, members_first=a.sdfg_name in members_first))
         else:
             if device:
                 aos_out_lines.append(f"    !$acc exit data delete({a.sdfg_name})")
@@ -1719,6 +1730,24 @@ def _aos_lead(a: FrozenArg) -> int:
     return a.aos_root_rank + a.aos_outer_rank
 
 
+def buffer_dim(a: FrozenArg, sdfg_dim: int, members_first: bool = False) -> int:
+    """The Fortran dimension (1-based) of the buffer of the record member ``a`` that holds the SDFG's dimension
+    ``sdfg_dim`` (0-based).  The buffer is laid out as the SDFG's shape reads, the record dimensions before the
+    member's, unless ``members_first``: then the member dimensions come first and the record dimensions after them
+    (:mod:`dace_fortran.bindings.record_layout`)."""
+    lead = _aos_lead(a)
+    if not members_first or not 0 < lead < a.rank:
+        return sdfg_dim + 1
+    return sdfg_dim - lead + 1 if sdfg_dim >= lead else sdfg_dim + a.rank - lead + 1
+
+
+def _buffer_spec(records: str, members: str, members_first: bool) -> str:
+    """Subscripts or allocation bounds of a record member's buffer: its record dimensions then its member dimensions,
+    or the other way round (``members_first``)."""
+    parts = (members, records) if members_first else (records, members)
+    return ", ".join(p for p in parts if p)
+
+
 def _aos_root_and_segment(a: FrozenArg) -> tuple[str, str]:
     """``field`` and ``comp`` of ``aos_origin_struct`` ``field % comp`` (a root that is itself an array of records)."""
     root, _, segment = a.aos_origin_struct.partition("%")
@@ -1850,7 +1879,12 @@ def _top_level_items(spec: str) -> list[str]:
 
 
 def _render_kept_release(
-    a: FrozenArg, loops: AosLoops, lowers: Sequence[str], uppers: Sequence[str], device: bool
+    a: FrozenArg,
+    loops: AosLoops,
+    lowers: Sequence[str],
+    uppers: Sequence[str],
+    device: bool,
+    members_first: bool = False,
 ) -> list[str]:
     """Drop a kept buffer whose shape the members no longer take (reallocated since it was packed): the call then
     packs it afresh."""
@@ -1858,7 +1892,9 @@ def _render_kept_release(
     lead = _aos_lead(a)
 
     def extents(spec: str) -> str:
-        return " .and. ".join(f"size({buf}, {k + 1}) == {e}" for k, e in enumerate(_top_level_items(spec)))
+        return " .and. ".join(
+            f"size({buf}, {buffer_dim(a, k, members_first)}) == {e}" for k, e in enumerate(_top_level_items(spec))
+        )
 
     out = [
         f"    if (allocated({buf})) then",
@@ -1869,8 +1905,9 @@ def _render_kept_release(
         "      end if",
     ]
     for j, (lo, hi) in enumerate(zip(lowers, uppers, strict=True)):
-        out.append(f"      {same} = {same} .and. lbound({buf}, {lead + j + 1}) == {lo} .and. &")
-        out.append(f"        ubound({buf}, {lead + j + 1}) == {hi}")
+        dim = buffer_dim(a, lead + j, members_first)
+        out.append(f"      {same} = {same} .and. lbound({buf}, {dim}) == {lo} .and. &")
+        out.append(f"        ubound({buf}, {dim}) == {hi}")
     out.append(f"      if (.not. {same}) then")
     if device:
         out.append(f"        !$acc exit data delete({buf})")
@@ -1892,7 +1929,9 @@ def keepable(a: FrozenArg) -> bool:
     )
 
 
-def _render_aos_copy_in(a: FrozenArg, device: bool = False, kept: bool = False) -> list[str]:
+def _render_aos_copy_in(
+    a: FrozenArg, device: bool = False, kept: bool = False, members_first: bool = False
+) -> list[str]:
     """Allocate the SoA buffer + pack the host AoS component in. A deferred-shape
     member keeps its own bounds: per member dim the buffer spans the lowest lower
     to the highest upper bound over the elements, and each element fills its own
@@ -1906,7 +1945,10 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False, kept: bool = False) 
 
     ``kept``: the buffer is the routine's own copy of the members, kept between calls (saved, never copied back):
     packed only while it is unallocated, and again whenever the members' shape no longer matches it.  Only a
-    deferred-shape member of a module array of records takes this lane."""
+    deferred-shape member of a module array of records takes this lane.
+
+    ``members_first``: the buffer is laid out with the member dimensions first and the record dimensions after them
+    (:mod:`dace_fortran.bindings.record_layout`); the SDFG's descriptor must carry the matching strides."""
     pieces = _aos_loop_pieces(a)
     if kept and not keepable(a):
         raise ValueError(
@@ -1971,12 +2013,12 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False, kept: bool = False) 
         ]
         out += prelude
         out.append(f"    if ({sp}) then")
-        out.append(f"      allocate({a.sdfg_name}({outer_dims}, {cap_dims})); {a.sdfg_name} = {zero}")
+        out.append(f"      allocate({a.sdfg_name}({_buffer_spec(outer_dims, cap_dims, members_first)})); {a.sdfg_name} = {zero}")
         out += do_open
-        out.append(f"        {a.sdfg_name}({idx}, {slc}) = {elem}")
+        out.append(f"        {a.sdfg_name}({_buffer_spec(idx, slc, members_first)}) = {elem}")
         out += do_close
         out.append("    else")
-        out.append(f"      allocate({a.sdfg_name}({one_dims}, {cap_dims})); {a.sdfg_name} = {zero}")
+        out.append(f"      allocate({a.sdfg_name}({_buffer_spec(one_dims, cap_dims, members_first)})); {a.sdfg_name} = {zero}")
         out.append("    end if")
         return out
     # member_rank > 0: 2D+ ALLOCATABLE/POINTER component per element, bounds
@@ -2002,16 +2044,18 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False, kept: bool = False) 
         out.append(f"    {hi} = max({hi}, {lo})")
     bound_dims = ", ".join(f"{lo}:{hi}" for lo, hi in zip(lowers, uppers, strict=True))
     start = len(out)
+    if members_first:
+        out[0] = out[0].replace("copy-in", "copy-in, member dimensions first")
     if kept:
         out[0] = out[0].replace("copy-in", "copy-in, kept between calls")
-        out += _render_kept_release(a, _aos_loops(a, pieces), lowers, uppers, device)
+        out += _render_kept_release(a, _aos_loops(a, pieces), lowers, uppers, device, members_first)
         # What follows allocates and packs: only for a buffer the call does not find.
         out.append(f"    if (.not. allocated({a.sdfg_name})) then")
         start = len(out)
     out.append(f"    if ({sp}) then")
-    out.append(f"      allocate({a.sdfg_name}({outer_dims}, {bound_dims}))")
+    out.append(f"      allocate({a.sdfg_name}({_buffer_spec(outer_dims, bound_dims, members_first)}))")
     out.append("    else")
-    out.append(f"      allocate({a.sdfg_name}({one_dims}, {bound_dims}))")
+    out.append(f"      allocate({a.sdfg_name}({_buffer_spec(one_dims, bound_dims, members_first)}))")
     out.append("    end if")
     if device:
         out[0] = out[0].replace("copy-in:", "copy-in on the device:")
@@ -2027,12 +2071,12 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False, kept: bool = False) 
         if device:
             member_idx = ", ".join(pieces.member_loop_vars)
             out.append(f"        if ({mp}) then")
-            out += _device_member_loop(pieces, f"{a.sdfg_name}({idx}, {member_idx}) = {elem}({member_idx})")
+            out += _device_member_loop(pieces, f"{a.sdfg_name}({_buffer_spec(idx, member_idx, members_first)}) = {elem}({member_idx})")
             out.append("        end if")
         else:
             slc = _own_bounds(elem, mrank)
             out.append(f"        if ({mp}) &")
-            out.append(f"          {a.sdfg_name}({idx}, {slc}) = {elem}")
+            out.append(f"          {a.sdfg_name}({_buffer_spec(idx, slc, members_first)}) = {elem}")
         out += do_close
         out.append("    end if")
     if kept:
@@ -2041,11 +2085,11 @@ def _render_aos_copy_in(a: FrozenArg, device: bool = False, kept: bool = False) 
     return out
 
 
-def _render_aos_copy_out(a: FrozenArg, device: bool = False) -> list[str]:
+def _render_aos_copy_out(a: FrozenArg, device: bool = False, members_first: bool = False) -> list[str]:
     """Pack the SoA buffer back into the host AoS component (only when the arg
     is WRITTEN), allocating each component first if the kernel created it.
     ``device`` mirrors :func:`_render_aos_copy_in`: OpenACC loops into the members' device copies, then the buffer's
-    device copy is deleted."""
+    device copy is deleted.  ``members_first``: the buffer's layout, as in :func:`_render_aos_copy_in`."""
     pieces = _aos_loop_pieces(a)
     its, _lowers, _uppers, mrank, elem = pieces[:5]
     if _aos_lead(a) == 0:
@@ -2084,7 +2128,7 @@ def _render_aos_copy_out(a: FrozenArg, device: bool = False) -> list[str]:
         ]
         out.append(f"    if ({sp}) then")
         out += do_open
-        out.append(f"        {elem} = {a.sdfg_name}({idx}, {slc})")
+        out.append(f"        {elem} = {a.sdfg_name}({_buffer_spec(idx, slc, members_first)})")
         out += do_close
         out.append("    end if")
         out.append(f"    deallocate({a.sdfg_name})")
@@ -2099,18 +2143,18 @@ def _render_aos_copy_out(a: FrozenArg, device: bool = False) -> list[str]:
             raise ValueError(f"{a.sdfg_name}: a member the kernel allocates cannot be unpacked on the device")
         alloc_dims = ", ".join(
             f"lbound({a.sdfg_name}, {k}):ubound({a.sdfg_name}, {k})"
-            for k in range(_aos_lead(a) + 1, _aos_lead(a) + mrank + 1)
+            for k in (buffer_dim(a, _aos_lead(a) + j, members_first) for j in range(mrank))
         )
         out.append(f"        if (.not. {mp}) allocate({elem}({alloc_dims}))")
     if device:
         member_idx = ", ".join(pieces.member_loop_vars)
         out.append(f"        if ({mp}) then")
-        out += _device_member_loop(pieces, f"{elem}({member_idx}) = {a.sdfg_name}({idx}, {member_idx})")
+        out += _device_member_loop(pieces, f"{elem}({member_idx}) = {a.sdfg_name}({_buffer_spec(idx, member_idx, members_first)})")
         out.append("        end if")
     else:
         slc = _own_bounds(elem, mrank)
         out.append(f"        if ({mp}) &")
-        out.append(f"          {elem} = {a.sdfg_name}({idx}, {slc})")
+        out.append(f"          {elem} = {a.sdfg_name}({_buffer_spec(idx, slc, members_first)})")
     out += do_close
     out.append("    end if")
     if device:
@@ -2171,6 +2215,7 @@ def _build_symbol_assigns(
     outer_dummy_set: set,
     iface: OriginalInterface,
     passed: Container[str] | None = None,
+    members_first: Container[str] = frozenset(),
 ) -> list[str]:
     """Emit one assignment per free SDFG symbol from the caller's actual storage:
     offset_<arr>_d<i> -> lbound, <arr>_d<i> -> extent/size. Flatten-plan expr
@@ -2179,7 +2224,8 @@ def _build_symbol_assigns(
 
     A symbol nothing gives a value gets a ``TODO`` comment and no assignment.  That is harmless only for one the
     wrapper does not hand the SDFG: one in ``passed`` (when given) raises :class:`UnsourcedSymbolError` instead of
-    passing an uninitialised local."""
+    passing an uninitialised local.  The extents and lower bounds of a buffer in ``members_first`` are read off the
+    buffer's dimension holding each SDFG dimension (:func:`buffer_dim`)."""
     _module_sources = effective_module_sources(frozen, iface, plan)
     _synth_members = _synthetic_members(plan)
     # Struct-member free symbols with no FlattenEntry (used only as a loop bound /
@@ -2291,6 +2337,13 @@ def _build_symbol_assigns(
         if sym in outer_dummy_set:
             continue
         if sym in aos_pack_syms:
+            continue
+        m = _OFFSET_SYM_RE.match(sym) or _EXTENT_SYM_RE.match(sym)
+        if m and m.group(1) in members_first:
+            buf = arg_by_sdfg[m.group(1)]
+            query = ExtentQuery.LBOUND if _OFFSET_SYM_RE.match(sym) else ExtentQuery.SIZE
+            dim = buffer_dim(buf, int(m.group(2)), True)
+            out.append(f"    {sym} = int({query.value}({buf.sdfg_name}, dim={dim}), c_int)")
             continue
         m = _EXTENT_SYM_RE.match(sym)
         if m and not _OFFSET_SYM_RE.match(sym):

@@ -56,6 +56,7 @@ def emit_bindings(
     private_access: Mapping[str, Mapping[str, ExposedVariable]] | None = None,
     private_imports: Sequence[str] = (),
     kept_images: Collection[str] = (),
+    members_first: Collection[str] = (),
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -110,6 +111,9 @@ def emit_bindings(
     else reads or writes their members between its calls): the wrapper packs such a buffer once, keeps it (and its
     device copy) for the next call and never copies it back, so the routine's state lives in the buffer instead of the
     members.  A call that finds the members reallocated to another shape packs the buffer afresh.
+    ``members_first``: buffers of module arrays of records the SDFG reads with the member dimensions fastest
+    (:func:`dace_fortran.bindings.record_layout.lay_out_members_first`): the wrapper allocates, packs, measures and
+    unpacks them with the member dimensions before the record dimensions.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -120,6 +124,12 @@ def emit_bindings(
         raise ValueError(
             "kept_images: not buffers of deferred-shape members of module arrays of records the SDFG "
             f"takes: {sorted(kept - eligible)}"
+        )
+    first = frozenset(members_first)
+    if first - eligible:
+        raise ValueError(
+            "members_first: not buffers of deferred-shape members of module arrays of records the SDFG "
+            f"takes: {sorted(first - eligible)}"
         )
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +160,7 @@ def emit_bindings(
             declinable=specialization is not None,
             passed=passed_symbols(frozen, dace_arglist, init_symbols),
             kept=kept,
+            members_first=first,
         ),
         "wrapper_tail": build_wrapper_tail(
             frozen,
@@ -161,6 +172,7 @@ def emit_bindings(
             module_allocatables_are_targets=module_allocatables_are_targets,
             acc_residency=acc_residency,
             kept=kept,
+            members_first=first,
         ),
         "finalize": build_finalize(iface),
     }
