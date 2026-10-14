@@ -48,3 +48,60 @@ def test_element_actual_composes_with_the_dummy_subscript(tmp_path):
     image = next(a for a in frozen.args if a.sdfg_name == "q_vf_sf")
     assert image.rank == 4
     assert not any(s.endswith("q_vf_sf_d4") for s in frozen.free_symbols)
+
+
+_SRC_BOUNDS = """
+MODULE m_recb
+  IMPLICIT NONE
+  TYPE scalar_field
+    REAL(8), POINTER :: sf(:, :, :) => NULL()
+  END TYPE
+  TYPE vector_field
+    TYPE(scalar_field), ALLOCATABLE :: vf(:)
+  END TYPE
+  TYPE int_bounds_info
+    INTEGER :: beg, end
+  END TYPE
+  TYPE(vector_field) :: q
+  TYPE(int_bounds_info) :: iv
+  INTEGER :: c_idx
+CONTAINS
+  SUBROUTINE pack_group(v, out, m)
+    INTEGER, INTENT(IN) :: m
+    TYPE(scalar_field), DIMENSION(iv%beg:iv%end), INTENT(IN) :: v
+    REAL(8), INTENT(OUT) :: out(0:m, 0:m, 0:m)
+    INTEGER :: i, j, k, l
+    DO i = iv%beg, iv%end
+      DO l = 0, m
+        DO k = 0, m
+          DO j = 0, m
+            out(j, k, l) = out(j, k, l) + i * v(i)%sf(j, k, l)
+          END DO
+        END DO
+      END DO
+    END DO
+  END SUBROUTINE pack_group
+  SUBROUTINE run(out, m, nv)
+    INTEGER, INTENT(IN) :: m, nv
+    REAL(8), INTENT(OUT) :: out(0:m, 0:m, 0:m)
+    out = 0.0D0
+    ! every variable first (MFC: 1:sys_size), then the one group (c_idx:c_idx) -- the same routine inlined twice
+    iv%beg = 1
+    iv%end = nv
+    CALL pack_group(q%vf(1:nv), out, m)
+    iv%beg = c_idx
+    iv%end = c_idx
+    CALL pack_group(q%vf(iv%beg:iv%end), out, m)
+  END SUBROUTINE run
+END MODULE m_recb
+"""
+
+
+def test_section_bounded_by_a_record_member_keeps_the_images_rank(tmp_path):
+    """MFC's surface tension: ``iv%beg = c_idx; iv%end = c_idx`` then the reconstruction over
+    ``q_prim_qp%vf(iv%beg:iv%end)`` with the dummy declared ``(iv%beg:iv%end)``."""
+    sdfg = build_sdfg(_SRC_BOUNDS, tmp_path / "sdfg", name="run", entry="m_recb::run").build()
+    frozen = get_frozen_signature(sdfg)
+    image = next(a for a in frozen.args if a.sdfg_name == "q_vf_sf")
+    assert image.rank == 4
+    assert not any(s.endswith("q_vf_sf_d4") for s in frozen.free_symbols)
