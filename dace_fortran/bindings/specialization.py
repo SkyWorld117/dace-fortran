@@ -207,6 +207,7 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
     lines.append(f"{_INDENT}block")
     lines += [f"{_INDENT}  integer(c_int64_t) :: {s}" for s in spec.values if assigns.get(s)]
     lines.append(f"{_INDENT}  character(len={width}) :: dace_mismatch")
+    lines.append(f"{_INDENT}  logical, save :: dace_said = .false.")
     lines.append(f"{_INDENT}  dace_mismatch = ''")
     for s in spec.values:
         lines += ["  " + ln for ln in assigns.get(s, ())]
@@ -216,6 +217,9 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
     lines += [
         f"{_INDENT}  if (dace_mismatch /= '') then",
         f"{_INDENT}    if (present({DECLINED_FLAG})) then",
+        f"{_INDENT}      if (.not. dace_said) write(0, '(3a)') '{iface.entry}_dace declines: ', trim(dace_mismatch), &",
+        f"{_INDENT}        ' does not hold the value the SDFG was specialised to'",
+        f"{_INDENT}      dace_said = .true.",
         f"{_INDENT}      {DECLINED_FLAG} = .true.",
         f"{_INDENT}      return",
         f"{_INDENT}    end if",

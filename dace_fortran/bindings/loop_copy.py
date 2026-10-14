@@ -485,7 +485,10 @@ def render_aos_alloc_members(
     )
     refuse = []
     if declined_flag:
-        refuse += [f"if (present({declined_flag})) then", f"  {declined_flag} = .true.", "  return", "end if"]
+        refuse += [f"if (present({declined_flag})) then",
+                   f"  write(0, '(a)') 'declined: an element of {outer_expr} is absent or not of the shape its "
+                   "siblings share'",
+                   f"  {declined_flag} = .true.", "  return", "end if"]
     refuse.append(f"error stop 'an element of {outer_expr} is absent or not of the shape its siblings share'")
     lines = [
         f"    ! ----- Members of {outer_expr}, one array per element, aliased in place -----",

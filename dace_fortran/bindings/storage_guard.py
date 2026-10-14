@@ -207,7 +207,10 @@ def build_storage_guard(
         f"{_INDENT}  {_COUNT} = 0",
     ]
     lines += [f"{_INDENT}  {ln}" for group in groups for ln in group]
-    refuse = [f"if (present({DECLINED_FLAG})) then", f"  {DECLINED_FLAG} = .true.", "  return", "end if"]
+    refuse = [f"if (present({DECLINED_FLAG})) then",
+              f"  write(0, '(a)') '{iface.entry}_dace declines: a member handed over apart from its record shares "
+              "storage with another array'",
+              f"  {DECLINED_FLAG} = .true.", "  return", "end if"]
     lines += [
         f"{_INDENT}  if (dace_spans_overlap({_SPANS}, {_COUNT})) then",
         *(f"{_INDENT}    {ln}" for ln in (refuse if declinable else [])),
