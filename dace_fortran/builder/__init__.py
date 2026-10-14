@@ -40,6 +40,7 @@ NOTE on nanobind bindings:
 
 from __future__ import annotations
 
+import os
 import ast
 import builtins
 import functools
@@ -2086,6 +2087,12 @@ class SDFGBuilder:
             "member and the access chain dead-ends at the struct root."
         )
         bullet = "\n  ".join(examples) if examples else "(no use site found)"
+        dump = os.environ.get("DACE_FORTRAN_DUMP_DIR")
+        if dump:  # the SDFG as built, for a look at the use sites with their containers and nesting
+            try:
+                sdfg.save(os.path.join(dump, "unresolved_symbols.sdfg"))
+            except Exception:  # noqa: BLE001 -- the diagnosis below matters more than the dump
+                pass
         raise RuntimeError(
             f"unresolved free symbol(s) in SDFG: {unresolved[:5]}"
             f"{'' if len(unresolved) <= 5 else f' (+{len(unresolved) - 5} more)'}"
