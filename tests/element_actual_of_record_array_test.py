@@ -116,3 +116,17 @@ def test_section_bounded_by_a_baked_record_member_keeps_the_images_rank(tmp_path
     image = next(a for a in frozen.args if a.sdfg_name == "q_vf_sf")
     assert image.rank == 4
     assert not any(s.endswith("q_vf_sf_d4") for s in frozen.free_symbols)
+
+
+def test_element_actual_into_a_dummy_with_a_record_lower_bound(tmp_path):
+    """The real surface-tension call: an ELEMENT ``q_prim_qp%vf(e)`` passed to a dummy declared
+    ``(iv%beg:iv%end)`` with ``iv%beg = e`` -- sequence association with a non-unit lower bound: ``v_vf(i)`` is
+    element ``e + (i - iv%beg)``."""
+    src = _SRC_BOUNDS.replace("CALL pack_group(q%vf(iv%beg:iv%end), out, m)", "CALL pack_group(q%vf(iv%beg), out, m)")
+    assert src != _SRC_BOUNDS
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="run", entry="m_recb::run",
+                      specialized_globals={"m_recb::c_idx": 4}).build()
+    frozen = get_frozen_signature(sdfg)
+    image = next(a for a in frozen.args if a.sdfg_name == "q_vf_sf")
+    assert image.rank == 4
+    assert not any(s.endswith("q_vf_sf_d4") for s in frozen.free_symbols)
