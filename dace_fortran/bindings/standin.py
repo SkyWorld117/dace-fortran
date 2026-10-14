@@ -311,7 +311,7 @@ def emit_substitute_entry(
     # The first call declined says why, once: a baked variable (the entry's own checks) or the binding's checks.
     report = [
         "if (declined .and. .not. dace_reported) then",
-        f"    write(*, '(3a)') '{iface.entry}: the substitute declined (', trim(dace_why), '); the original runs'",
+        f"    write(0, '(3a)') '{iface.entry}: the substitute declined (', trim(dace_why), '); the original runs'",
         "    dace_reported = .true.",
         "end if",
     ]
