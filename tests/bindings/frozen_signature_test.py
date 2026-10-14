@@ -371,7 +371,10 @@ def test_verify_against_happy_path():
     fs.verify_against(sdfg)
 
 
-def test_drift_detection_arg_reordering():
+def test_arg_reordering_is_not_drift():
+    """The names are compared as sets: the live arglist is in DaCe's lexicographic order while a snapshot lists the
+    elements of a split array of records in element order (``x_2`` before ``x_10``); the C interface takes its order
+    from the compiled signature, not from either list."""
     sdfg = dace.SDFG("compute")
     sdfg.add_symbol("m", dace.int64)
     sdfg.add_symbol("n", dace.int64)
@@ -387,8 +390,17 @@ def test_drift_detection_arg_reordering():
         args=(fs.args[1], fs.args[0]),
         free_symbols=fs.free_symbols,
     )
+    swapped.verify_against(sdfg)
+
+
+def test_drift_detection_arg_renamed():
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("m", dace.int64)
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"), dace.symbol("m")), dtype=dace.float64, transient=False)
+    sdfg.add_array("c", shape=(dace.symbol("n"), dace.symbol("m")), dtype=dace.float64, transient=False)
     with pytest.raises(SignatureDriftError):
-        swapped.verify_against(sdfg)
+        _demo_signature().verify_against(sdfg)
 
 
 def test_drift_detection_dtype_change():
