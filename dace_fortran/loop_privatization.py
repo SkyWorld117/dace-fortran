@@ -9,7 +9,9 @@ from one nest to another.
 
 :func:`privatize_loop_local_arrays` renames such an array per outermost loop when, in every loop using it, each read
 is covered by a write earlier in the same iteration: then the loops cannot exchange values through it, and each copy
-is local to its loop for ``LoopToMap`` to privatise.  Scalars are covered too: ``ScalarFission`` splits a scalar only
+is local to its loop for ``LoopToMap`` to privatise.  The same holds for an array that one loop uses this way and
+that code outside the loops only writes: nothing outside reads what the loop leaves in it (the copy-in of a callee's
+``intent(out)`` argument the bridge stages before the loop, say).  Scalars are covered too: ``ScalarFission`` splits a scalar only
 where one write dominates its reads and leaves it whole otherwise.  The check is conservative -- a write counts once
 every path through the iteration makes it and names constant elements, a read (in dataflow or on an interstate edge)
 only if it names constant elements already written, or any element once the whole array is -- and an array it cannot
@@ -45,34 +47,40 @@ def _privatize(sdfg: SDFG) -> dict[str, list[str]]:
     # Per array and outermost loop: the blocks accessing it -- states through access nodes, and the source blocks of
     # interstate edges whose condition or assignments read an element of it.
     users: dict[str, dict[LoopRegion, list[ControlFlowBlock]]] = defaultdict(lambda: defaultdict(list))
-    outside: set[str] = set()
+    # Arrays read, and arrays only written, by code outside every loop.
+    read_outside: set[str] = set()
+    written_outside: set[str] = set()
     for state in sdfg.states():
         loop = _outermost_loop(state, sdfg)
         for node in state.data_nodes():
             if not sdfg.arrays[node.data].transient:
                 continue
-            if loop is None:
-                outside.add(node.data)
-            else:
+            if loop is not None:
                 users[node.data][loop].append(state)
+            elif state.out_degree(node):
+                read_outside.add(node.data)
+            elif state.in_degree(node):
+                written_outside.add(node.data)
     for edge in sdfg.all_interstate_edges(recursive=True):
         loop = _outermost_loop(edge.src, sdfg)
         for read in edge.data.get_read_memlets(sdfg.arrays):
             if read.data not in sdfg.arrays or not sdfg.arrays[read.data].transient:
                 continue
             if loop is None:
-                outside.add(read.data)
+                read_outside.add(read.data)
             else:
                 users[read.data][loop].append(edge.src)
 
     renamed: dict[str, list[str]] = {}
     for name, loops in users.items():
-        if name in outside or len(loops) < 2:
+        # One loop and no other user: LoopToMap privatises it itself.
+        if name in read_outside or (len(loops) < 2 and name not in written_outside):
             continue
         if not all(_iteration_local(name, loop, blocks) for loop, blocks in loops.items()):
             continue
         copies = []
-        for loop in list(loops)[1:]:
+        # The writes outside keep the original name; every loop then needs a copy of its own.
+        for loop in list(loops) if name in written_outside else list(loops)[1:]:
             new_name = sdfg.add_datadesc(name, sdfg.arrays[name].clone(), find_new_name=True)
             for state in loop.all_states():
                 for node in state.data_nodes():

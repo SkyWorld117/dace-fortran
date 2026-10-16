@@ -603,7 +603,7 @@ def build_wrapper_head(
             scratch_lines.append(f"    integer(c_int) :: {', '.join(int_names)}")
 
     # Absent-optional data buffers with no host source: a degenerate local.
-    for a in _unsourced_array_args(frozen, iface, plan):
+    for a in unsourced_array_args(frozen, iface, plan):
         ftype = fortran_c_type(a.dtype)
         spec = "(" + ", ".join(":" for _ in range(a.rank)) + ")"
         scratch_lines.append(f"    {ftype}, allocatable, target :: {a.sdfg_name}{spec}")
@@ -665,7 +665,7 @@ def buffer_local_names(frozen: FrozenSignature, iface: OriginalInterface, plan: 
     one of them can only be assigned after that step."""
     names = {a.sdfg_name for a, _m, _mem in _orphan_module_args(frozen, iface, plan) if a.rank > 0}
     names |= {a.sdfg_name for a in _aos_module_args(frozen)}
-    names |= {a.sdfg_name for a in _unsourced_array_args(frozen, iface, plan)}
+    names |= {a.sdfg_name for a in unsourced_array_args(frozen, iface, plan)}
     # Copy-in/alias companions are also buffer-derived: a symbol reading their
     # lbound/size can only run AFTER the copy-in associates the companion, else it
     # reads an unassociated pointer (garbage lbound -> out-of-bounds SDFG index).
@@ -897,7 +897,7 @@ def build_wrapper_body(
                 )
             )
 
-    unsourced = _unsourced_array_args(frozen, iface, plan)
+    unsourced = unsourced_array_args(frozen, iface, plan)
     if unsourced:
         body.append("")
         body.append("    ! ----- Absent-optional buffers (degenerate, no host source) -----")
@@ -1094,7 +1094,7 @@ def build_wrapper_tail(
             if device:
                 aos_out_lines.append(f"    !$acc exit data delete({a.sdfg_name})")
             aos_out_lines.append(f"    deallocate({a.sdfg_name})")
-    for a in _unsourced_array_args(frozen, iface, plan):
+    for a in unsourced_array_args(frozen, iface, plan):
         aos_out_lines.append(f"    deallocate({a.sdfg_name})")
 
     writeback_block = ""
@@ -1555,7 +1555,7 @@ def _aos_module_args(frozen: FrozenSignature) -> list:
     return [a for a in frozen.args if a.aos_origin_struct and a.rank > 0]
 
 
-def _unsourced_array_args(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan) -> list:
+def unsourced_array_args(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan) -> list:
     """Array SDFG args with NO host source: not a dummy, flatten companion (or one element of a split one), module
     global, or AoS component -- data buffers of ABSENT inlined-callee optionals
     (QE's becphi_r). Need a shape-degenerate zero-filled local or c_loc() fails to compile."""
@@ -1588,7 +1588,7 @@ def _extra_local_symbols(frozen: FrozenSignature, iface: OriginalInterface, plan
     declared |= {a.sdfg_name for a in frozen.args if a.kind is FrozenArgKind.ARRAY}
     declared |= {a.sdfg_name for a, _m, _mem in _orphan_module_args(frozen, iface, plan)}
     declared |= {a.sdfg_name for a in _aos_module_args(frozen)}
-    declared |= {a.sdfg_name for a in _unsourced_array_args(frozen, iface, plan)}
+    declared |= {a.sdfg_name for a in unsourced_array_args(frozen, iface, plan)}
     declared |= {_USER_COMM_SYMBOL_NAME, _USER_COMM_SIZE_SYMBOL_NAME}
     ident = re.compile(r"^[A-Za-z_]\w*$")
 
@@ -2233,7 +2233,7 @@ def _build_symbol_assigns(
     _struct_member_sources, _struct_member_paths = _struct_member_symbol_sources(iface)
     # Absent-optional args are degenerate (1,1,...) placeholders: a named blocking
     # symbol must NOT source from one, or every size(<arr>,dim) transient collapses.
-    _unsourced_names = {a.sdfg_name for a in _unsourced_array_args(frozen, iface, plan)}
+    _unsourced_names = {a.sdfg_name for a in unsourced_array_args(frozen, iface, plan)}
     arg_by_sdfg = {a.sdfg_name: a for a in frozen.args}
     # SCALAR outer dummies declared OPTIONAL: their <name>_present companion is
     # forwarded from the caller's present(<name>), not defaulted.
