@@ -2276,17 +2276,37 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
         for (auto [dim, extent] : llvm::enumerate(seq.getShape()))
           if (extent == fir::SequenceType::getUnknownExtent()) dynamicDims.push_back(static_cast<unsigned>(dim));
       }
+      // Flang clamps every extent to zero (``arith.select %ext > 0, %ext, 0``): Fortran gives a negative extent a
+      // zero size. The extent tracers peel the clamp to reach the extent itself; the buffer's size keeps it, or an
+      // extent that is negative (an unset default, ``ALLOCATE(phi(1:n))`` with n = -100) allocates a huge buffer.
+      auto clamped = [](mlir::Value v) {
+        for (int k = 0; k < limits::kConvertChainDepth && v; ++k) {
+          auto* od = v.getDefiningOp();
+          if (!od) return false;
+          if (auto cv = mlir::dyn_cast<fir::ConvertOp>(od)) {
+            v = cv.getValue();
+            continue;
+          }
+          auto se = mlir::dyn_cast<mlir::arith::SelectOp>(od);
+          if (!se) return false;
+          auto f = traceConstInt(se.getFalseValue());
+          auto t = traceConstInt(se.getTrueValue());
+          return (f && *f == 0) || (t && *t == 0);
+        }
+        return false;
+      };
       unsigned operand = 0;
       for (auto sz : allocmem.getShape()) {
         unsigned const d = operand < dynamicDims.size() ? dynamicDims[operand] : operand;
         ++operand;
+        bool const clamp = clamped(sz);
         std::string const ext = traceExtentExpr(sz);
         if (!ext.empty()) {
           ASTNode an;
           an.kind = "assign";
           an.target = bufName + "_d" + std::to_string(d);
           an.target_is_array = false;
-          an.expr = ext;
+          an.expr = clamp ? "max(" + ext + ", 0)" : ext;
           nodes.push_back(std::move(an));
         } else {
           // Runtime array-element extent (ALLOCATE(tmp(sz(i)))): traceExtentExpr resolves only const-indexed / scalar /
@@ -2324,7 +2344,10 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
           collectReadAccesses(ev, an.accesses, 0);
           // Only when it really is an element read (accesses populated) and rendered cleanly; else leave the shape
           // symbol to the per-dim synthetic fallback rather than emit a bare array name.
-          if (!an.expr.empty() && an.expr != "?" && !an.accesses.empty()) nodes.push_back(std::move(an));
+          if (!an.expr.empty() && an.expr != "?" && !an.accesses.empty()) {
+            if (clamp) an.expr = "max(" + an.expr + ", 0)";
+            nodes.push_back(std::move(an));
+          }
         }
       }
     }
