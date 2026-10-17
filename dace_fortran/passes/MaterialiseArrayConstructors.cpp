@@ -58,7 +58,8 @@
 // read ``%ad``: the assignment copies it, ``hlfir.apply`` becomes an element
 // load, ``hlfir.destroy`` goes.  Because the temp is a real array, an item
 // that reads ``dst`` itself (``w = [w(3:4), w(1:2)]``) still sees the old
-// values.
+// values.  A whole-array reduction of the value (``maxval([c2, eps])``)
+// reduces ``%ad`` instead, as it would a named array.
 //
 // Runs after ``hlfir-expand-vector-subscript-gather``, which has already
 // materialised every elemental item (``s*w(1:3)``) into a named local array,
@@ -70,7 +71,8 @@
 // A constructor outside this scope (runtime extent, runtime pushes from an
 // implied-do, derived-type or character elements, a sliced embox or a rebox
 // as item, an ``hlfir.as_expr`` consumer other than an assignment,
-// ``hlfir.apply`` or ``hlfir.destroy``) is left untouched.
+// ``hlfir.apply``, ``hlfir.destroy`` or a reduction of the whole value) is
+// left untouched.
 // ============================================================================
 
 #include <optional>
@@ -159,12 +161,23 @@ mlir::Value storedBefore(fir::CallOp push, fir::CallOp init, mlir::Value slot) {
 /// The heap temp flang declares for an array constructor.
 bool isCtorTemp(hlfir::DeclareOp decl) { return decl.getUniqName().str().find(".tmp.arrayctor") != std::string::npos; }
 
+/// A reduction (SUM, PRODUCT, MAXVAL, MINVAL, ANY, ALL) of the constructor's whole value: its array operand, and no
+/// other, is the value.
+bool reducesValue(mlir::Operation* u, mlir::Value value) {
+  if (!mlir::isa<hlfir::SumOp, hlfir::ProductOp, hlfir::MaxvalOp, hlfir::MinvalOp, hlfir::AnyOp, hlfir::AllOp>(u))
+    return false;
+  for (unsigned i = 1; i < u->getNumOperands(); ++i)
+    if (u->getOperand(i) == value) return false;
+  return u->getOperand(0) == value;
+}
+
 /// The consumers of a constructor's value this pass can point at the local temp.
 bool supportedConsumers(hlfir::AsExprOp ae) {
   for (mlir::Operation* u : ae.getResult().getUsers()) {
     if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u); as && as.getRhs() == ae.getResult()) continue;
     if (mlir::isa<hlfir::DestroyOp>(u)) continue;
     if (auto ap = mlir::dyn_cast<hlfir::ApplyOp>(u); ap && ap.getTypeparams().empty()) continue;
+    if (reducesValue(u, ae.getResult())) continue;
     return false;
   }
   return true;
@@ -195,6 +208,8 @@ void readFromTemp(llvm::ArrayRef<hlfir::AsExprOp> exprs, mlir::Value temp, mlir:
     for (mlir::Operation* u : llvm::make_early_inc_range(ae.getResult().getUsers())) {
       if (auto as = mlir::dyn_cast<hlfir::AssignOp>(u)) {
         as->setOperand(0, temp);
+      } else if (reducesValue(u, ae.getResult())) {
+        u->setOperand(0, temp);
       } else if (auto ap = mlir::dyn_cast<hlfir::ApplyOp>(u)) {
         mlir::OpBuilder b(ap);
         auto el = b.create<hlfir::DesignateOp>(ap.getLoc(), eleRefTy, temp, ap.getIndices());
