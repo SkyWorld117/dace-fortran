@@ -295,6 +295,7 @@ def emit_substitute_entry(
     baked: Sequence[tuple[RecordedValue, int | float]] = (),
     private_access: PrivateAccess | None = None,
     private_imports: Sequence[str] = (),
+    refuse_handover: bool = False,
 ) -> Path:
     """Write ``dace_sub_<entry>``: calls the binding's ``wrapper`` and, when it declines the call (``dace_declined``),
     the original instead.
@@ -302,12 +303,24 @@ def emit_substitute_entry(
     ``baked``: module variables the SDFG was specialised to before it was built (``SDFGBuilder``'s
     ``specialized_globals``), with their values. Their reads are gone from the SDFG, so the binding cannot check them;
     the entry does, before anything else, and calls the original when any of them differs. ``private_access`` and
-    ``private_imports``: as for :func:`emit_recording_standin`, for baked variables their modules keep private."""
+    ``private_imports``: as for :func:`emit_recording_standin`, for baked variables their modules keep private.
+    ``refuse_handover``: the binding keeps buffers between calls (``emit_bindings(kept_images=...)``), which the members
+    do not follow: once the binding has taken a call, a call it would leave to the original stops the program instead
+    (the original would compute on members the kept buffers have moved past)."""
     args = [a.name for a in iface.args]
     original = standin_name("original", iface.entry)
     uses = [f"use {binding_module}, only: {wrapper}"]
     local = ["logical :: declined", "character(len=120) :: dace_why", "logical, save :: dace_reported = .false."]
+    if refuse_handover:
+        local.append("logical, save :: dace_took = .false.")
     body: list[str] = []
+    refuse = [
+        "if (dace_took) then",
+        f"    write(0, '(3a)') '{iface.entry}: the substitute declines (', trim(dace_why), ') after it took calls; &",
+        "        &its buffers kept between calls are not in the members the original reads: stopping'",
+        "    error stop",
+        "end if",
+    ] if refuse_handover else []
     # The first call declined says why, once: a baked variable (the entry's own checks) or the binding's checks.
     report = [
         "if (declined .and. .not. dace_reported) then",
@@ -326,11 +339,15 @@ def emit_substitute_entry(
         for (v, _value), c in zip(baked, checks, strict=True):
             body += [f"if ({c}) then", "    declined = .true.",
                      f"    if (dace_why == '') dace_why = 'baked {v.module}::{v.name} differs'", "end if"]
-        body += ["if (declined) then", *(f"    {ln}" for ln in report),
+        body += ["if (declined) then", *(f"    {ln}" for ln in refuse), *(f"    {ln}" for ln in report),
                  *(f"    {ln}" for ln in _with_arguments(f"call {original}", args)), "    return", "end if"]
     body += [
         *_with_arguments(f"call {wrapper}", [*args, "dace_declined=declined"]),
         "dace_why = 'a check of the binding: members, storage or specialised extents'",
+    ]
+    if refuse_handover:
+        body += ["if (declined) then", *(f"    {ln}" for ln in refuse), "else", "    dace_took = .true.", "end if"]
+    body += [
         *report,
         *_with_arguments(f"if (declined) call {original}", args),
     ]

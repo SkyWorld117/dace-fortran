@@ -371,3 +371,25 @@ def test_a_private_allocatable_is_refused(tmp_path: Path):
     allocatable = {"opts": {"flags": replace(exposed["flags"], allocatable=True)}}
     with pytest.raises(UnsupportedStandinError, match="allocatable"):
         emit_recording_standin(iface, _OPTS_VALUES[1:2], tmp_path / "r", tmp_path / "s.f90", allocatable)
+
+
+def test_a_handover_after_taken_calls_stops_when_the_binding_keeps_buffers(tmp_path: Path):
+    """The first call is taken, then a baked value changes, so the second call goes to the original. With
+    ``refuse_handover`` (a binding with buffers kept between calls, which the members no longer follow) the program
+    stops there instead; without it, the original takes over."""
+    iface = _interface(tmp_path)
+    main = _MAIN.replace("    use kern, only: step\n", "    use kern, only: step\n    use cfg, only: nsweeps\n")
+    main = main.replace("    call step(q, 4, x, y, 3)\n", "    nsweeps = 5\n    call step(q, 4, x, y, 3)\n")
+    (tmp_path / "modules.f90").write_text(_MODULES)
+    (tmp_path / "main.f90").write_text(main)
+    (tmp_path / "binding.f90").write_text(_BINDING_TAKES)
+    for refuse in (False, True):
+        entry = emit_substitute_entry(iface, "step_dace_bindings", "step_dace", tmp_path / "sub_step.f90", _BAKED,
+                                      refuse_handover=refuse)
+        sources = [tmp_path / "modules.f90", tmp_path / "binding.f90", entry, tmp_path / "main.f90"]
+        if refuse:
+            with pytest.raises(subprocess.CalledProcessError) as stopped:
+                _run(tmp_path, sources, "dace_sub_step")
+            assert "after it took calls" in stopped.value.stderr
+        else:
+            _run(tmp_path, sources, "dace_sub_step")

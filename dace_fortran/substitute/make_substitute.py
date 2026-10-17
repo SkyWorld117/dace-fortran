@@ -1274,6 +1274,7 @@ def main() -> int:
             baked=baked,
             private_access={a["module"]: a["variables"] for a in access},
             private_imports=list(dict.fromkeys(line for a in access for line in a["imports"])),
+            refuse_handover=bool(kept_images),
         )
         if private_baked:
             print(f"substitute entry checks baked private variables through accessors: {private_baked}", flush=True)
