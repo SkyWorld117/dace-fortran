@@ -1017,6 +1017,7 @@ def baked_values(records: list[Path], values: dict | None) -> list:
     return baked
 
 def main() -> int:
+    global DUMP_DIR, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH, STARTUP
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--combine-divisions", action="store_true",
@@ -1100,7 +1101,6 @@ def main() -> int:
     args = parse_with_config(ap, "make_substitute")
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    global DUMP_DIR, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH, STARTUP
     DUMP_DIR = out
     HEAVY_LAUNCH_BOUNDS = args.heavy_launch_bounds
     CUDA_ARCH = args.cuda_arch

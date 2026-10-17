@@ -9,7 +9,7 @@ from dace_fortran.bindings.frozen_signature import (FrozenArg, FrozenArgKind, Fr
                                                     attach_to_sdfg, get_frozen_signature)
 
 from dace_fortran.substitute.auto_scratch import candidates, infer, scratch_keys
-from test_outside_refs import _FIELDS, _MAIN, _STEPPER
+from .test_outside_refs import _FIELDS, _MAIN, _STEPPER
 
 N = 10
 
