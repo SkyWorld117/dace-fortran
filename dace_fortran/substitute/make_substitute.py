@@ -234,24 +234,31 @@ def keep_startup_values(values: dict, what: str) -> dict:
 
 
 def keep_startup_symbols(recorded: dict, frozen, iface, plan: FlattenPlan) -> dict:
-    """The recorded symbols and scalar inputs (``--specialize``) that keep their values after the routine's first call:
-    one the binding computes from a module variable (read through its import alias ``<name>__mod``) that code may
-    change later is dropped; one computed from the routine's own arguments stays (the recorded calls decide it)."""
+    """The recorded symbols and scalar inputs (``--specialize``) that keep their values after the routine's first call.
+    The binding computes each from its inputs (``_guard_assigns``): one that reads a module variable (through its
+    import alias ``<name>__mod``) that code may change later is dropped -- its shape, when the expression only inquires
+    about it (``size``, ``lbound``, ...); one computed from the routine's own arguments stays (the recorded calls
+    decide it)."""
     from dace_fortran.bindings.block_builders import effective_module_sources  # noqa: PLC0415
     from dace_fortran.bindings.specialization import _guard_assigns, _scalar_sources  # noqa: PLC0415
+    from dace_fortran.substitute.outside_refs import INQUIRIES, _masked  # noqa: PLC0415
 
     sources = effective_module_sources(frozen, iface, plan)
     scalars = _scalar_sources(frozen, iface, plan)
     assigns = _guard_assigns(frozen, iface, plan, [n for n in recorded if n not in scalars])
     kept, dropped = {}, {}
     for name, value in recorded.items():
-        text = scalars[name][0] if name in scalars else "\n".join(assigns.get(name, []))
-        origins = {sources[name]} if name in sources else set()
-        for tok in re.findall(r"[a-z_]\w*", text.lower()):
+        if name in scalars:
+            text = scalars[name][0].lower()
+        else:  # the right-hand sides: the symbol's own name on the left is no input
+            text = "\n".join(line.split("=", 1)[-1] for line in assigns.get(name, [])).lower()
+        read_as_value = set(re.findall(r"[a-z_]\w*", _masked(text, INQUIRIES)))
+        origins = {(sources[name], False)} if not text and name in sources else set()
+        for tok in set(re.findall(r"[a-z_]\w*", text)) - {name}:
             base = tok[: -len("__mod")] if tok.endswith("__mod") else tok
             if base in sources:
-                origins.add(sources[base])
-        why = [w for o in sorted(origins) for w in STARTUP.changes((o.module, o.entity))]
+                origins.add((sources[base], tok not in read_as_value))
+        why = [w for o, shape in sorted(origins) for w in STARTUP.changes((o.module, o.entity), shape=shape)]
         if why:
             dropped[name] = why
         else:

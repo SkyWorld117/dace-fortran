@@ -113,3 +113,59 @@ def test_without_a_loop_start_up_ends_at_the_call(tmp_path):
     a = _analysis(tmp_path, main)
     assert a.changes(("m_params", "in_loop")) == []  # before the one call
     assert a.changes(("m_params", "n_cells"))  # after it
+
+
+_SHAPES = """
+module m_arrays
+    implicit none
+    real(8), allocatable :: field(:), resized(:), reassigned(:)
+end module m_arrays
+"""
+
+_RHS_SHAPES = """
+module m_rhs
+    use m_arrays
+    implicit none
+contains
+    subroutine s_rhs(q)
+        real(8), intent(inout) :: q(:)
+        field = q
+        q = q + 1
+    end subroutine s_rhs
+end module m_rhs
+"""
+
+_MAIN_SHAPES = """
+program p_main
+    use m_arrays
+    use m_rhs
+    implicit none
+    real(8) :: q(10)
+    integer :: i
+    allocate (field(10), resized(10), reassigned(10))
+    do i = 1, 3
+        call s_rhs(q)
+        if (i == 2) then
+            deallocate (resized)
+            allocate (resized(20))
+        end if
+        reassigned = [q, q]
+    end do
+    deallocate (field, resized, reassigned)
+end program p_main
+"""
+
+
+def test_shapes_change_only_by_allocation_between_two_calls(tmp_path):
+    paths = []
+    for name, text in {"m_arrays.f90": _SHAPES, "m_rhs.f90": _RHS_SHAPES, "p_main.f90": _MAIN_SHAPES}.items():
+        path = tmp_path / name
+        path.write_text(text)
+        paths.append(path)
+    a = StartupAnalysis(parse_sources(paths), ("m_rhs", "s_rhs"))
+    # field: values written in every call, deallocated only after the last one -- its shape holds.
+    assert a.changes(("m_arrays", "field"))
+    assert a.changes(("m_arrays", "field"), shape=True) == []
+    # resized: reallocated between calls; reassigned: an allocatable assigned as a whole (it may be reallocated).
+    assert any(c.startswith("allocated in p_main") for c in a.changes(("m_arrays", "resized"), shape=True))
+    assert any(c.startswith("assigned as a whole") for c in a.changes(("m_arrays", "reassigned"), shape=True))

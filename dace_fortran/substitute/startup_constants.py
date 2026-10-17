@@ -4,17 +4,21 @@ A substitute specialised to values recorded over a routine's first calls is righ
 changed those values in between.  :class:`StartupAnalysis` tells, from the sources of the whole program and
 conservatively, where code may change a module variable once the routine has been called:
 
-* Start-up is the main program up to the first statement that can lead to a call of the routine (up to the outermost
-  loop around that statement, if there is one), with the procedures only it calls.  Everything else may run after the
-  first call: the rest of the main program and everything it calls (a procedure called in a loop runs again, its
-  statements before the call included), the routine's own calls, and every procedure a type binding, C or a procedure
-  pointer can reach.  Without exactly one main program in the sources, everything may run after the first call.
-* There, a variable changes where it is assigned, allocated, deallocated or nullified, the variable of a DO loop, read
-  into (an input item, a specifier such as ``iostat=``, a namelist group it belongs to), or passed as an actual
-  argument to a procedure whose dummy is neither INTENT(IN) nor VALUE (every procedure of the name or generic; a
-  procedure the sources do not define, such as an MPI routine, changes it).
-* Anywhere in the program, a variable may change under another name when it is pointer-associated, its address taken,
-  it shares storage (EQUIVALENCE, COMMON), or it is passed to a procedure that may keep a pointer to its argument.
+* Code that runs between two calls of the routine is the part of the main program from the first statement that can
+  lead to a call (from the outermost loop around it, if there is one) to the last (to the end of the outermost loop
+  around it), and everything that part calls (a procedure called in a loop runs again, its statements before the call
+  included), the routine's own calls, and every procedure a type binding, C or a procedure pointer can reach.  What
+  the main program does before (start-up) or after (finalisation) does not count.  Without exactly one main program in
+  the sources, everything counts.
+* There, a variable's value changes where it is assigned, allocated, deallocated or nullified, the variable of a DO
+  loop, read into (an input item, a specifier such as ``iostat=``, a namelist group it belongs to), or passed as an
+  actual argument to a procedure whose dummy is neither INTENT(IN) nor VALUE (every procedure of the name or generic; a
+  procedure the sources do not define, such as an MPI routine, changes it).  Anywhere in the program, it may change
+  under another name when it is pointer-associated, its address taken, it shares storage (EQUIVALENCE, COMMON), or it
+  is passed to a procedure that may keep a pointer to its argument.
+* A variable's shape (what its extents and lower bounds tell) changes only where it is allocated, deallocated,
+  nullified or pointer-associated, assigned as a whole when it is allocatable (assignment may reallocate it), passed
+  to MOVE_ALLOC, or passed to a dummy that is ALLOCATABLE or POINTER and not INTENT(IN).
 
 Not followed: arguments of function references (taken as read), ASSOCIATE names, and calls the sources do not show.
 The substitute checks every specialised value on every call regardless, and leaves a call with other values to the
@@ -35,6 +39,7 @@ from dace_fortran.substitute.outside_refs import (
     _matching_paren,
     _split_top,
     _tokens,
+    _top_level,
     classify,
     escaping_procedures,
 )
@@ -95,6 +100,20 @@ def _read_only_dummies(proc: Scope) -> set[str]:
     return out
 
 
+def _dynamic_dummies(proc: Scope) -> set[str]:
+    """The dummies of ``proc`` declared ALLOCATABLE or POINTER and not INTENT(IN): a call may reallocate them."""
+    out: set[str] = set()
+    for st in proc.statements:
+        s = st.text
+        if not re.search(r"\b(allocatable|pointer)\b", s) or re.search(r"\bintent\s*\(\s*in\s*\)", s):
+            continue
+        entities = _declared_entities(s)
+        if entities is None and "::" in s:
+            entities = {m.group(0) for item in _split_top(s.split("::", 1)[1]) if (m := _ID.match(item.strip()))}
+        out |= (entities or set()) & proc.dummies
+    return out
+
+
 def _namelist_groups(prog: Program) -> dict[str, set[str]]:
     """Every namelist group's members, by group name (over all scopes)."""
     groups: dict[str, set[str]] = defaultdict(set)
@@ -130,16 +149,16 @@ class StartupAnalysis:
                     grown = True
         roots = {id(target[0])} | _address_taken(prog, self.by_name)
         roots |= {id(p) for p in prog.procedures if p.bind_c or p.name in prog.bound}
-        #: per scope (id), the index of its first statement that may run after the routine's first call
-        self.first_after: dict[int, int] = {}
+        #: per scope (id), the range of its statements that may run between two calls of the routine
+        self.between: dict[int, tuple[int, int]] = {}
         mains = [p for p in prog.procedures if p.kind == "program"]
         self.main = mains[0] if len(mains) == 1 else None
         if self.main is None:
             roots |= set(procs)
         else:
-            start = self._startup_end(self.main, leads)
-            self.first_after[id(self.main)] = start
-            for st in self.main.statements[start:]:
+            start, end = self._between_calls(self.main, leads)
+            self.between[id(self.main)] = (start, end)
+            for st in self.main.statements[start:end]:
                 roots |= self._callees(st.text)
         after = set(roots)
         frontier = list(roots)
@@ -149,53 +168,71 @@ class StartupAnalysis:
                     after.add(t)
                     frontier.append(t)
         for pid in after:
-            self.first_after[pid] = 0
+            self.between[pid] = (0, len(procs[pid].statements))
         self.after_procedures = {procs[pid].qualified for pid in after if pid in procs}
         self.resolver = Resolver(prog)
         self.escaping = escaping_procedures(prog)
         self.namelists = _namelist_groups(prog)
         self.read_only = {id(p): _read_only_dummies(p) for p in prog.procedures}
-        self._cache: dict[Key, list[str]] = {}
+        self.dynamic = {id(p): _dynamic_dummies(p) for p in prog.procedures}
+        self._cache: dict[tuple[Key, bool], list[str]] = {}
 
     def _callees(self, text: str) -> set[int]:
         return _statement_callees(self.prog, self.by_name, text)
 
-    def _startup_end(self, main: Scope, leads: set[int]) -> int:
-        """Index of the first statement of ``main`` that may run after the routine's first call."""
+    def _between_calls(self, main: Scope, leads: set[int]) -> tuple[int, int]:
+        """The range of statements of ``main`` that may run between two calls of the routine: from the first statement
+        that can lead to a call (its outermost enclosing loop) to the last (the end of its outermost enclosing loop)."""
         open_loops: list[int] = []
+        loop_end: dict[int, int] = {}
+        outermost: dict[int, int] = {}  # statement -> its outermost enclosing loop's DO
+        leading: list[int] = []
         for i, st in enumerate(main.statements):
             if _END_DO.match(st.text):
                 if open_loops:
-                    open_loops.pop()
+                    loop_end[open_loops.pop()] = i
                 continue
             if self._callees(st.text) & leads:
-                return open_loops[0] if open_loops else i
+                leading.append(i)
+                if open_loops:
+                    outermost[i] = open_loops[0]
             if _DO.match(st.text):
                 open_loops.append(i)
-        return len(main.statements)
+        if not leading:
+            return len(main.statements), len(main.statements)
+        first, last = leading[0], leading[-1]
+        start = outermost.get(first, first)
+        end = loop_end.get(outermost[last], len(main.statements) - 1) + 1 if last in outermost else last + 1
+        return start, end
 
-    def changes(self, key: Key) -> list[str]:
-        """Where the module variable ``key`` (module, name) may change after the routine's first call; empty when its
-        value at that call holds for the rest of the run."""
+    def changes(self, key: Key, shape: bool = False) -> list[str]:
+        """Where code that may run after the routine's first call may change the module variable ``key`` (module,
+        name) -- its shape only, with ``shape`` -- empty when what it has at that call holds for the rest of the run."""
         key = (key[0].lower(), key[1].lower())
-        if key not in self._cache:
-            self._cache[key] = self._find_changes(key)
-        return self._cache[key]
+        if (key, shape) not in self._cache:
+            self._cache[(key, shape)] = self._find_changes(key, shape)
+        return self._cache[(key, shape)]
 
-    def _find_changes(self, key: Key) -> list[str]:
+    def _find_changes(self, key: Key, shape: bool) -> list[str]:
         if key[0] not in self.prog.modules:
             return [f"module {key[0]} not in the sources"]
+        allocatable = shape and self._allocatable(key)
         out: list[str] = []
         for scope in [*self.prog.modules.values(), *self.prog.procedures]:
             names = self.resolver.names_in(scope, key)
             if not names:
                 continue
-            first = self.first_after.get(id(scope))
+            start, end = self.between.get(id(scope), (0, 0))
             for i, st in enumerate(scope.statements):
                 toks = {t for _, t in _tokens(st.text)}
                 if not toks & names and not st.text.startswith("read"):
                     continue
                 where = f"{scope.qualified} ({scope.file.name}:{st.line})"
+                between = start <= i < end
+                if shape:
+                    if between:
+                        out += [f"{why} in {where}" for why in self._reshaped_by(st.text, names, allocatable)]
+                    continue
                 kinds = [kind for kind, _ in classify(st.text, names)]
                 for kind in ("alias", "address", "shared"):
                     if kind in kinds:
@@ -203,11 +240,51 @@ class StartupAnalysis:
                 passed = sorted((toks & self.escaping) - {scope.name}) if toks & names else []
                 if passed:
                     out.append(f"passed to {passed[0]}, which may keep a pointer to its argument, in {where}")
-                if first is None or i < first:
+                if not between:
                     continue
                 if "write" in kinds:
                     out.append(f"assigned in {where}")
                 out += [f"{why} in {where}" for why in self._changed_by(st.text, names, toks)]
+        return out
+
+    def _allocatable(self, key: Key) -> bool:
+        """Whether the module declares the variable ``key`` ALLOCATABLE."""
+        for st in self.prog.modules[key[0]].statements:
+            if re.search(r"\ballocatable\b", st.text) and key[1] in (_declared_entities(st.text) or set()):
+                return True
+        return False
+
+    def _reshaped_by(self, s: str, names: set[str], allocatable: bool) -> list[str]:
+        """How statement ``s`` may change the shape of the variable known as ``names``."""
+        m = re.match(r"^(allocate|deallocate|nullify)\s*\(", s)
+        if m:
+            close = _matching_paren(s, m.end() - 1)
+            items = [a for a in _split_top(s[m.end():close]) if not re.match(r"^\s*[a-z_]\w*\s*=(?!=)", a)]
+            return [f"{m.group(1)}d" if m.group(1) != "nullify" else "nullified"
+                    for a in items if _base_name(a) in names]
+        arrow = _top_level(s, "=>")
+        if arrow > 0 and _base_name(s[:arrow]) in names and not re.match(r"^(associate|use|procedure|select)\b", s):
+            return ["pointer-associated"]
+        eq = _top_level(s, "=")
+        if allocatable and eq > 0 and re.fullmatch(r"\s*[a-z_]\w*\s*", s[:eq]) and s[:eq].strip() in names:
+            return ["assigned as a whole (an allocatable may be reallocated)"]
+        m = _CALL.match(s)
+        if not m:
+            return []
+        callee, args = m.group(1), _split_top(m.group(2) or "")
+        if callee == "move_alloc":
+            return ["passed to move_alloc"] if any(_base_name(a.partition("=")[2] or a) in names for a in args) else []
+        candidates = [q for n in {callee} | self.prog.generics.get(callee, set()) for q in self.by_name.get(n, ())]
+        out = []
+        for pos, arg in enumerate(args):
+            keyword, _, value = arg.partition("=") if re.match(r"^\s*[a-z_]\w*\s*=(?!=)", arg) else ("", "", arg)
+            if not _DESIGNATOR.match(value.strip()) or _base_name(value) not in names:
+                continue
+            for q in candidates:
+                dummy = keyword.strip() if keyword else (q.dummy_order[pos] if pos < len(q.dummy_order) else None)
+                if dummy in self.dynamic[id(q)]:
+                    out.append(f"passed to {q.qualified}, whose dummy {dummy} is allocatable or a pointer")
+                    break
         return out
 
     def _changed_by(self, s: str, names: set[str], toks: set[str]) -> list[str]:
