@@ -21,5 +21,5 @@ def test_top_level_gpu_maps_get_gpu_events():
                           external_edges=True)
     assert make_substitute.instrument_kernels(sdfg) == 1
     kinds = {n.map.label: n.map.instrument for n in st.nodes() if isinstance(n, dace.nodes.MapEntry)}
-    assert kinds["gpu"] == dace.InstrumentationType.GPU_Events
-    assert kinds["host"] == dace.InstrumentationType.No_Instrumentation
+    assert kinds["gpu_map"] == dace.InstrumentationType.GPU_Events
+    assert kinds["host_map"] == dace.InstrumentationType.No_Instrumentation
