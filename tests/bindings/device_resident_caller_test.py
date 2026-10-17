@@ -291,6 +291,34 @@ def test_module_record_array_images_pack_on_the_device():
     assert acc.data_region == (("COPY", "idw_beg"),)  # host data, staged as before
 
 
+def test_a_member_of_a_module_record_takes_the_device_lane():
+    """A deferred-shape member of one module record (``divu%sf``) is the caller's device data too: it is copied into
+    the buffer's device copy and back into the member's on the device -- no transfer through the host, and the
+    caller's device copy has the result."""
+    from dace_fortran.bindings.block_builders import _render_aos_copy_in, _render_aos_copy_out
+
+    sdfg = _synthetic_sdfg({"divu_sf": dace.StorageType.GPU_Global})
+    member = FrozenArg(
+        fortran_name="divu_sf", sdfg_name="divu_sf", kind=FrozenArgKind.ARRAY, dtype="float64", rank=3,
+        shape=("divu_sf_d0", "divu_sf_d1", "divu_sf_d2"), is_written=True,
+        aos_origin_mod="m_bubbles", aos_origin_struct="divu", aos_member_path="sf", aos_outer_rank=0,
+        aos_member_pointer=True,
+    )
+    frozen = FrozenSignature(entry="k", mangled="_QPk", args=(member,), free_symbols=("n",))
+    acc = plan_device_resident_caller(sdfg, frozen, OriginalInterface(entry="k", args=()), FlattenPlan(entries=()))
+    assert acc.device_pack == ("divu_sf",)
+    assert acc.data_region == ()  # no COPY through the host
+    copy_in = "\n".join(_render_aos_copy_in(member, device=True))
+    assert "!$acc enter data create(divu_sf)" in copy_in
+    assert copy_in.index("!$acc kernels default(present)") < copy_in.index("divu_sf = divu%sf")
+    copy_out = "\n".join(_render_aos_copy_out(member, device=True))
+    assert copy_out.index("!$acc kernels default(present)") < copy_out.index("divu%sf = divu_sf")
+    assert "!$acc exit data delete(divu_sf)" in copy_out
+    # A host caller keeps the host copies.
+    host = "\n".join([*_render_aos_copy_in(member), *_render_aos_copy_out(member)])
+    assert "!$acc" not in host and "divu_sf = divu%sf" in host
+
+
 def test_a_host_sdfg_plans_nothing():
     cpu = dace.StorageType.CPU_Heap
     sdfg = _synthetic_sdfg({"x": cpu})

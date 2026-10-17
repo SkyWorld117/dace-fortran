@@ -1969,6 +1969,26 @@ def _render_aos_copy_in(
             # (allocated/associated are illegal on non-ALLOCATABLE/non-POINTER).
             static_dims = ", ".join(str(d) for d in a.shape[_aos_lead(a) :])
             out.append(f"    allocate({a.sdfg_name}({static_dims})); {a.sdfg_name} = {member}")
+        elif a.rank and device:
+            # The member is the caller's device data: the buffer gets a device copy, filled from the member's device
+            # copy (no transfer through the host).
+            mp = _present(member, a.aos_member_pointer)
+            live_dims = _own_bounds(member, a.rank)
+            degen_dims = ", ".join("1" for _ in range(a.rank))
+            out[0] = out[0].replace("scalar-struct member:", "scalar-struct member on the device:")
+            out.append(f"    if ({mp}) then")
+            out.append(f"      allocate({a.sdfg_name}({live_dims}))")
+            out.append(f"      !$acc enter data create({a.sdfg_name})")
+            out.append("      !$acc kernels default(present)")
+            out.append(f"      {a.sdfg_name} = {member}")
+            out.append("      !$acc end kernels")
+            out.append("    else")
+            out.append(f"      allocate({a.sdfg_name}({degen_dims}))")
+            out.append(f"      !$acc enter data create({a.sdfg_name})")
+            out.append("      !$acc kernels default(present)")
+            out.append(f"      {a.sdfg_name} = {zero}")
+            out.append("      !$acc end kernels")
+            out.append("    end if")
         elif a.rank:
             mp = _present(member, a.aos_member_pointer)
             live_dims = _own_bounds(member, a.rank)
@@ -2100,6 +2120,15 @@ def _render_aos_copy_out(a: FrozenArg, device: bool = False, members_first: bool
         if a.rank and _aos_member_is_static(a):
             # Fixed-shape VALUE member: unconditionally present, no guard needed.
             out.append(f"    {member} = {a.sdfg_name}")
+        elif a.rank and device:
+            # Back into the member's device copy, which the caller computes with next.
+            mp = _present(member, a.aos_member_pointer)
+            out.append(f"    if ({mp}) then")
+            out.append("      !$acc kernels default(present)")
+            out.append(f"      {member} = {a.sdfg_name}")
+            out.append("      !$acc end kernels")
+            out.append("    end if")
+            out.append(f"    !$acc exit data delete({a.sdfg_name})")
         elif a.rank:
             mp = _present(member, a.aos_member_pointer)
             out.append(f"    if ({mp}) {member} = {a.sdfg_name}")
