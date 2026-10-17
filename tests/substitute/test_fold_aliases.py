@@ -12,7 +12,7 @@ N = 8
 
 def _sdfg() -> dace.SDFG:
     """``jac`` (module array, (N,)) and the image ``jac_sf_sf`` ((1, d1), offsets d1) of ``jac_sf(1)%sf``: a map
-    doubles ``jac`` in place, a nested SDFG adds one to the image's element (the ghost-fill routine of MFC)."""
+    doubles ``jac`` in place, a nested SDFG adds one to the image's element (a routine that fills ghost cells)."""
     sdfg = dace.SDFG("igr")
     sdfg.add_symbol("jac_sf_sf_d1", dace.int64)
     sdfg.add_symbol("offset_jac_sf_sf_d1", dace.int64)

@@ -1,6 +1,6 @@
 """Module entities a generated binding imports that their module keeps private.
 
-Usage: private_imports.py <bindings.f90> <MFC src dir>
+Usage: private_imports.py <bindings.f90> <src dir>
 
 Reads the binding's ``use <module>, only: ...`` lists, finds each module's source (``module <name>`` in a .fpp/.f90
 under the source dir), and reports the imported names that module does not make public: a module whose

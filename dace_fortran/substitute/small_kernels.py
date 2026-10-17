@@ -53,7 +53,7 @@ def inline_small_reductions(sdfg: dace.SDFG, max_elements: int = 64) -> int:
     """Replace every whole-array ANY/ALL (an AnyNode or AllNode reducing to a scalar) over a rank-1 mask of at most
     ``max_elements`` elements by a tasklet that ORs (ANDs) them. The GPU transformation treats a tasklet like any other
     small work (on the host, or a one-thread kernel); the library node's reduction expansion put a host-side reduction
-    into device code (a hypoelastic build failed validation that way: ANY over the three shear indices). Returns the
+    into device code (a build failed validation that way: ANY over three indices). Returns the
     number replaced."""
     import copy
 
@@ -160,9 +160,9 @@ def run_sequentially(sdfg: dace.SDFG, guids: list[str]) -> int:
 
 def host_maps_sequential(sdfg: dace.SDFG) -> int:
     """After the GPU transformation: every map left outside device code gets a sequential schedule, for the reason of
-    :func:`run_sequentially` (a map of a nested SDFG the frontend made, say: 2D_hypo_hlld's copy of the six-element
-    stress permutation became an OpenMP loop, and GCC's runtime aborted next to NVHPC's with "libgomp: TODO").
-    Inside device code a default map is a thread-block map and stays as it is. Returns the number of maps changed."""
+    :func:`run_sequentially` (a map of a nested SDFG the frontend made, say: the copy of a six-element permutation
+    became an OpenMP loop, and GCC's runtime aborted next to NVHPC's with "libgomp: TODO"). Inside device code a
+    default map is a thread-block map and stays as it is. Returns the number of maps changed."""
     changed = 0
     for node, state in sdfg.all_nodes_recursive():
         if (isinstance(node, nodes.MapEntry)

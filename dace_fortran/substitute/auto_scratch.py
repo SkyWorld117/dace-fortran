@@ -63,7 +63,7 @@ class Inference:
 def candidates(sdfg: dace.SDFG, synthetic: Iterable = ()) -> dict[str, list[str]]:
     """``module::variable`` -> the non-transient arrays of ``sdfg`` that hold (parts of) it: module arrays (by their
     origin) and the packed images of module records (by the record they were built from). A flattened member of a
-    module record (``idwbuff(:)%beg`` as ``idwbuff_beg``) counts under its record, as the frontend's flatten plan
+    module record (``rec(:)%beg`` as ``rec_beg``) counts under its record, as the frontend's flatten plan
     names it in ``synthetic`` (FlattenPlan.synthetic_globals)."""
     frozen = get_frozen_signature(sdfg)
     if frozen is None:

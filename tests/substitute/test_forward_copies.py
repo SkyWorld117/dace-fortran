@@ -1,5 +1,5 @@
 """Copy forwarding (``fuse_stencils.forward_copy``) into a nested SDFG that reads the scratch array in an interstate
-assignment, as MFC's MUSCL slopes do: the subscripts follow the element relation like the memlets.
+assignment, as the slopes of a scheme do: the subscripts follow the element relation like the memlets.
 Run: PYTHONPATH=../../dace python -m pytest test_forward_copies.py"""
 import numpy as np
 import dace

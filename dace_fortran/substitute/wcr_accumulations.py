@@ -1,13 +1,13 @@
 """Accumulations into neighbouring elements become write-conflict-resolved writes, so the loop can become a map.
 
-MFC's IGR Riemann solvers add a face's flux to the cells on both sides, ``rhs(j) = rhs(j) + f`` and
+Riemann solvers add a face's flux to the cells on both sides, ``rhs(j) = rhs(j) + f`` and
 ``rhs(j + 1) = rhs(j + 1) - f``, under an OpenACC atomic that flang drops from the HLFIR: iteration ``j`` and
 iteration ``j + 1`` write the same element, so LoopToMap keeps the loop sequential and the whole sweep runs serially
-(3D_IGR_jet: 60x slower than the original). Such a tasklet, ``out = in +/- e`` reading and writing one element of an
-array the loop writes at more than one offset, becomes ``out = +/-e`` with a sum write-conflict resolution on its
-write (an atomic add on the GPU, as the original); the loop then maps. So does an accumulation into an element the
-iteration picks through a value it loads: MFC's acoustic sources add to the cell ``coord(:, i)`` of each support
-point (distinct cells, so the original needs no atomic; the loop cannot know that).
+(60x slower than the original on a three-dimensional case). Such a tasklet, ``out = in +/- e`` reading and writing one
+element of an array the loop writes at more than one offset, becomes ``out = +/-e`` with a sum write-conflict
+resolution on its write (an atomic add on the GPU, as the original); the loop then maps. So does an accumulation into
+an element the iteration picks through a value it loads: a source term that adds to the cell ``coord(:, i)`` of each
+support point (distinct cells, so the original needs no atomic; the loop cannot know that).
 """
 
 from __future__ import annotations

@@ -10,8 +10,6 @@ Three steps, each driven by the dataflow alone:
    none of its outputs has a reader left.
 3. ``forward_copies``: a transient that only mirrors a non-transient array through plain copy maps (an input pack, an
    output unpack) is removed and its users address the array directly, through the copy's element relation.
-
-The slice harness (slice/fused/fuse_dev.py) exercises the same functions on one direction of the benchmark.
 """
 
 from __future__ import annotations
@@ -408,8 +406,8 @@ def _remap_nested(node: nodes.NestedSDFG, parent: dace.SDFG, conn: str, full_scr
     inner = nsdfg.arrays[conn]
     inner.shape, inner.strides, inner.total_size = real_desc.shape, real_desc.strides, real_desc.total_size
     inner.offset = real_desc.offset
-    # MUSCL's slopes read the scratch array in interstate assignments (3D_shockdroplet_muscl): left in the scratch's
-    # order of dims, they addressed the real array's dims in the wrong order, out of its bounds.
+    # Slopes can read the scratch array in interstate assignments: left in the scratch's order of dims, they
+    # addressed the real array's dims in the wrong order, out of its bounds.
     for e in nsdfg.all_interstate_edges():
         e.data.assignments = {k: _remap_code(v, conn, mapping) for k, v in e.data.assignments.items()}
         e.data.condition = CodeBlock(_remap_code(e.data.condition.as_string, conn, mapping))

@@ -64,7 +64,7 @@ def test_a_loop_that_also_reads_the_array_is_left_alone():
 
 
 def _scatter_loop() -> tuple[dace.SDFG, LoopRegion]:
-    """``c = idx[j]`` on an interstate edge, then ``rhs[c] = rhs[c] + f[j]`` (an acoustic source's support points)."""
+    """``c = idx[j]`` on an interstate edge, then ``rhs[c] = rhs[c] + f[j]`` (the support points of a source term)."""
     sdfg = dace.SDFG("scatter")
     sdfg.add_array("rhs", [N + 1], dace.float64)
     sdfg.add_array("f", [N], dace.float64)

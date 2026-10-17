@@ -1,7 +1,7 @@
-"""An array dummy of records bound to ONE ELEMENT of a module record array (sequence association, MFC's surface
-tension passes ``q_prim_qp%vf(c_idx)`` to a routine whose dummy is ``v_vf(n)``): after inlining, the dummy's own
-subscript composes with the element's (``vf(c + i - 1)``) and the image keeps its four dimensions. This simple
-form passes; 2D_laplace_pressure_jump's deeper chain (``offset_q_prim_qp_vf_sf_d4`` unresolved) is still open.
+"""An array dummy of records bound to ONE ELEMENT of a module record array (sequence association, a call passes
+``q%vf(c)`` to a routine whose dummy is ``v(n)``): after inlining, the dummy's own subscript composes with the
+element's (``vf(c + i - 1)``) and the image keeps its four dimensions. This simple form passes; a deeper chain
+(``offset_q_vf_sf_d4`` unresolved) is still open.
 Bridge-side: needs LLVM."""
 from dace_fortran.bindings.frozen_signature import get_frozen_signature
 from tests._util import build_sdfg
@@ -85,7 +85,7 @@ CONTAINS
     INTEGER, INTENT(IN) :: m, nv
     REAL(8), INTENT(OUT) :: out(0:m, 0:m, 0:m)
     out = 0.0D0
-    ! every variable first (MFC: 1:sys_size), then the one group (c_idx:c_idx) -- the same routine inlined twice
+    ! every variable first (1:nv), then the one group (c_idx:c_idx) -- the same routine inlined twice
     iv%beg = 1
     iv%end = nv
     CALL pack_group(q%vf(1:nv), out, m)
@@ -98,8 +98,8 @@ END MODULE m_recb
 
 
 def test_section_bounded_by_a_record_member_keeps_the_images_rank(tmp_path):
-    """MFC's surface tension: ``iv%beg = c_idx; iv%end = c_idx`` then the reconstruction over
-    ``q_prim_qp%vf(iv%beg:iv%end)`` with the dummy declared ``(iv%beg:iv%end)``."""
+    """A one-variable group: ``iv%beg = c_idx; iv%end = c_idx`` then a call over ``q%vf(iv%beg:iv%end)`` with the
+    dummy declared ``(iv%beg:iv%end)``."""
     sdfg = build_sdfg(_SRC_BOUNDS, tmp_path / "sdfg", name="run", entry="m_recb::run").build()
     frozen = get_frozen_signature(sdfg)
     image = next(a for a in frozen.args if a.sdfg_name == "q_vf_sf")
@@ -119,9 +119,8 @@ def test_section_bounded_by_a_baked_record_member_keeps_the_images_rank(tmp_path
 
 
 def test_element_actual_into_a_dummy_with_a_record_lower_bound(tmp_path):
-    """The real surface-tension call: an ELEMENT ``q_prim_qp%vf(e)`` passed to a dummy declared
-    ``(iv%beg:iv%end)`` with ``iv%beg = e`` -- sequence association with a non-unit lower bound: ``v_vf(i)`` is
-    element ``e + (i - iv%beg)``."""
+    """An ELEMENT ``q%vf(e)`` passed to a dummy declared ``(iv%beg:iv%end)`` with ``iv%beg = e`` -- sequence
+    association with a non-unit lower bound: ``v(i)`` is element ``e + (i - iv%beg)``."""
     src = _SRC_BOUNDS.replace("CALL pack_group(q%vf(iv%beg:iv%end), out, m)", "CALL pack_group(q%vf(iv%beg), out, m)")
     assert src != _SRC_BOUNDS
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="run", entry="m_recb::run",

@@ -290,11 +290,10 @@ std::pair<std::string, std::vector<DimEntry>> expandDesignateChain(hlfir::Design
       if (t) ++T;
     auto sidx = sec.getIndices();
     if (elementOfRank1Dummy && T == 0 && !sidx.empty() && !entries.empty()) {
-      // An ELEMENT actual bound to a rank-1 dummy (sequence association, MFC's
-      // ``s_reconstruct...(q_prim_qp%vf(e), ...)`` with ``v_vf(iv%beg:iv%end)``): the dummy's subscript counts
-      // from that element on -- ``v_vf(i)`` is element ``e + (i - lb)`` -- so it composes with the element's
-      // last subscript instead of standing beside it as a dimension of its own. The element's other (leading)
-      // subscripts stay dimensions.
+      // An ELEMENT actual bound to a rank-1 dummy (sequence association, ``call s(q%vf(e), ...)`` with the dummy
+      // declared ``v(r%beg:r%end)``): the dummy's subscript counts from that element on -- ``v(i)`` is element
+      // ``e + (i - lb)`` -- so it composes with the element's last subscript instead of standing beside it as a
+      // dimension of its own. The element's other (leading) subscripts stay dimensions.
       std::vector<DimEntry> newRec;
       for (size_t s = 0; s + 1 < sidx.size(); ++s) {
         std::string const n = resolveIndex(sidx[s]);

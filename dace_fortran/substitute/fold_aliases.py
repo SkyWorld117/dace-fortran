@@ -1,8 +1,8 @@
 """Fold the image of a member of an element of a module array of records onto the array it IS.
 
-MFC's IGR solver points ``jac_sf(1)%sf`` at the module array ``jac`` and hands ``jac_sf`` to the boundary routines:
-the SDFG takes the image ``jac_sf_sf`` and ``jac`` as two arrays, and the binding's storage guard declines every
-call (the two share storage). The sizing run records the association (``<record>.aliases``, see
+A program may point ``rec(1)%f`` at the module array ``arr`` and hand ``rec`` to other routines: the SDFG takes the
+image ``rec_f`` and ``arr`` as two arrays, and the binding's storage guard declines every call (the two share
+storage). The sizing run records the association (``<record>.aliases``, see
 ``dace_fortran.bindings.storage_guard.build_alias_record``): here every access of the image becomes an access of the
 array (its leading element dimension of one dropped), in the nested SDFGs too, the image's extent and offset symbols
 become the array's, and the image leaves the SDFG and its frozen signature.

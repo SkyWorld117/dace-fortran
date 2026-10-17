@@ -79,8 +79,8 @@ def test_small_work_left_on_the_host_by_the_gpu_transformation():
 
 
 def test_maps_outside_device_code_run_sequentially():
-    """A host map left after the GPU transformation (2D_hypo_hlld: the expansion of a copy of flang's six-element
-    constant into a host buffer) becomes sequential, so no OpenMP loop; a map inside a kernel keeps its schedule."""
+    """A host map left after the GPU transformation (the expansion of a copy of flang's six-element constant
+    into a host buffer) becomes sequential, so no OpenMP loop; a map inside a kernel keeps its schedule."""
     sdfg = dace.SDFG("host_and_device_maps")
     sdfg.add_array("ro", [6], dace.int32)
     sdfg.add_array("perm", [6], dace.int32)
