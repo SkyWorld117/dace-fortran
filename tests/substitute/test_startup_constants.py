@@ -108,11 +108,26 @@ def test_values_code_may_change_after_the_first_call(tmp_path):
         assert any(c.startswith(why) for c in changes), (name, changes)
 
 
-def test_without_a_loop_start_up_ends_at_the_call(tmp_path):
-    main = _MAIN.replace("    do i = 1, n_steps\n", "").replace("    end do\n", "").replace("in_loop = i", "in_loop = 1")
-    a = _analysis(tmp_path, main)
-    assert a.changes(("m_params", "in_loop")) == []  # before the one call
-    assert a.changes(("m_params", "n_cells"))  # after it
+_MAIN_NO_LOOP = """
+program p_main
+    use m_params
+    use m_time
+    implicit none
+    real(8) :: q(10)
+    in_loop = 1
+    call s_step(q)
+    n_cells = 2
+    call s_step(q)
+    set_once = 7
+end program p_main
+"""
+
+
+def test_without_a_loop_what_lies_between_the_first_and_the_last_call_counts(tmp_path):
+    a = _analysis(tmp_path, _MAIN_NO_LOOP)
+    assert a.changes(("m_params", "in_loop")) == []  # before the first call
+    assert a.changes(("m_params", "n_cells"))  # between the two
+    assert a.changes(("m_params", "set_once")) == []  # after the last
 
 
 _SHAPES = """
@@ -129,7 +144,7 @@ module m_rhs
 contains
     subroutine s_rhs(q)
         real(8), intent(inout) :: q(:)
-        field = q
+        field(1:10) = q
         q = q + 1
     end subroutine s_rhs
 end module m_rhs
@@ -163,7 +178,7 @@ def test_shapes_change_only_by_allocation_between_two_calls(tmp_path):
         path.write_text(text)
         paths.append(path)
     a = StartupAnalysis(parse_sources(paths), ("m_rhs", "s_rhs"))
-    # field: values written in every call, deallocated only after the last one -- its shape holds.
+    # field: values written in every call (a section: no reallocation), deallocated only after the last call.
     assert a.changes(("m_arrays", "field"))
     assert a.changes(("m_arrays", "field"), shape=True) == []
     # resized: reallocated between calls; reassigned: an allocatable assigned as a whole (it may be reallocated).
