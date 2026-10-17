@@ -196,6 +196,70 @@ def order_for_coalescing(sdfg: dace.SDFG) -> int:
 UNROLL_LIMIT = 16
 
 
+#: --startup-constants: where code that may run after the routine's first call changes module variables
+#: (startup_constants.StartupAnalysis); None: every recorded value counts.
+STARTUP = None
+
+
+def _report_startup(kept: dict, dropped: dict, what: str) -> None:
+    print(f"start-up constants: {len(kept)} of {len(kept) + len(dropped)} {what} kept", flush=True)
+    for name, why in sorted(dropped.items()):
+        more = f" (+{len(why) - 1} more)" if len(why) > 1 else ""
+        print(f"  may change after the first call: {name}: {why[0]}{more}", flush=True)
+
+
+def startup_constant(name: str) -> bool:
+    """Whether the recorded module value ``module::variable...`` keeps its value after the routine's first call."""
+    if STARTUP is None:
+        return True
+    module, var = name.split("::", 1)
+    return not STARTUP.changes((module, re.split(r"[(%]", var)[0]))
+
+
+def keep_startup_values(values: dict, what: str) -> dict:
+    """The entries of ``values`` (``module::variable...`` -> value) whose variable keeps its value after the routine's
+    first call (all of them without --startup-constants)."""
+    if STARTUP is None:
+        return values
+    kept, dropped = {}, {}
+    for name, value in values.items():
+        module, var = name.split("::", 1)
+        why = STARTUP.changes((module, re.split(r"[(%]", var)[0]))
+        if why:
+            dropped[name] = why
+        else:
+            kept[name] = value
+    _report_startup(kept, dropped, what)
+    return kept
+
+
+def keep_startup_symbols(recorded: dict, frozen, iface, plan: FlattenPlan) -> dict:
+    """The recorded symbols and scalar inputs (``--specialize``) that keep their values after the routine's first call:
+    one the binding computes from a module variable (read through its import alias ``<name>__mod``) that code may
+    change later is dropped; one computed from the routine's own arguments stays (the recorded calls decide it)."""
+    from dace_fortran.bindings.block_builders import effective_module_sources  # noqa: PLC0415
+    from dace_fortran.bindings.specialization import _guard_assigns, _scalar_sources  # noqa: PLC0415
+
+    sources = effective_module_sources(frozen, iface, plan)
+    scalars = _scalar_sources(frozen, iface, plan)
+    assigns = _guard_assigns(frozen, iface, plan, [n for n in recorded if n not in scalars])
+    kept, dropped = {}, {}
+    for name, value in recorded.items():
+        text = scalars[name][0] if name in scalars else "\n".join(assigns.get(name, []))
+        origins = {sources[name]} if name in sources else set()
+        for tok in re.findall(r"[a-z_]\w*", text.lower()):
+            base = tok[: -len("__mod")] if tok.endswith("__mod") else tok
+            if base in sources:
+                origins.add(sources[base])
+        why = [w for o in sorted(origins) for w in STARTUP.changes((o.module, o.entity))]
+        if why:
+            dropped[name] = why
+        else:
+            kept[name] = value
+    _report_startup(kept, dropped, "recorded symbols and scalars")
+    return kept
+
+
 def merged_invariants(records: list[Path]) -> dict:
     """The values that stayed the same in every call of every record of ``records`` (successive recording rounds of
     one run: a later round's recorder was pruned by the earlier values and records the rest); a name the records
@@ -223,6 +287,8 @@ def recorded_elements(records: list[Path], sdfg: dace.SDFG) -> dict[str, list]:
         return int(value) if re.fullmatch(r"-?\d+", value) else float(value)
 
     for line in lines:
+        if not line.strip() or not startup_constant(line.split()[0]):
+            continue
         m = re.match(r"\S+::(\w+)\((-?\d+)\)%(\w+)\s+(\S+)$", line)
         if m and f"{m.group(1)}_{m.group(3)}" in sdfg.arrays:
             found.setdefault(f"{m.group(1)}_{m.group(3)}", {})[int(m.group(2)) - 1] = number(m.group(4))
@@ -873,14 +939,14 @@ def private_baked_variables(baked: list, dirs: list[Path], records: list[Path]) 
 
 
 
-def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scalars: dict, dropped: list[str]) -> list[str]:
+def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scalars: dict, dropped: list[str],
+                  recorded: dict) -> list[str]:
     """--auto-scratch: what make_scratch_transient is to match for the module variables auto_scratch.infer finds
     scratch, those given with --scratch left out. The in-call analysis runs on a copy specialised as this build
     specialises the SDFG (the branches the recorded configuration never takes are gone); ``dropped``: the procedures
-    whose calls the build drops."""
+    whose calls the build drops; ``recorded``: the recorded symbols the build may rely on."""
     from dace_fortran.substitute.auto_scratch import infer, scratch_keys  # noqa: PLC0415
 
-    recorded = recorded_invariants(args.specialize) if args.specialize else {}
 
     def specialise(copy: dace.SDFG) -> dict:
         split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops) if symbols or scalars else {}
@@ -1006,6 +1072,10 @@ def main() -> int:
     ap.add_argument("--auto-keep", action="store_true", help="infer the module arrays of records to keep "
                     "(auto_scratch.infer_kept: nothing outside the routine's calls reads, writes, aliases or takes the "
                     "address of them; needs --fypp) and keep them, with any given")
+    ap.add_argument("--startup-constants", action="store_true",
+                    help="specialise only to recorded values that no code after the routine's first call can change "
+                    "(startup_constants.py, on the build's sources: needs --fypp); the recorded calls still decide "
+                    "which values stay the same")
     ap.add_argument("--fuse", action="store_true", help="recompute stencil producers inside their consumers (GPU)")
     ap.add_argument("--tile-fuse", action="store_true",
                     help="with --fuse: fuse through a shared-memory tile (the producer once per tile) instead")
@@ -1030,11 +1100,21 @@ def main() -> int:
     args = parse_with_config(ap, "make_substitute")
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    global DUMP_DIR, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH
+    global DUMP_DIR, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH, STARTUP
     DUMP_DIR = out
     HEAVY_LAUNCH_BOUNDS = args.heavy_launch_bounds
     CUDA_ARCH = args.cuda_arch
-    globals_ = merged_invariants(args.globals) if args.globals else None
+    if args.startup_constants:
+        if not args.fypp:
+            raise SystemExit("--startup-constants needs the build's sources (--fypp)")
+        from dace_fortran.substitute.outside_refs import parse_sources, source_files  # noqa: PLC0415
+        from dace_fortran.substitute.startup_constants import StartupAnalysis  # noqa: PLC0415
+
+        STARTUP = StartupAnalysis(parse_sources(source_files(args.fypp)), tuple(args.entry.lower().split("::")))
+        start = f"main program {STARTUP.main.name}" if STARTUP.main else "no single main program"
+        print(f"start-up: {start}; {len(STARTUP.after_procedures)} procedures may run after the first call",
+              flush=True)
+    globals_ = keep_startup_values(merged_invariants(args.globals), "recorded module values") if args.globals else None
     for name in args.stub:
         keep_external(name, stub=True)
     builder = SDFGBuilder(args.hlfir, entry=args.entry, specialized_globals=globals_)
@@ -1046,20 +1126,20 @@ def main() -> int:
     unsourced = make_unsourced_transient(sdfg, general, iface, plan)
     if unsourced:
         print(f"arguments no caller supplies made transient: {unsourced}", flush=True)
+    recorded = recorded_invariants(args.specialize) if args.specialize else {}
+    if STARTUP is not None and recorded:
+        recorded = keep_startup_symbols(recorded, general, iface, plan)
     values = {}
     if args.specialize:
-        recorded = recorded_invariants(args.specialize)
         guardable = specializable(general, iface, plan)
         values = {name: value for name, value in sorted(recorded.items()) if name in guardable}
     symbols = {name: value for name, value in values.items() if name in general.free_symbols}
     scalars = {name: value for name, value in values.items() if name not in symbols}
     scratch_names = list(args.scratch)
     if args.auto_scratch:
-        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars,
-                                       args.stub)
+        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded)
     scratch, scratch_images = [], {}
     if scratch_names:
-        recorded = recorded_invariants(args.specialize) if args.specialize else {}
         scratch, scratch_images = make_scratch_transient(sdfg, scratch_names, recorded)
         print(f"scratch module arrays made transient: {scratch}; images deferred: {sorted(scratch_images)}", flush=True)
     keep_keys = [k.lower() for k in args.keep]
@@ -1074,7 +1154,7 @@ def main() -> int:
             print(f"  not kept: {key}: {why[0]}" + (f" (+{len(why) - 1} more)" if len(why) > 1 else ""), flush=True)
         keep_keys += [k for k in kept if k not in keep_keys]
     if args.specialize:
-        print(f"specialised to {len(values)} of {len(recorded_invariants(args.specialize))} invariant values: "
+        print(f"specialised to {len(values)} of {len(recorded)} invariant values: "
               f"{values}", flush=True)
     if values:
         split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops)
@@ -1086,7 +1166,7 @@ def main() -> int:
 
         aliases = recorded_aliases(args.specialize)
         if aliases:
-            print(f"aliases folded: {fold_aliases(sdfg, aliases, recorded_invariants(args.specialize))}", flush=True)
+            print(f"aliases folded: {fold_aliases(sdfg, aliases, recorded)}", flush=True)
     elements = {}
     if args.globals and (args.fuse or args.forward):
         elements = recorded_elements(args.globals, sdfg)

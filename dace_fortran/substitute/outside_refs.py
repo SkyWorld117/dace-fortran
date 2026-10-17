@@ -82,6 +82,7 @@ class Scope:
     module: "Scope | None" = None  # the module a procedure is in
     host: "Scope | None" = None  # the enclosing scope (module or host procedure); None for a module
     dummies: set[str] = field(default_factory=set)
+    dummy_order: list[str] = field(default_factory=list)  # the dummies as the procedure statement lists them
     declared: set[str] = field(default_factory=set)  # unguarded local declarations (and dummies, result)
     guarded_declared: set[str] = field(default_factory=set)
     uses: list[Use] = field(default_factory=list)
@@ -345,7 +346,8 @@ def _parse_file(path: Path, prog: Program) -> None:
             host = stack[-1] if stack else None
             proc = Scope(name, kind, path, st.line, host=host)
             proc.module = host if host is not None and host.kind == "module" else (host.module if host else None)
-            proc.dummies = {a.strip() for a in args.split(",") if a.strip() and a.strip() != "*"}
+            proc.dummy_order = [a.strip() for a in args.split(",") if a.strip() and a.strip() != "*"]
+            proc.dummies = set(proc.dummy_order)
             proc.declared |= proc.dummies
             if kind == "function":
                 result = re.search(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", rest)
