@@ -174,3 +174,103 @@ def test_a_specialised_binding_runs_its_values_and_declines_others(tmp_path):
     assert "if (nv__mod /= 3) dace_mismatch = 'nv'" in text and "error stop" in text
     assert "if (scaled__mod .neqv. .true.) dace_mismatch = 'scaled'" in text
     assert "if (factor__mod /= 2.0_c_double) dace_mismatch = 'factor'" in text
+
+
+# A small allocatable integer module array the kernel indexes with: the record holds its elements, the guard checks
+# them (and its size, and that it is allocated) on every call.
+_IDX_SRC = """
+module idxs_{entry}
+  implicit none
+  integer, allocatable :: idx(:)
+end module idxs_{entry}
+
+module kern_{entry}
+  implicit none
+contains
+  subroutine {entry}(x, y)
+    use idxs_{entry}, only: idx
+    real(8), intent(in) :: x(:)
+    real(8), intent(inout) :: y(:)
+    integer :: k
+    do k = 1, 2
+      y(idx(k)) = 2*x(idx(k))
+    end do
+  end subroutine {entry}
+end module kern_{entry}
+"""
+
+_IDX_SHIM = f"""
+subroutine run_kern(xin, yout, n, first, declined_out) bind(c, name="run_kern")
+  use iso_c_binding
+  use idxs_{{entry}}, only: idx
+  use {{entry}}_dace_bindings, only: {{entry}}_dace
+  real(c_double), intent(in) :: xin({_N})
+  real(c_double), intent(inout) :: yout({_N})
+  integer(c_int), value :: n, first
+  integer(c_int), intent(out) :: declined_out
+  logical :: declined
+  integer :: k
+  if (allocated(idx)) deallocate(idx)
+  if (n > 0) then
+    allocate(idx(n))
+    idx = [(first + 2 * (k - 1), k = 1, n)]
+  end if
+  {{call}}
+  declined_out = merge(1, 0, declined)
+end subroutine run_kern
+"""
+
+
+def _idx_library(tmp_path: Path, entry: str, call: str, **binding):
+    """The kernel of _IDX_SRC behind a binding (``binding`` and ``specialization`` of the general SDFG, given as a
+    function of its frozen signature); returns a function of the length and first element of ``idx`` returning
+    ``(y, declined)``."""
+    source = _IDX_SRC.format(entry=entry)
+    src = tmp_path / f"{entry}.f90"
+    src.write_text(source)
+    builder = build_sdfg(source, tmp_path / "sdfg", name=entry, entry=f"kern_{entry}::{entry}")
+    plan = FlattenPlan.from_dict(builder.module.get_flatten_plan())
+    sdfg = builder.build()
+    sdfg.name = entry
+    sdfg.build_folder = str(tmp_path / "dacecache")
+    iface = build_auto_interface(sdfg._fortran_interface_raw, entry)
+    if "specialization" in binding:
+        binding["specialization"] = binding["specialization"](get_frozen_signature(sdfg))
+    shim = tmp_path / "shim.f90"
+    shim.write_text(_IDX_SHIM.format(entry=entry, call=call.format(entry=entry)))
+    lib = build_fortran_library(sdfg, iface, plan, str(tmp_path / "lib"), prelude_sources=[src], extra_sources=[shim],
+                                **binding)
+    fn = lib.load().run_kern
+    fn.restype = None
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+
+    def run(n: int = 2, first: int = 1) -> tuple[np.ndarray, bool]:
+        x = np.arange(1, _N + 1, dtype=np.float64)
+        y = np.full(_N, -1.0)
+        declined = np.zeros(1, dtype=np.int32)
+        fn(x.ctypes.data, y.ctypes.data, n, first, declined.ctypes.data)
+        return y, bool(declined[0])
+
+    return run
+
+
+def test_a_general_binding_records_the_elements_of_small_integer_module_arrays(tmp_path):
+    record = tmp_path / "idx_rec.symbols"
+    run = _idx_library(tmp_path, "idx_rec", "call {entry}_dace(xin, yout)\n  declined = .false.",
+                       record_symbols_to=record)
+    run(n=2, first=1)
+    run(n=2, first=2)
+    first, second = (call.splitlines() for call in record.read_text().split("\n\n")[:2])
+    assert "idx[0] 1" in first and "idx[1] 3" in first and "idx[0] 2" in second and "idx[1] 4" in second
+
+
+def test_a_specialised_binding_checks_the_elements_of_small_integer_module_arrays(tmp_path):
+    run = _idx_library(tmp_path, "idx_spec", "call {entry}_dace(xin, yout, dace_declined=declined)",
+                       specialization=lambda frozen: Specialization({}, frozen, {"idx": (1, 3)}))
+    y, declined = run(n=2, first=1)
+    assert not declined
+    np.testing.assert_array_equal(y, [2, -1, 6, -1, -1, -1])
+    for n, first in ((2, 2), (3, 1), (0, 1)):  # other elements, another size, not allocated
+        y, declined = run(n=n, first=first)
+        assert declined, (n, first)
+        np.testing.assert_array_equal(y, -1.0)

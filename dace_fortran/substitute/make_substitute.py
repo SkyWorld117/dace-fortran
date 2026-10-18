@@ -283,9 +283,20 @@ def keep_startup_symbols(recorded: dict, frozen, iface, plan: FlattenPlan) -> di
 
     sources = effective_module_sources(frozen, iface, plan)
     scalars = _scalar_sources(frozen, iface, plan)
-    assigns = _guard_assigns(frozen, iface, plan, [n for n in recorded if n not in scalars])
+    elements = {n for n in recorded if "[" in n}  # of small integer module arrays (recorded_arrays)
+    assigns = _guard_assigns(frozen, iface, plan, [n for n in recorded if n not in scalars and n not in elements])
     kept, dropped = {}, {}
     for name, value in recorded.items():
+        if name in elements:
+            base = name.split("[")[0]
+            o = sources.get(base)
+            why = ["no module array behind it"] if o is None else [
+                *STARTUP.changes((o.module, o.entity)), *STARTUP.changes((o.module, o.entity), shape=True)]
+            if why:
+                dropped[name] = why
+            else:
+                kept[name] = value
+            continue
         if name in scalars:
             text = scalars[name][0].lower()
         else:  # the right-hand sides: the symbol's own name on the left is no input
@@ -510,12 +521,14 @@ def heavy_innermost_loop(min_tasklets: int, limit: int = UNROLL_LIMIT):
 
 
 def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scalars: dict,
-                         keep_heavy_loops: int = 0) -> dict[str, dict[int, str]]:
+                         keep_heavy_loops: int = 0, arrays: dict | None = None) -> dict[str, dict[int, str]]:
     """Specialise ``sdfg`` and split the arrays of records its element loops then index by constants.
 
     Constant propagation and dead-branch elimination come first: a loop bound computed from a specialised value is a
     literal only after them, and indices into parts the case does not have sit in branches it never takes.
     ``keep_heavy_loops``: innermost short loops with bodies of at least this many tasklets stay loops (0: none).
+    ``arrays``: small integer module arrays and their elements (recorded_arrays): once the short loops are unrolled,
+    their element reads in control flow are literals (an equation index ``rs(k)`` the loop over ``k`` reads).
     """
     specialize(sdfg, symbols=symbols, scalars=scalars)
     # Until the dead branches are gone, accesses in them may fall outside arrays the case left degenerate (a
@@ -535,6 +548,11 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
         print(f"short loops unrolled before splitting: {unrolled}; heavy innermost loops kept: "
               f"{[(r.label[:40], r.loop_variable) for r in kept][:12]}", flush=True)
     sdfg.simplify(validate=False, validate_all=False)
+    if arrays:
+        from dace_fortran.substitute.fuse_stencils import fold_control_flow_constants  # noqa: PLC0415
+
+        fold_control_flow_constants(sdfg, {}, {name: list(e) for name, e in arrays.items()})
+        sdfg.simplify(validate=False, validate_all=False)
     sdfg.validate()
     return split_record_companions(sdfg, plan)
 
@@ -984,8 +1002,22 @@ def private_baked_variables(baked: list, dirs: list[Path], records: list[Path]) 
 
 
 
+def recorded_arrays(recorded: dict, frozen, iface, plan: FlattenPlan) -> dict[str, tuple[int, ...]]:
+    """The small integer module arrays (``specialization.small_array_sources``) whose every element the sizing run
+    recorded (``<name>[<k>] <value>``, the same in every call): name -> the elements."""
+    from dace_fortran.bindings.specialization import small_array_sources  # noqa: PLC0415
+
+    sources = small_array_sources(frozen, iface, plan)
+    found: dict[str, dict[int, int]] = {}
+    for key, value in recorded.items():
+        m = re.fullmatch(r"(\w+)\[(\d+)\]", key)
+        if m and m.group(1) in sources:
+            found.setdefault(m.group(1), {})[int(m.group(2))] = int(value)
+    return {name: tuple(e[k] for k in range(len(e))) for name, e in sorted(found.items()) if set(e) == set(range(len(e)))}
+
+
 def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scalars: dict, dropped: list[str],
-                  recorded: dict) -> list[str]:
+                  recorded: dict, arrays: dict) -> list[str]:
     """--auto-scratch: what make_scratch_transient is to match for the module variables auto_scratch.infer finds
     scratch, those given with --scratch left out. The in-call analysis runs on a copy specialised as this build
     specialises the SDFG (the branches the recorded configuration never takes are gone); ``dropped``: the procedures
@@ -997,7 +1029,8 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
     folded: list[tuple[str, int, str, int]] = []  # the member aliases the analysed copy holds as one storage
 
     def specialise(copy: dace.SDFG) -> dict:
-        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops) if symbols or scalars else {}
+        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops, arrays) \
+            if symbols or scalars else {}
         if member_aliases:
             folded.extend(fold_member_aliases(copy, member_aliases, recorded))
         # A record image made a transient takes the recorded extents and lower bounds (finish_scratch_images): the
@@ -1186,9 +1219,12 @@ def main() -> int:
         values = {name: value for name, value in sorted(recorded.items()) if name in guardable}
     symbols = {name: value for name, value in values.items() if name in general.free_symbols}
     scalars = {name: value for name, value in values.items() if name not in symbols}
+    arrays = recorded_arrays(recorded, general, iface, plan) if args.specialize else {}
+    if arrays:
+        print(f"specialised to the elements of small module arrays: {arrays}", flush=True)
     scratch_names = list(args.scratch)
     if args.auto_scratch:
-        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded)
+        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays)
     scratch, scratch_images = [], {}
     if scratch_names:
         scratch, scratch_images = make_scratch_transient(sdfg, scratch_names, recorded)
@@ -1208,7 +1244,7 @@ def main() -> int:
         print(f"specialised to {len(values)} of {len(recorded)} invariant values: "
               f"{values}", flush=True)
     if values:
-        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops)
+        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops, arrays)
         print(f"arrays of records handed over per element: {split}", flush=True)
     if args.specialize:
         # A member of an element of a module array of records that IS another array of the SDFG (the sizing run's
@@ -1290,7 +1326,7 @@ def main() -> int:
         init_symbols=compiled_init_symbols(sdfg_so, sdfg.name),
         module_allocatables_are_targets=False,
         acc_residency=acc,
-        specialization=Specialization(values, general),
+        specialization=Specialization(values, general, arrays),
         record_symbols_to=args.record.resolve() if args.record else None,
         record_only=args.record_only,
         kept_images=kept_images,

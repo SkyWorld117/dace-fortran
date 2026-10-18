@@ -10,6 +10,8 @@ for calls that pass exactly those values.  The pieces here connect the two ends 
   and every scalar it reads from a module variable or a scalar dummy to a file, so a representative run shows which
   values the caller holds fixed;
 * :func:`recorded_invariants`: the values that stayed the same across all recorded calls;
+* small integer module arrays the SDFG reads (``rs(1:nb)``, the equation of each bubble): a sizing run records their
+  elements too (``rs[0] 3``), so a loop over them that is unrolled reads literals, and the guard checks them;
 * :class:`Specialization` and :func:`build_specialization_guard`: the binding of the specialised SDFG computes those
   values as the general binding would, and compares them with the baked ones before it does any work.  A mismatch
   declines the call through the optional ``dace_declined`` flag, so the caller can run its own code instead, or
@@ -21,7 +23,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from dace_fortran.bindings.flatten_plan import FlattenPlan
@@ -35,7 +37,8 @@ Value = int | float
 
 @dataclass(frozen=True)
 class Specialization:
-    """The integer symbols and scalar inputs an SDFG was specialised to, by name (logicals as 0 and 1).
+    """The integer symbols and scalar inputs an SDFG was specialised to, by name (logicals as 0 and 1), and the
+    elements of the small integer module arrays it was specialised to (:func:`small_array_sources`).
 
     ``frozen`` is the signature of the SDFG before the specialisation, which still takes them: the binding computes
     them from it.
@@ -43,6 +46,7 @@ class Specialization:
 
     values: Mapping[str, Value]
     frozen: FrozenSignature
+    arrays: Mapping[str, tuple[int, ...]] = field(default_factory=dict)  # small integer module arrays: elements
 
 
 def _symbols(frozen: FrozenSignature) -> tuple[str, ...]:
@@ -74,6 +78,31 @@ def _scalar_sources(frozen: FrozenSignature, iface: OriginalInterface, plan: Fla
     return out
 
 
+#: The most elements of a module array whose elements a sizing run records (and a guard compares on every call).
+SMALL_ARRAY = 16
+
+
+def small_array_sources(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan) -> dict[str, tuple]:
+    """The rank-1 integer module arrays the SDFG takes and never writes, by name: the Fortran expression of the array
+    and its argument.  A sizing run records their elements when there are at most :data:`SMALL_ARRAY`."""
+    from dace_fortran.bindings.block_builders import _module_value_expr, _synthetic_members, effective_module_sources
+
+    module_sources = effective_module_sources(frozen, iface, plan)
+    members = _synthetic_members(plan)
+    return {a.sdfg_name: (_module_value_expr(a.sdfg_name, members), a) for a in frozen.args
+            if not a.is_written and a.rank == 1 and tuple(a.shape) != ("1",) and a.dtype in ("int32", "int64")
+            and a.sdfg_name in module_sources}
+
+
+def _defined(expr: str, a, lines: list[str]) -> list[str]:
+    """``lines`` inside a test that the module array ``expr`` (argument ``a``) is allocated, where it may not be."""
+    from dace_fortran.bindings.block_builders import _module_arg_may_be_unallocated, _present
+
+    if not _module_arg_may_be_unallocated(a):
+        return lines
+    return [f"if ({_present(expr, a.module_origin_pointer)}) then", *(f"  {ln}" for ln in lines), "end if"]
+
+
 def _record_write(name: str, expr: str, dtype: str) -> str:
     """One record line: an integer as itself, a logical as 0 or 1, a real with the 17 decimals that round-trip it."""
     if dtype in LOGICAL_DTYPES:
@@ -87,16 +116,26 @@ def render_symbol_record(
     frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, path: str | Path
 ) -> list[str]:
     """Wrapper lines appending ``<name> <value>`` for every integer symbol and every scalar input from the caller to
-    ``path``, and an empty line that ends the call.  They go after the wrapper has assigned all of them, right before
+    ``path``, ``<name>[<k>] <value>`` for every element of a small integer module array (:func:`small_array_sources`),
+    and an empty line that ends the call.  They go after the wrapper has assigned all of them, right before
     the SDFG call."""
     lines = [
         f"{_INDENT}! ----- Symbol record: the integer symbols and scalar inputs of this call -----",
         f"{_INDENT}block",
-        f"{_INDENT}  integer :: dace_record_unit",
+        f"{_INDENT}  integer :: dace_record_unit, dace_k",
         f"{_INDENT}  open(newunit=dace_record_unit, file='{Path(path)}', position='append', action='write')",
     ]
     lines += [f"{_INDENT}  " + _record_write(s, s, "int64") for s in _symbols(frozen)]
     lines += [f"{_INDENT}  " + _record_write(s, e, t) for s, (e, t) in _scalar_sources(frozen, iface, plan).items()]
+    for name, (expr, a) in small_array_sources(frozen, iface, plan).items():
+        lines += [f"{_INDENT}  {ln}" for ln in _defined(expr, a, [
+            f"if (size({expr}) <= {SMALL_ARRAY}) then",
+            f"  do dace_k = 1, size({expr})",
+            f"    write(dace_record_unit, '(2a, i0, a, 1x, i0)') '{name}', '[', dace_k - 1, ']', "
+            f"{expr}(lbound({expr}, 1) + dace_k - 1)",
+            "  end do",
+            "end if",
+        ])]
     lines += [
         f"{_INDENT}  write(dace_record_unit, '(a)') ''",
         f"{_INDENT}  close(dace_record_unit)",
@@ -208,10 +247,11 @@ def specializable(frozen: FrozenSignature, iface: OriginalInterface, plan: Flatt
 
 
 def guard_module_sources(spec: Specialization, iface: OriginalInterface, plan: FlattenPlan) -> dict[str, ModuleOrigin]:
-    """The module variables the guard of ``spec`` reads: those of its values that come from a module."""
+    """The module variables the guard of ``spec`` reads: those of its values and arrays that come from a module."""
     from dace_fortran.bindings.block_builders import effective_module_sources
 
-    return {s: o for s, o in effective_module_sources(spec.frozen, iface, plan).items() if s in spec.values}
+    return {s: o for s, o in effective_module_sources(spec.frozen, iface, plan).items()
+            if s in spec.values or s in spec.arrays}
 
 
 def _differs(expr: str, value: Value, dtype: str) -> str:
@@ -245,12 +285,14 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
         f"{_INDENT}! ----- Specialisation guard: the SDFG holds these values -----",
         f"{_INDENT}if (present({DECLINED_FLAG})) {DECLINED_FLAG} = .false.",
     ]
-    if not spec.values:
+    if not spec.values and not spec.arrays:
         return lines
-    width = max(len(s) for s in spec.values)
+    width = max(len(s) for s in [*spec.values, *spec.arrays])
     lines.append(f"{_INDENT}block")
     lines += [f"{_INDENT}  integer(c_int64_t) :: {s}" for s in spec.values if assigns.get(s)]
     lines.append(f"{_INDENT}  character(len={width}) :: dace_mismatch")
+    if spec.arrays:
+        lines.append(f"{_INDENT}  logical :: dace_holds")
     lines.append(f"{_INDENT}  logical, save :: dace_said = .false.")
     lines.append(f"{_INDENT}  dace_mismatch = ''")
     for s in spec.values:
@@ -258,6 +300,13 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
     for s, v in spec.values.items():
         expr, dtype = scalars.get(s, (s, "int64"))
         lines.append(f"{_INDENT}  if ({_differs(expr, v, dtype)}) dace_mismatch = '{s}'")
+    sources = small_array_sources(spec.frozen, iface, plan)
+    for name, elements in spec.arrays.items():
+        expr, a = sources[name]
+        lines.append(f"{_INDENT}  dace_holds = .false.")
+        lines += [f"{_INDENT}  {ln}" for ln in _defined(expr, a, [
+            f"if (size({expr}) == {len(elements)}) dace_holds = all({expr} == [{', '.join(str(int(e)) for e in elements)}])"])]
+        lines.append(f"{_INDENT}  if (.not. dace_holds) dace_mismatch = '{name}'")
     lines += [
         f"{_INDENT}  if (dace_mismatch /= '') then",
         f"{_INDENT}    if (present({DECLINED_FLAG})) then",
