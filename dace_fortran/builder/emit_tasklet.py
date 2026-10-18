@@ -41,6 +41,19 @@ if TYPE_CHECKING:
 _IDENT_RE = re.compile(r"(?<![0-9.])[a-zA-Z_]\w*")
 
 
+def _outside_brackets(expr: str) -> str:
+    """``expr`` without the text inside its (balanced) square brackets: the subscripts of the reads it spells out."""
+    out, depth = [], 0
+    for ch in expr:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
 def _ident_tokens(expr: str) -> set:
     """Identifier tokens in ``expr``, excluding complex-literal imaginary
     units (see ``_IDENT_RE``)."""
@@ -225,16 +238,23 @@ def emit_tasklet(
     r_scl |= _len1_views
     target = assign_node.target
 
-    # Index arrays (e.g. edge_idx) move onto the interstate edge as symbols, not connectors.
+    # Index arrays (e.g. edge_idx) move onto the interstate edge as symbols, not connectors. One read as a value
+    # too (``s = cell(1) + x(cell(1))``) keeps its connectors for those reads: its index loads, each listed right
+    # before the access it indexes, are not occurrences in the expression.
     indirect_arrays = {indirect_host(expr) for expr in indirect_syms}
-    r_arr -= indirect_arrays
+    index_loads = {
+        i for i, ac in enumerate(accesses[:-1])
+        if ac.is_read and ac.array_name in indirect_arrays
+        and any(f"{ac.array_name}[" in str(e) for e in accesses[i + 1].index_exprs or [])
+    }
+    r_arr -= {nm for nm in indirect_arrays if nm not in _ident_tokens(_outside_brackets(assign_node.expr))}
 
     # ONE connector + ONE memlet per textual occurrence (never deduplicated): deduplication misaligns the
     # occurrence-to-access mapping when the accesses list and the expression disagree on count (e.g. MIN/MAX
     # cmp+select).
     reads_by_name: dict[str, list[AccessLike]] = {}
-    for ac in accesses:
-        if ac.is_read and ac.array_name in r_arr:
+    for i, ac in enumerate(accesses):
+        if ac.is_read and ac.array_name in r_arr and i not in index_loads:
             reads_by_name.setdefault(ac.array_name, []).append(ac)
 
     # Connector substitution: scalars -> ``_in_<name>``, Nth array occurrence
