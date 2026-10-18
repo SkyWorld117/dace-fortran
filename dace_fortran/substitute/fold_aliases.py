@@ -19,6 +19,7 @@ from dataclasses import replace
 import dace
 import networkx as nx
 from dace import nodes, subsets, symbolic
+from dace.properties import CodeBlock
 from dace.sdfg import dealias
 from dace.sdfg.state import AbstractControlFlowRegion
 from dace_fortran.array_split import _UNKNOWN, _keep_order, _subset_of
@@ -163,7 +164,8 @@ def _same_extent(sdfg: dace.SDFG, a: str, b: str, known: dict) -> bool:
 def _moved_nodes(sdfg: dace.SDFG, image: str, moves: dict[int, tuple[str, int]]):
     """Per state, the access nodes of ``image`` with an edge at a moved element; None when an access may reach a
     moved element without picking one literal element (a range over elements, a nested SDFG's whole image), or a
-    condition, loop header or interstate assignment reads the image."""
+    condition or loop header reads the image, or an interstate assignment reads it other than at a literal element
+    (one at a moved element :func:`_rewrite_code` rewrites)."""
     found = []
     for state in sdfg.states():
         for edge in state.edges():
@@ -182,8 +184,10 @@ def _moved_nodes(sdfg: dace.SDFG, image: str, moves: dict[int, tuple[str, int]])
             for e in [*state.in_edges(n), *state.out_edges(n)])]
         found += [(state, n) for n in nodes_]
     for edge in sdfg.all_interstate_edges():
-        if any(m.data == image for m in edge.data.get_read_memlets(sdfg.arrays)):
-            return None
+        for m in edge.data.get_read_memlets(sdfg.arrays):
+            rng = _element_range(m.subset) if m.data == image else ()
+            if rng is None or (rng and rng[0] != rng[1]):
+                return None
     for block in sdfg.all_control_flow_blocks():
         if isinstance(block, AbstractControlFlowRegion) and any(m.data == image for m in block.get_meta_read_memlets()):
             return None
@@ -201,6 +205,39 @@ def _renamed_bounds(sdfg: dace.SDFG, image: str, other: str, known: dict) -> dic
             elif theirs in known:
                 out[mine] = str(known[theirs])
     return out
+
+
+def _rewrite_code(code: str, image: str, moves: dict[int, tuple[str, int]], rename: dict[str, dict]) -> str:
+    """``code`` (an interstate assignment or condition) with every subscript of ``image`` at a moved element made one
+    of the other image's element, its bounds symbols those of the other image (``rename``: per other image, symbol ->
+    expression)."""
+    import ast  # noqa: PLC0415
+
+    class Moved(ast.NodeTransformer):
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            if not (isinstance(node.value, ast.Name) and node.value.id == image):
+                return node
+            index = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            try:
+                element = int(symbolic.pystr_to_symbolic(ast.unparse(index[0])))
+            except (TypeError, ValueError):
+                return node
+            if element not in moves:
+                return node
+            other, other_element = moves[element]
+            subs = {str(k): str(v) for k, v in rename[other].items()}
+
+            class Bounds(ast.NodeTransformer):
+                def visit_Name(self, name):
+                    return ast.parse(subs[name.id], mode="eval").body if name.id in subs else name
+
+            rest = [Bounds().visit(i) for i in index[1:]]
+            node.value = ast.Name(id=other, ctx=ast.Load())
+            node.slice = ast.Tuple(elts=[ast.Constant(other_element), *rest], ctx=ast.Load())
+            return node
+
+    return ast.unparse(Moved().visit(ast.parse(code)))
 
 
 def _ordered(state: dace.SDFGState, a: nodes.AccessNode, b: nodes.AccessNode) -> bool:
@@ -275,6 +312,12 @@ def _fold_one(sdfg: dace.SDFG, image: str, moves: dict[int, tuple[str, int]], kn
             _keep_order(state, list(parts.values()))
         else:
             _keep_order(state, [node, *parts.values()])
+    # Interstate assignments and conditions that read the image at a moved element.
+    for edge in sdfg.all_interstate_edges():
+        if not any(m.data == image for m in edge.data.get_read_memlets(sdfg.arrays)):
+            continue
+        edge.data.assignments = {k: _rewrite_code(v, image, moves, rename) for k, v in edge.data.assignments.items()}
+        edge.data.condition = CodeBlock(_rewrite_code(edge.data.condition.as_string, image, moves, rename))
     # Memlets inside scopes that name the image at a moved element (a tasklet's edge to a map exit, say).
     for state in sdfg.states():
         for edge in state.edges():

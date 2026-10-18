@@ -142,3 +142,25 @@ def test_images_of_different_extents_are_kept_apart():
     sdfg = _members()
     sdfg.arrays["c_sf"].set_shape([3, N + 1])
     assert fold_member_aliases(sdfg, [("p_sf", 0, "c_sf", 0)]) == []
+
+
+def test_an_interstate_read_of_a_moved_element_reads_the_other_image():
+    """``s = p(1)%sf(2)``, assigned on an interstate edge after the boundary and added to y: once p(1)'s accesses are
+    c(1)'s, the assignment reads c(1) too."""
+    sdfg = _members()
+    use = next(s for s in sdfg.states() if s.label == "use")
+    edge = sdfg.in_edges(use)[0]
+    edge.data.assignments = {"s": "p_sf[0, 1]"}
+    sdfg.add_symbol("s", dace.float64)
+    tasklet = next(n for n in use.nodes() if isinstance(n, dace.nodes.Tasklet))
+    tasklet.code = dace.properties.CodeBlock("w = a + d + s")
+    sdfg.validate()
+    assert fold_member_aliases(sdfg, [("p_sf", 0, "c_sf", 0)]) == [("p_sf", 0, "c_sf", 0)]
+    assert sdfg.in_edges(use)[0].data.assignments == {"s": "c_sf[0, 1]"}
+    sdfg.validate()
+    x = np.random.default_rng(3).random((3, N))
+    y = np.zeros(N)
+    sdfg(x=x, p_sf=np.zeros((3, N)), c_sf=np.zeros((3, N)), y=y)
+    c0 = x[0].copy()
+    c0[0] = c0[1]
+    np.testing.assert_allclose(y, c0 + 2 * x[1] + c0 + c0[1])
