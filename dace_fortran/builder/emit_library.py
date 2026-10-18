@@ -1592,14 +1592,17 @@ class CallTerm(NamedTuple):
 def _image_of_record_array(builder: SDFGBuilder, ctx: Ctx, name: str) -> str:
     """The SDFG array a call argument names: itself, or, for an array of records the flattening unpacked into one
     member image (``q_vf`` -> ``q_vf_sf``), that image, which is what the SDFG holds and the callee's shim takes."""
-    if name in ctx.sdfg.arrays or name in ctx.sdfg.symbols:
+    if name in ctx.sdfg.arrays or name in ctx.sdfg.symbols or not name:
         return name
     plan = builder.module.get_flatten_plan() or {}
     images = sorted({f for e in plan.get("entries") or [] for f in e.get("recipe", {}).get("flat_names") or []
                      if f.startswith(f"{name}_")})
+    # A module array of records: its member images are arrays of the SDFG already (records.py).
+    if not images:
+        images = sorted(a for a in ctx.sdfg.arrays if a.startswith(f"{name}_"))
+    print(f"kept call: {name} is no array or symbol of the SDFG; member images {images}", flush=True)
     if len(images) != 1:
         return name
-    print(f"kept call: the array of records {name} is passed as its member image {images[0]}", flush=True)
     return images[0]
 
 
