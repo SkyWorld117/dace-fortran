@@ -155,8 +155,11 @@ def _same_extent(sdfg: dace.SDFG, a: str, b: str, known: dict) -> bool:
     for k in range(1, len(da.shape)):
         pairs = [(da.shape[k], db.shape[k]), (offset(f"offset_{a}_d{k}"), offset(f"offset_{b}_d{k}"))]
         for x, y in pairs:
-            diff = symbolic.pystr_to_symbolic(str(x)).subs(subs) - symbolic.pystr_to_symbolic(str(y)).subs(subs)
-            if symbolic.simplify(diff) != 0:
+            diff = symbolic.simplify(
+                symbolic.pystr_to_symbolic(str(x)).subs(subs) - symbolic.pystr_to_symbolic(str(y)).subs(subs))
+            # Extents left to the run (an extent that differs between the ranks of a run) are two symbols the
+            # recorded alias says are equal: only known extents that differ refuse.
+            if diff != 0 and not getattr(diff, "free_symbols", set()):
                 return False
     return True
 
