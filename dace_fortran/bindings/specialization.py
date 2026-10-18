@@ -234,14 +234,24 @@ def recorded_member_aliases(path: str | Path) -> list[tuple[str, int, str, int]]
     return sorted(calls[0])
 
 
-def recorded_invariants(path: str | Path) -> dict[str, Value]:
-    """The values that stayed the same in every call recorded at ``path`` (see :func:`render_symbol_record`)."""
+def _recorded_values(path: str | Path) -> dict[str, set[Value]]:
     seen: dict[str, set[Value]] = {}
     for line in Path(path).read_text().splitlines():
         fields = line.split()
         if len(fields) == 2:
             seen.setdefault(fields[0], set()).add(_parse(fields[1]))
-    return {name: values.pop() for name, values in seen.items() if len(values) == 1}
+    return seen
+
+
+def recorded_invariants(path: str | Path) -> dict[str, Value]:
+    """The values that stayed the same in every call recorded at ``path`` (see :func:`render_symbol_record`)."""
+    return {name: values.pop() for name, values in _recorded_values(path).items() if len(values) == 1}
+
+
+def recorded_value_sets(path: str | Path) -> dict[str, list[Value]]:
+    """The values each name took that did not stay the same at ``path`` (a boundary type that differs between the
+    ranks of one run): every call takes one of them, which decides the conditions that come out the same for all."""
+    return {name: sorted(values, key=str) for name, values in _recorded_values(path).items() if len(values) > 1}
 
 
 def _guard_assigns(

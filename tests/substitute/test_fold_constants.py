@@ -44,3 +44,44 @@ def test_a_branch_on_a_recorded_element_folds_once_its_subscript_is_known():
     x, out = np.arange(8, dtype=np.float64), np.zeros(8)
     sdfg(x=x, out=out, flags=np.array([1, 0, 1], dtype=np.int32))
     np.testing.assert_array_equal(out, 3.0 * x)  # flags[1] == 0: the else branch
+
+
+def _branch_on_symbol(condition: str) -> dace.SDFG:
+    """out[i] = x[i] * (2 if <condition> else 3), the condition reading the symbol ``bc``."""
+    sdfg = dace.SDFG("branch_on_symbol")
+    sdfg.add_array("x", [8], dace.float64)
+    sdfg.add_array("out", [8], dace.float64)
+    sdfg.add_symbol("bc", dace.int64)
+    sdfg.add_state("init", is_start_block=True)
+    branch = ConditionalBlock("on_bc")
+    sdfg.add_node(branch)
+    sdfg.add_edge(sdfg.start_state, branch, dace.InterstateEdge())
+    for code, factor in ((condition, 2.0), (None, 3.0)):
+        body = dace.sdfg.state.ControlFlowRegion(f"b{int(factor)}", sdfg=sdfg)
+        st = body.add_state(f"s{int(factor)}", is_start_block=True)
+        st.add_mapped_tasklet("scale", {"i": "0:8"}, {"_x": dace.Memlet("x[i]")}, f"_o = _x * {factor}",
+                              {"_o": dace.Memlet("out[i]")}, external_edges=True)
+        branch.add_branch(dace.properties.CodeBlock(code) if code else None, body)
+    return sdfg
+
+
+def test_a_condition_the_same_for_every_value_of_a_set_folds_and_one_that_differs_stays():
+    from dace_fortran.substitute.fuse_stencils import fold_conditions_over_value_sets
+
+    sdfg = _branch_on_symbol("bc <= -5")  # a boundary condition no rank has: bc is 0 on one rank, -3 on the other
+    assert fold_conditions_over_value_sets(sdfg, {"bc": [0, -3]}) == 1
+    sdfg.simplify()
+    assert not any(isinstance(b, ConditionalBlock) for b in sdfg.all_control_flow_blocks(recursive=True))
+    x, out = np.arange(8, dtype=np.float64), np.zeros(8)
+    sdfg(x=x, out=out, bc=0)
+    np.testing.assert_array_equal(out, 3.0 * x)
+
+    kept = _branch_on_symbol("bc >= 0")  # the exchange with a neighbour: one rank has it, the other has not
+    assert fold_conditions_over_value_sets(kept, {"bc": [0, -3]}) == 0
+    kept.simplify()
+    assert any(isinstance(b, ConditionalBlock) for b in kept.all_control_flow_blocks(recursive=True))
+    out = np.zeros(8)
+    kept(x=x, out=out, bc=-3)
+    np.testing.assert_array_equal(out, 3.0 * x)
+    kept(x=x, out=out, bc=0)
+    np.testing.assert_array_equal(out, 2.0 * x)

@@ -85,6 +85,50 @@ def _fold_conditional_expressions(text: str) -> str:
     return ast.unparse(tree) if fold.changed else text
 
 
+def fold_conditions_over_value_sets(sdfg: dace.SDFG, sets: dict[str, list]) -> int:
+    """Replace every branch and interstate condition that reads only names of ``sets`` and comes out the same for
+    every combination of their values by that literal (``bc <= -5`` with ``bc`` one of 0 and -3 is false whichever
+    the rank has); conditions that differ between the values stay.  Returns the number of conditions replaced."""
+    import itertools
+
+    names = sorted(sets)
+    combinations = list(itertools.product(*(sets[n] for n in names)))
+
+    def decided(code: CodeBlock | None) -> CodeBlock | None:
+        if code is None:
+            return None
+        try:
+            expr = symbolic.pystr_to_symbolic(code.as_string)
+        except Exception:  # noqa: BLE001 -- not an expression the folding can judge
+            return None
+        free = {str(f) for f in expr.free_symbols}
+        if not free or not free <= set(names):
+            return None
+        results = set()
+        for values in combinations:
+            value = expr.subs({symbolic.symbol(n): v for n, v in zip(names, values, strict=True)})
+            if value not in (True, False) and getattr(value, "is_Boolean", False) is False:
+                return None
+            results.add(bool(value))
+            if len(results) > 1:
+                return None
+        return CodeBlock("1" if results.pop() else "0", language=code.language)
+
+    replaced = 0
+    for sd in sdfg.all_sdfgs_recursive():
+        for e in sd.all_interstate_edges(recursive=True):
+            cond = decided(e.data.condition)
+            if cond is not None and cond.as_string != e.data.condition.as_string:
+                e.data.condition, replaced = cond, replaced + 1
+        for blk in sd.all_control_flow_blocks(recursive=True):
+            if isinstance(blk, ConditionalBlock):
+                for i, (c, b) in enumerate(list(blk.branches)):
+                    cond = decided(c)
+                    if cond is not None and cond.as_string != c.as_string:
+                        blk.branches[i], replaced = (cond, b), replaced + 1
+    return replaced
+
+
 def fold_control_flow_constants(sdfg: dace.SDFG, scalars: dict[str, object], elements: dict[str, list]) -> None:
     """Replace reads of known scalars and of elements of constant arrays in every condition, loop statement and
     interstate assignment, recursively; then propagate the constants and drop the branches they decide. Folding and

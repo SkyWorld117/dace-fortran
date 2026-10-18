@@ -47,7 +47,13 @@ from dace_fortran.bindings.build_fortran_library import compiled_init_symbols
 from dace_fortran.bindings.fortran_interface import build_auto_interface
 from dace_fortran.bindings.frozen_signature import attach_to_sdfg, drop_unread_module_inputs, get_frozen_signature, refreeze
 from dace_fortran.bindings.record_split import split_record_companions
-from dace_fortran.bindings.specialization import Specialization, recorded_aliases, recorded_invariants, specializable
+from dace_fortran.bindings.specialization import (
+    Specialization,
+    recorded_aliases,
+    recorded_invariants,
+    recorded_value_sets,
+    specializable,
+)
 from dace_fortran.builder import SDFGBuilder
 from dace_fortran.external import keep_external
 from dace_fortran import pipelines as P
@@ -521,7 +527,8 @@ def heavy_innermost_loop(min_tasklets: int, limit: int = UNROLL_LIMIT):
 
 
 def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scalars: dict,
-                         keep_heavy_loops: int = 0, arrays: dict | None = None) -> dict[str, dict[int, str]]:
+                         keep_heavy_loops: int = 0, arrays: dict | None = None,
+                         value_sets: dict | None = None) -> dict[str, dict[int, str]]:
     """Specialise ``sdfg`` and split the arrays of records its element loops then index by constants.
 
     Constant propagation and dead-branch elimination come first: a loop bound computed from a specialised value is a
@@ -531,6 +538,13 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
     their element reads in control flow are literals (an equation index ``rs(k)`` the loop over ``k`` reads).
     """
     specialize(sdfg, symbols=symbols, scalars=scalars)
+    # A value that differs between the ranks of a run stays a symbol, but the conditions that come out the same for
+    # every value it takes (a boundary condition no rank has) still fold.
+    if value_sets:
+        from dace_fortran.substitute.fuse_stencils import fold_conditions_over_value_sets  # noqa: PLC0415
+
+        print(f"conditions decided over the values of {sorted(value_sets)}: "
+              f"{fold_conditions_over_value_sets(sdfg, value_sets)}", flush=True)
     # Until the dead branches are gone, accesses in them may fall outside arrays the case left degenerate (a
     # boundary condition's coefficients for a direction without it): validate once they are.
     sdfg.simplify(validate=False, validate_all=False)
@@ -1029,7 +1043,7 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
     folded: list[tuple[str, int, str, int]] = []  # the member aliases the analysed copy holds as one storage
 
     def specialise(copy: dace.SDFG) -> dict:
-        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops, arrays) \
+        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops, arrays, value_sets) \
             if symbols or scalars else {}
         if member_aliases:
             folded.extend(fold_member_aliases(copy, member_aliases, recorded))
@@ -1099,6 +1113,11 @@ def baked_values(records: list[Path], values: dict | None) -> list:
     baked = [(RecordedValue(*name.split("::", 1), types[name]), value) for name, value in sorted(values.items())]
     print(f"substitute entry checks {len(baked)} baked values", flush=True)
     return baked
+
+def iface_scalar_names(iface) -> set[str]:
+    """The names of the routine's scalar arguments (a recorded value may be one rather than a symbol)."""
+    return {a.name for a in iface.args if getattr(a, "rank", 1) == 0}
+
 
 def external_signature(spec: str) -> tuple[str, dict]:
     """``NAME=C_NAME(KIND,...)`` of --external as ``keep_external``'s name and keywords."""
@@ -1257,6 +1276,11 @@ def main() -> int:
     arrays = recorded_arrays(recorded, general, iface, plan) if args.specialize else {}
     if arrays:
         print(f"specialised to the elements of small module arrays: {arrays}", flush=True)
+    # The recorded values that differ (between the ranks of a run): known sets, not baked.
+    value_sets = {name: v for name, v in recorded_value_sets(args.specialize).items()
+                  if name in general.free_symbols or name in iface_scalar_names(iface)} if args.specialize else {}
+    if value_sets:
+        print(f"values that differ between calls or ranks, kept as symbols: {value_sets}", flush=True)
     scratch_names = list(args.scratch)
     if args.auto_scratch:
         scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays)
@@ -1279,7 +1303,7 @@ def main() -> int:
         print(f"specialised to {len(values)} of {len(recorded)} invariant values: "
               f"{values}", flush=True)
     if values:
-        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops, arrays)
+        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops, arrays, value_sets)
         print(f"arrays of records handed over per element: {split}", flush=True)
     if args.specialize:
         # A member of an element of a module array of records that IS another array of the SDFG (the sizing run's

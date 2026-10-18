@@ -320,3 +320,12 @@ def test_extra_procedures_are_part_of_the_binding_module(tmp_path):
     v = np.zeros(1, dtype=np.int32)
     probe(v.ctypes.data)
     assert v[0] == 42
+
+
+def test_recorded_value_sets_are_the_values_that_did_not_stay_the_same(tmp_path):
+    from dace_fortran.bindings.specialization import recorded_value_sets
+
+    record = tmp_path / "ranks.symbols"
+    record.write_text("bc_x_beg -3\nbc_x_end 0\nm 99\n\nbc_x_beg 0\nbc_x_end -3\nm 99\n\n")
+    assert recorded_invariants(record) == {"m": 99}
+    assert recorded_value_sets(record) == {"bc_x_beg": [-3, 0], "bc_x_end": [-3, 0]}
