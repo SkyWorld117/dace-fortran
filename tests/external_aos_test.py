@@ -891,3 +891,42 @@ end module
         assert "assoc_scalar" not in body, body
     finally:
         clear_external_registry()
+
+
+def test_literal_arguments_through_an_inlined_callee_are_their_values(tmp_path):
+    """``call wrap(x, 1, -1)`` where ``wrap`` hands its integer dummies to the kept call: the inlined dummies
+    re-declare the literal adapters, and the call's terms are still the literals."""
+    so = _build_c_so(tmp_path, "ext_in", "void ext_in(double* x, int* d, int* s){x[0] += *d * *s;}")
+    src = """
+module m_in
+  use iso_c_binding
+  implicit none
+  interface
+    subroutine ext_in(x, d, s) bind(c, name="ext_in")
+      import :: c_double, c_int
+      real(c_double), intent(inout) :: x(*)
+      integer(c_int), intent(in) :: d, s
+    end subroutine
+  end interface
+contains
+  subroutine wrap(x, d, s)
+    real(c_double), intent(inout) :: x(4)
+    integer(c_int), intent(in) :: d, s
+    call ext_in(x, d, s)
+  end subroutine
+  subroutine kern(x)
+    real(c_double), intent(inout) :: x(4)
+    call wrap(x, 1, -1)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_in", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                      Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+                                      Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_in::kern").build()
+        body = _external_call_body(sdfg)
+        assert "assoc_scalar" not in body, body
+    finally:
+        clear_external_registry()

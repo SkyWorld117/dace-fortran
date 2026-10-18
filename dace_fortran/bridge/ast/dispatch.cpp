@@ -1980,23 +1980,30 @@ std::vector<ASTNode> buildReductionAssignNodes(hlfir::AssignOp assign, mlir::Ope
 // recognised identically in both. io_state/fft_plans thread the I/O and FFTW3 plan state machines across calls in one
 // block.
 /// The constant a ``__assoc_scalar`` adapter holds: flang passes a literal actual by reference through an alloca
-/// it stores the literal into once, declared under a ``__assoc_scalar_N`` name. Nullopt for anything else.
+/// it stores the literal into once, declared under a ``__assoc_scalar_N`` name; an inlined callee's dummy
+/// re-declares that memory under its own name. Nullopt for anything else (a variable of the program).
 static std::optional<int64_t> traceAssocScalarLiteral(mlir::Value v) {
-  auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(v.getDefiningOp());
-  if (!decl || decl.getUniqName().str().find("__assoc_scalar") == std::string::npos) return std::nullopt;
+  std::vector<mlir::Value> places;  // every result of the re-declare chain, then the memory itself
+  bool adapter = false;
+  mlir::Value cur = v;
+  for (int i = 0; i < 8; ++i) {
+    auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(cur.getDefiningOp());
+    if (!decl) break;
+    adapter = adapter || decl.getUniqName().str().find("__assoc_scalar") != std::string::npos;
+    places.push_back(decl.getResult(0));
+    places.push_back(decl.getResult(1));
+    cur = decl.getMemref();
+  }
+  if (!adapter) return std::nullopt;
+  places.push_back(cur);
   std::optional<int64_t> literal;
   int stores = 0;
-  for (auto result : {decl.getResult(0), decl.getResult(1)})
-    for (auto* user : result.getUsers())
+  for (auto place : places)
+    for (auto* user : place.getUsers())
       if (auto st = mlir::dyn_cast<fir::StoreOp>(user)) {
         ++stores;
         literal = traceConstInt(st.getValue());
       }
-  for (auto* user : decl.getMemref().getUsers())
-    if (auto st = mlir::dyn_cast<fir::StoreOp>(user)) {
-      ++stores;
-      literal = traceConstInt(st.getValue());
-    }
   return stores == 1 ? literal : std::nullopt;
 }
 
