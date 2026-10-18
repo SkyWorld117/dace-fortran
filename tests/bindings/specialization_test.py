@@ -289,6 +289,10 @@ def test_a_binding_recording_per_rank_writes_the_file_of_its_rank(tmp_path, monk
         record_symbols_to=record,
         record_per_rank=True,
     )
+    from dace_fortran.bindings.specialization import RANK_VARIABLES
+
+    for var in RANK_VARIABLES:  # the test itself may run under a launcher
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("OMPI_COMM_WORLD_RANK", "3")
     run(nv=3)
     monkeypatch.delenv("OMPI_COMM_WORLD_RANK")
