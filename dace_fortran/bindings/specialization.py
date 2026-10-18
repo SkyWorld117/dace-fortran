@@ -117,6 +117,26 @@ def _record_write(name: str, expr: str, dtype: str) -> str:
 RANK_VARIABLES = ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID")
 
 
+def record_open_lines(unit: str, path: str, per_rank: bool) -> tuple[list[str], list[str]]:
+    """Declarations and statements opening the record file ``path`` (a Fortran character expression) on ``unit`` for
+    appending.  ``per_rank``: a process an MPI launcher started (:data:`RANK_VARIABLES`) opens ``<path>.<rank>``
+    instead, so the ranks of one run do not write into one file."""
+    if not per_rank:
+        return [], [f"open(newunit={unit}, file={path}, position='append', action='write')"]
+    statements = ["dace_rank_status = 1"]
+    for var in RANK_VARIABLES:
+        statements.append(f"if (dace_rank_status /= 0) "
+                          f"call get_environment_variable('{var}', dace_rank, status=dace_rank_status)")
+    statements += [
+        "if (dace_rank_status == 0) then",
+        f"  open(newunit={unit}, file={path} // '.' // trim(dace_rank), position='append', action='write')",
+        "else",
+        f"  open(newunit={unit}, file={path}, position='append', action='write')",
+        "end if",
+    ]
+    return ["character(len=32) :: dace_rank", "integer :: dace_rank_status"], statements
+
+
 def render_symbol_record(
     frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, path: str | Path, per_rank: bool = False
 ) -> list[str]:
@@ -125,30 +145,14 @@ def render_symbol_record(
     and an empty line that ends the call.  They go after the wrapper has assigned all of them, right before
     the SDFG call.  ``per_rank``: a process launched by MPI (:data:`RANK_VARIABLES`) records to ``<path>.<rank>``
     instead, so the ranks of one run do not write into one file."""
+    declarations, opening = record_open_lines("dace_record_unit", f"'{Path(path)}'", per_rank)
     lines = [
         f"{_INDENT}! ----- Symbol record: the integer symbols and scalar inputs of this call -----",
         f"{_INDENT}block",
         f"{_INDENT}  integer :: dace_record_unit, dace_k",
+        *(f"{_INDENT}  {ln}" for ln in declarations),
+        *(f"{_INDENT}  {ln}" for ln in opening),
     ]
-    if per_rank:
-        lines += [
-            f"{_INDENT}  character(len=32) :: dace_rank",
-            f"{_INDENT}  integer :: dace_rank_status",
-            f"{_INDENT}  dace_rank_status = 1",
-        ]
-        for var in RANK_VARIABLES:
-            lines.append(f"{_INDENT}  if (dace_rank_status /= 0) "
-                         f"call get_environment_variable('{var}', dace_rank, status=dace_rank_status)")
-        lines += [
-            f"{_INDENT}  if (dace_rank_status == 0) then",
-            f"{_INDENT}    open(newunit=dace_record_unit, file='{Path(path)}.' // trim(dace_rank), position='append', "
-            "action='write')",
-            f"{_INDENT}  else",
-            f"{_INDENT}    open(newunit=dace_record_unit, file='{Path(path)}', position='append', action='write')",
-            f"{_INDENT}  end if",
-        ]
-    else:
-        lines.append(f"{_INDENT}  open(newunit=dace_record_unit, file='{Path(path)}', position='append', action='write')")
     lines += [f"{_INDENT}  " + _record_write(s, s, "int64") for s in _symbols(frozen)]
     lines += [f"{_INDENT}  " + _record_write(s, e, t) for s, (e, t) in _scalar_sources(frozen, iface, plan).items()]
     for name, (expr, a) in small_array_sources(frozen, iface, plan).items():

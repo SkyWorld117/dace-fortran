@@ -393,3 +393,20 @@ def test_a_handover_after_taken_calls_stops_when_the_binding_keeps_buffers(tmp_p
             assert "after it took calls" in stopped.value.stderr
         else:
             _run(tmp_path, sources, "dace_sub_step")
+
+
+def test_a_recording_stand_in_per_rank_writes_the_file_of_its_rank(tmp_path: Path, monkeypatch):
+    from dace_fortran.bindings.specialization import RANK_VARIABLES
+
+    iface = _interface(tmp_path)
+    (tmp_path / "modules.f90").write_text(_MODULES)
+    (tmp_path / "main.f90").write_text(_MAIN)
+    record = tmp_path / "calls.record"
+    values = [RecordedValue("cfg", "nsweeps", "integer(4)")]
+    standin = emit_recording_standin(iface, values, record, tmp_path / "record_step.f90", per_rank=True)
+    for var in RANK_VARIABLES:  # the test itself may run under a launcher
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OMPI_COMM_WORLD_RANK", "2")
+    _run(tmp_path, [tmp_path / "modules.f90", standin, tmp_path / "main.f90"], "dace_record_step")
+    assert recorded_invariants(tmp_path / "calls.record.2") == {"cfg::nsweeps": 2}
+    assert not record.exists()

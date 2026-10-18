@@ -42,6 +42,8 @@ def _prefix_pipeline() -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fypp", type=Path, action="append", default=[], help="more source directories (repeatable)")
+    ap.add_argument("--record-per-rank", action="store_true", help="a process MPI launched records to "
+                    "<record>.<rank> (the records of all ranks together are the values equal on every rank)")
     ap.add_argument("hlfir")
     ap.add_argument("entry")
     ap.add_argument("fypp_dir", type=Path)
@@ -116,6 +118,7 @@ def main() -> int:
         out_dir / f"record_{procedure}.f90",
         private_access={a["module"]: a["variables"] for a in access},
         private_imports=list(dict.fromkeys(line for a in access for line in a["imports"])),
+        per_rank=args.record_per_rank,
     )
     # The types of the recorded values: a substitute built from the record checks them at run time
     # (make_substitute.py --globals), and needs each one's type to compare it.

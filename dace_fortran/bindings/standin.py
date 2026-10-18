@@ -238,9 +238,12 @@ def emit_recording_standin(
     out_path: str | Path,
     private_access: PrivateAccess | None = None,
     private_imports: Sequence[str] = (),
+    per_rank: bool = False,
 ) -> Path:
     """Write ``dace_record_<entry>``: on every call it appends ``module::name value`` for each of ``values`` and an
-    empty line to ``record_path``, then calls the original with the arguments unchanged.
+    empty line to ``record_path`` (``per_rank``: to ``<record_path>.<rank>`` in a process an MPI launcher started,
+    :func:`dace_fortran.bindings.specialization.record_open_lines`), then calls the original with the arguments
+    unchanged.
 
     A value's variable is imported from its module unless ``private_access`` lists it (per module, the private
     variables of a copy of the module made with
@@ -248,13 +251,16 @@ def emit_recording_standin(
     copy's ``bind(c)`` accessor, and the copy must be linked in place of the module's object. ``private_imports``: the
     ``use`` lines the declarations of those variables need
     (:func:`~dace_fortran.bindings.module_access.declaration_imports`)."""
+    from dace_fortran.bindings.specialization import record_open_lines
+
     reads = _value_reads(values, "dace_value", private_access, private_imports)
-    local = ["integer :: dace_record_unit", *_character_constant("dace_record_path", str(record_path))]
+    declarations, opening = record_open_lines("dace_record_unit", "dace_record_path", per_rank)
+    local = ["integer :: dace_record_unit", *declarations, *_character_constant("dace_record_path", str(record_path))]
     for i, v in enumerate(values):
         local += _character_constant(f"dace_label_{i}", f"{v.module}::{v.name}")
     body = [
         *reads.statements,
-        "open(newunit=dace_record_unit, file=dace_record_path, position='append', action='write')",
+        *opening,
         *(
             _write(e, v.fortran_type, f"dace_label_{i}")
             for i, (v, e) in enumerate(zip(values, reads.expressions, strict=True))
