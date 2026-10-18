@@ -710,6 +710,14 @@ class ExternalCall(dace.sdfg.nodes.LibraryNode):
         fsyms.update(str(dep) for dep in self.symbol_deps)  # dace types the Property as ``list[type[str]]``
         return fsyms
 
+    def specialize(self, values: Mapping[str, Any]) -> None:
+        """Replace the symbols the body forwards by ``values`` (the SDFG specialised to them: the symbols are gone,
+        the C text would still name them)."""
+        for name, value in values.items():
+            if name in self.symbol_deps:
+                self.body = re.sub(rf"\b{re.escape(name)}\b", f"({value})", self.body)
+                self.symbol_deps = [str(d) for d in self.symbol_deps if str(d) != name]
+
     def validate(self, sdfg: dace.SDFG, state: SDFGState) -> None:
         """Reject the node if the C body does not actually call ``c_name``
         or leaves a connector unreferenced.

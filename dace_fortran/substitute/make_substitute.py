@@ -55,7 +55,7 @@ from dace_fortran.bindings.specialization import (
     specializable,
 )
 from dace_fortran.builder import SDFGBuilder
-from dace_fortran.external import keep_external
+from dace_fortran.external import ExternalCall, keep_external
 from dace_fortran import pipelines as P
 from dace_fortran.pipelines import num_maps, specialize
 from dace_fortran.substitute.config import parse_with_config
@@ -538,6 +538,9 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
     their element reads in control flow are literals (an equation index ``rs(k)`` the loop over ``k`` reads).
     """
     specialize(sdfg, symbols=symbols, scalars=scalars)
+    for node, _ in sdfg.all_nodes_recursive():
+        if isinstance(node, ExternalCall):  # a kept call forwards the values it named as symbols
+            node.specialize({**symbols, **scalars})
     # Until the dead branches are gone, accesses in them may fall outside arrays the case left degenerate (a
     # boundary condition's coefficients for a direction without it): validate once they are.
     sdfg.simplify(validate=False, validate_all=False)

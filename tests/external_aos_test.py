@@ -966,3 +966,11 @@ end module
         np.testing.assert_allclose(x[0], 5.0)
     finally:
         clear_external_registry()
+
+
+def test_a_kept_call_forwards_the_values_the_sdfg_was_specialised_to():
+    from dace_fortran.external import ExternalCall
+
+    node = ExternalCall("call", c_name="f", body="f(_a0, n, m);", symbol_deps=["n", "m"])
+    node.specialize({"n": 5, "k": 2})
+    assert node.body == "f(_a0, (5), m);" and list(node.symbol_deps) == ["m"]
