@@ -9,7 +9,8 @@ A module array, or a module record whose packed image the SDFG takes, is scratch
   aliases it or takes its address (outside_refs.outside_readers on the build's preprocessed sources).
 
 Then the binding need not copy it in or out, and the SDFG may hold it as a transient. Aliased variables (a pointer
-of one associated with the other) are scratch only together.
+of one associated with the other) are scratch only together -- unless the SDFG accesses the storage they share
+through one of them only (the sizing run's member aliases, folded).
 """
 
 from __future__ import annotations
@@ -117,6 +118,7 @@ def infer(
     outside_procedures: Iterable[str] = (),
     asserted: Iterable[str] = (),
     synthetic: Iterable = (),
+    associated: Iterable[tuple[str, int, str, int]] = (),
 ) -> Inference:
     """The scratch module variables of the routine ``entry`` (``module::routine``) that ``sdfg`` (as built) is.
 
@@ -125,7 +127,9 @@ def infer(
     sources; without them nothing is scratch (nothing proves the outside condition). ``outside_procedures``: callees
     whose calls the build drops or keeps external -- they count as outside the routine. ``asserted``: variables
     given as scratch (``--scratch``): taken as scratch where another variable is aliased with them. ``synthetic``:
-    the flattened members of module records (FlattenPlan.synthetic_globals)."""
+    the flattened members of module records (FlattenPlan.synthetic_globals). ``associated``: the member aliases
+    ``(image, element, other image, other element)`` the specialised copy holds as one storage
+    (fold_aliases.fold_member_aliases, filled in by ``specialise``): their variables are no alias group any more."""
     t0 = time.time()
     found = candidates(sdfg, synthetic)
     result = Inference(containers=found)
@@ -168,6 +172,12 @@ def infer(
             result.unproven[k] = v.reasons
             v.reasons = []
         result.reasons[k] = v.reasons
+    owner = {name: tuple(key.split("::")) for key, names in found.items() for name in names}
+    for image, _elem, other, _other_elem in associated:
+        a, b = owner.get(image), owner.get(other)
+        if a in verdicts and b in verdicts:
+            verdicts[a].aliases.discard(b)
+            verdicts[b].aliases.discard(a)
     outside_refs.close_alias_groups(verdicts)
     for key, v in verdicts.items():
         result.reasons["::".join(key)] = v.reasons

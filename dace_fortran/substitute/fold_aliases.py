@@ -6,15 +6,22 @@ storage). The sizing run records the association (``<record>.aliases``, see
 ``dace_fortran.bindings.storage_guard.build_alias_record``): here every access of the image becomes an access of the
 array (its leading element dimension of one dropped), in the nested SDFGs too, the image's extent and offset symbols
 become the array's, and the image leaves the SDFG and its frozen signature.
+
+A member may also be the member of an element of another array of records (``p(1)%f => c(1)%f``): every access of
+that element of the one image becomes an access of the element of the other (:func:`fold_member_aliases`).
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import replace
 
 import dace
+import networkx as nx
 from dace import nodes, subsets, symbolic
 from dace.sdfg import dealias
+from dace.sdfg.state import AbstractControlFlowRegion
+from dace_fortran.array_split import _UNKNOWN, _keep_order, _subset_of
 from dace_fortran.bindings.frozen_signature import FrozenSignature, attach_to_sdfg, get_frozen_signature
 
 
@@ -119,3 +126,183 @@ def fold_aliases(sdfg: dace.SDFG, aliases: list[tuple[str, int, str]], known: di
     if frozen is not None:
         attach_to_sdfg(sdfg, frozen)
     return done
+
+
+def _element_range(subset) -> tuple[int, int] | None:
+    """The literal first and last element of a subset's leading (element) dimension, or None."""
+    if subset is None or subset is _UNKNOWN:
+        return None
+    begin, end, step = subset.ranges[0]
+    try:
+        first, last = int(symbolic.simplify(begin)), int(symbolic.simplify(end))
+    except (TypeError, ValueError):
+        return None
+    return (first, last) if step == 1 or first == last else None
+
+
+def _same_extent(sdfg: dace.SDFG, a: str, b: str, known: dict) -> bool:
+    """Whether the arrays ``a`` and ``b`` have the same dtype and, past their element dimension, the same extents and
+    lower bounds (``offset_<array>_d<k>`` symbols, with the values ``known`` holds)."""
+    da, db = sdfg.arrays[a], sdfg.arrays[b]
+    if da.dtype != db.dtype or len(da.shape) != len(db.shape):
+        return False
+    subs = {symbolic.pystr_to_symbolic(k): v for k, v in known.items()}
+    for k in range(1, len(da.shape)):
+        pairs = [(da.shape[k], db.shape[k]), (f"offset_{a}_d{k}", f"offset_{b}_d{k}")]
+        for x, y in pairs:
+            diff = symbolic.pystr_to_symbolic(str(x)).subs(subs) - symbolic.pystr_to_symbolic(str(y)).subs(subs)
+            if symbolic.simplify(diff) != 0:
+                return False
+    return True
+
+
+def _moved_nodes(sdfg: dace.SDFG, image: str, moves: dict[int, tuple[str, int]]):
+    """Per state, the access nodes of ``image`` with an edge at a moved element; None when an access may reach a
+    moved element without picking one literal element (a range over elements, a nested SDFG's whole image), or a
+    condition, loop header or interstate assignment reads the image."""
+    found = []
+    for state in sdfg.states():
+        for edge in state.edges():
+            if edge.data.is_empty():
+                continue
+            subset = _subset_of(edge, state, image)
+            if subset is None:
+                continue
+            rng = _element_range(subset)
+            if rng is None or (rng[0] != rng[1] and any(rng[0] <= e <= rng[1] for e in moves)):
+                return None
+            if edge.data.data != image and edge.data.other_subset is None:
+                return None  # a copy whose subset in the image is left implicit
+        nodes_ = [n for n in state.data_nodes() if n.data == image and any(
+            not e.data.is_empty() and _element_range(_subset_of(e, state, image)) in {(k, k) for k in moves}
+            for e in [*state.in_edges(n), *state.out_edges(n)])]
+        found += [(state, n) for n in nodes_]
+    for edge in sdfg.all_interstate_edges():
+        if any(m.data == image for m in edge.data.get_read_memlets(sdfg.arrays)):
+            return None
+    for block in sdfg.all_control_flow_blocks():
+        if isinstance(block, AbstractControlFlowRegion) and any(m.data == image for m in block.get_meta_read_memlets()):
+            return None
+    return found
+
+
+def _renamed_bounds(sdfg: dace.SDFG, image: str, other: str, known: dict) -> dict[str, str]:
+    """The image's extent and offset symbols -> the other image's (of equal value, see :func:`_same_extent`): its
+    symbol where the SDFG has it, else the known value; a moved subset then reads the other image's bounds."""
+    out = {}
+    for k in range(1, len(sdfg.arrays[image].shape)):
+        for mine, theirs in ((f"{image}_d{k}", f"{other}_d{k}"), (f"offset_{image}_d{k}", f"offset_{other}_d{k}")):
+            if theirs in sdfg.symbols:
+                out[mine] = theirs
+            elif theirs in known:
+                out[mine] = str(known[theirs])
+    return out
+
+
+def _ordered(state: dace.SDFGState, a: nodes.AccessNode, b: nodes.AccessNode) -> bool:
+    return nx.has_path(state.nx, a, b) or nx.has_path(state.nx, b, a)
+
+
+def _written(state: dace.SDFGState, node: nodes.AccessNode) -> bool:
+    return any(not e.data.is_empty() for e in state.in_edges(node))
+
+
+def _fold_one(sdfg: dace.SDFG, image: str, moves: dict[int, tuple[str, int]], known: dict) -> bool:
+    """Fold the elements ``moves`` of ``image`` onto the other images' (:func:`fold_member_aliases`); False, and
+    ``sdfg`` unchanged, when they cannot be."""
+    found = _moved_nodes(sdfg, image, moves)
+    if not found:
+        return False
+    targets = {o for o, _ in moves.values()}
+    landing = set(moves.values())
+
+    def lands(state: dace.SDFGState, q: nodes.AccessNode) -> bool:
+        """Whether the node of an other image accesses an element a move lands on (or may: a range it cannot tell)."""
+        for e in [*state.in_edges(q), *state.out_edges(q)]:
+            rng = None if e.data.is_empty() else _element_range(_subset_of(e, state, q.data))
+            if not e.data.is_empty() and (rng is None or any(
+                    o == q.data and rng[0] <= oe <= rng[1] for o, oe in landing)):
+                return True
+        return False
+
+    if any((_written(st, n) or _written(st, q)) and not _ordered(st, n, q) and lands(st, q)
+           for st, n in found for q in st.data_nodes() if q.data in targets):
+        return False
+    rename = {o: {symbolic.pystr_to_symbolic(k): symbolic.pystr_to_symbolic(v)
+                  for k, v in _renamed_bounds(sdfg, image, o, known).items()} for o in targets}
+
+    def moved(rng: subsets.Range, elem: int) -> tuple[str, subsets.Range]:
+        other, other_elem = moves[elem]
+        out = subsets.Range([(other_elem, other_elem, 1)] + list(rng.ranges[1:]))
+        out.replace(rename[other])
+        return other, out
+
+    for state, node in found:
+        parts = {}
+        for edge in [*state.in_edges(node), *state.out_edges(node)]:
+            if edge.data.is_empty():
+                continue
+            rng = _element_range(_subset_of(edge, state, image))
+            if rng is None or rng[0] not in moves:
+                continue
+            memlet = edge.data
+            if memlet.data == image:
+                other, memlet.subset = moved(memlet.subset, rng[0])
+                memlet.data = other
+            else:
+                other, memlet.other_subset = moved(memlet.other_subset, rng[0])
+            if other not in parts:
+                parts[other] = state.add_access(other)
+            if edge.dst is node:
+                state.add_edge(edge.src, edge.src_conn, parts[other], edge.dst_conn, memlet)
+            else:
+                state.add_edge(parts[other], edge.src_conn, edge.dst, edge.dst_conn, memlet)
+            state.remove_edge(edge)
+        # What ordered the node orders its parts; the node stays for the elements that stay.
+        ordering = [e for e in [*state.in_edges(node), *state.out_edges(node)] if e.data.is_empty()]
+        for e in ordering:
+            for part in parts.values():
+                if e.dst is node:
+                    state.add_edge(e.src, e.src_conn, part, None, dace.Memlet())
+                else:
+                    state.add_edge(part, None, e.dst, e.dst_conn, dace.Memlet())
+        if all(e.data.is_empty() for e in [*state.in_edges(node), *state.out_edges(node)]):
+            state.remove_node(node)
+            _keep_order(state, list(parts.values()))
+        else:
+            _keep_order(state, [node, *parts.values()])
+    # Memlets inside scopes that name the image at a moved element (a tasklet's edge to a map exit, say).
+    for state in sdfg.states():
+        for edge in state.edges():
+            memlet = edge.data
+            rng = _element_range(memlet.subset) if memlet.data == image else None
+            if rng is not None and rng[0] == rng[1] and rng[0] in moves:
+                memlet.data, memlet.subset = moved(memlet.subset, rng[0])
+    return True
+
+
+def fold_member_aliases(sdfg: dace.SDFG, aliases: list[tuple[str, int, str, int]], known: dict | None = None
+                        ) -> list[tuple[str, int, str, int]]:
+    """Fold every ``(image, element, other, other element)`` alias -- the member of ``element`` of the records whose
+    SDFG image is ``image`` is that of ``other element`` of ``other`` (``p(1)%f => c(1)%f``) -- that can be: every
+    access of the element becomes one of the other image's element, so the SDFG takes the storage as the program
+    does. ``known``: values of the extent and offset symbols, to tell that the two images' elements have the same
+    shape. The images keep their other elements, in the SDFG and its frozen signature. Returns the aliases folded.
+
+    The elements of an image fold only all together, when every access of the image picks its element by a literal
+    (as once the element loops are unrolled), and the image's own and the other image's accesses in a state that one
+    of them writes are ordered there: the two were different containers, and nothing ordered a read of the one after
+    a write of the other."""
+    known = known or {}
+    pairs = [(i, e, o, oe) for i, e, o, oe in aliases
+             if i != o and i in sdfg.arrays and o in sdfg.arrays and _same_extent(sdfg, i, o, known)]
+    folded = []
+    # One image's elements onto the other's, or the other way when an access of the one stands in the way.
+    for a, b in sorted({(i, o) for i, _e, o, _oe in pairs}):
+        forward = {e: (o, oe) for i, e, o, oe in pairs if (i, o) == (a, b)}
+        backward = {oe: (i, e) for i, e, o, oe in pairs if (i, o) == (a, b)}
+        if _fold_one(sdfg, a, forward, known):
+            folded += [(a, e, o, oe) for e, (o, oe) in sorted(forward.items())]
+        elif _fold_one(sdfg, b, backward, known):
+            folded += [(b, e, o, oe) for e, (o, oe) in sorted(backward.items())]
+    return folded

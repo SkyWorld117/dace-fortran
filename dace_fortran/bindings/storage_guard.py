@@ -249,8 +249,9 @@ def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: 
     """Wrapper lines of a sizing run appending, to ``<path>.aliases``, a line ``alias <image> <element> <array>`` for
     every member of an element of a rank-1 module array of records (``<image>`` its SDFG image, ``<element>`` the
     0-based element) whose storage is exactly that of a module array or array dummy the SDFG takes in place
-    (``<array>``), and an empty line that ends the call.  The substitute built from the record takes the two as one
-    array (``fold_aliases``), which the storage guard would otherwise decline.  Empty when the SDFG takes no such
+    (``<array>``), a line ``same <image> <element> <image> <element>`` for every two such members with the same
+    storage, and an empty line that ends the call.  The substitute built from the record takes the two as one array
+    (``fold_aliases``), which the storage guard would otherwise decline.  Empty when the SDFG takes no such
     member."""
     from pathlib import Path
 
@@ -314,7 +315,8 @@ STORAGE_GUARD_HELPERS = """\
   end subroutine dace_span_add
 
   ! Write ``alias <member image> <element> <array>`` for every member handed over apart (kind 1 or 2, of a named
-  ! element) whose range is exactly that of an array the SDFG takes in place (kind 3 or 4): the same storage.
+  ! element) whose range is exactly that of an array the SDFG takes in place (kind 3 or 4): the same storage; and
+  ! ``same <member image> <element> <member image> <element>`` for every two such members with the same range.
   subroutine dace_spans_aliases(spans, n, unit, names)
     integer(c_intptr_t), allocatable, intent(in) :: spans(:, :)
     integer, intent(in) :: n, unit
@@ -324,11 +326,14 @@ STORAGE_GUARD_HELPERS = """\
       if (spans(3, i) > 2 .or. spans(5, i) < 1) cycle
       if (len_trim(names(int(spans(4, i)))) == 0) cycle
       do j = 1, n
-        if (spans(3, j) < 3) cycle
         if (len_trim(names(int(spans(4, j)))) == 0) cycle
-        if (spans(1, i) == spans(1, j) .and. spans(2, i) == spans(2, j)) then
+        if (spans(1, i) /= spans(1, j) .or. spans(2, i) /= spans(2, j)) cycle
+        if (spans(3, j) >= 3) then
           write(unit, '(a, 1x, a, 1x, i0, 1x, a)') 'alias', trim(names(int(spans(4, i)))), int(spans(5, i)) - 1, &
             trim(names(int(spans(4, j))))
+        else if (j > i .and. spans(5, j) >= 1) then
+          write(unit, '(a, 1x, a, 1x, i0, 1x, a, 1x, i0)') 'same', trim(names(int(spans(4, i)))), &
+            int(spans(5, i)) - 1, trim(names(int(spans(4, j)))), int(spans(5, j)) - 1
         end if
       end do
     end do

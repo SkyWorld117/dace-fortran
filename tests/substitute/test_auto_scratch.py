@@ -116,3 +116,11 @@ def test_variables_the_specialised_sdfg_never_accesses_are_left_to_the_build(tmp
     result = infer(_routine(), "m_fields::s_rhs", specialise, [_sources(tmp_path)])
     assert result.scratch == []
     assert "not accessed" in result.reasons["m_fields::work"][0]
+
+
+def test_variables_whose_shared_storage_the_sdfg_holds_as_one_are_no_alias_group(tmp_path: Path):
+    """pb is scratch once the specialised copy accesses the storage it shares with pa through one image only (a
+    folded member alias); pa, read before it is written, still is not."""
+    result = infer(_routine(), "m_fields::s_rhs", None, [_sources(tmp_path)], associated=[("pa_sf", 0, "pb_sf", 0)])
+    assert result.scratch == ["m_fields::pb", "m_fields::work"]
+    assert "pa_sf" in result.reasons["m_fields::pa"][0]

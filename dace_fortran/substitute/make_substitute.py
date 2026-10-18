@@ -200,6 +200,9 @@ UNROLL_LIMIT = 16
 #: (startup_constants.StartupAnalysis); None: every recorded value counts.
 STARTUP = None
 
+#: The member aliases the scratch inference took as one storage (infer_scratch): the build must fold them all.
+INFERRED_MEMBER_ALIASES: list[tuple[str, int, str, int]] = []
+
 
 def _report_startup(kept: dict, dropped: dict, what: str) -> None:
     print(f"start-up constants: {len(kept)} of {len(kept) + len(dropped)} {what} kept", flush=True)
@@ -230,6 +233,29 @@ def keep_startup_values(values: dict, what: str) -> dict:
         else:
             kept[name] = value
     _report_startup(kept, dropped, what)
+    return kept
+
+
+def startup_member_aliases(record: Path, frozen) -> list[tuple[str, int, str, int]]:
+    """The member aliases the sizing run recorded (``recorded_member_aliases``) between images of module records no
+    code that may run after the routine's first call associates anew (all of them without --startup-constants)."""
+    from dace_fortran.bindings.specialization import recorded_member_aliases  # noqa: PLC0415
+
+    aliases = recorded_member_aliases(record)
+    if STARTUP is None or not aliases:
+        return aliases
+    origin = {a.sdfg_name: (a.aos_origin_mod.lower(), a.aos_origin_struct.split("%")[0].strip().lower())
+              for a in frozen.args if getattr(a, "aos_origin_struct", "") and getattr(a, "aos_origin_mod", "")}
+    kept, dropped = [], {}
+    for alias in aliases:
+        keys = [origin.get(alias[0]), origin.get(alias[2])]
+        why = ["no module record behind the image"] if None in keys else [
+            w for k in keys for w in STARTUP.changes(k, shape=True)]
+        if why:
+            dropped[f"{alias[0]}[{alias[1]}] = {alias[2]}[{alias[3]}]"] = why
+        else:
+            kept.append(alias)
+    _report_startup({f"{a[0]}[{a[1]}] = {a[2]}[{a[3]}]": True for a in kept}, dropped, "recorded member aliases")
     return kept
 
 
@@ -953,10 +979,15 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
     specialises the SDFG (the branches the recorded configuration never takes are gone); ``dropped``: the procedures
     whose calls the build drops; ``recorded``: the recorded symbols the build may rely on."""
     from dace_fortran.substitute.auto_scratch import infer, scratch_keys  # noqa: PLC0415
+    from dace_fortran.substitute.fold_aliases import fold_member_aliases  # noqa: PLC0415
 
+    member_aliases = startup_member_aliases(args.specialize, get_frozen_signature(sdfg)) if args.specialize else []
+    folded: list[tuple[str, int, str, int]] = []  # the member aliases the analysed copy holds as one storage
 
     def specialise(copy: dace.SDFG) -> dict:
         split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops) if symbols or scalars else {}
+        if member_aliases:
+            folded.extend(fold_member_aliases(copy, member_aliases, recorded))
         # A record image made a transient takes the recorded extents and lower bounds (finish_scratch_images): the
         # analysis judges each image as it would then be built.
         fold = {}
@@ -974,8 +1005,9 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
         return split
 
     result = infer(sdfg, args.entry, specialise, args.fypp, dropped, asserted=args.scratch,
-                   synthetic=plan.synthetic_globals)
+                   synthetic=plan.synthetic_globals, associated=folded)
     print(result.report(), flush=True)
+    INFERRED_MEMBER_ALIASES[:] = folded
     given = {s.lower() for s in args.scratch}
     used = [c for v in result.scratch for c in result.containers[v] if c in result.used]
     return [k for k in scratch_keys(sdfg, used) if k not in given]
@@ -1174,6 +1206,17 @@ def main() -> int:
         aliases = recorded_aliases(args.specialize)
         if aliases:
             print(f"aliases folded: {fold_aliases(sdfg, aliases, recorded)}", flush=True)
+        # A member that IS the member of an element of another module array of records (``q_prim(1)%sf =>
+        # q_cons(1)%sf``): the SDFG accesses the storage through one image only.
+        from dace_fortran.substitute.fold_aliases import fold_member_aliases  # noqa: PLC0415
+
+        member_aliases = startup_member_aliases(args.specialize, general)
+        if member_aliases:
+            folded = fold_member_aliases(sdfg, member_aliases, recorded)
+            print(f"member aliases folded: {folded} (recorded: {member_aliases})", flush=True)
+            if set(INFERRED_MEMBER_ALIASES) - set(folded):
+                raise SystemExit(f"the scratch inference held {INFERRED_MEMBER_ALIASES} as one storage, but the build "
+                                 f"folds only {folded}")
     elements = {}
     if args.globals and (args.fuse or args.forward):
         elements = recorded_elements(args.globals, sdfg)

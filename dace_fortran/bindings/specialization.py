@@ -145,6 +145,28 @@ def recorded_aliases(path: str | Path) -> list[tuple[str, int, str]]:
     return sorted(set.intersection(*calls))
 
 
+def recorded_member_aliases(path: str | Path) -> list[tuple[str, int, str, int]]:
+    """The ``(image, element, other image, other element)`` member aliases the calls recorded at ``path`` reported
+    (``same`` lines of ``<path>.aliases``: the member of ``element`` of the records ``image`` is the SDFG image of
+    is that of ``other element`` of ``other image``), when every call reported the same ones; empty otherwise, and
+    without the file. (Folding an alias some call did not have would be as wrong as missing one another call had.)"""
+    file = Path(f"{path}.aliases")
+    if not file.is_file():
+        return []
+    calls: list[set[tuple[str, int, str, int]]] = [set()]
+    for line in file.read_text().splitlines():
+        fields = line.split()
+        if not fields:
+            calls.append(set())
+            continue
+        if len(fields) == 5 and fields[0] == "same":
+            calls[-1].add((fields[1], int(fields[2]), fields[3], int(fields[4])))
+    calls = calls[:-1] if not calls[-1] else calls  # the empty line that ends the last call
+    if not calls or any(c != calls[0] for c in calls):
+        return []
+    return sorted(calls[0])
+
+
 def recorded_invariants(path: str | Path) -> dict[str, Value]:
     """The values that stayed the same in every call recorded at ``path`` (see :func:`render_symbol_record`)."""
     seen: dict[str, set[Value]] = {}

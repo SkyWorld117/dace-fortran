@@ -297,3 +297,16 @@ def test_recorded_aliases_are_those_of_every_call(tmp_path):
     assert recorded_aliases(record) == []
     (tmp_path / "record.aliases").write_text("alias g_sf 0 t\nalias g_sf 1 x\n\nalias g_sf 0 t\n\n")
     assert recorded_aliases(record) == [("g_sf", 0, "t")]
+
+
+def test_recorded_member_aliases_are_those_every_call_reported_alike(tmp_path):
+    from dace_fortran.bindings.specialization import recorded_member_aliases
+    from dace_fortran.bindings.storage_guard import STORAGE_GUARD_HELPERS
+
+    assert "'same'" in STORAGE_GUARD_HELPERS  # the sizing binding writes them
+    record = tmp_path / "record"
+    assert recorded_member_aliases(record) == []
+    (tmp_path / "record.aliases").write_text("same p_sf 0 c_sf 0\nalias g_sf 0 t\n\nsame p_sf 0 c_sf 0\n\n")
+    assert recorded_member_aliases(record) == [("p_sf", 0, "c_sf", 0)]
+    (tmp_path / "record.aliases").write_text("same p_sf 0 c_sf 0\n\n\n")  # the second call had none
+    assert recorded_member_aliases(record) == []
