@@ -78,3 +78,17 @@ def test_two_stores_into_one_node_run_in_statement_order():
     y = np.zeros(1)
     sdfg(y=y)
     assert y[0] == 5.0
+
+
+def test_stores_into_different_elements_stay_unordered():
+    """``b(1) = 1`` and ``b(2) = 2`` into one node need no order: no edge is added."""
+    sdfg = dace.SDFG("two_elements")
+    sdfg.add_array("b", [2], dace.float64)
+    state = sdfg.add_state()
+    b = state.add_access("b")
+    one = state.add_tasklet("one", {}, {"o"}, "o = 1.0")
+    state.add_edge(one, "o", b, None, dace.Memlet("b[0]"))
+    two = state.add_tasklet("two", {}, {"o"}, "o = 2.0")
+    state.add_edge(two, "o", b, None, dace.Memlet("b[1]"))
+    assert order_state(state) == []
+    assert not nx.has_path(state.nx, one, two) and not nx.has_path(state.nx, two, one)

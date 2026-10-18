@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, NamedTuple
 
-from dace import Memlet
+from dace import Memlet, subsets
 from dace.sdfg import nodes
 
 if TYPE_CHECKING:
@@ -113,22 +113,22 @@ class SkippedEdge(NamedTuple):
 
 
 def order_writers(state: SDFGState) -> list[SkippedEdge]:
-    """Order the writers of every access node that more than one statement writes: two stores into one node
-    (``p = 0`` and, once a branch is folded, ``p = expr``) are otherwise unordered, and the last store emitted
-    wins whichever it is.  Each writer runs after the one emitted before it; accumulations (write-conflict
-    resolved stores) commute and stay as they are.
+    """Order the writers of every access node that more than one statement stores into at elements that may be the
+    same: two stores into one node (``p = 0`` and, once a branch is folded, ``p = expr``) are otherwise unordered,
+    and the last store emitted wins whichever it is.  The later writer runs after the earlier one; stores into
+    elements that cannot be the same (``b(1) = ...``, ``b(2) = ...``), and accumulations (write-conflict resolved
+    stores), which commute, stay as they are.
 
     :return: the edges that had to be skipped to keep the state acyclic.
     """
     skipped: list[SkippedEdge] = []
     for node in state.data_nodes():
-        writers = []
-        for edge in state.in_edges(node):
-            if edge.data.is_empty() or edge.data.wcr is not None or edge.src in writers:
-                continue
-            writers.append(edge.src)
-        writers.sort(key=state.node_id)
-        for earlier, later in zip(writers, writers[1:]):
+        stores = [(e.src, e.data.get_dst_subset(e, state)) for e in state.in_edges(node)
+                  if not e.data.is_empty() and e.data.wcr is None]
+        stores.sort(key=lambda store: state.node_id(store[0]))
+        pairs = [(a, b) for i, (a, sa) in enumerate(stores) for b, sb in stores[i + 1:]
+                 if a is not b and (sa is None or sb is None or subsets.intersects(sa, sb) is not False)]
+        for earlier, later in pairs:
             src, dst = completion_anchor(state, earlier), start_anchor(state, later)
             if dst in descendants(state, src):
                 continue
