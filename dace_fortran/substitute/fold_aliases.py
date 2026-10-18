@@ -147,8 +147,12 @@ def _same_extent(sdfg: dace.SDFG, a: str, b: str, known: dict) -> bool:
     if da.dtype != db.dtype or len(da.shape) != len(db.shape):
         return False
     subs = {symbolic.pystr_to_symbolic(k): v for k, v in known.items()}
+
+    def offset(name: str):  # an image without the symbol starts at 0
+        return name if name in sdfg.symbols or name in known else 0
+
     for k in range(1, len(da.shape)):
-        pairs = [(da.shape[k], db.shape[k]), (f"offset_{a}_d{k}", f"offset_{b}_d{k}")]
+        pairs = [(da.shape[k], db.shape[k]), (offset(f"offset_{a}_d{k}"), offset(f"offset_{b}_d{k}"))]
         for x, y in pairs:
             diff = symbolic.pystr_to_symbolic(str(x)).subs(subs) - symbolic.pystr_to_symbolic(str(y)).subs(subs)
             if symbolic.simplify(diff) != 0:
