@@ -1100,6 +1100,29 @@ def baked_values(records: list[Path], values: dict | None) -> list:
     print(f"substitute entry checks {len(baked)} baked values", flush=True)
     return baked
 
+def external_signature(spec: str) -> tuple[str, dict]:
+    """``NAME=C_NAME(KIND,...)`` of --external as ``keep_external``'s name and keywords."""
+    from dace_fortran.external import Arg, ArgKind, Intent
+
+    name, rest = spec.split("=", 1)
+    c_name, kinds = rest.rstrip(")").split("(", 1)
+    args = []
+    for kind in [k.strip() for k in kinds.split(",") if k.strip()]:
+        if kind == "array":
+            args.append(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT))
+        elif kind in ("int", "real"):
+            args.append(Arg(kind=ArgKind.SCALAR, dtype="int32" if kind == "int" else "float64", intent=Intent.IN))
+        else:
+            raise SystemExit(f"--external {spec}: no argument kind {kind!r} (array, int or real)")
+    return name.strip(), {"c_name": c_name.strip(), "args": tuple(args)}
+
+
+def config_path(path, config) -> Path:
+    """A path of an option: as given, or relative to the --config file's directory when it set it."""
+    path = Path(path)
+    return path if path.is_absolute() or config is None or path.exists() else Path(config).resolve().parent / path
+
+
 def main() -> int:
     global DUMP_DIR, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH, STARTUP
     ap = argparse.ArgumentParser()
@@ -1150,6 +1173,10 @@ def main() -> int:
                     "procedures are appended to the binding module, e.g. the bind(c) shim of an external call "
                     "(repeatable)")
     ap.add_argument("--stub", action="append", default=[], help="procedure whose calls are dropped (repeatable)")
+    ap.add_argument("--external", action="append", default=[], help="procedure whose calls stay calls, of a bind(c) "
+                    "function: NAME=C_NAME(KIND,...), one KIND per argument of the call site: array (a real(8) "
+                    "array, read and written), int or real (a scalar, read); the function comes from --binding-extra "
+                    "or a linked library (repeatable)")
     ap.add_argument("--scratch", action="append", default=[], help="module array the routine only uses as scratch "
                     "(module::variable): it becomes a transient of the SDFG and leaves the binding (repeatable)")
     ap.add_argument("--auto-scratch", action="store_true", help="infer the module arrays the routine only uses as "
@@ -1206,6 +1233,8 @@ def main() -> int:
     globals_ = keep_startup_values(merged_invariants(args.globals), "recorded module values") if args.globals else None
     for name in args.stub:
         keep_external(name, stub=True)
+    for spec in args.external:
+        keep_external(*external_signature(spec))
     builder = SDFGBuilder(args.hlfir, entry=args.entry, specialized_globals=globals_)
     plan = FlattenPlan.from_dict(builder.module.get_flatten_plan())
     sdfg = builder.build()
@@ -1335,7 +1364,7 @@ def main() -> int:
         record_symbols_to=args.record.resolve() if args.record else None,
         record_only=args.record_only,
         record_per_rank=args.record_per_rank,
-        extra_procedures="\n\n".join(f.read_text() for f in args.binding_extra),
+        extra_procedures="\n\n".join(config_path(f, args.config).read_text() for f in args.binding_extra),
         kept_images=kept_images,
         members_first=members_first,
     )
