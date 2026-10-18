@@ -642,7 +642,7 @@ class ExpandExternalCallPure(ExpandTransformation):
     ) -> dace.nodes.Tasklet:
         assert isinstance(node, ExternalCall)
         if node.c_decl:
-            parent_sdfg.append_global_code(node.c_decl)
+            parent_sdfg.append_global_code(f"\n{node.c_decl}\n")  # on lines of its own: it may hold a pragma
         return dace.sdfg.nodes.Tasklet(
             node.label,
             dict(node.in_connectors),
