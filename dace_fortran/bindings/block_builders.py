@@ -1820,12 +1820,14 @@ def _aos_loops(a: FrozenArg, pieces: AosLoopPieces) -> AosLoops:
     its = pieces.loop_vars
     one_dims = ", ".join("1" for _ in its)
     if not a.aos_root_rank:
+        # The buffer's record dims keep the record array's own bounds (a moment array ``mom(0:2, 0:2, :)``): the
+        # offsets the SDFG reads off them are then the array's, and an element lands at its own index.
         struct = a.aos_origin_struct
         return AosLoops(
             [],
-            [f"      do {itv} = 1, size({struct}, {k + 1})" for k, itv in enumerate(its)],
+            [f"      do {itv} = lbound({struct}, {k + 1}), ubound({struct}, {k + 1})" for k, itv in enumerate(its)],
             ["      end do" for _ in its],
-            ", ".join(f"size({struct}, {k + 1})" for k in range(len(its))),
+            ", ".join(f"lbound({struct}, {k + 1}):ubound({struct}, {k + 1})" for k in range(len(its))),
             one_dims,
             ".true." if a.aos_struct_static else _present(struct, a.aos_struct_pointer),
         )
@@ -1910,10 +1912,12 @@ def _render_kept_release(
     buf, same = a.sdfg_name, _kept_unchanged_local(a.sdfg_name)
     lead = _aos_lead(a)
 
+    def extent(dim: int, e: str) -> str:  # ``lo:hi`` (a record dim with the array's bounds) or an extent
+        lo, colon, hi = e.partition(":")
+        return f"lbound({buf}, {dim}) == {lo} .and. ubound({buf}, {dim}) == {hi}" if colon else f"size({buf}, {dim}) == {e}"
+
     def extents(spec: str) -> str:
-        return " .and. ".join(
-            f"size({buf}, {buffer_dim(a, k, members_first)}) == {e}" for k, e in enumerate(_top_level_items(spec))
-        )
+        return " .and. ".join(extent(buffer_dim(a, k, members_first), e) for k, e in enumerate(_top_level_items(spec)))
 
     out = [
         f"    if (allocated({buf})) then",

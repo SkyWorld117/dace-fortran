@@ -52,17 +52,18 @@ def test_ndim_cartesian_copy_in_indexes_all_outer_dims():
     rank-4 companion is allocated over the three outer extents + literal 3."""
     src = "\n".join(_render_aos_copy_in(_cartesian_member_arg()))
     # Three nested element loops over the three record-array dims.
-    assert "do aos_p_diag_p_vn_dual_x_i0 = 1, size(p_diag % p_vn_dual, 1)" in src
-    assert "do aos_p_diag_p_vn_dual_x_i1 = 1, size(p_diag % p_vn_dual, 2)" in src
-    assert "do aos_p_diag_p_vn_dual_x_i2 = 1, size(p_diag % p_vn_dual, 3)" in src
+    assert "do aos_p_diag_p_vn_dual_x_i0 = lbound(p_diag % p_vn_dual, 1), ubound(p_diag % p_vn_dual, 1)" in src
+    assert "do aos_p_diag_p_vn_dual_x_i1 = lbound(p_diag % p_vn_dual, 2), ubound(p_diag % p_vn_dual, 2)" in src
+    assert "do aos_p_diag_p_vn_dual_x_i2 = lbound(p_diag % p_vn_dual, 3), ubound(p_diag % p_vn_dual, 3)" in src
     # The element accessor uses all three indices (not a single-index 1/3 ref).
     assert (
         "p_diag % p_vn_dual(aos_p_diag_p_vn_dual_x_i0, aos_p_diag_p_vn_dual_x_i1, aos_p_diag_p_vn_dual_x_i2)%x"
     ) in src
     # Rank-4 allocate: three outer extents + the literal member extent.
     assert (
-        "allocate(p_diag_p_vn_dual_x(size(p_diag % p_vn_dual, 1), "
-        "size(p_diag % p_vn_dual, 2), size(p_diag % p_vn_dual, 3), 3)"
+        "allocate(p_diag_p_vn_dual_x(lbound(p_diag % p_vn_dual, 1):ubound(p_diag % p_vn_dual, 1), "
+        "lbound(p_diag % p_vn_dual, 2):ubound(p_diag % p_vn_dual, 2), "
+        "lbound(p_diag % p_vn_dual, 3):ubound(p_diag % p_vn_dual, 3), 3)"
     ) in src
 
 
@@ -78,7 +79,7 @@ def test_static_value_member_emits_no_presence_guard():
 def test_static_value_member_copy_out_scatters_all_dims():
     """When written, copy-out scatters back through all three element loops."""
     src = "\n".join(_render_aos_copy_out(_cartesian_member_arg(is_written=True)))
-    assert "do aos_p_diag_p_vn_dual_x_i2 = 1, size(p_diag % p_vn_dual, 3)" in src
+    assert "do aos_p_diag_p_vn_dual_x_i2 = lbound(p_diag % p_vn_dual, 3), ubound(p_diag % p_vn_dual, 3)" in src
     assert (
         "p_diag % p_vn_dual(aos_p_diag_p_vn_dual_x_i0, aos_p_diag_p_vn_dual_x_i1, "
         "aos_p_diag_p_vn_dual_x_i2)%x = p_diag_p_vn_dual_x(aos_p_diag_p_vn_dual_x_i0, "
@@ -90,7 +91,7 @@ def test_1d_allocatable_member_unchanged():
     """Regression: QE ``becxx(:)%k`` 1-D allocatable path keeps its single element
     loop, bounds scan, and member ``allocated`` guard after the N-dim generalisation."""
     src = "\n".join(_render_aos_copy_in(_becxx_member_arg()))
-    assert "do aos_becxx_k_i0 = 1, size(becxx, 1)" in src
+    assert "do aos_becxx_k_i0 = lbound(becxx, 1), ubound(becxx, 1)" in src
     assert "allocated(becxx(aos_becxx_k_i0)%k)" in src  # allocatable member guard
     assert "aos_becxx_k_l0 = min(aos_becxx_k_l0, lbound(becxx(aos_becxx_k_i0)%k, 1))" in src
     assert "aos_becxx_k_u1 = max(aos_becxx_k_u1, ubound(becxx(aos_becxx_k_i0)%k, 2))" in src

@@ -58,8 +58,8 @@ def test_copy_in_allocates_packs_and_measures_in_the_permuted_order():
     a = _member()
     plain, first = _render_aos_copy_in(a, kept=True), _render_aos_copy_in(a, kept=True, members_first=True)
     bounds = "aos_acc_vf_sf_l0:aos_acc_vf_sf_u0, aos_acc_vf_sf_l1:aos_acc_vf_sf_u1, aos_acc_vf_sf_l2:aos_acc_vf_sf_u2"
-    assert f"allocate(acc_vf_sf(size(acc % vf, 1), {bounds}))" in _line_with(plain, "allocate(acc_vf_sf(size")
-    assert f"allocate(acc_vf_sf({bounds}, size(acc % vf, 1)))" in _line_with(first, "allocate(acc_vf_sf(aos")
+    assert f"allocate(acc_vf_sf(lbound(acc % vf, 1):ubound(acc % vf, 1), {bounds}))" in _line_with(plain, "allocate(acc_vf_sf(lbound")
+    assert f"allocate(acc_vf_sf({bounds}, lbound(acc % vf, 1):ubound(acc % vf, 1)))" in _line_with(first, "allocate(acc_vf_sf(aos")
     assert f"allocate(acc_vf_sf({bounds}, 1))" in _line_with(first, "allocate(acc_vf_sf(aos_acc_vf_sf_l0:aos_acc_vf_sf_u0, aos_acc_vf_sf_l1:aos_acc_vf_sf_u1, aos_acc_vf_sf_l2:aos_acc_vf_sf_u2, 1")
     # the host pack: the element's section first, its index last
     pack = _line_with(first, "= acc % vf(aos_acc_vf_sf_i0)%sf")
@@ -67,10 +67,10 @@ def test_copy_in_allocates_packs_and_measures_in_the_permuted_order():
     assert pack.endswith(", aos_acc_vf_sf_i0) = acc % vf(aos_acc_vf_sf_i0)%sf")
     assert _line_with(plain, "= acc % vf(aos_acc_vf_sf_i0)%sf").startswith("acc_vf_sf(aos_acc_vf_sf_i0, lbound(")
     # the kept buffer is measured where each dimension now sits
-    assert "size(acc_vf_sf, 4) == size(acc % vf, 1)" in _line_with(first, "__kept = size(acc_vf_sf")
-    assert "size(acc_vf_sf, 1) == size(acc % vf, 1)" in _line_with(plain, "__kept = size(acc_vf_sf")
-    assert "lbound(acc_vf_sf, 1) == aos_acc_vf_sf_l0" in _line_with(first, "lbound(acc_vf_sf")
-    assert "lbound(acc_vf_sf, 2) == aos_acc_vf_sf_l0" in _line_with(plain, "lbound(acc_vf_sf")
+    assert "lbound(acc_vf_sf, 4) == lbound(acc % vf, 1) .and. ubound(acc_vf_sf, 4) == ubound(acc % vf, 1)" in _line_with(first, "__kept = lbound(acc_vf_sf")
+    assert "lbound(acc_vf_sf, 1) == lbound(acc % vf, 1) .and. ubound(acc_vf_sf, 1) == ubound(acc % vf, 1)" in _line_with(plain, "__kept = lbound(acc_vf_sf")
+    assert "lbound(acc_vf_sf, 1) == aos_acc_vf_sf_l0" in _line_with(first, "lbound(acc_vf_sf, 1) ==")
+    assert "lbound(acc_vf_sf, 2) == aos_acc_vf_sf_l0" in _line_with(plain, "lbound(acc_vf_sf, 2) ==")
     assert "member dimensions first" in first[0]
     # the device pack loop
     device = _render_aos_copy_in(a, device=True, members_first=True)
