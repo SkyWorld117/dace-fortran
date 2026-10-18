@@ -1129,8 +1129,10 @@ def external_signature(spec: str) -> tuple[str, dict]:
             args.append(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT))
         elif kind in ("int", "real"):
             args.append(Arg(kind=ArgKind.SCALAR, dtype="int32" if kind == "int" else "float64", intent=Intent.IN))
+        elif kind == "none":
+            args.append(Arg(kind=ArgKind.NONE, intent=Intent.IN))
         else:
-            raise SystemExit(f"--external {spec}: no argument kind {kind!r} (array, int or real)")
+            raise SystemExit(f"--external {spec}: no argument kind {kind!r} (array, int, real or none)")
     return name.strip(), {"c_name": c_name.strip(), "args": tuple(args)}
 
 

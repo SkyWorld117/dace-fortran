@@ -930,3 +930,39 @@ end module
         assert "assoc_scalar" not in body, body
     finally:
         clear_external_registry()
+
+
+def test_an_absent_optional_of_a_kept_call_is_a_null_pointer(tmp_path):
+    """An argument registered as ``none`` reaches the callee as a null pointer and connects nothing."""
+    so = _build_c_so(tmp_path, "ext_opt", "void ext_opt(double* x, void* o){x[0] += o ? 1.0 : 2.0;}")
+    src = """
+module m_opt
+  use iso_c_binding
+  implicit none
+contains
+  subroutine kern(x, y)
+    real(c_double), intent(inout) :: x(4)
+    real(c_double), intent(in) :: y(4)
+    interface
+      subroutine ext_opt(x, o) bind(c, name="ext_opt")
+        import :: c_double
+        real(c_double), intent(inout) :: x(*)
+        real(c_double), intent(in) :: o(*)
+      end subroutine
+    end interface
+    call ext_opt(x, y)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_opt", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                       Arg(kind=ArgKind.NONE, intent=Intent.IN)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_opt::kern").build()
+        body = _external_call_body(sdfg)
+        assert "nullptr" in body and "_a1" not in body, body
+        x, y = np.array([3.0, 0.0, 0.0, 0.0]), np.zeros(4)
+        sdfg(x=x, y=y)
+        np.testing.assert_allclose(x[0], 5.0)
+    finally:
+        clear_external_registry()

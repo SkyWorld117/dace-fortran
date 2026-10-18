@@ -1794,6 +1794,10 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     prev_gid = None
     for i, (kind, _dtype, intent, gid) in enumerate(plan):
         name = names[i]
+        if kind is ArgKind.NONE:  # an absent optional: a null pointer, nothing connected
+            logical_terms.append(CallTerm(TermKind.LITERAL, "nullptr"))
+            prev_gid = None
+            continue
         if gid is not None:
             desc = ctx.sdfg.arrays.get(name)
             if desc is None:

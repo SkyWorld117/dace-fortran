@@ -82,6 +82,8 @@ class ArgKind(Enum):
     SCALAR = "scalar"
     AOS = "aos"
     COMM = "comm"
+    #: An absent optional argument: the call passes a null pointer and the SDFG connects nothing.
+    NONE = "none"
 
 
 class CAbi(Enum):
@@ -209,6 +211,8 @@ class Arg:
 
         :raises ValueError: unsupported ``kind`` or ``dtype``.
         """
+        if self.kind is ArgKind.NONE:
+            return "void *"
         if self.kind is ArgKind.COMM:
             return _OPAQUE_COMM_DTYPE
         if self.kind is ArgKind.AOS:
