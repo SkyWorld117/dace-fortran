@@ -441,11 +441,14 @@ def image_symbols(name: str, desc, values: dict) -> dict:
 def finish_scratch_images(sdfg: dace.SDFG, images: dict[str, dict]) -> None:
     """Make the packed record images ``images`` (name -> recorded shape and offset symbol values) transients: they
     leave the frozen signature (no longer arguments the binding packs), their symbols take the recorded values, and
-    they are laid out with the field dimensions contiguous."""
+    they are laid out with the field dimensions contiguous. A symbol without a recorded value (an extent that differs
+    between the ranks of a run) stays one the binding reads off the record (``shape_only_args``)."""
     if not images:
         return
     frozen = get_frozen_signature(sdfg)
-    attach_to_sdfg(sdfg, replace(frozen, args=tuple(a for a in frozen.args if a.sdfg_name not in images)))
+    gone = tuple(a for a in frozen.args if a.sdfg_name in images)
+    attach_to_sdfg(sdfg, replace(frozen, args=tuple(a for a in frozen.args if a not in gone),
+                                 shape_only_args=frozen.shape_only_args + gone))
     fold = {}
     for name, values in images.items():
         sdfg.arrays[name].transient = True

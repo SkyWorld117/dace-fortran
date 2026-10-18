@@ -176,6 +176,9 @@ class FrozenSignature:
     # extent), and a wrapper declaring another width hands it a half-written register. Derived from the SDFG
     # (filled in from it when a snapshot lacks it), so it takes no part in comparing snapshots.
     symbol_dtypes: dict[str, str] = field(default_factory=dict, compare=False)
+    # Record images the SDFG allocates itself (scratch of the routine): the binding passes nothing for them, but
+    # reads an extent or lower bound of theirs that stayed a symbol off the record on the host.
+    shape_only_args: tuple[FrozenArg, ...] = field(default_factory=tuple)
 
     # ----- I/O ---------------------------------------------------------
 
@@ -193,6 +196,7 @@ class FrozenSignature:
             "module_symbol_origins": {k: list(v) for k, v in self.module_symbol_origins.items()},
             "user_comm_source": self.user_comm_source,
             "symbol_dtypes": dict(self.symbol_dtypes),
+            "shape_only_args": [a.to_dict() for a in self.shape_only_args],
         }
 
     @classmethod
@@ -207,6 +211,7 @@ class FrozenSignature:
             module_symbol_origins={k: ModuleOrigin(*v) for k, v in d.get("module_symbol_origins", {}).items()},
             user_comm_source=d.get("user_comm_source"),
             symbol_dtypes=dict(d.get("symbol_dtypes", {})),
+            shape_only_args=tuple(FrozenArg.from_dict(a) for a in d.get("shape_only_args", [])),
         )
 
     def to_json(self, path: str) -> None:

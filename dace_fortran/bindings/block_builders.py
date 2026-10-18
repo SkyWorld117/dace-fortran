@@ -1320,7 +1320,7 @@ def assemble_module(
     # starts from (``qp`` of ``qp % vf``). A DUMMY-rooted component (empty
     # aos_origin_mod) needs no import -- its root is already a wrapper argument.
     aos_by_mod: dict = {}
-    for a in _aos_module_args(frozen):
+    for a in _aos_module_args(frozen) + list(frozen.shape_only_args):
         if a.aos_origin_mod:
             struct = a.aos_origin_struct.split("%")[0].strip()
             if not any(local == struct for local, _ in pointers) and not through_accessor(a.aos_origin_mod, struct, struct):
@@ -1754,6 +1754,23 @@ def _aos_root_and_segment(a: FrozenArg) -> tuple[str, str]:
     """``field`` and ``comp`` of ``aos_origin_struct`` ``field % comp`` (a root that is itself an array of records)."""
     root, _, segment = a.aos_origin_struct.partition("%")
     return root.strip(), segment.strip()
+
+
+def _shape_only_source(a: FrozenArg, dim: int, lower: bool) -> tuple[str, str] | None:
+    """The Fortran expression reading extent ``dim`` (its lower bound when ``lower``) of the image ``a`` the SDFG
+    allocates itself off the record on the host, and the guard that the record and its member exist. The image's
+    leading dims are the record array's, the others a member's, read off the record array's first element. None
+    under a root that is itself an array of records."""
+    if a.aos_root_rank:
+        return None
+    struct, query, lead = a.aos_origin_struct, "lbound" if lower else "size", _aos_lead(a)
+    present = "" if a.aos_struct_static else _present(struct, a.aos_struct_pointer)
+    if dim < lead:
+        return f"{query}({struct}, dim={dim + 1})", present
+    first = ", ".join(f"lbound({struct}, {k + 1})" for k in range(lead))
+    elem = f"{struct}({first})%{a.aos_member_path}" if lead else f"{struct}%{a.aos_member_path}"
+    member = "" if _aos_member_is_static(a) else _present(elem, a.aos_member_pointer)
+    return f"{query}({elem}, dim={dim - lead + 1})", " .and. ".join(g for g in (present, member) if g)
 
 
 def _aos_loop_pieces(a: FrozenArg) -> AosLoopPieces:
@@ -2266,6 +2283,7 @@ def _build_symbol_assigns(
     # symbol must NOT source from one, or every size(<arr>,dim) transient collapses.
     _unsourced_names = {a.sdfg_name for a in unsourced_array_args(frozen, iface, plan)}
     arg_by_sdfg = {a.sdfg_name: a for a in frozen.args}
+    shape_only = {a.sdfg_name: a for a in frozen.shape_only_args}
     # SCALAR outer dummies declared OPTIONAL: their <name>_present companion is
     # forwarded from the caller's present(<name>), not defaulted.
     outer_optional_set = {oa.name for oa, _fa in _optional_outer_dummies(frozen, iface)}
@@ -2378,6 +2396,11 @@ def _build_symbol_assigns(
         if sym in aos_pack_syms:
             continue
         m = _OFFSET_SYM_RE.match(sym) or _EXTENT_SYM_RE.match(sym)
+        source = _shape_only_source(shape_only[m.group(1)], int(m.group(2)), bool(_OFFSET_SYM_RE.match(sym))) \
+            if m and m.group(1) in shape_only else None
+        if source is not None:  # an image the SDFG allocates itself: its extents are the record's
+            out.extend(_guarded_assign(sym, source[0], source[1], absent="1"))
+            continue
         if m and m.group(1) in renamed:
             target, dim = renamed[m.group(1)], int(m.group(2)) + 1
             if _OFFSET_SYM_RE.match(sym):
