@@ -216,7 +216,33 @@ class SmallMapFusionHorizontal(MapFusionHorizontal):
             return False
         if _body_tasklets(graph, first) + _body_tasklets(graph, second) > self.max_tasklets:
             return False
-        return super().can_be_applied(graph, expr_index, sdfg, permissive)
+        if not super().can_be_applied(graph, expr_index, sdfg, permissive):
+            return False
+        return not _orphans_a_live_write(graph, sdfg, first, second, self.ordering_edges_into_sources)
+
+
+def _orphans_a_live_write(state: dace.SDFGState, sdfg: dace.SDFG, first: nodes.MapEntry, second: nodes.MapEntry,
+                          into_sources: bool) -> bool:
+    """Whether fusing two maps that happens-before edges order would leave a node of a transient the first map writes
+    without any edge out, while another node of the state reads that transient: dead-dataflow elimination then takes
+    the write for dead (no reader reachable from it) and drops it. The fusion removes the ordering edges, and an edge
+    out of such a node was the only one (a suite test lost two fields of a scratch array that way)."""
+    from dace.transformation.dataflow import map_fusion_helper as mfhelper
+
+    if mfhelper.is_parallel(graph=state, node1=first, node2=second):
+        return False
+    plan = mfhelper.analyze_happens_before_fusion(state, sdfg, first, second,
+                                                  mfhelper.find_parameter_remapping(first.map, second.map),
+                                                  into_sources=into_sources)
+    removed = set(plan[0]) if plan else set()
+    for edge in removed:
+        node = edge.src
+        if not isinstance(node, nodes.AccessNode) or not sdfg.arrays[node.data].transient:
+            continue
+        if all(e in removed for e in state.out_edges(node)) and any(
+                n is not node and n.data == node.data and state.out_degree(n) for n in state.data_nodes()):
+            return True
+    return False
 
 
 def fuse_small_maps(sdfg: dace.SDFG, max_iterations: int, max_tasklets: int = 128,
