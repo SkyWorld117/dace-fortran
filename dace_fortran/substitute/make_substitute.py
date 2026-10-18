@@ -1234,7 +1234,8 @@ def main() -> int:
     for name in args.stub:
         keep_external(name, stub=True)
     for spec in args.external:
-        keep_external(*external_signature(spec))
+        name, signature = external_signature(spec)
+        keep_external(name, **signature)
     builder = SDFGBuilder(args.hlfir, entry=args.entry, specialized_globals=globals_)
     plan = FlattenPlan.from_dict(builder.module.get_flatten_plan())
     sdfg = builder.build()
