@@ -198,6 +198,8 @@ def build_fortran_library(
     fortran_compiler: FortranCompiler = GFORTRAN,
     specialization: Specialization | None = None,
     record_symbols_to: str | Path | None = None,
+    record_per_rank: bool = False,
+    extra_procedures: str = "",
 ) -> FortranLibrary:
     """Emit + verify + link a Fortran-callable library for ``sdfg``.
 
@@ -286,6 +288,8 @@ def build_fortran_library(
         directive=directive,
         specialization=specialization,
         record_symbols_to=record_symbols_to,
+        record_per_rank=record_per_rank,
+        extra_procedures=extra_procedures,
     )
 
     # Threaded between the binding (which the shim USEs) and extra_sources

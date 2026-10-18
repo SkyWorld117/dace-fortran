@@ -274,3 +274,45 @@ def test_a_specialised_binding_checks_the_elements_of_small_integer_module_array
         y, declined = run(n=n, first=first)
         assert declined, (n, first)
         np.testing.assert_array_equal(y, -1.0)
+
+
+def test_a_binding_recording_per_rank_writes_the_file_of_its_rank(tmp_path, monkeypatch):
+    sdfg, iface, plan, src = _build(tmp_path, "scale_rank")
+    record = tmp_path / "scale_rank.symbols"
+    run = _library(
+        tmp_path,
+        sdfg,
+        iface,
+        plan,
+        src,
+        "call {entry}_dace(xin, yout)\n  declined = .false.",
+        record_symbols_to=record,
+        record_per_rank=True,
+    )
+    monkeypatch.setenv("OMPI_COMM_WORLD_RANK", "3")
+    run(nv=3)
+    monkeypatch.delenv("OMPI_COMM_WORLD_RANK")
+    run(nv=4)
+    assert "nv 3" in (tmp_path / "scale_rank.symbols.3").read_text()
+    assert "nv 4" in record.read_text()  # a process no launcher started records to the file itself
+
+
+def test_extra_procedures_are_part_of_the_binding_module(tmp_path):
+    sdfg, iface, plan, src = _build(tmp_path, "scale_extra")
+    shim = tmp_path / "shim.f90"
+    shim.write_text(_SHIM.format(entry=iface.entry, call=f"call {iface.entry}_dace(xin, yout)\n  declined = .false."))
+    extra = (
+        "  subroutine extra_probe(v) bind(c, name='extra_probe')\n"
+        "    integer(c_int), intent(out) :: v\n"
+        "    v = 42\n"
+        "  end subroutine extra_probe\n"
+    )
+    lib = build_fortran_library(
+        sdfg, iface, plan, str(tmp_path / "lib"), prelude_sources=[src], extra_sources=[shim], extra_procedures=extra
+    )
+    assert "extra_probe" in Path(lib.bindings_f90).read_text() if hasattr(lib, "bindings_f90") else True
+    probe = lib.load().extra_probe
+    probe.restype = None
+    v = np.zeros(1, dtype=np.int32)
+    probe(v.ctypes.data)
+    assert v[0] == 42

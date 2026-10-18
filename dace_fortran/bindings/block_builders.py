@@ -1277,9 +1277,10 @@ def assemble_module(
     extra_sources: Mapping[str, ModuleOrigin] | None = None,
     private_access: Mapping[str, Mapping[str, ExposedVariable]] | None = None,
     private_imports: Sequence[str] = (),
+    extra_procedures: str = "",
 ) -> str:
     """Stitch the rendered blocks into the complete Fortran module
-    (template: templates/module.f90.in).
+    (template: templates/module.f90.in).  ``extra_procedures``: module procedures appended as they are.
 
     ``extra_sources``: module variables of symbols the SDFG no longer takes but the wrapper still reads (those of a
     specialisation guard), imported alongside ``frozen``'s.
@@ -1363,7 +1364,8 @@ def assemble_module(
         handle_state=handle_state,
         wrapper_body=wrapper_body,
         # Module procedures the wrapper calls (the storage guard's), after the finalizer.
-        finalize_body="\n\n".join([blocks["finalize"], *([blocks["helpers"]] if blocks.get("helpers") else [])]),
+        finalize_body="\n\n".join([blocks["finalize"], *([blocks["helpers"]] if blocks.get("helpers") else []),
+                                   *([extra_procedures] if extra_procedures else [])]),
     )
     # A private variable is a pointer here: ``associated`` asks what ``allocated`` asks of the variable (its accessor
     # returns a null pointer for an unallocated allocatable).

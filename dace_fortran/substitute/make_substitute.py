@@ -1144,6 +1144,11 @@ def main() -> int:
                     "successive recording rounds, each pruned by the ones before, together hold every value)")
     ap.add_argument("--record-only", action="store_true", help="with --record: decline every call once recorded, so "
                     "the original runs (a sizing run that never executes the general SDFG)")
+    ap.add_argument("--record-per-rank", action="store_true", help="with --record: a process MPI launched records to "
+                    "<file>.<rank> (the records of all ranks together are the values equal on every rank)")
+    ap.add_argument("--binding-extra", type=Path, action="append", default=[], help="Fortran file whose module "
+                    "procedures are appended to the binding module, e.g. the bind(c) shim of an external call "
+                    "(repeatable)")
     ap.add_argument("--stub", action="append", default=[], help="procedure whose calls are dropped (repeatable)")
     ap.add_argument("--scratch", action="append", default=[], help="module array the routine only uses as scratch "
                     "(module::variable): it becomes a transient of the SDFG and leaves the binding (repeatable)")
@@ -1329,6 +1334,8 @@ def main() -> int:
         specialization=Specialization(values, general, arrays),
         record_symbols_to=args.record.resolve() if args.record else None,
         record_only=args.record_only,
+        record_per_rank=args.record_per_rank,
+        extra_procedures="\n\n".join(f.read_text() for f in args.binding_extra),
         kept_images=kept_images,
         members_first=members_first,
     )

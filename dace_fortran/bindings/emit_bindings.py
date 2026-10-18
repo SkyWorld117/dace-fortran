@@ -53,6 +53,8 @@ def emit_bindings(
     specialization: Specialization | None = None,
     record_symbols_to: str | Path | None = None,
     record_only: bool = False,
+    record_per_rank: bool = False,
+    extra_procedures: str = "",
     private_access: Mapping[str, Mapping[str, ExposedVariable]] | None = None,
     private_imports: Sequence[str] = (),
     kept_images: Collection[str] = (),
@@ -107,6 +109,10 @@ def emit_bindings(
     (:mod:`dace_fortran.bindings.storage_guard`).
     ``private_access`` / ``private_imports``: module variables their modules keep private, reached through the
     accessors of the modules' copies, and the ``use`` lines their declarations need (see :func:`assemble_module`).
+    ``record_per_rank``: a process MPI launched records to ``<record_symbols_to>.<rank>``
+    (:func:`dace_fortran.bindings.specialization.render_symbol_record`).
+    ``extra_procedures``: Fortran module procedures appended to the binding module as they are, e.g. a ``bind(c)``
+    shim an external call of the SDFG reaches, which may use the module's buffers and private-variable pointers.
     ``kept_images``: arguments of the SDFG that are buffers of module arrays of records only the routine uses (nothing
     else reads or writes their members between its calls): the wrapper packs such a buffer once, keeps it (and its
     device copy) for the next call and never copies it back, so the routine's state lives in the buffer instead of the
@@ -188,7 +194,7 @@ def emit_bindings(
     if record_only and (record_symbols_to is None or specialization is None):
         raise ValueError("record_only needs record_symbols_to and a specialization (the wrapper declines through it)")
     if record_symbols_to is not None:
-        record = render_symbol_record(frozen, iface, plan, record_symbols_to)
+        record = render_symbol_record(frozen, iface, plan, record_symbols_to, per_rank=record_per_rank)
         if record_only:
             # The members of elements of module arrays of records that are another array of the SDFG: the substitute
             # built from the record folds the two (its storage guard would decline them).
@@ -209,6 +215,7 @@ def emit_bindings(
             extra_sources=extra,
             private_access=private_access,
             private_imports=private_imports,
+            extra_procedures=extra_procedures,
         )
     )
     return out_file
