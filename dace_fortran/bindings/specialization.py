@@ -84,14 +84,15 @@ SMALL_ARRAY = 16
 
 def small_array_sources(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan) -> dict[str, tuple]:
     """The rank-1 integer module arrays the SDFG takes and never writes, by name: the Fortran expression of the array
-    and its argument.  A sizing run records their elements when there are at most :data:`SMALL_ARRAY`."""
+    and its argument.  A sizing run records their elements when there are at most :data:`SMALL_ARRAY`.  The members
+    of module arrays of records the frontend flattened (``idwbuff(:)%beg`` as ``idwbuff_beg``) are no such array."""
     from dace_fortran.bindings.block_builders import _module_value_expr, _synthetic_members, effective_module_sources
 
     module_sources = effective_module_sources(frozen, iface, plan)
     members = _synthetic_members(plan)
     return {a.sdfg_name: (_module_value_expr(a.sdfg_name, members), a) for a in frozen.args
             if not a.is_written and a.rank == 1 and tuple(a.shape) != ("1",) and a.dtype in ("int32", "int64")
-            and a.sdfg_name in module_sources}
+            and a.sdfg_name in module_sources and a.sdfg_name not in members}
 
 
 def _defined(expr: str, a, lines: list[str]) -> list[str]:
