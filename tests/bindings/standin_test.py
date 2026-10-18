@@ -410,3 +410,23 @@ def test_a_recording_stand_in_per_rank_writes_the_file_of_its_rank(tmp_path: Pat
     _run(tmp_path, [tmp_path / "modules.f90", standin, tmp_path / "main.f90"], "dace_record_step")
     assert recorded_invariants(tmp_path / "calls.record.2") == {"cfg::nsweeps": 2}
     assert not record.exists()
+
+
+def test_an_extent_reached_through_a_re_exporting_module_is_imported_from_its_own():
+    """``bc(num_dims, 2)`` with ``num_dims`` a variable of m_common that the routine's module reaches through
+    m_params (which re-exports it): the routine's imports name no module for it, so the stand-in takes the module
+    the recorded value of ``num_dims`` names."""
+    from dace_fortran.bindings.fortran_interface import OriginalArg, OriginalInterface
+    from dace_fortran.bindings.standin import render_dummies
+
+    iface = OriginalInterface(
+        entry="step",
+        args=(OriginalArg(name="bc", fortran_type="integer", rank=2, shape=("num_dims", "2"), intent="in",
+                          passing="address"),),
+        struct_types={},
+        used_modules={"m_params": ["sys_size"]},
+    )
+    uses, decls = render_dummies(iface, {"num_dims": "m_common"})
+    assert "use m_common, only: num_dims" in uses
+    assert "integer, intent(in) :: bc(num_dims, 2)" in decls
+    assert "use m_common, only: num_dims" not in render_dummies(iface)[0]

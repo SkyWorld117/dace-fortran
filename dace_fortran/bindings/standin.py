@@ -155,9 +155,10 @@ def _declaration(a: OriginalArg) -> str:
     return f"{', '.join(attributes)} :: {a.name}{shape}"
 
 
-def render_dummies(iface: OriginalInterface) -> tuple[list[str], list[str]]:
+def render_dummies(iface: OriginalInterface, known: Mapping[str, str] | None = None) -> tuple[list[str], list[str]]:
     """(``use`` statements, declarations) of the entry's dummies, declared so that the caller's arguments pass through
-    a stand-in unchanged."""
+    a stand-in unchanged. ``known``: the module of other variables by name (the recorded values'), for an extent
+    the routine's own imports do not name -- a variable it reaches through a module that re-exports it."""
     uses = ["use iso_c_binding"]
     for a in iface.args:
         if a.struct_type:
@@ -174,6 +175,10 @@ def render_dummies(iface: OriginalInterface) -> tuple[list[str], list[str]]:
         names = sorted(s for s in syms if s.lower() in extents)
         if names:
             uses.append(f"use {module}, only: {', '.join(names)}")
+            extents -= {n.lower() for n in names}
+    for name in sorted(extents):
+        if (known or {}).get(name):
+            uses.append(f"use {known[name]}, only: {name}")
     return list(dict.fromkeys(uses)), [_declaration(a) for a in iface.args]
 
 
@@ -186,9 +191,10 @@ def _with_arguments(head: str, names: Sequence[str]) -> list[str]:
 
 
 def _subroutine(
-    name: str, iface: OriginalInterface, body: list[str], extra_uses: Sequence[str] = (), local: Sequence[str] = ()
+    name: str, iface: OriginalInterface, body: list[str], extra_uses: Sequence[str] = (), local: Sequence[str] = (),
+    known: Mapping[str, str] | None = None,
 ) -> list[str]:
-    uses, decls = render_dummies(iface)
+    uses, decls = render_dummies(iface, known)
     args = [a.name for a in iface.args]
     original = standin_name("original", iface.entry)
     return [
@@ -269,7 +275,8 @@ def emit_recording_standin(
         "close(dace_record_unit)",
         *_with_arguments(f"call {standin_name('original', iface.entry)}", [a.name for a in iface.args]),
     ]
-    lines = _subroutine(standin_name("record", iface.entry), iface, body, reads.uses, [*local, *reads.declarations])
+    lines = _subroutine(standin_name("record", iface.entry), iface, body, reads.uses, [*local, *reads.declarations],
+                        known={_variable(v.name).lower(): v.module for v in values})
     out = Path(out_path)
     out.write_text("\n".join(lines) + "\n")
     return out
@@ -357,7 +364,8 @@ def emit_substitute_entry(
         *report,
         *_with_arguments(f"if (declined) call {original}", args),
     ]
-    lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, local)
+    lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, local,
+                        known={_variable(v.name).lower(): v.module for v, _ in baked})
     out = Path(out_path)
     out.write_text("\n".join(lines) + "\n")
     return out
