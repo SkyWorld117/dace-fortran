@@ -93,10 +93,13 @@ def _members(ranged: bool = False) -> dace.SDFG:
     t = boundary.add_tasklet("b", {"v"}, {"w"}, "w = v")
     boundary.add_edge(boundary.add_read("p_sf"), None, t, "v", dace.Memlet("p_sf[0, 1]"))
     boundary.add_edge(t, "w", boundary.add_write("p_sf"), None, dace.Memlet("p_sf[0, 0]"))
+    # One map per element of p read: a map reading two takes them through one connector, over both elements.
     use = sdfg.add_state_after(boundary, "use")
-    use.add_mapped_tasklet("u", {"i": f"0:{N}"}, {"a": dace.Memlet("c_sf[0, i]"), "b": dace.Memlet("p_sf[0, i]"),
-                                                 "d": dace.Memlet("p_sf[1, i]")}, "w = a + b + d",
-                           {"w": dace.Memlet("y[i]")}, external_edges=True)
+    use.add_mapped_tasklet("u", {"i": f"0:{N}"}, {"a": dace.Memlet("c_sf[0, i]"), "d": dace.Memlet("p_sf[1, i]")},
+                           "w = a + d", {"w": dace.Memlet("y[i]")}, external_edges=True)
+    more = sdfg.add_state_after(use, "use_more")
+    more.add_mapped_tasklet("v", {"i": f"0:{N}"}, {"a": dace.Memlet("y[i]"), "b": dace.Memlet("p_sf[0, i]")},
+                            "w = a + b", {"w": dace.Memlet("y[i]")}, external_edges=True)
     sdfg.validate()
     return sdfg
 
