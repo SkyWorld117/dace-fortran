@@ -1979,6 +1979,27 @@ std::vector<ASTNode> buildReductionAssignNodes(hlfir::AssignOp assign, mlir::Ope
 // dispatchScfWhileCall) so every call shape (MPI/FFTW3/QE FFT/BLAS/LAPACK/unsupported-libcall/Fortran I/O/generic) is
 // recognised identically in both. io_state/fft_plans thread the I/O and FFTW3 plan state machines across calls in one
 // block.
+/// The constant a ``__assoc_scalar`` adapter holds: flang passes a literal actual by reference through an alloca
+/// it stores the literal into once, declared under a ``__assoc_scalar_N`` name. Nullopt for anything else.
+static std::optional<int64_t> traceAssocScalarLiteral(mlir::Value v) {
+  auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(v.getDefiningOp());
+  if (!decl || decl.getUniqName().str().find("__assoc_scalar") == std::string::npos) return std::nullopt;
+  std::optional<int64_t> literal;
+  int stores = 0;
+  for (auto result : {decl.getResult(0), decl.getResult(1)})
+    for (auto* user : result.getUsers())
+      if (auto st = mlir::dyn_cast<fir::StoreOp>(user)) {
+        ++stores;
+        literal = traceConstInt(st.getValue());
+      }
+  for (auto* user : decl.getMemref().getUsers())
+    if (auto st = mlir::dyn_cast<fir::StoreOp>(user)) {
+      ++stores;
+      literal = traceConstInt(st.getValue());
+    }
+  return stores == 1 ? literal : std::nullopt;
+}
+
 static void dispatchCallOp(fir::CallOp call, std::vector<ASTNode>& nodes, IoState& io_state,
                            std::map<std::string, FftPlanInfo>& fft_plans) {
   ASTNode n;
@@ -2084,9 +2105,14 @@ static void dispatchCallOp(fir::CallOp call, std::vector<ASTNode>& nodes, IoStat
   }
   // Resolves each operand to a decl name so the builder can lower a registered external (bind(c)) call to a tasklet
   // (harmless for unregistered callees). A by-value integer-constant operand has no decl -- emit its literal value
-  // instead of an empty term.
+  // instead of an empty term. A literal passed by reference comes through flang's ``__assoc_scalar`` adapter (an
+  // alloca with one store of the constant): its value is the term, since nothing else ever defines the adapter.
   for (auto v : call.getArgOperands()) {
-    std::string nm = traceToDecl(v);
+    std::string nm;
+    if (auto lit = traceAssocScalarLiteral(v))
+      nm = std::to_string(*lit);
+    else
+      nm = traceToDecl(v);
     if (nm.empty())
       if (auto c = traceConstInt(v)) nm = std::to_string(*c);
     n.call_args.push_back(nm);
