@@ -27,7 +27,7 @@ def test_element_read_as_index_and_as_value(tmp_path):
     sdfg = build_sdfg(SRC, tmp_path, name="cellpos", entry="m_cellpos::kern").build()
     n = 4
     pos = np.array([1.5, 2.25, 3.5, 1.0])
-    x_cb = np.linspace(0.0, n, n + 1)
+    x_cb = np.arange(n + 1, dtype=np.float64)
     dx = np.full(n, 1.0)
     s = np.zeros(n)
     sdfg(pos=pos, x_cb=x_cb, dx=dx, s=s, n=n)
