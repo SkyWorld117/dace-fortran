@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 import dace.symbolic
 from dace import InterstateEdge, Memlet, dtypes
 
-from dace_fortran.builder.access import acc, iter_view_dim_map
-from dace_fortran.builder.records import NodeLike, SyntheticNode
+from dace_fortran.builder.access import acc, resolve_section_alias
+from dace_fortran.builder.records import NodeLike, SyntheticAccess, SyntheticNode
 from dace_fortran.dace_types import input_connector, output_connector
 from dace_fortran.external import C_TYPES, Arg, ArgKind, CAbi, Intent
 
@@ -120,9 +120,22 @@ def _parse_reduce_identity(s: str) -> bool | int | float:
         raise NotImplementedError(f"unsupported reduction identity {s!r}") from None
 
 
+def whole_array_subset(builder: SDFGBuilder, ctx: Ctx, name: str) -> tuple[str, str]:
+    """The array a whole-array access of ``name`` reads or writes, and its subset there: all of ``name`` itself, or,
+    for a ``section_alias`` dummy, which has no array of its own, the slab of its source the section covers -- every
+    dimension the section keeps whole, the dropped ones at the scalars' positions (``call op(w(:, q))`` gives
+    ``w[0:4, (q) - offset_w_d1]``)."""
+    src, access = resolve_section_alias(builder, name, SyntheticAccess(array_name=name))
+    shape = ctx.sdfg.arrays[src].shape
+    exprs = access.index_exprs or [""] * len(shape)
+    subset = ", ".join(f"0:{shape[d]}" if e == "" else f"({e}) - offset_{src}_d{d}" for d, e in enumerate(exprs))
+    return src, subset
+
+
 def add_copy_node(builder: SDFGBuilder, ctx: Ctx, state: SDFGState, src_name: str, tgt_name: str) -> None:
     """Add a ``CopyLibraryNode`` copying the whole array ``src_name`` into ``tgt_name`` in ``state``. Connector
-    names come from the node class so this stays correct across libnode renames.
+    names come from the node class so this stays correct across libnode renames. A ``section_alias`` dummy on either
+    side is the slab of its source (``whole_array_subset``).
 
     A copy of a container onto exactly itself (``a = a``, or a record assigned from a dummy the caller
     associated with that record, once the inlined dummy's members resolve onto the record's own) moves no data
@@ -135,27 +148,29 @@ def add_copy_node(builder: SDFGBuilder, ctx: Ctx, state: SDFGState, src_name: st
 
     if src_name == tgt_name:
         return
-    src_desc = ctx.sdfg.arrays[src_name]
-    tgt_desc = ctx.sdfg.arrays[tgt_name]
+    src_data, src_subset = whole_array_subset(builder, ctx, src_name)
+    tgt_data, tgt_subset = whole_array_subset(builder, ctx, tgt_name)
+    src_desc = ctx.sdfg.arrays[src_data]
+    tgt_desc = ctx.sdfg.arrays[tgt_data]
 
-    src_access = acc(builder, state, src_name)
-    src_memlet = Memlet.from_array(src_name, src_desc)
+    src_access = acc(builder, state, src_data)
+    src_memlet = Memlet(data=src_data, subset=src_subset)
     # An allocatable transient can carry its own symbolic ALLOCATE extent, distinct from the
     # source's; drive the dest memlet off the source's shape when they differ (same rank) so
     # both subsets align -- conformance keeps the dest subset in bounds.
     same_rank_diff_shape = len(src_desc.shape) == len(tgt_desc.shape) and list(src_desc.shape) != list(tgt_desc.shape)
     tgt_memlet = (
-        Memlet.from_array(tgt_name, src_desc) if same_rank_diff_shape else Memlet.from_array(tgt_name, tgt_desc)
+        Memlet.from_array(tgt_data, src_desc) if same_rank_diff_shape else Memlet(data=tgt_data, subset=tgt_subset)
     )
 
     cache = builder.access_caches[state]  # ``acc`` above created it
-    live = cache.get(tgt_name)
+    live = cache.get(tgt_data)
     if live is not None and (live is src_access or state.out_degree(live) > 0):
-        tgt_access = state.add_access(tgt_name)
-        cache[tgt_name] = tgt_access
-        ensure_view_writeback_link(builder, state, tgt_access, tgt_name)
+        tgt_access = state.add_access(tgt_data)
+        cache[tgt_data] = tgt_access
+        ensure_view_writeback_link(builder, state, tgt_access, tgt_data)
     else:
-        tgt_access = acc(builder, state, tgt_name)
+        tgt_access = acc(builder, state, tgt_data)
 
     cp = CopyLibraryNode(name=f"copy_{tgt_name}_{builder.nid()}")
     state.add_node(cp)
@@ -177,7 +192,8 @@ def _state_for_whole_write(builder: SDFGBuilder, ctx: Ctx, region: ControlFlowRe
 
 def emit_copy(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
     """Whole-array ``b = a`` -> ``CopyLibraryNode``."""
-    state = _state_for_whole_write(builder, ctx, region, n.target)
+    tgt_data, _ = whole_array_subset(builder, ctx, n.target)
+    state = _state_for_whole_write(builder, ctx, region, tgt_data)
     add_copy_node(builder, ctx, state, n.reduce_src, n.target)  # buildCopyNode stored the source in reduce_src
 
 
@@ -187,26 +203,15 @@ def emit_memset(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlow
     from dace.libraries.standard.nodes import FillLibraryNode
 
     tgt_name = n.target
-    # Section-alias dummies route memset through the source array, writing the slab
-    # view_dim_map carves out.
+    # Section-alias dummies route memset through the source array, writing the slab the section covers.
     v_tgt = builder.arrays.get(tgt_name)
     if v_tgt is not None and v_tgt.role == "section_alias":
-        src_name = v_tgt.view_source
+        src_name, slab = whole_array_subset(builder, ctx, tgt_name)
         state = _state_for_whole_write(builder, ctx, region, src_name)
-        src_desc = ctx.sdfg.arrays[src_name]
-        slab_parts = []
-        for src_dim, slot, dummy_dim in iter_view_dim_map(v_tgt.view_dim_map):
-            if dummy_dim is not None:
-                slab_parts.append(f"0:{src_desc.shape[src_dim]}")
-            else:
-                slab_parts.append(f"({slot}) - 1")
-        slab_subset = ", ".join(slab_parts)
         ms = FillLibraryNode(name=f"memset_{tgt_name}_{builder.nid()}")
         state.add_node(ms)
         tgt_access = acc(builder, state, tgt_name)  # redirects to src via resolve
-        state.add_edge(
-            ms, output_connector(FillLibraryNode), tgt_access, None, Memlet(data=src_name, subset=slab_subset)
-        )
+        state.add_edge(ms, output_connector(FillLibraryNode), tgt_access, None, Memlet(data=src_name, subset=slab))
         ctx.new_state(builder, region)
         return
 

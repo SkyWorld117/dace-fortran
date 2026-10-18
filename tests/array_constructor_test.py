@@ -237,3 +237,32 @@ def test_implied_do_inside_a_loop(tmp_path):
     j = np.arange(1, n + 1)
     expected = np.vstack([j, *(i * a * j for i in range(1, 4))])
     np.testing.assert_array_equal(m, expected)
+
+
+_REDUCE_SRC = """
+subroutine floor_and_sums(c2, eps, a, b, s, p, both)
+  implicit none
+  real(8), intent(inout) :: c2
+  real(8), intent(in) :: eps, a, b
+  real(8), intent(out) :: s, p
+  logical, intent(out) :: both
+  c2 = maxval((/c2, eps/))
+  s = sum([a, b, c2])
+  p = product([a, b])
+  both = all([a > 0d0, b > 0d0])
+end subroutine floor_and_sums
+"""
+
+
+def test_reductions_of_a_constructor(tmp_path):
+    """A reduction of an array constructor reduces its elements; an item reading the destination sees the old value
+    (``c2 = maxval((/c2, eps/))`` keeps ``c2`` at least ``eps``)."""
+    sdfg = build_sdfg(_REDUCE_SRC, tmp_path, name="floor_and_sums").build()
+    sdfg.validate()
+    for c2_in, eps in ((0.5, 1e-3), (1e-6, 1e-3)):
+        c2 = np.array([c2_in])
+        s, p = np.zeros(1), np.zeros(1)
+        both = np.zeros(1, dtype=np.uint32)
+        sdfg(c2=c2, eps=eps, a=2.0, b=-3.0, s=s, p=p, both=both)
+        assert c2[0] == max(c2_in, eps)
+        assert s[0] == 2.0 - 3.0 + max(c2_in, eps) and p[0] == -6.0 and not both[0]
