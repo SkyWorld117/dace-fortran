@@ -1595,9 +1595,12 @@ def _image_of_record_array(builder: SDFGBuilder, ctx: Ctx, name: str) -> str:
     if name in ctx.sdfg.arrays or name in ctx.sdfg.symbols:
         return name
     plan = builder.module.get_flatten_plan() or {}
-    images = [f for e in plan.get("entries") or [] for f in e.get("recipe", {}).get("flat_names") or []
-              if f.startswith(f"{name}_") and f in ctx.sdfg.arrays]
-    return images[0] if len(images) == 1 else name
+    images = sorted({f for e in plan.get("entries") or [] for f in e.get("recipe", {}).get("flat_names") or []
+                     if f.startswith(f"{name}_")})
+    if len(images) != 1:
+        return name
+    print(f"kept call: the array of records {name} is passed as its member image {images[0]}", flush=True)
+    return images[0]
 
 
 def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
