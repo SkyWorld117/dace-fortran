@@ -2144,10 +2144,11 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
                 f"external {callee!r}: unsupported module_symbol_forward dtype {dtype!r} for ``{module}::{member}``"
             )
         decl_types.append(f"{fwd_ct}*" if rank > 0 else fwd_ct)
+    c_decl = f'extern "C" void {sig.c_name}({", ".join(decl_types) or "void"});'
     # A function no library of the registration exports comes from the program that loads the SDFG library (a
     # bind(c) procedure of its binding): weak, so the library loads on its own, as the build does to read it.
-    linkage = 'extern "C" void' if sig.libraries else 'extern "C" __attribute__((weak)) void'
-    c_decl = f'{linkage} {sig.c_name}({", ".join(decl_types) or "void"});'
+    if not sig.libraries:
+        c_decl = f"#pragma weak {sig.c_name}\n{c_decl}"
 
     body_text = "\n".join(body_lines)
     # Symbols the call string forwards (dynamic-member extents + lower bounds).
