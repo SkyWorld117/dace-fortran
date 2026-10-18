@@ -538,16 +538,19 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
     their element reads in control flow are literals (an equation index ``rs(k)`` the loop over ``k`` reads).
     """
     specialize(sdfg, symbols=symbols, scalars=scalars)
-    # A value that differs between the ranks of a run stays a symbol, but the conditions that come out the same for
-    # every value it takes (a boundary condition no rank has) still fold.
-    if value_sets:
-        from dace_fortran.substitute.fuse_stencils import fold_conditions_over_value_sets  # noqa: PLC0415
-
-        print(f"conditions decided over the values of {sorted(value_sets)}: "
-              f"{fold_conditions_over_value_sets(sdfg, value_sets)}", flush=True)
     # Until the dead branches are gone, accesses in them may fall outside arrays the case left degenerate (a
     # boundary condition's coefficients for a direction without it): validate once they are.
     sdfg.simplify(validate=False, validate_all=False)
+    # A value that differs between the ranks of a run stays a symbol, but the conditions that come out the same for
+    # every value it takes (a boundary condition no rank has) still fold: once the simplification has promoted the
+    # scalars the conditions read to symbols, and with their branches dropped by another.
+    if value_sets:
+        from dace_fortran.substitute.fuse_stencils import fold_conditions_over_value_sets  # noqa: PLC0415
+
+        decided = fold_conditions_over_value_sets(sdfg, value_sets)
+        print(f"conditions decided over the values of {sorted(value_sets)}: {decided}", flush=True)
+        if decided:
+            sdfg.simplify(validate=False, validate_all=False)
     if DUMP_DIR != Path("."):  # the tool's output directory (not a test's working directory)
         # The specialised SDFG with its short loops still loops: the input for designing which of them become maps.
         sdfg.save(str(DUMP_DIR / "pre_unroll.sdfgz"), compress=True)
