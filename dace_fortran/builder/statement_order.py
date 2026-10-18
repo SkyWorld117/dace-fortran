@@ -112,19 +112,46 @@ class SkippedEdge(NamedTuple):
     dst: nodes.Node
 
 
+def order_writers(state: SDFGState) -> list[SkippedEdge]:
+    """Order the writers of every access node that more than one statement writes: two stores into one node
+    (``p = 0`` and, once a branch is folded, ``p = expr``) are otherwise unordered, and the last store emitted
+    wins whichever it is.  Each writer runs after the one emitted before it; accumulations (write-conflict
+    resolved stores) commute and stay as they are.
+
+    :return: the edges that had to be skipped to keep the state acyclic.
+    """
+    skipped: list[SkippedEdge] = []
+    for node in state.data_nodes():
+        writers = []
+        for edge in state.in_edges(node):
+            if edge.data.is_empty() or edge.data.wcr is not None or edge.src in writers:
+                continue
+            writers.append(edge.src)
+        writers.sort(key=state.node_id)
+        for earlier, later in zip(writers, writers[1:]):
+            src, dst = completion_anchor(state, earlier), start_anchor(state, later)
+            if dst in descendants(state, src):
+                continue
+            if src in descendants(state, dst):
+                skipped.append(SkippedEdge(node.data, src, dst))
+                continue
+            state.add_nedge(src, dst, Memlet())
+    return skipped
+
+
 def order_state(state: SDFGState) -> list[SkippedEdge]:
     """Add ordering edges for every unordered same-container pair in ``state``.
 
     :return: list of ``(container, src, dst)`` triples that had to be skipped to keep the state
         acyclic.
     """
+    skipped = order_writers(state)
     scopes = state.scope_dict()
     by_container = defaultdict(list)
     for node in state.data_nodes():
         if scopes[node] is None:
             by_container[node.root_data].append(node)
 
-    skipped: list[SkippedEdge] = []
     for container, access_nodes in by_container.items():
         if len(access_nodes) < 2:
             continue
