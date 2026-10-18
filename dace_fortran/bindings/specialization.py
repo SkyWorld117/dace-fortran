@@ -249,9 +249,18 @@ def recorded_invariants(path: str | Path) -> dict[str, Value]:
 
 
 def recorded_value_sets(path: str | Path) -> dict[str, list[Value]]:
-    """The values each name took that did not stay the same at ``path`` (a boundary type that differs between the
-    ranks of one run): every call takes one of them, which decides the conditions that come out the same for all."""
-    return {name: sorted(values, key=str) for name, values in _recorded_values(path).items() if len(values) > 1}
+    """The values each name takes on the ranks of a run: constant within every rank's record (``<path>.<rank>``,
+    :func:`render_symbol_record` with ``per_rank``) and different between ranks (a boundary type at a face one rank
+    shares with a neighbour).  Every call takes one of them, which decides the conditions that come out the same for
+    all.  A name that varies within a rank's record (a time step) takes values no record shows and has no set; a
+    record of one process gives none."""
+    files = sorted(Path(path).parent.glob(f"{Path(path).name}.[0-9]*"))
+    if len(files) < 2:
+        return {}
+    per_rank = [recorded_invariants(f) for f in files]
+    names = set.intersection(*(set(r) for r in per_rank))
+    return {name: sorted({r[name] for r in per_rank}, key=str) for name in sorted(names)
+            if len({r[name] for r in per_rank}) > 1}
 
 
 def _guard_assigns(

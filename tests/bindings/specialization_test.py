@@ -326,6 +326,10 @@ def test_recorded_value_sets_are_the_values_that_did_not_stay_the_same(tmp_path)
     from dace_fortran.bindings.specialization import recorded_value_sets
 
     record = tmp_path / "ranks.symbols"
-    record.write_text("bc_x_beg -3\nbc_x_end 0\nm 99\n\nbc_x_beg 0\nbc_x_end -3\nm 99\n\n")
+    # Two ranks, two calls each: the boundary types differ between the ranks, the time step between the calls.
+    (tmp_path / "ranks.symbols.0").write_text("bc_x_beg -3\nbc_x_end 0\nm 99\nt_step 0\n\nbc_x_beg -3\nbc_x_end 0\nm 99\nt_step 1\n\n")
+    (tmp_path / "ranks.symbols.1").write_text("bc_x_beg 0\nbc_x_end -3\nm 99\nt_step 0\n\nbc_x_beg 0\nbc_x_end -3\nm 99\nt_step 1\n\n")
+    record.write_text((tmp_path / "ranks.symbols.0").read_text() + (tmp_path / "ranks.symbols.1").read_text())
     assert recorded_invariants(record) == {"m": 99}
-    assert recorded_value_sets(record) == {"bc_x_beg": [-3, 0], "bc_x_end": [-3, 0]}
+    assert recorded_value_sets(record) == {"bc_x_beg": [-3, 0], "bc_x_end": [-3, 0]}  # not t_step
+    assert recorded_value_sets(tmp_path / "ranks.symbols.0") == {}  # one process: no sets

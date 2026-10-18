@@ -1031,7 +1031,7 @@ def recorded_arrays(recorded: dict, frozen, iface, plan: FlattenPlan) -> dict[st
 
 
 def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scalars: dict, dropped: list[str],
-                  recorded: dict, arrays: dict) -> list[str]:
+                  recorded: dict, arrays: dict, value_sets: dict | None = None) -> list[str]:
     """--auto-scratch: what make_scratch_transient is to match for the module variables auto_scratch.infer finds
     scratch, those given with --scratch left out. The in-call analysis runs on a copy specialised as this build
     specialises the SDFG (the branches the recorded configuration never takes are gone); ``dropped``: the procedures
@@ -1283,7 +1283,7 @@ def main() -> int:
         print(f"values that differ between calls or ranks, kept as symbols: {value_sets}", flush=True)
     scratch_names = list(args.scratch)
     if args.auto_scratch:
-        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays)
+        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, value_sets)
     scratch, scratch_images = [], {}
     if scratch_names:
         scratch, scratch_images = make_scratch_transient(sdfg, scratch_names, recorded)
