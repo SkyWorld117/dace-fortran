@@ -1589,6 +1589,17 @@ class CallTerm(NamedTuple):
     value: Any
 
 
+def _image_of_record_array(builder: SDFGBuilder, ctx: Ctx, name: str) -> str:
+    """The SDFG array a call argument names: itself, or, for an array of records the flattening unpacked into one
+    member image (``q_vf`` -> ``q_vf_sf``), that image, which is what the SDFG holds and the callee's shim takes."""
+    if name in ctx.sdfg.arrays or name in ctx.sdfg.symbols:
+        return name
+    plan = builder.module.get_flatten_plan() or {}
+    images = [f for e in plan.get("entries") or [] for f in e.get("recipe", {}).get("flat_names") or []
+              if f.startswith(f"{name}_") and f in ctx.sdfg.arrays]
+    return images[0] if len(images) == 1 else name
+
+
 def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
     """Lower a *registered* external ``bind(c)`` call to an
     :class:`dace_fortran.external.ExternalCall` library node.
@@ -1643,7 +1654,7 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     from collections import defaultdict
     from math import prod
 
-    names = list(n.call_args)
+    names = [_image_of_record_array(builder, ctx, name) for name in n.call_args]
     groups = list(n.aos_marshal_groups)  # flat [start, count, ...]
     group_pairs = [(groups[i], groups[i + 1]) for i in range(0, len(groups), 2)]
 
