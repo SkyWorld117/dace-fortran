@@ -611,16 +611,9 @@ def _sibling_rw_hazard(assigns: Sequence[NodeLike]) -> bool:
 
 
 def _rhs_free_symbols(rhs: str) -> set[str]:
-    """Names an interstate-assignment RHS reads.
-
-    Symbolic parse first -- robust to substrings and to the ``int32(...)`` typecast, which is a
-    function, not a symbol.  Identifier regex as the fallback for expressions sympy rejects
-    (conservative: also yields function names, which only ever over-approximates the read set).
-    """
-    try:
-        return {str(s) for s in dace.symbolic.pystr_to_symbolic(rhs).free_symbols}
-    except Exception:
-        return set(re.findall(r"[A-Za-z_]\w*", str(rhs)))
+    """Names an interstate-assignment RHS reads: its identifiers. Over-approximate (a typecast such as ``int32`` and
+    the array of an element load ``cell[1]`` count too), which only ever costs an edge or a state more."""
+    return set(re.findall(r"[A-Za-z_]\w*", str(rhs)))
 
 
 def _hoist_hazard_targets(hoisted_pairs: Sequence[tuple[str, str]], later_targets: set[str]) -> set[str]:
