@@ -94,20 +94,29 @@ def fold_conditions_over_value_sets(sdfg: dace.SDFG, sets: dict[str, list]) -> i
     names = sorted(sets)
     combinations = list(itertools.product(*(sets[n] for n in names)))
 
+    import ast
+
+    functions = {"Min": min, "Max": max, "abs": abs, "int": int}
+
     def decided(code: CodeBlock | None) -> CodeBlock | None:
+        """The condition as a literal when every combination of the sets' values gives the same truth, else None.
+        The condition is the frontend's Python expression (``(bc <= -5) and (bc >= -12)``), evaluated as such."""
         if code is None:
             return None
+        text = code.as_string
         try:
-            expr = symbolic.pystr_to_symbolic(code.as_string)
-        except Exception:  # noqa: BLE001 -- not an expression the folding can judge
+            tree = ast.parse(text, mode="eval")
+        except SyntaxError:
             return None
-        free = {str(f) for f in expr.free_symbols}
-        if not free or not free <= set(names):
+        read = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        if not read & set(names) or not read <= set(names) | set(functions):
             return None
         results = set()
         for values in combinations:
-            value = expr.subs({symbolic.symbol(n): v for n, v in zip(names, values, strict=True)})
-            if value not in (True, False) and getattr(value, "is_Boolean", False) is False:
+            try:
+                value = eval(compile(tree, "<condition>", "eval"), {"__builtins__": {}},  # noqa: S307 -- our own text
+                             {**functions, **dict(zip(names, values, strict=True))})
+            except Exception:  # noqa: BLE001 -- not decidable this way
                 return None
             results.add(bool(value))
             if len(results) > 1:
