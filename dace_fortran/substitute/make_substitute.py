@@ -1114,11 +1114,6 @@ def baked_values(records: list[Path], values: dict | None) -> list:
     print(f"substitute entry checks {len(baked)} baked values", flush=True)
     return baked
 
-def iface_scalar_names(iface) -> set[str]:
-    """The names of the routine's scalar arguments (a recorded value may be one rather than a symbol)."""
-    return {a.name for a in iface.args if getattr(a, "rank", 1) == 0}
-
-
 def external_signature(spec: str) -> tuple[str, dict]:
     """``NAME=C_NAME(KIND,...)`` of --external as ``keep_external``'s name and keywords."""
     from dace_fortran.external import Arg, ArgKind, Intent
@@ -1276,11 +1271,12 @@ def main() -> int:
     arrays = recorded_arrays(recorded, general, iface, plan) if args.specialize else {}
     if arrays:
         print(f"specialised to the elements of small module arrays: {arrays}", flush=True)
-    # The recorded values that differ (between the ranks of a run): known sets, not baked.
+    # The recorded values that differ between the ranks of a run: known sets, not baked (the names the guard could
+    # check, like the baked ones).
     value_sets = {name: v for name, v in recorded_value_sets(args.specialize).items()
-                  if name in general.free_symbols or name in iface_scalar_names(iface)} if args.specialize else {}
+                  if name in specializable(general, iface, plan)} if args.specialize else {}
     if value_sets:
-        print(f"values that differ between calls or ranks, kept as symbols: {value_sets}", flush=True)
+        print(f"values that differ between the ranks, kept with their sets: {value_sets}", flush=True)
     scratch_names = list(args.scratch)
     if args.auto_scratch:
         scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, value_sets)
