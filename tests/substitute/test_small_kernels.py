@@ -194,3 +194,35 @@ def test_a_large_any_stays_a_library_node():
     from dace_fortran.substitute.small_kernels import inline_small_reductions
 
     assert inline_small_reductions(_any_sdfg(100, "any")) == 0
+
+
+def _ordered_scratch_fields() -> dace.SDFG:
+    """One state: ``T[0, i] = a[i]`` and ``T[1, i] = b[i]`` (T a transient), the second ordered after the first by
+    the empty edge StateFusionExtended puts on its source node, then ``out[i] = T[0, i] + T[1, i]`` read through
+    the second map's node of T: nothing but that edge leads from the first map's node of T to a reader."""
+    sdfg = dace.SDFG("ordered_scratch_fields")
+    for name in ("a", "b", "out"):
+        sdfg.add_array(name, [N], dace.float64)
+    sdfg.add_transient("T", [2, N], dace.float64)
+    state = sdfg.add_state()
+    first_t, second_t, b = state.add_access("T"), state.add_access("T"), state.add_read("b")
+    state.add_mapped_tasklet("first", {"i": f"0:{N}"}, {"x": dace.Memlet("a[i]")}, "y = x",
+                             {"y": dace.Memlet("T[0, i]")}, external_edges=True, output_nodes={"T": first_t})
+    state.add_mapped_tasklet("second", {"i": f"0:{N}"}, {"x": dace.Memlet("b[i]")}, "y = 2 * x",
+                             {"y": dace.Memlet("T[1, i]")}, external_edges=True, input_nodes={"b": b},
+                             output_nodes={"T": second_t})
+    state.add_nedge(first_t, b, dace.Memlet())
+    state.add_mapped_tasklet("use", {"i": f"0:{N}"}, {"p": dace.Memlet("T[0, i]"), "q": dace.Memlet("T[1, i]")},
+                             "o = p + q", {"o": dace.Memlet("out[i]")}, external_edges=True,
+                             input_nodes={"T": second_t})
+    sdfg.validate()
+    return sdfg
+
+
+def test_maps_whose_fusion_would_orphan_a_scratch_write_stay_apart():
+    sdfg = _ordered_scratch_fields()
+    _states, maps = fuse_small_maps(sdfg, max_iterations=N)
+    sdfg.simplify()
+    args = _run(sdfg)
+    np.testing.assert_array_equal(args["out"], args["a"] + 2 * args["b"])
+    assert maps == 0
