@@ -124,9 +124,9 @@ _BODIES = {
     ),
 }
 
-# Whole-array copies, broadcasts and reductions through a dummy bound to a section are not lowered at all (they fail
-# to build whatever the call sites), so ``passed_on`` covers the statement kinds that are.
-_PASSED_ON_BODIES = ("intrinsic", "normalise", "section")
+# Broadcasts and reductions through a dummy bound to a section are not lowered at all (they fail to build whatever the
+# call sites), so ``passed_on`` covers the statement kinds that are.
+_PASSED_ON_BODIES = ("copy_through_local", "intrinsic", "normalise", "section")
 
 
 def _source(actuals: str, shape: str, body: str) -> str:
