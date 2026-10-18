@@ -205,13 +205,15 @@ def image_keys(sdfg: dace.SDFG) -> dict[str, list[str]]:
     return dict(out)
 
 
-def infer_kept(sdfg: dace.SDFG, entry: str, source_dirs: Iterable[Path],
-               outside_procedures: Iterable[str] = ()) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+def infer_kept(sdfg: dace.SDFG, entry: str, source_dirs: Iterable[Path], outside_procedures: Iterable[str] = (),
+               associated: Iterable[tuple[str, str]] = ()) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """The module arrays of records only the routine ``entry`` uses, whose buffers the binding can keep between its
     calls (``emit_bindings(kept_images=...)``): no code outside the routine's calls reads them, writes them, aliases
     them or takes their address (outside_refs on the build's sources).  Then the buffer the binding packed once
     evolves exactly as the members would, and nothing ever looks at the members again; unlike scratch, values may flow
-    from one call into the next.  Returns ``(kept, rejected)``: ``module::record`` -> its buffers, and -> why not."""
+    from one call into the next.  ``associated``: pairs of ``module::variable`` whose shared storage the SDFG accesses
+    through one of them only (folded member aliases): no alias of each other here.  Returns ``(kept, rejected)``:
+    ``module::record`` -> its buffers, and -> why not."""
     images = image_keys(sdfg)
     dirs = [Path(d) for d in source_dirs]
     if not images:
@@ -227,7 +229,9 @@ def infer_kept(sdfg: dace.SDFG, entry: str, source_dirs: Iterable[Path],
         k = "::".join(key)
         why = list(v.reasons)
         why += [f"written outside the routine's calls in {w}" for w in v.writes]
-        why += [f"pointer-associated with {o[0]}::{o[1]}" for o in sorted(v.aliases)]
+        one = {frozenset(pair) for pair in associated}
+        why += [f"pointer-associated with {o[0]}::{o[1]}" for o in sorted(v.aliases)
+                if frozenset((k, "::".join(o))) not in one]
         if why:
             rejected[k] = why
         else:

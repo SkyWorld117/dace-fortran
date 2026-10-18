@@ -236,6 +236,19 @@ def keep_startup_values(values: dict, what: str) -> dict:
     return kept
 
 
+def _image_origins(frozen) -> dict[str, tuple[str, str]]:
+    """The images of members of module records the SDFG takes -> the record's (module, variable)."""
+    return {a.sdfg_name: (a.aos_origin_mod.lower(), a.aos_origin_struct.split("%")[0].strip().lower())
+            for a in frozen.args if getattr(a, "aos_origin_struct", "") and getattr(a, "aos_origin_mod", "")}
+
+
+def alias_keys(aliases, frozen) -> list[tuple[str, str]]:
+    """The ``module::variable`` pairs of the records behind member aliases ``(image, element, image, element)``."""
+    origin = _image_origins(frozen)
+    return sorted({("::".join(origin[a]), "::".join(origin[b])) for a, _e, b, _f in aliases
+                   if a in origin and b in origin})
+
+
 def startup_member_aliases(record: Path, frozen) -> list[tuple[str, int, str, int]]:
     """The member aliases the sizing run recorded (``recorded_member_aliases``) between images of module records no
     code that may run after the routine's first call associates anew (all of them without --startup-constants)."""
@@ -244,8 +257,7 @@ def startup_member_aliases(record: Path, frozen) -> list[tuple[str, int, str, in
     aliases = recorded_member_aliases(record)
     if STARTUP is None or not aliases:
         return aliases
-    origin = {a.sdfg_name: (a.aos_origin_mod.lower(), a.aos_origin_struct.split("%")[0].strip().lower())
-              for a in frozen.args if getattr(a, "aos_origin_struct", "") and getattr(a, "aos_origin_mod", "")}
+    origin = _image_origins(frozen)
     kept, dropped = [], {}
     for alias in aliases:
         keys = [origin.get(alias[0]), origin.get(alias[2])]
@@ -1185,8 +1197,8 @@ def main() -> int:
     if args.auto_keep:
         from dace_fortran.substitute.auto_scratch import infer_kept  # noqa: PLC0415
 
-        kept, rejected = infer_kept(sdfg, args.entry, args.fypp,
-                                    args.stub)
+        kept, rejected = infer_kept(sdfg, args.entry, args.fypp, args.stub,
+                                    associated=alias_keys(INFERRED_MEMBER_ALIASES, general))
         print(f"auto-keep: {len(kept)} of {len(kept) + len(rejected)} module arrays of records the SDFG takes are "
               f"kept between calls: {sorted(kept)}", flush=True)
         for key, why in sorted(rejected.items()):

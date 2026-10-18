@@ -124,3 +124,21 @@ def test_variables_whose_shared_storage_the_sdfg_holds_as_one_are_no_alias_group
     result = infer(_routine(), "m_fields::s_rhs", None, [_sources(tmp_path)], associated=[("pa_sf", 0, "pb_sf", 0)])
     assert result.scratch == ["m_fields::pb", "m_fields::work"]
     assert "pa_sf" in result.reasons["m_fields::pa"][0]
+
+
+def test_records_whose_shared_storage_the_sdfg_holds_as_one_may_be_kept(tmp_path: Path):
+    """pa and pb (pb%sf => pa%sf) are not kept between calls while the SDFG takes them as two arrays; once it
+    accesses their storage through one of them only (a folded member alias), both are."""
+    from dace_fortran.substitute.auto_scratch import infer_kept
+
+    sdfg = _routine()
+    frozen = get_frozen_signature(sdfg)
+    images = ("pa_sf", "pb_sf")
+    attach_to_sdfg(sdfg, replace(frozen, args=tuple(
+        replace(a, rank=2, aos_outer_rank=1, aos_member_pointer=True) if a.sdfg_name in images else a
+        for a in frozen.args)))
+    kept, rejected = infer_kept(sdfg, "m_fields::s_rhs", [_sources(tmp_path)])
+    assert kept == {} and "pointer-associated with m_fields::pb" in " ".join(rejected["m_fields::pa"])
+    kept, rejected = infer_kept(sdfg, "m_fields::s_rhs", [_sources(tmp_path)],
+                                associated=[("m_fields::pa", "m_fields::pb")])
+    assert kept == {"m_fields::pa": ["pa_sf"], "m_fields::pb": ["pb_sf"]} and rejected == {}
