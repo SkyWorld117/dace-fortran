@@ -15,13 +15,15 @@ that code outside the loops only writes: nothing outside reads what the loop lea
 where one write dominates its reads and leaves it whole otherwise.  The check is conservative -- a write counts once
 every path through the iteration makes it and names constant elements, a read (in dataflow or on an interstate edge)
 only if it names constant elements already written, or any element once the whole array is -- and an array it cannot
-decide is left as it is.
+decide is left as it is.  Loops that can never both run -- the branches of one conditional, or blocks of one region
+with no path between them -- cannot exchange values either, whatever the loops do with the array, as long as nothing
+outside the loops touches it: each of those gets its own copy too.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from itertools import product
+from itertools import combinations, product
 from math import prod
 
 from dace import SDFG, subsets
@@ -76,7 +78,8 @@ def _privatize(sdfg: SDFG) -> dict[str, list[str]]:
         # One loop and no other user: LoopToMap privatises it itself.
         if name in read_outside or (len(loops) < 2 and name not in written_outside):
             continue
-        if not all(_iteration_local(name, loop, blocks) for loop, blocks in loops.items()):
+        exclusive = name not in written_outside and _mutually_exclusive(list(loops), sdfg)
+        if not exclusive and not all(_iteration_local(name, loop, blocks) for loop, blocks in loops.items()):
             continue
         copies = []
         # The writes outside keep the original name; every loop then needs a copy of its own.
@@ -103,6 +106,47 @@ def _outermost_loop(block: ControlFlowBlock, top: SDFG) -> LoopRegion | None:
             found = region
         region = region.parent_graph
     return found
+
+
+def _mutually_exclusive(loops: list[LoopRegion], top: SDFG) -> bool:
+    """Can no two of ``loops`` (outermost loops of ``top``) run in one execution of ``top``?"""
+    return all(_exclusive(a, b, top) for a, b in combinations(loops, 2))
+
+
+def _exclusive(a: ControlFlowBlock, b: ControlFlowBlock, top: SDFG) -> bool:
+    """Do ``a`` and ``b`` sit in different branches of one conditional, or in blocks of one region with no path
+    from either to the other?  Neither is inside a loop, so nothing runs the pair again."""
+    chain_a, chain_b = _ancestry(a, top), _ancestry(b, top)
+    common = next(x for x in chain_a if x in chain_b)
+    ia, ib = chain_a.index(common), chain_b.index(common)
+    if ia == 0 or ib == 0:
+        return False  # one holds the other
+    child_a, child_b = chain_a[ia - 1], chain_b[ib - 1]
+    if isinstance(common, ConditionalBlock):
+        return child_a is not child_b
+    if isinstance(common, ControlFlowRegion):
+        return not _reaches(common, child_a, child_b) and not _reaches(common, child_b, child_a)
+    return False
+
+
+def _ancestry(block: ControlFlowBlock, top: SDFG) -> list:
+    """``block``, its parent, and so on up to ``top``."""
+    chain = [block]
+    while chain[-1] is not top:
+        chain.append(chain[-1].parent_graph)
+    return chain
+
+
+def _reaches(region: ControlFlowRegion, src: ControlFlowBlock, dst: ControlFlowBlock) -> bool:
+    seen, stack = {src}, [src]
+    while stack:
+        for nxt in region.successors(stack.pop()):
+            if nxt is dst:
+                return True
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return False
 
 
 def _loop_chain(block: ControlFlowBlock, stop: LoopRegion) -> list[LoopRegion]:
