@@ -47,6 +47,9 @@ class Specialization:
     values: Mapping[str, Value]
     frozen: FrozenSignature
     arrays: Mapping[str, tuple[int, ...]] = field(default_factory=dict)  # small integer module arrays: elements
+    # The values that differ between the ranks of the recorded run, one combination per rank (recorded_rank_values):
+    # the SDFG still takes them, but was built for these combinations only (its scratch proof may rely on them).
+    per_rank: tuple[Mapping[str, Value], ...] = ()
 
 
 def _symbols(frozen: FrozenSignature) -> tuple[str, ...]:
@@ -263,6 +266,15 @@ def recorded_value_sets(path: str | Path) -> dict[str, list[Value]]:
             if len({r[name] for r in per_rank}) > 1}
 
 
+def recorded_rank_values(path: str | Path) -> list[dict[str, Value]]:
+    """Per rank of a run recorded at ``path`` (see :func:`recorded_value_sets`): the values of the names that differ
+    between the ranks, together -- each rank's combination, as the ranks hold them (a rank's own extent with its own
+    boundary types)."""
+    sets = recorded_value_sets(path)
+    files = sorted(Path(path).parent.glob(f"{Path(path).name}.[0-9]*"))
+    return [{name: r[name] for name in sets} for r in (recorded_invariants(f) for f in files)] if sets else []
+
+
 def _guard_assigns(
     frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, names: Iterable[str]
 ) -> dict[str, list[str]]:
@@ -318,8 +330,10 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
     from dace_fortran.bindings.block_builders import DECLINED_FLAG
 
     scalars = _scalar_sources(spec.frozen, iface, plan)
-    assigns = _guard_assigns(spec.frozen, iface, plan, [s for s in spec.values if s not in scalars])
-    unguardable = sorted(set(spec.values) - set(assigns) - set(scalars))
+    rank_names = sorted({name for values in spec.per_rank for name in values})
+    names = [*spec.values, *rank_names]
+    assigns = _guard_assigns(spec.frozen, iface, plan, [s for s in names if s not in scalars])
+    unguardable = sorted(set(names) - set(assigns) - set(scalars))
     if unguardable:
         raise ValueError(
             f"cannot guard the specialisation of {', '.join(unguardable)}: the wrapper computes "
@@ -332,17 +346,20 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
         f"{_INDENT}! ----- Specialisation guard: the SDFG holds these values -----",
         f"{_INDENT}if (present({DECLINED_FLAG})) {DECLINED_FLAG} = .false.",
     ]
-    if not spec.values and not spec.arrays:
+    if not spec.values and not spec.arrays and not spec.per_rank:
         return lines
-    width = max(len(s) for s in [*spec.values, *spec.arrays])
+    rank_label = "the values of every recorded rank"
+    width = max(len(s) for s in [*spec.values, *spec.arrays, *([rank_label] if spec.per_rank else [])])
     lines.append(f"{_INDENT}block")
-    lines += [f"{_INDENT}  integer(c_int64_t) :: {s}" for s in spec.values if assigns.get(s)]
+    lines += [f"{_INDENT}  integer(c_int64_t) :: {s}" for s in names if assigns.get(s)]
     lines.append(f"{_INDENT}  character(len={width}) :: dace_mismatch")
     if spec.arrays:
         lines.append(f"{_INDENT}  logical :: dace_holds")
+    if spec.per_rank:
+        lines.append(f"{_INDENT}  logical :: dace_this_rank, dace_some_rank")
     lines.append(f"{_INDENT}  logical, save :: dace_said = .false.")
     lines.append(f"{_INDENT}  dace_mismatch = ''")
-    for s in spec.values:
+    for s in names:
         lines += ["  " + ln for ln in assigns.get(s, ())]
     for s, v in spec.values.items():
         expr, dtype = scalars.get(s, (s, "int64"))
@@ -354,6 +371,16 @@ def build_specialization_guard(spec: Specialization, iface: OriginalInterface, p
         lines += [f"{_INDENT}  {ln}" for ln in _defined(expr, a, [
             f"if (size({expr}) == {len(elements)}) dace_holds = all({expr} == [{', '.join(str(int(e)) for e in elements)}])"])]
         lines.append(f"{_INDENT}  if (.not. dace_holds) dace_mismatch = '{name}'")
+    if spec.per_rank:
+        # The call's values must be one recorded rank's combination, all of them together.
+        lines.append(f"{_INDENT}  dace_some_rank = .false.")
+        for values in spec.per_rank:
+            lines.append(f"{_INDENT}  dace_this_rank = .true.")
+            for s, v in values.items():
+                expr, dtype = scalars.get(s, (s, "int64"))
+                lines.append(f"{_INDENT}  if ({_differs(expr, v, dtype)}) dace_this_rank = .false.")
+            lines.append(f"{_INDENT}  if (dace_this_rank) dace_some_rank = .true.")
+        lines.append(f"{_INDENT}  if (.not. dace_some_rank) dace_mismatch = '{rank_label}'")
     lines += [
         f"{_INDENT}  if (dace_mismatch /= '') then",
         f"{_INDENT}    if (present({DECLINED_FLAG})) then",

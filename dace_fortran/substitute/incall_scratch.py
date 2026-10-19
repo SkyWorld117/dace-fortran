@@ -8,7 +8,8 @@ The analysis is conservative: anything it cannot prove leaves a read uncovered.
 
 * Subsets are boxes of inclusive bounds, symbolic.  Comparisons are decided over the ranges of the enclosing loop
   variables and map parameters (a bound linear in them is evaluated at the extreme that decides it); a comparison
-  that still depends on other symbols, or on anything non-linear, is undecided.  Whether a union of boxes holds a box
+  that still depends on other symbols is decided over the combinations of values they can take (``cases``: one per
+  rank of a recorded run, whose binding admits no other), and undecided otherwise, as is anything non-linear.  Whether a union of boxes holds a box
   is decided by subtracting one box after the other.
 * A state: a read at an access node is covered by the boxes written before the state and by the writes into the access
   nodes of the same array it is reachable from (its own in-edges included).  The map scopes a read and a write share
@@ -91,11 +92,12 @@ class Facts:
     """Ranges of the loop variables and map parameters in scope, outermost first (inclusive; None: unbounded)."""
 
     ranges: dict = field(default_factory=dict)  # sympy.Symbol -> (lo, hi)
+    cases: tuple = ()  # the combinations of values the other symbols can take: ({name: value}, ...)
 
     def with_range(self, var, lo, hi) -> "Facts":
         r = dict(self.ranges)
         r[var] = (lo, hi)
-        return Facts(r)
+        return Facts(r, self.cases)
 
     def nonneg(self, expr) -> bool:
         """``expr >= 0`` for every value of the variables in their ranges (False when undecided)."""
@@ -112,7 +114,16 @@ class Facts:
             if bound is None:
                 return False
             e = sympy.expand(rest + coeff * bound)
-        return bool(e >= 0) if e.is_number else False
+        if e.is_number:
+            return bool(e >= 0)
+        names = {str(s) for s in e.free_symbols}
+        if not self.cases or any(not names <= case.keys() for case in self.cases):
+            return False
+        for case in self.cases:
+            value = e.xreplace({s: sympy.sympify(case[str(s)]) for s in e.free_symbols})
+            if not value.is_number or not bool(value >= 0):
+                return False
+        return True
 
     def le(self, a, b) -> bool:
         return self.nonneg(b - a)
@@ -358,8 +369,12 @@ class _Analysis:
             msgs.append(f"{where}: reads {_show(box)} not provably written before")
 
     def check(self, name: str, box, written: Iterable[Box], facts: Facts, where: str) -> None:
-        if box is None or not covered(box, list(written), facts):
-            self.uncovered(name, where, box)
+        written = list(written)
+        if box is None or not covered(box, written, facts):
+            known = {str(v) for v in facts.ranges} | {k for case in facts.cases for k in case}
+            others = sorted({str(s) for b in [box or (), *written] for bound in b for e in bound
+                             for s in getattr(e, "free_symbols", ())} - known)
+            self.uncovered(name, where + (f" (over the symbols {', '.join(others[:6])})" if others else ""), box)
 
     def values(self, env: Env, ctx: _Ctx) -> dict:
         return {**ctx.subs, **env.values()}
@@ -779,13 +794,14 @@ def _viewed(sdfg: dace.SDFG, names: set[str]) -> dict[str, str]:
     return out
 
 
-def uncovered_reads(sdfg: dace.SDFG, names: Iterable[str]) -> dict[str, list[str]]:
+def uncovered_reads(sdfg: dace.SDFG, names: Iterable[str], cases: Iterable[dict] = ()) -> dict[str, list[str]]:
     """For each array of ``names`` (containers of ``sdfg``): where it reads elements not provably written earlier in
-    the same execution -- empty when there is no such read."""
+    the same execution -- empty when there is no such read.  ``cases``: the combinations of values the SDFG's free
+    symbols can take (each ``{name: value}``; see :class:`Facts`)."""
     names = [n for n in names if n in sdfg.arrays]
     viewed = _viewed(sdfg, set(names))
     analysis = _Analysis()
-    analysis.region(sdfg, Env(), Facts(), _Ctx(sdfg, set(names) - set(viewed)))
+    analysis.region(sdfg, Env(), Facts(cases=tuple(cases)), _Ctx(sdfg, set(names) - set(viewed)))
     out = {n: list(analysis.reasons.get(n, [])) for n in names}
     for n, why in viewed.items():
         out[n] = [why]

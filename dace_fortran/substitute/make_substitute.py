@@ -51,6 +51,7 @@ from dace_fortran.bindings.specialization import (
     Specialization,
     recorded_aliases,
     recorded_invariants,
+    recorded_rank_values,
     recorded_value_sets,
     specializable,
 )
@@ -1047,7 +1048,7 @@ def recorded_arrays(recorded: dict, frozen, iface, plan: FlattenPlan) -> dict[st
 
 
 def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scalars: dict, dropped: list[str],
-                  recorded: dict, arrays: dict, value_sets: dict | None = None) -> list[str]:
+                  recorded: dict, arrays: dict, value_sets: dict | None = None, rank_values: list | None = None) -> list[str]:
     """--auto-scratch: what make_scratch_transient is to match for the module variables auto_scratch.infer finds
     scratch, those given with --scratch left out. The in-call analysis runs on a copy specialised as this build
     specialises the SDFG (the branches the recorded configuration never takes are gone); ``dropped``: the procedures
@@ -1080,7 +1081,7 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
         return split
 
     result = infer(sdfg, args.entry, specialise, args.fypp, dropped, asserted=args.scratch,
-                   synthetic=plan.synthetic_globals, associated=folded)
+                   synthetic=plan.synthetic_globals, associated=folded, rank_values=rank_values or ())
     print(result.report(), flush=True)
     INFERRED_MEMBER_ALIASES[:] = folded
     given = {s.lower() for s in args.scratch}
@@ -1297,11 +1298,14 @@ def main() -> int:
     # check, like the baked ones).
     value_sets = {name: v for name, v in recorded_value_sets(args.specialize).items()
                   if name in specializable(general, iface, plan)} if args.specialize else {}
+    # Each rank's combination of them: the binding admits these only, so the build may rely on them.
+    rank_values = [{n: r[n] for n in value_sets} for r in recorded_rank_values(args.specialize)] if value_sets else []
     if value_sets:
         print(f"values that differ between the ranks, kept with their sets: {value_sets}", flush=True)
     scratch_names = list(args.scratch)
     if args.auto_scratch:
-        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, value_sets)
+        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, value_sets,
+                                       rank_values)
     scratch, scratch_images = [], {}
     if scratch_names:
         scratch, scratch_images = make_scratch_transient(sdfg, scratch_names, recorded)
@@ -1403,7 +1407,7 @@ def main() -> int:
         init_symbols=compiled_init_symbols(sdfg_so, sdfg.name),
         module_allocatables_are_targets=False,
         acc_residency=acc,
-        specialization=Specialization(values, general, arrays),
+        specialization=Specialization(values, general, arrays, tuple(rank_values)),
         record_symbols_to=args.record.resolve() if args.record else None,
         record_only=args.record_only,
         record_per_rank=args.record_per_rank,

@@ -333,3 +333,40 @@ def test_recorded_value_sets_are_the_values_that_did_not_stay_the_same(tmp_path)
     assert recorded_invariants(record) == {"m": 99}
     assert recorded_value_sets(record) == {"bc_x_beg": [-3, 0], "bc_x_end": [-3, 0]}  # not t_step
     assert recorded_value_sets(tmp_path / "ranks.symbols.0") == {}  # one process: no sets
+
+
+def test_recorded_rank_values_keep_each_ranks_combination(tmp_path):
+    from dace_fortran.bindings.specialization import recorded_rank_values
+
+    record = tmp_path / "ranks.symbols"
+    (tmp_path / "ranks.symbols.0").write_text("bc_x_beg -3\nbc_x_end 1\nm 158\nn 99\n\n")
+    (tmp_path / "ranks.symbols.1").write_text("bc_x_beg 0\nbc_x_end -3\nm 157\nn 99\n\n")
+    record.write_text("")
+    assert recorded_rank_values(record) == [{"bc_x_beg": -3, "bc_x_end": 1, "m": 158},
+                                            {"bc_x_beg": 0, "bc_x_end": -3, "m": 157}]
+    assert recorded_rank_values(tmp_path / "ranks.symbols.0") == []
+
+
+def test_a_binding_built_for_the_ranks_of_a_run_runs_their_values_only(tmp_path):
+    """The per-rank values stay symbols of the SDFG; the guard admits exactly the recorded combinations."""
+    sdfg, iface, plan, src = _build(tmp_path, "scale_ranks")
+    before = get_frozen_signature(sdfg)
+    baked = {"scaled": 1, "factor": 2.0}
+    specialize(sdfg, scalars=baked)
+    refreeze(sdfg)
+    run = _library(
+        tmp_path,
+        sdfg,
+        iface,
+        plan,
+        src,
+        "call {entry}_dace(xin, yout, dace_declined=declined)",
+        specialization=Specialization(baked, before, per_rank=({"nv": 3}, {"nv": 2})),
+    )
+    for nv, expected in ((3, [2, 4, 6, -1, -1, -1]), (2, [2, 4, -1, -1, -1, -1])):
+        y, declined = run(nv=nv)
+        assert not declined, nv
+        np.testing.assert_array_equal(y, expected)
+    y, declined = run(nv=4)
+    assert declined
+    np.testing.assert_array_equal(y, -1.0)

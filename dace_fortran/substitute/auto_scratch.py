@@ -119,6 +119,7 @@ def infer(
     asserted: Iterable[str] = (),
     synthetic: Iterable = (),
     associated: Iterable[tuple[str, int, str, int]] = (),
+    rank_values: Iterable[dict] = (),
 ) -> Inference:
     """The scratch module variables of the routine ``entry`` (``module::routine``) that ``sdfg`` (as built) is.
 
@@ -129,7 +130,9 @@ def infer(
     given as scratch (``--scratch``): taken as scratch where another variable is aliased with them. ``synthetic``:
     the flattened members of module records (FlattenPlan.synthetic_globals). ``associated``: the member aliases
     ``(image, element, other image, other element)`` the specialised copy holds as one storage
-    (fold_aliases.fold_member_aliases, filled in by ``specialise``): their variables are no alias group any more."""
+    (fold_aliases.fold_member_aliases, filled in by ``specialise``): their variables are no alias group any more.
+    ``rank_values``: the combinations of the values that differ between the ranks (recorded_rank_values); the in-call
+    analysis decides its comparisons over them, as the binding admits no other."""
     t0 = time.time()
     found = candidates(sdfg, synthetic)
     result = Inference(containers=found)
@@ -145,7 +148,8 @@ def infer(
     used = accessed(analysed)
     result.used = {name for key, names in found.items() for name in names
                    if any(n in used for n in (split[name].values() if name in split else [name]))}
-    incall = incall_scratch.uncovered_reads(analysed, [n for ns in names_of.values() for n in ns if n in used])
+    incall = incall_scratch.uncovered_reads(analysed, [n for ns in names_of.values() for n in ns if n in used],
+                                            rank_values)
     t1 = time.time()
     for key, names in names_of.items():
         why = [f"{n}: {r}" for n in names for r in incall.get(n, [])]

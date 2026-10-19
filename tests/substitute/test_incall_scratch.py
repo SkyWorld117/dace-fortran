@@ -333,3 +333,29 @@ def test_unstructured_cycle_does_not_trust_its_counter():
     region.add_edge(body, head, dace.InterstateEdge(assignments={"i": "i + 1"}))
     region.add_edge(head, region.add_state("exit"), dace.InterstateEdge(condition=f"i >= {N}"))
     assert uncovered_reads(sdfg, ["a"])["a"]
+
+
+def _symbolic_extents() -> dace.SDFG:
+    """``a[0:n]`` written, then ``a[0:m]`` read: covered exactly when m <= n."""
+    sdfg = _sdfg("extents", "a", "b", "out")
+    sdfg.add_symbol("m", dace.int64)
+    sdfg.add_symbol("n", dace.int64)
+    s1 = sdfg.add_state(is_start_block=True)
+    _mapped(s1, "b", "a", "0:n")
+    s2 = sdfg.add_state_after(s1)
+    _mapped(s2, "a", "out", "0:m")
+    return sdfg
+
+
+def test_a_comparison_over_free_symbols_is_undecided_without_their_values():
+    found = uncovered_reads(_symbolic_extents(), ["a"])["a"]
+    assert found and "over the symbols m, n" in found[0]
+
+
+def test_a_comparison_over_free_symbols_is_decided_over_every_rank_combination():
+    """Each rank of a run holds its own extents (m and n alike per rank); the read is covered on every rank."""
+    assert uncovered_reads(_symbolic_extents(), ["a"], [{"m": 5, "n": 5}, {"m": 6, "n": 6}])["a"] == []
+    # One combination where it is not: not covered.
+    assert uncovered_reads(_symbolic_extents(), ["a"], [{"m": 5, "n": 5}, {"m": 6, "n": 5}])["a"]
+    # A combination that does not name every symbol decides nothing.
+    assert uncovered_reads(_symbolic_extents(), ["a"], [{"m": 5}])["a"]
