@@ -640,6 +640,8 @@ def collapse_then_fuse(sdfg: dace.SDFG, map_heavy_loops: int = 0) -> int:
     # Accumulations into the cells on both sides of a face (IGR's Riemann solvers, atomic updates in the source)
     # become atomic sums, so their loops can map.
     print(f"accumulations made atomic sums: {len(accumulations_to_wcr(sdfg))}", flush=True)
+    if DUMP_DIR != Path("."):
+        sdfg.save(str(DUMP_DIR / "pre_parallel.sdfgz"), compress=True)  # debugging aid: the loops LoopToMap sees
     sdfg.apply_transformations_repeated(P.LoopToMap)
     sdfg.apply_transformations_repeated(P.StateFusionExtended)
     sdfg.simplify()
