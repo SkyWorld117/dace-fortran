@@ -933,6 +933,7 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
     sdfg.expand_library_nodes()
     print(f"host maps made sequential: {host_maps_sequential(sdfg)}", flush=True)
+    sdfg.save(str(DUMP_DIR / "post_gpu.sdfgz"), compress=True)  # debugging aid: what the code generator gets
     refreeze(sdfg)
     sdfg.validate()
     dace.Config.set("compiler", "cuda", "cuda_arch", value=CUDA_ARCH)
