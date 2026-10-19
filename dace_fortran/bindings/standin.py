@@ -312,6 +312,7 @@ def emit_substitute_entry(
     private_access: PrivateAccess | None = None,
     private_imports: Sequence[str] = (),
     refuse_handover: bool = False,
+    known: Mapping[str, str] | None = None,
 ) -> Path:
     """Write ``dace_sub_<entry>``: calls the binding's ``wrapper`` and, when it declines the call (``dace_declined``),
     the original instead.
@@ -322,7 +323,9 @@ def emit_substitute_entry(
     ``private_imports``: as for :func:`emit_recording_standin`, for baked variables their modules keep private.
     ``refuse_handover``: the binding keeps buffers between calls (``emit_bindings(kept_images=...)``), which the members
     do not follow: once the binding has taken a call, a call it would leave to the original stops the program instead
-    (the original would compute on members the kept buffers have moved past)."""
+    (the original would compute on members the kept buffers have moved past). ``known``: the module of other
+    variables by name, for an extent of a dummy that neither the routine's imports nor ``baked`` name
+    (:func:`render_dummies`)."""
     args = [a.name for a in iface.args]
     original = standin_name("original", iface.entry)
     uses = [f"use {binding_module}, only: {wrapper}"]
@@ -368,7 +371,7 @@ def emit_substitute_entry(
         *_with_arguments(f"if (declined) call {original}", args),
     ]
     lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, local,
-                        known={_variable(v.name).lower(): v.module for v, _ in baked})
+                        known={**(known or {}), **{_variable(v.name).lower(): v.module for v, _ in baked}})
     out = Path(out_path)
     out.write_text("\n".join(lines) + "\n")
     return out

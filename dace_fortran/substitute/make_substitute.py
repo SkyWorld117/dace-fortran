@@ -1432,6 +1432,9 @@ def main() -> int:
         # No hand-written shim: generate the substitute entry from the interface snapshot.
         from dace_fortran.bindings.standin import emit_substitute_entry  # noqa: PLC0415
 
+        # The modules of every recorded variable: an extent of a dummy may name one no import of the routine does.
+        known = {re.split(r"[(%]", k.split("::")[1])[0].lower(): k.split("::")[0]
+                 for k in (merged_invariants(args.globals) if args.globals else {})}
         shim = emit_substitute_entry(
             iface,
             f"{sdfg.name}_dace_bindings",
@@ -1441,6 +1444,7 @@ def main() -> int:
             private_access={a["module"]: a["variables"] for a in access},
             private_imports=list(dict.fromkeys(line for a in access for line in a["imports"])),
             refuse_handover=bool(kept_images),
+            known=known,
         )
         if private_baked:
             print(f"substitute entry checks baked private variables through accessors: {private_baked}", flush=True)
