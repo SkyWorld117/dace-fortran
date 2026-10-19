@@ -14,7 +14,8 @@ def _kernel_reading_scalars(write_t: bool) -> dace.SDFG:
     sdfg.add_scalar("s", dace.float64)
     sdfg.add_scalar("t", dace.float64)
     sdfg.add_array("h", [1], dace.float64)
-    scalar = {n: dace.Memlet.from_array(n, sdfg.arrays[n]) for n in ("s", "t")}
+    def scalar(n):  # a fresh memlet per edge
+        return dace.Memlet.from_array(n, sdfg.arrays[n])
     state = sdfg.add_state(is_start_block=True)
     body = dace.SDFG("body")
     body.add_array("a", [8], dace.float64)
@@ -30,16 +31,16 @@ def _kernel_reading_scalars(write_t: bool) -> dace.SDFG:
     bstate.add_edge(bt, "y", bstate.add_write("b"), None, dace.Memlet("b[i]"))
     if write_t:
         wt = state.add_tasklet("set_t", {}, {"o"}, "o = 2.0")
-        state.add_edge(wt, "o", state.add_write("t"), None, scalar["t"])
+        state.add_edge(wt, "o", state.add_write("t"), None, scalar("t"))
     nested = state.add_nested_sdfg(body, {"a", "s", "t"}, {"b"}, symbol_mapping={"i": "i"})
     me, mx = state.add_map("m", {"i": "0:8"})
     state.add_memlet_path(state.add_read("A"), me, nested, dst_conn="a", memlet=dace.Memlet("A[0:8]"))
     s_node = state.add_read("s")
-    state.add_memlet_path(s_node, me, nested, dst_conn="s", memlet=scalar["s"])
-    state.add_memlet_path(state.add_access("t"), me, nested, dst_conn="t", memlet=scalar["t"])
+    state.add_memlet_path(s_node, me, nested, dst_conn="s", memlet=scalar("s"))
+    state.add_memlet_path(state.add_access("t"), me, nested, dst_conn="t", memlet=scalar("t"))
     state.add_memlet_path(nested, mx, state.add_write("B"), src_conn="b", memlet=dace.Memlet("B[0:8]"))
     host = state.add_tasklet("host", {"x"}, {"y"}, "y = x")
-    state.add_edge(s_node, None, host, "x", scalar["s"])
+    state.add_edge(s_node, None, host, "x", scalar("s"))
     state.add_edge(host, "y", state.add_write("h"), None, dace.Memlet("h[0]"))
     sdfg.validate()
     return sdfg
