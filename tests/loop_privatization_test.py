@@ -157,7 +157,7 @@ end subroutine zones
 """
 
 # The nests of ZONES_SRC under two IFs in sequence instead of one IF/ELSE: the conditions exclude each other.
-SEQUENTIAL_IFS_SRC = ZONES_SRC.replace("subroutine zones", "subroutine zones2").replace("end subroutine zones", "end subroutine zones2").replace(
+SEQUENTIAL_IFS_SRC = ZONES_SRC.replace("zones(", "zones2(").replace("end subroutine zones", "end subroutine zones2").replace(
     "  else\n    do i = 1, n", "  end if\n  if (idir == 2) then\n    do i = 1, n")
 assert SEQUENTIAL_IFS_SRC.count("if (idir == 2)") == 1
 

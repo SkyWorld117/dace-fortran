@@ -27,7 +27,8 @@ def device_copies_of_kernel_read_scalars(sdfg: dace.SDFG) -> list[str]:
 
 
 def _device_copies(sdfg: dace.SDFG) -> list[str]:
-    written = {n.data for st in sdfg.states() for n in st.data_nodes() if st.in_degree(n)}
+    written = {n.data for st in sdfg.states() for n in st.data_nodes()
+               if any(not e.data.is_empty() for e in st.in_edges(n))}
     uses: list[tuple[dace.SDFGState, nodes.AccessNode, bool]] = []  # (state, access node, inside a map)
     for state in sdfg.states():
         scope = state.scope_dict()
@@ -58,8 +59,6 @@ def _device_copies(sdfg: dace.SDFG) -> list[str]:
             for inner in state.scope_subgraph(entry).edges():
                 if inner.data.data == name:
                     inner.data.data = dev
-                    if isinstance(inner.dst, nodes.NestedSDFG):  # the body reads device data now
-                        inner.dst.sdfg.arrays[inner.dst_conn].storage = dace.StorageType.GPU_Global
         if inside:
             node.data = dev
             continue
