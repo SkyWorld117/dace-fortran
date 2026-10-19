@@ -31,7 +31,8 @@ def device_copies_of_kernel_read_scalars(sdfg: dace.SDFG) -> list[str]:
     for name in sorted(read_by_maps):
         dev, _ = sdfg.add_scalar(f"{name}_dev", sdfg.arrays[name].dtype, storage=dace.StorageType.GPU_Global,
                                  transient=True, find_new_name=True)
-        copy_state.add_nedge(copy_state.add_read(name), copy_state.add_write(dev), dace.Memlet(name))
+        copy_state.add_nedge(copy_state.add_read(name), copy_state.add_write(dev),
+                             dace.Memlet.from_array(name, sdfg.arrays[name]))
         for state in sdfg.states():
             scope = state.scope_dict()
             for entry in [n for n in state.nodes() if isinstance(n, nodes.MapEntry) and scope[n] is None]:
@@ -41,7 +42,7 @@ def device_copies_of_kernel_read_scalars(sdfg: dace.SDFG) -> list[str]:
                     for inner in state.scope_subgraph(entry).edges():
                         if inner.data.data == name:
                             inner.data.data = dev
-                    state.add_edge(state.add_read(dev), None, entry, e.dst_conn, dace.Memlet(dev))
+                    state.add_edge(state.add_read(dev), None, entry, e.dst_conn, dace.Memlet.from_array(dev, sdfg.arrays[dev]))
                     src = e.src
                     state.remove_edge(e)
                     if state.degree(src) == 0:
