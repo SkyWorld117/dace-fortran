@@ -883,6 +883,10 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
             moved.append(name)
     print(f"{len(moved)} argument arrays on the GPU: {sorted(moved)}; read by host control flow, kept on the host: "
           f"{sorted(host_read & on_gpu)}", flush=True)
+    from dace_fortran.substitute.device_scalars import device_copies_of_kernel_read_scalars  # noqa: PLC0415
+
+    print(f"scalar arguments kernels read, copied to the device: {device_copies_of_kernel_read_scalars(sdfg)}",
+          flush=True)
     # Arguments no map touches stay where the caller holds them: a copy between two of them (a record's array members
     # assigned whole, say) runs on the host instead of through device copies made and dropped on every call.
     host = [n for n, d in sdfg.arrays.items() if not d.transient and d.storage != dace.StorageType.GPU_Global]
