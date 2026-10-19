@@ -1218,6 +1218,9 @@ def main() -> int:
                     help="specialise only to recorded values that no code after the routine's first call can change "
                     "(startup_constants.py, on the build's sources: needs --fypp); the recorded calls still decide "
                     "which values stay the same")
+    ap.add_argument("--keeps-arguments", action="append", default=[], metavar="PROCEDURE",
+                    help="with --startup-constants: a procedure the sources do not define (a library's) that changes "
+                    "none of its arguments, so a value passed to it stays a start-up constant (repeatable)")
     ap.add_argument("--fuse", action="store_true", help="recompute stencil producers inside their consumers (GPU)")
     ap.add_argument("--tile-fuse", action="store_true",
                     help="with --fuse: fuse through a shared-memory tile (the producer once per tile) instead")
@@ -1251,7 +1254,8 @@ def main() -> int:
         from dace_fortran.substitute.outside_refs import parse_sources, source_files  # noqa: PLC0415
         from dace_fortran.substitute.startup_constants import StartupAnalysis  # noqa: PLC0415
 
-        STARTUP = StartupAnalysis(parse_sources(source_files(args.fypp)), tuple(args.entry.lower().split("::")))
+        STARTUP = StartupAnalysis(parse_sources(source_files(args.fypp)), tuple(args.entry.lower().split("::")),
+                                  keeps_arguments=frozenset(n.lower() for n in args.keeps_arguments))
         start = f"main program {STARTUP.main.name}" if STARTUP.main else "no single main program"
         print(f"start-up: {start}; {len(STARTUP.after_procedures)} procedures may run after the first call",
               flush=True)

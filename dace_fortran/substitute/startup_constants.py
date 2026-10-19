@@ -127,8 +127,11 @@ def _namelist_groups(prog: Program) -> dict[str, set[str]]:
 class StartupAnalysis:
     """Where code that may run after the first call of ``routine`` (module, procedure) may change module variables."""
 
-    def __init__(self, prog: Program, routine: Key):
+    def __init__(self, prog: Program, routine: Key, keeps_arguments: frozenset[str] = frozenset()):
+        """``keeps_arguments``: procedures the sources do not define (a library's) that change none of their
+        arguments, lower-case; a call of one leaves the variables passed to it as they were."""
         self.prog = prog
+        self.keeps_arguments = keeps_arguments
         self.by_name: dict[str, list[Scope]] = defaultdict(list)
         for p in prog.procedures:
             self.by_name[p.name].append(p)
@@ -333,7 +336,8 @@ class StartupAnalysis:
                 if not _DESIGNATOR.match(value.strip()) or _base_name(value) not in names:
                     continue
                 if not candidates:
-                    out.append(f"passed to {callee}, which the sources do not define")
+                    if callee not in self.keeps_arguments:
+                        out.append(f"passed to {callee}, which the sources do not define")
                     continue
                 for q in candidates:
                     dummy = keyword.strip() if keyword else (q.dummy_order[pos] if pos < len(q.dummy_order) else None)
