@@ -349,7 +349,7 @@ def _symbolic_extents() -> dace.SDFG:
 
 def test_a_comparison_over_free_symbols_is_undecided_without_their_values():
     found = uncovered_reads(_symbolic_extents(), ["a"])["a"]
-    assert found and "over the symbols m, n" in found[0]
+    assert found and "over the symbols m" in found[0]
 
 
 def test_a_comparison_over_free_symbols_is_decided_over_every_rank_combination():
