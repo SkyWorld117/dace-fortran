@@ -147,8 +147,22 @@ def _branches_contradict(block_a: ConditionalBlock, branch_a: ControlFlowRegion,
         if condition is None:
             return False
         conditions.append(condition.as_string)
+    # A condition may be a symbol an edge assigns the test to (``if_cond_1 = idir == 1``): one assigned once in the
+    # whole SDFG stands for its expression.
+    assigned_once: dict[str, list[str]] = defaultdict(list)
+    for edge in region.sdfg.all_interstate_edges(recursive=True):
+        for sym, value in edge.data.assignments.items():
+            assigned_once[sym].append(value)
+    definitions = {sym: values[0] for sym, values in assigned_once.items() if len(values) == 1}
     try:
-        both = sympy.And(*(symbolic.pystr_to_symbolic(c) for c in conditions))
+        terms = []
+        for condition in conditions:
+            term = symbolic.pystr_to_symbolic(condition)
+            for sym in list(term.free_symbols):
+                if str(sym) in definitions:
+                    term = term.subs(sym, symbolic.pystr_to_symbolic(definitions[str(sym)]))
+            terms.append(term)
+        both = sympy.And(*terms)
         if sympy.simplify(both) is not sympy.false:
             return False
     except (TypeError, ValueError, AttributeError, sympy.SympifyError):

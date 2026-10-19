@@ -110,7 +110,7 @@ def test_a_scalar_read_from_inside_the_map_scope_gets_a_device_copy():
     copies = _copies(state)
     assert copies == {"s": inner.data}
     dev_node = next(n for n in state.nodes() if isinstance(n, nodes.AccessNode) and n.data == inner.data
-                    and state.in_degree(n))
+                    and any(not e.data.is_empty() for e in state.in_edges(n)))
     assert any(e.dst is me for e in state.out_edges(dev_node)), "the copy is ordered before the kernel"
 
 
