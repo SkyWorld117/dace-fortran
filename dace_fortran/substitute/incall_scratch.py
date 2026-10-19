@@ -371,8 +371,11 @@ class _Analysis:
     def check(self, name: str, box, written: Iterable[Box], facts: Facts, where: str) -> None:
         written = list(written)
         if box is None or not covered(box, written, facts):
+            # The symbols the comparisons met that are neither loop variables nor given values: the read box, the
+            # boxes written, and the ranges of the loop variables in scope.
             known = {str(v) for v in facts.ranges} | {k for case in facts.cases for k in case}
-            others = sorted({str(s) for b in [box or (), *written] for bound in b for e in bound
+            pairs = [*(box or ()), *(pair for w in written for pair in w), *facts.ranges.values()]
+            others = sorted({str(s) for pair in pairs for e in pair if e is not None
                              for s in getattr(e, "free_symbols", ())} - known)
             self.uncovered(name, where + (f" (over the symbols {', '.join(others[:6])})" if others else ""), box)
 
