@@ -524,6 +524,11 @@ def forward_copy(sdfg: dace.SDFG, scratch: str, real: str, reads: bool, known: d
     copies = copy_tasklets(sdfg, src, dst)
     if not copies:
         raise LookupError(f"no copy {src} -> {dst}")
+    # An element read on an inter-state edge (a condition on a reconstructed state) is not a memlet the relation
+    # rewrites: the array stays.
+    for edge in sdfg.all_interstate_edges():
+        if scratch in {str(sym) for sym in edge.data.free_symbols}:
+            raise LookupError(f"{scratch} is read on an inter-state edge ({edge.src.label} -> {edge.dst.label})")
     by_state: dict = {}
     for state, entry, tasklet in copies:
         by_state.setdefault(state, []).append((state, entry, tasklet))
