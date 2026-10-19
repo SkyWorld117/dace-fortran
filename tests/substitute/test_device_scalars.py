@@ -79,3 +79,23 @@ def test_a_scalar_the_sdfg_writes_keeps_its_host_copy():
     sdfg.validate()
     inputs = _map_inputs(sdfg)
     assert "t" in inputs and "s" not in inputs
+
+
+def test_a_scalar_read_from_inside_the_map_scope_gets_a_device_copy():
+    sdfg = dace.SDFG("inside_scope")
+    sdfg.add_array("A", [8], dace.float64)
+    sdfg.add_array("B", [8], dace.float64)
+    sdfg.add_scalar("s", dace.float64)
+    state = sdfg.add_state(is_start_block=True)
+    me, mx = state.add_map("m", {"i": "0:8"})
+    t = state.add_tasklet("t", {"x", "cs"}, {"y"}, "y = x * cs")
+    state.add_memlet_path(state.add_read("A"), me, t, dst_conn="x", memlet=dace.Memlet("A[i]"))
+    inner = state.add_read("s")  # inside the scope: no edge through the map entry
+    state.add_edge(inner, None, t, "cs", dace.Memlet.from_array("s", sdfg.arrays["s"]))
+    state.add_nedge(me, inner, dace.Memlet())
+    state.add_memlet_path(t, mx, state.add_write("B"), src_conn="y", memlet=dace.Memlet("B[i]"))
+    sdfg.validate()
+    assert device_copies_of_kernel_read_scalars(sdfg) == ["s"]
+    sdfg.validate()
+    assert inner.data != "s" and sdfg.arrays[inner.data].storage == dace.StorageType.GPU_Global
+    assert sdfg.start_block.label == "scalars_to_device"

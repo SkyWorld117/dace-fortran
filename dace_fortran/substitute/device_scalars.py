@@ -13,38 +13,49 @@ from dace.sdfg import nodes
 
 
 def device_copies_of_kernel_read_scalars(sdfg: dace.SDFG) -> list[str]:
-    """Give every non-transient scalar a top-level map reads, and nothing in ``sdfg`` writes, a device copy made in a
-    new first state, and let the maps read the copy. Returns the scalars copied."""
+    """Give every non-transient scalar a top-level map reads (through an edge into the map, or an access node inside
+    it), and nothing in ``sdfg`` writes, a device copy made in a new first state, and let the maps read the copy.
+    Returns the scalars copied."""
     written = {n.data for st in sdfg.states() for n in st.data_nodes() if st.in_degree(n)}
-    read_by_maps = set()
+    uses: list[tuple[dace.SDFGState, nodes.AccessNode, bool]] = []  # (state, access node, inside a map)
     for state in sdfg.states():
         scope = state.scope_dict()
-        for node in state.nodes():
-            if isinstance(node, nodes.MapEntry) and scope[node] is None:
-                for e in state.in_edges(node):
-                    desc = sdfg.arrays.get(e.data.data)
-                    if isinstance(desc, dace.data.Scalar) and not desc.transient and e.data.data not in written:
-                        read_by_maps.add(e.data.data)
-    if not read_by_maps:
+        for node in state.data_nodes():
+            desc = sdfg.arrays[node.data]
+            if not isinstance(desc, dace.data.Scalar) or desc.transient or node.data in written:
+                continue
+            if scope[node] is not None:
+                uses.append((state, node, True))
+            elif any(isinstance(e.dst, nodes.MapEntry) for e in state.out_edges(node)):
+                uses.append((state, node, False))
+    names = sorted({node.data for _state, node, _inside in uses})
+    if not names:
         return []
     copy_state = sdfg.add_state_before(sdfg.start_block, "scalars_to_device")
-    for name in sorted(read_by_maps):
+    copies = {}
+    for name in names:
         dev, _ = sdfg.add_scalar(f"{name}_dev", sdfg.arrays[name].dtype, storage=dace.StorageType.GPU_Global,
                                  transient=True, find_new_name=True)
+        copies[name] = dev
         copy_state.add_nedge(copy_state.add_read(name), copy_state.add_write(dev),
                              dace.Memlet.from_array(name, sdfg.arrays[name]))
-        for state in sdfg.states():
-            scope = state.scope_dict()
-            for entry in [n for n in state.nodes() if isinstance(n, nodes.MapEntry) and scope[n] is None]:
-                for e in list(state.in_edges(entry)):
-                    if e.data.data != name:
-                        continue
-                    for inner in state.scope_subgraph(entry).edges():
-                        if inner.data.data == name:
-                            inner.data.data = dev
-                    state.add_edge(state.add_read(dev), None, entry, e.dst_conn, dace.Memlet.from_array(dev, sdfg.arrays[dev]))
-                    src = e.src
-                    state.remove_edge(e)
-                    if state.degree(src) == 0:
-                        state.remove_node(src)
-    return sorted(read_by_maps)
+    for state, node, inside in uses:
+        name, dev = node.data, copies[node.data]
+        scopes = [state.scope_dict()[node]] if inside else [e.dst for e in state.out_edges(node)
+                                                            if isinstance(e.dst, nodes.MapEntry)]
+        for entry in scopes:
+            for inner in state.scope_subgraph(entry).edges():
+                if inner.data.data == name:
+                    inner.data.data = dev
+                    if isinstance(inner.dst, nodes.NestedSDFG):  # the body reads device data now
+                        inner.dst.sdfg.arrays[inner.dst_conn].storage = dace.StorageType.GPU_Global
+        if inside:
+            node.data = dev
+            continue
+        for e in list(state.out_edges(node)):
+            if isinstance(e.dst, nodes.MapEntry):
+                state.add_edge(state.add_read(dev), None, e.dst, e.dst_conn, dace.Memlet.from_array(dev, sdfg.arrays[dev]))
+                state.remove_edge(e)
+        if state.degree(node) == 0:
+            state.remove_node(node)
+    return names
