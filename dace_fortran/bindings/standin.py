@@ -245,6 +245,7 @@ def emit_recording_standin(
     private_access: PrivateAccess | None = None,
     private_imports: Sequence[str] = (),
     per_rank: bool = False,
+    known: Mapping[str, str] | None = None,
 ) -> Path:
     """Write ``dace_record_<entry>``: on every call it appends ``module::name value`` for each of ``values`` and an
     empty line to ``record_path`` (``per_rank``: to ``<record_path>.<rank>`` in a process an MPI launcher started,
@@ -256,7 +257,9 @@ def emit_recording_standin(
     :func:`~dace_fortran.bindings.module_access.expose_module_variables`): then the stand-in reads it through the
     copy's ``bind(c)`` accessor, and the copy must be linked in place of the module's object. ``private_imports``: the
     ``use`` lines the declarations of those variables need
-    (:func:`~dace_fortran.bindings.module_access.declaration_imports`)."""
+    (:func:`~dace_fortran.bindings.module_access.declaration_imports`). ``known``: the module of other variables by
+    name, for an extent of a dummy that none of ``values`` names (one an earlier round recorded, see
+    :func:`render_dummies`)."""
     from dace_fortran.bindings.specialization import record_open_lines
 
     reads = _value_reads(values, "dace_value", private_access, private_imports)
@@ -276,7 +279,7 @@ def emit_recording_standin(
         *_with_arguments(f"call {standin_name('original', iface.entry)}", [a.name for a in iface.args]),
     ]
     lines = _subroutine(standin_name("record", iface.entry), iface, body, reads.uses, [*local, *reads.declarations],
-                        known={_variable(v.name).lower(): v.module for v in values})
+                        known={**(known or {}), **{_variable(v.name).lower(): v.module for v in values}})
     out = Path(out_path)
     out.write_text("\n".join(lines) + "\n")
     return out

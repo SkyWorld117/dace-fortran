@@ -62,15 +62,19 @@ def main() -> int:
         raise SystemExit(f"cannot parse {hlfir}")
     symbol = _resolve_entry_symbol(module, entry)
     module.set_entry_symbol(symbol)
+    known: dict[str, str] = {}  # variable -> module, every configuration candidate of either round
     if earlier is not None:
         from dace_fortran.bindings.specialization import recorded_invariants  # noqa: PLC0415
         from dace_fortran.builder import _global_value_text  # noqa: PLC0415
 
-        module.set_specialized_globals({k: _global_value_text(v) for k, v in recorded_invariants(earlier).items()})
+        invariants = recorded_invariants(earlier)
+        module.set_specialized_globals({k: _global_value_text(v) for k, v in invariants.items()})
+        known.update({re.split(r"[(%]", k.split("::")[1])[0].lower(): k.split("::")[0] for k in invariants})
     procedure = entry.split("::")[-1]
     iface = build_auto_interface(module.get_fortran_interface(symbol), procedure)
     module.run_passes(_prefix_pipeline())
     candidates = dict(module.get_configuration_candidates())
+    known.update({re.split(r"[(%]", k.split("::")[1])[0].lower(): k.split("::")[0] for k in candidates})
 
     files = module_files([args.fypp_dir, *args.fypp])
     public: dict[str, set[str]] = {}
@@ -118,6 +122,7 @@ def main() -> int:
         out_dir / f"record_{procedure}.f90",
         private_access={a["module"]: a["variables"] for a in access},
         private_imports=list(dict.fromkeys(line for a in access for line in a["imports"])),
+        known=known,
         per_rank=args.record_per_rank,
     )
     # The types of the recorded values: a substitute built from the record checks them at run time
