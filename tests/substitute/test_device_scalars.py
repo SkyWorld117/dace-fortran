@@ -23,10 +23,10 @@ def _kernel_reading_scalars(write_t: bool) -> dace.SDFG:
     body.add_scalar("t", dace.float64)
     body.add_symbol("i", dace.int32)
     bstate = body.add_state()
-    bt = bstate.add_tasklet("bt", {"x", "s", "t"}, {"y"}, "y = x * s + t")
+    bt = bstate.add_tasklet("bt", {"x", "cs", "ct"}, {"y"}, "y = x * cs + ct")
     bstate.add_edge(bstate.add_read("a"), None, bt, "x", dace.Memlet("a[i]"))
-    bstate.add_edge(bstate.add_read("s"), None, bt, "s", dace.Memlet.from_array("s", body.arrays["s"]))
-    bstate.add_edge(bstate.add_read("t"), None, bt, "t", dace.Memlet.from_array("t", body.arrays["t"]))
+    bstate.add_edge(bstate.add_read("s"), None, bt, "cs", dace.Memlet.from_array("s", body.arrays["s"]))
+    bstate.add_edge(bstate.add_read("t"), None, bt, "ct", dace.Memlet.from_array("t", body.arrays["t"]))
     bstate.add_edge(bt, "y", bstate.add_write("b"), None, dace.Memlet("b[i]"))
     if write_t:
         wt = state.add_tasklet("set_t", {}, {"o"}, "o = 2.0")
