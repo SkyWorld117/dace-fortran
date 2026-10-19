@@ -26,7 +26,9 @@ from collections import defaultdict
 from itertools import combinations, product
 from math import prod
 
-from dace import SDFG, subsets
+import sympy
+
+from dace import SDFG, subsets, symbolic
 from dace.sdfg import nodes
 from dace.sdfg.analysis import cfg as cfg_analysis
 from dace.sdfg.state import ConditionalBlock, ControlFlowBlock, ControlFlowRegion, LoopRegion, SDFGState
@@ -125,8 +127,34 @@ def _exclusive(a: ControlFlowBlock, b: ControlFlowBlock, top: SDFG) -> bool:
     if isinstance(common, ConditionalBlock):
         return child_a is not child_b
     if isinstance(common, ControlFlowRegion):
-        return not _reaches(common, child_a, child_b) and not _reaches(common, child_b, child_a)
+        if not _reaches(common, child_a, child_b) and not _reaches(common, child_b, child_a):
+            return True
+        # Two conditionals in sequence whose branches (the ones holding the loops) can never both be taken:
+        # ``if (idir == 1) ... end if; if (idir == 2) ... end if``.
+        if isinstance(child_a, ConditionalBlock) and isinstance(child_b, ConditionalBlock) and ia >= 2 and ib >= 2:
+            return _branches_contradict(child_a, chain_a[ia - 2], child_b, chain_b[ib - 2], common)
     return False
+
+
+def _branches_contradict(block_a: ConditionalBlock, branch_a: ControlFlowRegion, block_b: ConditionalBlock,
+                         branch_b: ControlFlowRegion, region: ControlFlowRegion) -> bool:
+    """Can the conditions of ``branch_a`` of ``block_a`` and ``branch_b`` of ``block_b`` not both hold?  Only when
+    sympy reduces their conjunction to false and no edge of ``region`` assigns a symbol they read (an ``else``
+    branch has no condition of its own: never)."""
+    conditions = []
+    for block, branch in ((block_a, branch_a), (block_b, branch_b)):
+        condition = next((c for c, b in block.branches if b is branch), None)
+        if condition is None:
+            return False
+        conditions.append(condition.as_string)
+    try:
+        both = sympy.And(*(symbolic.pystr_to_symbolic(c) for c in conditions))
+        if sympy.simplify(both) is not sympy.false:
+            return False
+    except (TypeError, ValueError, AttributeError, sympy.SympifyError):
+        return False
+    read = set(map(str, both.free_symbols))
+    return not any(read & edge.data.assignments.keys() for edge in region.all_interstate_edges(recursive=True))
 
 
 def _ancestry(block: ControlFlowBlock, top: SDFG) -> list:

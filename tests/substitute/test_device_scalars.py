@@ -99,3 +99,23 @@ def test_a_scalar_read_from_inside_the_map_scope_gets_a_device_copy():
     sdfg.validate()
     assert inner.data != "s" and sdfg.arrays[inner.data].storage == dace.StorageType.GPU_Global
     assert sdfg.start_block.label == "scalars_to_device"
+
+
+def test_a_host_side_nested_sdfg_gets_its_own_copies():
+    """The kernel sits in a nested SDFG outside any map; the scalar reaches it as a connector."""
+    outer = dace.SDFG("outer")
+    outer.add_array("A", [8], dace.float64)
+    outer.add_array("B", [8], dace.float64)
+    outer.add_scalar("s", dace.float64)
+    inner = _kernel_reading_scalars(write_t=False)
+    inner.arrays["t"].transient = True
+    inner.arrays["h"].transient = True
+    state = outer.add_state(is_start_block=True)
+    node = state.add_nested_sdfg(inner, {"A", "s"}, {"B"})
+    state.add_edge(state.add_read("A"), None, node, "A", dace.Memlet("A[0:8]"))
+    state.add_edge(state.add_read("s"), None, node, "s", dace.Memlet.from_array("s", outer.arrays["s"]))
+    state.add_edge(node, "B", state.add_write("B"), None, dace.Memlet("B[0:8]"))
+    outer.validate()
+    assert device_copies_of_kernel_read_scalars(outer) == [f"{inner.label}.s"]
+    outer.validate()
+    assert inner.start_block.label == "scalars_to_device"

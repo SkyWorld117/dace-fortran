@@ -156,6 +156,11 @@ subroutine zones(n, idir, a, b)
 end subroutine zones
 """
 
+# The nests of ZONES_SRC under two IFs in sequence instead of one IF/ELSE: the conditions exclude each other.
+SEQUENTIAL_IFS_SRC = ZONES_SRC.replace("subroutine zones", "subroutine zones2").replace("end subroutine zones", "end subroutine zones2").replace(
+    "  else\n    do i = 1, n", "  end if\n  if (idir == 2) then\n    do i = 1, n")
+assert SEQUENTIAL_IFS_SRC.count("if (idir == 2)") == 1
+
 
 def _loops(sdfg) -> list[LoopRegion]:
     return [r for r in sdfg.all_control_flow_regions(recursive=True) if isinstance(r, LoopRegion)]
@@ -302,4 +307,19 @@ def test_nests_that_never_both_run_are_both_parallel(tmp_path, direction):
     b, b_ref = np.zeros(9), np.zeros(9)
     sdfg(n=9, idir=direction, a=a, b=b)
     ref.zones(direction, a, b_ref)
+    np.testing.assert_array_equal(b, b_ref)
+
+
+@pytest.mark.parametrize("direction", [1, 2])
+def test_nests_under_contradicting_conditions_are_both_parallel(tmp_path, direction):
+    sdfg = build_sdfg(SEQUENTIAL_IFS_SRC, tmp_path / "sdfg", name="zones2").build()
+    assert list(privatize_loop_local_arrays(sdfg)) == ["w"]
+    sdfg = build_sdfg(SEQUENTIAL_IFS_SRC, tmp_path / "sdfg2", name="zones2").build()
+    optimize(sdfg)
+    assert _loops(sdfg) == [], "a nest stayed a loop"
+    ref = f2py_compile(SEQUENTIAL_IFS_SRC, tmp_path / "ref", f"zones2_ref_{direction}")
+    a = np.linspace(-2.0, 3.0, 9).copy()
+    b, b_ref = np.zeros(9), np.zeros(9)
+    sdfg(n=9, idir=direction, a=a, b=b)
+    ref.zones2(direction, a, b_ref)
     np.testing.assert_array_equal(b, b_ref)

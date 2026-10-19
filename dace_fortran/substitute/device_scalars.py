@@ -14,8 +14,19 @@ from dace.sdfg import nodes
 
 def device_copies_of_kernel_read_scalars(sdfg: dace.SDFG) -> list[str]:
     """Give every non-transient scalar a top-level map reads (through an edge into the map, or an access node inside
-    it), and nothing in ``sdfg`` writes, a device copy made in a new first state, and let the maps read the copy.
-    Returns the scalars copied."""
+    it), and nothing in the SDFG writes, a device copy made in a new first state, and let the maps read the copy; in
+    ``sdfg`` and in the nested SDFGs that sit outside maps (host-side nested SDFGs, which the GPU transformation
+    treats as programs of their own). Returns the scalars copied, qualified by the SDFG's label when nested."""
+    copied = _device_copies(sdfg)
+    for state in sdfg.states():
+        scope = state.scope_dict()
+        for node in state.nodes():
+            if isinstance(node, nodes.NestedSDFG) and scope[node] is None:
+                copied += [f"{node.sdfg.label}.{name}" for name in device_copies_of_kernel_read_scalars(node.sdfg)]
+    return copied
+
+
+def _device_copies(sdfg: dace.SDFG) -> list[str]:
     written = {n.data for st in sdfg.states() for n in st.data_nodes() if st.in_degree(n)}
     uses: list[tuple[dace.SDFGState, nodes.AccessNode, bool]] = []  # (state, access node, inside a map)
     for state in sdfg.states():
