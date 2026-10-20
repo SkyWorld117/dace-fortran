@@ -57,8 +57,27 @@ def test_an_assignment_the_consumer_does_not_read_moves_past_it_and_the_pair_fus
     assert fuse_stencil_pairs(_split_pair()) == ["tmp (recompute)"]  # joined first, then fused
 
 
-def test_an_assignment_the_consumer_reads_keeps_the_states_apart():
+def test_an_assignment_the_consumer_reads_takes_its_value_there(tmp_path):
+    """The consumer's map runs to iend: in its state iend is p, which replaces it, and the states join."""
     sdfg = _split_pair(consumer_range="1:iend")
+    assert join_stencil_states(sdfg) == 1
+    consume = next(n for s in sdfg.states() for n in s.nodes() if isinstance(n, dace.nodes.MapEntry)
+                   and n.map.label == "consume")
+    assert str(consume.map.range[0][1]) == "p - 1"
+    sdfg.build_folder = str(tmp_path / "build")
+    a, b, c = np.arange(16, dtype=np.float64), np.zeros(16), np.zeros(1)
+    sdfg(a=a, b=b, c=c, p=14)
+    expected = np.zeros(16)
+    expected[1:14] = 2 * a[2:15]
+    np.testing.assert_array_equal(b, expected)
+    assert c[0] == 14
+
+
+def test_an_assignment_of_a_value_read_from_data_keeps_the_states_apart():
+    """The value reads a container the consumer's state might write: the assignment stays before it."""
+    sdfg = _split_pair()
+    sdfg.add_scalar("n", dace.int64)
+    first, second = list(sdfg.states())[:2]
+    sdfg.edges_between(first, second)[0].data.assignments = {"iend": "n"}
     assert join_stencil_states(sdfg) == 0
-    assert len(list(sdfg.states())) == 3
-    assert sdfg.edges_between(*list(sdfg.states())[:2])[0].data.assignments == {"iend": "p"}
+    assert sdfg.edges_between(first, second)[0].data.assignments == {"iend": "n"}

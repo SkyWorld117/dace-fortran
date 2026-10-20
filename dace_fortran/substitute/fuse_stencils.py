@@ -210,33 +210,27 @@ def stencil_pairs(sdfg: dace.SDFG, fusion: type = OTFStencilFusion
 
 
 def _movable_past(edge, sdfg: dace.SDFG) -> bool:
-    """Whether ``edge``'s symbol assignments can move onto the edges out of its destination state unchanged in effect:
-    the edge is unconditional and the state's only way in, the state reads none of the symbols, their values read no
-    data (a state changes no symbol, but may change a container), and no edge out of the state reads one of them (in
-    its condition or an assignment, which see the values of before the edge's own assignments)."""
+    """Whether ``edge``'s symbol assignments can move onto the edges out of its destination state: the edge is
+    unconditional and the state's only way in (in the state each symbol then holds its assigned value: a state changes
+    no symbol), the state has a way out, and the values read no data (which the state may change) and none of the
+    symbols the edge assigns (whose old values they read)."""
     state, graph = edge.dst, edge.dst.parent_graph
     assigned = set(edge.data.assignments)
     if not assigned or not edge.data.is_unconditional() or not isinstance(state, dace.SDFGState):
         return False
-    if graph.in_degree(state) != 1 or not graph.out_degree(state) or assigned & set(state.free_symbols):
+    if graph.in_degree(state) != 1 or not graph.out_degree(state):
         return False
-    if any(set(map(str, symbolic.free_symbols_and_functions(v))) & set(sdfg.arrays)
-           for v in edge.data.assignments.values()):
-        return False
-    for out in graph.out_edges(state):
-        reads = set(out.data.condition.get_free_symbols()) | {
-            str(x) for v in out.data.assignments.values() for x in symbolic.free_symbols_and_functions(v)}
-        if reads & assigned:
-            return False
-    return True
+    reads = {str(x) for v in edge.data.assignments.values() for x in symbolic.free_symbols_and_functions(v)}
+    return not reads & (set(sdfg.arrays) | assigned)
 
 
 def join_stencil_states(sdfg: dace.SDFG) -> int:
-    """Fuse each state holding a stencil's consumer into its producer's state where only symbol assignments the
-    consumer's state does not read keep them apart (loop bounds of later code a source sets between the two, say: a
-    value it knows only at run time stays an assignment, a constant would have been propagated): the assignments
-    move onto the edges out of the consumer's state (one of those that assigns a symbol again keeps its own value),
-    the two states fuse, and the stencil fusion sees the pair. Returns the number of states joined."""
+    """Fuse each state holding a stencil's consumer into its producer's state where only symbol assignments keep them
+    apart (loop bounds of later code a source sets between the two, say: a value known only at run time stays an
+    assignment, a constant would have been propagated): the values replace the symbols in the consumer's state and in
+    the conditions and values of the edges out of it, the assignments move onto those edges (one that assigns a symbol
+    again keeps its own value), the two states fuse, and the stencil fusion sees the pair. Returns the number of
+    states joined."""
     joined = 0
     for state in list(sdfg.states()):
         graph = state.parent_graph
@@ -254,8 +248,11 @@ def join_stencil_states(sdfg: dace.SDFG) -> int:
         if edge.data.assignments:
             if not _movable_past(edge, sdfg):
                 continue
+            values = dict(edge.data.assignments)
+            after.replace_dict(values)
             for out in graph.out_edges(after):
-                out.data.assignments = {**edge.data.assignments, **out.data.assignments}
+                out.data.replace_dict(values, replace_keys=False)
+                out.data.assignments = {**values, **out.data.assignments}
             edge.data.assignments = {}
         fusion = StateFusion()
         fusion.first_state, fusion.second_state = state, after
