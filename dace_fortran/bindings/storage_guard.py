@@ -219,7 +219,7 @@ def build_storage_guard(
         f"{_INDENT}! ----- Storage guard: members handed over apart share no storage with another array -----",
         f"{_INDENT}block",
         f"{_INDENT}  integer(c_intptr_t), allocatable :: {_SPANS}(:, :)",
-        f"{_INDENT}  integer :: {_COUNT}, dace_tag_a, dace_tag_b",
+        f"{_INDENT}  integer :: {_COUNT}, dace_tag_a, dace_tag_b, dace_elem_a, dace_elem_b",
         f"{_INDENT}  character(len={_NAME_LEN}), parameter :: dace_span_names({len(names)}) = [character(len={_NAME_LEN}) :: &",
         *(f"{_INDENT}    '{n}'{',' if i + 1 < len(names) else ''} &" for i, n in enumerate(names)),
         f"{_INDENT}    ]",
@@ -227,12 +227,13 @@ def build_storage_guard(
     ]
     lines += [f"{_INDENT}  {ln}" for group in groups for ln in group]
     refuse = [f"if (present({DECLINED_FLAG})) then",
-              f"  write(0, '(5a)') '{iface.entry}_dace declines: ', trim(dace_span_names(dace_tag_a)), &",
+              f"  write(0, '(5a, i0, a, i0, a)') '{iface.entry}_dace declines: ', trim(dace_span_names(dace_tag_a)), &",
               "    ' shares storage with ', trim(dace_span_names(dace_tag_b)), &",
-              "    ' (a member handed over apart from its record)'",
+              "    ' (a member handed over apart from its record; elements ', dace_elem_a - 1, ' and ', &",
+              "    dace_elem_b - 1, ', -1: a whole array)'",
               f"  {DECLINED_FLAG} = .true.", "  return", "end if"]
     lines += [
-        f"{_INDENT}  if (dace_spans_overlap({_SPANS}, {_COUNT}, dace_tag_a, dace_tag_b)) then",
+        f"{_INDENT}  if (dace_spans_overlap({_SPANS}, {_COUNT}, dace_tag_a, dace_tag_b, dace_elem_a, dace_elem_b)) then",
         *(f"{_INDENT}    {ln}" for ln in (refuse if declinable else [])),
         f"{_INDENT}    write(0, '(5a)') '{iface.entry}_dace: ', trim(dace_span_names(dace_tag_a)), &",
         f"{_INDENT}      ' shares storage with ', trim(dace_span_names(dace_tag_b)), &",
@@ -343,20 +344,23 @@ STORAGE_GUARD_HELPERS = """\
   ! over apart from its record (kind 1, or 2 when written) and any other array, unless neither is written.  Two
   ! arrays the SDFG takes in place (3, or 4 when written) are the caller's.  Sorts the ranges by their start
   ! (heapsort), then sweeps them once, keeping per kind the farthest end so far.
-  logical function dace_spans_overlap(spans, n, tag_a, tag_b) result(overlap)
+  logical function dace_spans_overlap(spans, n, tag_a, tag_b, elem_a, elem_b) result(overlap)
     integer(c_intptr_t), allocatable, intent(inout) :: spans(:, :)
     integer, intent(in) :: n
-    integer, intent(out) :: tag_a, tag_b
+    integer, intent(out) :: tag_a, tag_b, elem_a, elem_b  ! the two ranges that overlap: array tags, elements
     ! clash(j, k): a range of kind j must not overlap one of kind k.
     logical, parameter :: clash(4, 4) = reshape([.false., .true., .false., .true., .true., .true., .true., .true., &
                                                  .false., .true., .false., .false., .true., .true., .false., .false.], &
                                                 [4, 4])
     integer(c_intptr_t) :: reach(4), held(5)
-    integer :: i, k, j, root, child, last, reach_tag(4)
+    integer :: i, k, j, root, child, last, reach_tag(4), reach_elem(4)
     overlap = .false.
     tag_a = 0
     tag_b = 0
+    elem_a = 0
+    elem_b = 0
     reach_tag = 0
+    reach_elem = 0
     if (n < 2) return
     do i = n / 2, 1, -1
       call sift(i, n)
@@ -375,12 +379,15 @@ STORAGE_GUARD_HELPERS = """\
           overlap = .true.
           tag_a = int(spans(4, i))
           tag_b = reach_tag(j)
+          elem_a = int(spans(5, i))
+          elem_b = reach_elem(j)
           return
         end if
       end do
       if (spans(2, i) > reach(k)) then
         reach(k) = spans(2, i)
         reach_tag(k) = int(spans(4, i))
+        reach_elem(k) = int(spans(5, i))
       end if
     end do
   contains

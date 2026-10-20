@@ -174,8 +174,8 @@ def _run(lib, which: int) -> tuple[np.ndarray, bool, np.ndarray]:
 def test_the_member_is_handed_over_as_an_image_behind_a_storage_guard(library):
     text, _lib = library
     assert "g_sf(aos_g_sf_i0, " in text  # the member's image, packed from g(:)%sf
-    assert "dace_spans_overlap(dace_spans, dace_nspans, dace_tag_a, dace_tag_b)" in text
-    assert "dace_span_names(" in text  # the decline message names the two arrays that overlap
+    assert "dace_spans_overlap(dace_spans, dace_nspans, dace_tag_a, dace_tag_b, dace_elem_a, dace_elem_b)" in text
+    assert "dace_span_names(" in text  # the decline message names the two arrays that overlap, and their elements
 
 
 def test_a_member_apart_from_the_other_arrays_takes_the_call(library):
