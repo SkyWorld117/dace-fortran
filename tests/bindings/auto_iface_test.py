@@ -37,10 +37,13 @@ def test_auto_iface_flat_matches_handwritten(tmp_path):
     assert auto.entry == "kernel"
     assert auto.used_modules == {}
     assert auto.args == (
-        OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, shape=(), intent="in"),
-        OriginalArg(name="a", fortran_type="complex(c_double_complex)", rank=1, shape=("1",), intent="in"),
-        OriginalArg(name="x", fortran_type="complex(c_double_complex)", rank=1, shape=("n",), intent="in"),
-        OriginalArg(name="y", fortran_type="complex(c_double_complex)", rank=1, shape=("n",), intent="inout"),
+        OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, shape=(), intent="in", passing="address"),
+        OriginalArg(name="a", fortran_type="complex(c_double_complex)", rank=1, shape=("1",), intent="in",
+                    passing="address"),
+        OriginalArg(name="x", fortran_type="complex(c_double_complex)", rank=1, shape=("n",), intent="in",
+                    passing="address"),
+        OriginalArg(name="y", fortran_type="complex(c_double_complex)", rank=1, shape=("n",), intent="inout",
+                    passing="address"),
     )
 
 
@@ -168,7 +171,8 @@ end module kern_fld_mod
     auto = _auto(src, tmp_path, "kern", "kern_fld_mod::kern")
 
     assert auto.args == (
-        OriginalArg(name="fld", fortran_type="type(t_auto_fld)", rank=0, intent="inout", struct_type="t_auto_fld"),
+        OriginalArg(name="fld", fortran_type="type(t_auto_fld)", rank=0, intent="inout", struct_type="t_auto_fld",
+                    passing="address"),
     )
     assert "t_auto_fld" in auto.struct_types
     st = auto.struct_types["t_auto_fld"]
