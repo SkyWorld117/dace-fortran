@@ -602,6 +602,13 @@ def build_wrapper_head(
         if int_names:
             scratch_lines.append(f"    integer(c_int) :: {', '.join(int_names)}")
 
+    # Images the SDFG allocates itself (scratch): the element loop their bounds are taken with.
+    for a in frozen.shape_only_args:
+        pieces = _aos_loop_pieces(a)
+        int_names = pieces.loop_vars + pieces.lower_vars + pieces.upper_vars + pieces.segment_caps
+        if int_names:
+            scratch_lines.append(f"    integer(c_int) :: {', '.join(int_names)}")
+
     # Absent-optional data buffers with no host source: a degenerate local.
     for a in unsourced_array_args(frozen, iface, plan):
         ftype = fortran_c_type(a.dtype)
@@ -1756,41 +1763,51 @@ def _aos_root_and_segment(a: FrozenArg) -> tuple[str, str]:
     return root.strip(), segment.strip()
 
 
-def _shape_only_source(a: FrozenArg, dim: int, lower: bool) -> tuple[str, str] | None:
-    """The Fortran expression reading extent ``dim`` (its lower bound when ``lower``) of the image ``a`` the SDFG
-    allocates itself off the record on the host, and the guard that the record and its member exist. The image's
-    leading dims are the record array's, the others a member's, read off the record array's first element. Under a
-    root that is itself an array of records (``field(j) % comp(i) % data``) the root's dims come first, then the
-    segment's, read off the root's first element, then the member's, read off the first element of both."""
-    if a.aos_root_rank:
-        return _shape_only_source_under_root(a, dim, lower)
-    struct, query, lead = a.aos_origin_struct, "lbound" if lower else "size", _aos_lead(a)
-    present = "" if a.aos_struct_static else _present(struct, a.aos_struct_pointer)
-    if dim < lead:
-        return f"{query}({struct}, dim={dim + 1})", present
-    first = ", ".join(f"lbound({struct}, {k + 1})" for k in range(lead))
-    elem = f"{struct}({first})%{a.aos_member_path}" if lead else f"{struct}%{a.aos_member_path}"
-    member = "" if _aos_member_is_static(a) else _present(elem, a.aos_member_pointer)
-    return f"{query}({elem}, dim={dim - lead + 1})", " .and. ".join(g for g in (present, member) if g)
+def _shape_only_bounds(a: FrozenArg) -> list[str]:
+    """The lines taking, on the host, the bounds of the image ``a`` the SDFG allocates itself, as
+    :func:`_render_aos_copy_in` lays a packed image out: under a root array of records the largest segment over the
+    root's elements, and each member dim spanning every present element's bounds, from the smallest lower to the
+    largest upper (the elements differ: MFC's fluxes keep each direction's own axis first)."""
+    pieces = _aos_loop_pieces(a)
+    loops = _aos_loops(a, pieces)
+    elem = pieces.accessor
+    present = ".true." if _aos_member_is_static(a) else _present(elem, a.aos_member_pointer)
+    bounds = list(zip(pieces.lower_vars, pieces.upper_vars, strict=True))
+    out = [f"    ! ----- bounds of the image of {a.fortran_name}, which the SDFG allocates itself -----", *loops.prelude]
+    for lo, hi in bounds:
+        out += [f"    {lo} = huge({lo})", f"    {hi} = -huge({hi})"]
+    out += [f"    if ({loops.present}) then", *loops.do_open, f"        if ({present}) then"]
+    for k, (lo, hi) in enumerate(bounds, start=1):
+        out += [f"          {lo} = min({lo}, lbound({elem}, {k}))", f"          {hi} = max({hi}, ubound({elem}, {k}))"]
+    out += ["        end if", *loops.do_close, "    end if"]
+    for lo, hi in bounds:  # no element present: a one-element dim
+        out += [f"    if ({lo} > {hi}) {lo} = 1", f"    {hi} = max({hi}, {lo})"]
+    return out
 
 
-def _shape_only_source_under_root(a: FrozenArg, dim: int, lower: bool) -> tuple[str, str]:
-    """:func:`_shape_only_source` of an image under a root array of records. The segment's extent is the first
-    element's (the packing takes the largest over the elements: the same where the elements match, as MFC's do)."""
-    query, lead = "lbound" if lower else "size", _aos_lead(a)
-    root, segment = _aos_root_and_segment(a)
-    root_present = "" if a.aos_struct_static else f"allocated({root})"
+def _shape_only_source(a: FrozenArg, dim: int, lower: bool) -> tuple[str, str]:
+    """The Fortran expression of extent ``dim`` (its lower bound when ``lower``) of the image ``a`` the SDFG
+    allocates itself, and the guard that the record array exists. The leading dims are the record array's (under a
+    root array of records the root's, then the largest segment's, from 1); the others are the bounds
+    :func:`_shape_only_bounds` took, or the member's own without leading dims."""
+    query = "lbound" if lower else "size"
+    lead = _aos_lead(a)
+    if not lead:
+        elem = f"{a.aos_origin_struct}%{a.aos_member_path}"
+        present = "" if _aos_member_is_static(a) else _present(elem, a.aos_member_pointer)
+        return f"{query}({elem}, dim={dim + 1})", present
+    pieces = _aos_loop_pieces(a)
+    if dim >= lead:
+        lo, hi = pieces.lower_vars[dim - lead], pieces.upper_vars[dim - lead]
+        return (lo if lower else f"{hi} - {lo} + 1"), ""
+    present = "" if a.aos_struct_static else _aos_loops(a, pieces).present
+    if not a.aos_root_rank:
+        return f"{query}({a.aos_origin_struct}, dim={dim + 1})", present
+    if lower:
+        return "1", ""
     if dim < a.aos_root_rank:
-        return f"{query}({root}, dim={dim + 1})", root_present
-    element_segment = f"{root}({', '.join(f'lbound({root}, {k + 1})' for k in range(a.aos_root_rank))})%{segment}"
-    guards = [g for g in (root_present, _present(element_segment, a.aos_struct_pointer)) if g]
-    if dim < lead:
-        return f"{query}({element_segment}, dim={dim - a.aos_root_rank + 1})", " .and. ".join(guards)
-    first = ", ".join(f"lbound({element_segment}, {k + 1})" for k in range(a.aos_outer_rank))
-    elem = f"{element_segment}({first})%{a.aos_member_path}"
-    if not _aos_member_is_static(a):
-        guards.append(_present(elem, a.aos_member_pointer))
-    return f"{query}({elem}, dim={dim - lead + 1})", " .and. ".join(guards)
+        return f"size({_aos_root_and_segment(a)[0]}, dim={dim + 1})", present
+    return f"max({pieces.segment_caps[dim - a.aos_root_rank]}, 1)", ""
 
 
 def _aos_loop_pieces(a: FrozenArg) -> AosLoopPieces:
@@ -2414,16 +2431,20 @@ def _build_symbol_assigns(
     }
     out: list[str] = []
     unsourced: list[str] = []
+    bounds_taken: set[str] = set()  # the scratch images whose bounds the lines above take
     for sym in frozen.free_symbols:
         if sym in outer_dummy_set:
             continue
         if sym in aos_pack_syms:
             continue
         m = _OFFSET_SYM_RE.match(sym) or _EXTENT_SYM_RE.match(sym)
-        source = _shape_only_source(shape_only[m.group(1)], int(m.group(2)), bool(_OFFSET_SYM_RE.match(sym))) \
-            if m and m.group(1) in shape_only else None
-        if source is not None:  # an image the SDFG allocates itself: its extents are the record's
-            out.extend(_guarded_assign(sym, source[0], source[1], absent="1"))
+        if m and m.group(1) in shape_only:  # an image the SDFG allocates itself: its extents are the record's
+            image = shape_only[m.group(1)]
+            if _aos_lead(image) and image.sdfg_name not in bounds_taken:
+                out.extend(_shape_only_bounds(image))
+                bounds_taken.add(image.sdfg_name)
+            expr, guard = _shape_only_source(image, int(m.group(2)), bool(_OFFSET_SYM_RE.match(sym)))
+            out.extend(_guarded_assign(sym, expr, guard, absent="1"))
             continue
         if m and m.group(1) in renamed:
             target, dim = renamed[m.group(1)], int(m.group(2)) + 1
