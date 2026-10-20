@@ -1557,12 +1557,14 @@ def emit_fft(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowReg
 
 
 class PlannedArg(NamedTuple):
-    """One call argument of an external call; ``group`` is the marshalled struct an AOS member belongs to."""
+    """One call argument of an external call; ``group`` is the marshalled struct an AOS member belongs to;
+    ``by_pointer``: a scalar crossing by address (an optional one: null where the call site leaves it absent)."""
 
     kind: ArgKind
     dtype: str
     intent: Intent
     group: int | None
+    by_pointer: bool = False
 
 
 class MemberSlot(NamedTuple):
@@ -1760,7 +1762,8 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
                 plan.append(PlannedArg(ArgKind.AOS, a.dtype, a.intent, gi))
             gi += 1
         else:
-            plan.append(PlannedArg(a.kind, a.dtype, a.intent, None))
+            plan.append(PlannedArg(a.kind, a.dtype, a.intent, None,
+                                   a.kind is ArgKind.SCALAR and a.resolved_c_abi() is CAbi.POINTER))
     if len(plan) != len(names):
         raise ValueError(
             f"external {callee!r}: expanded signature expects "
@@ -1797,11 +1800,27 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     # logical-term position to ``(shape_tuple,)``.
     array_shape_at_term: dict = {}
     prev_gid = None
-    for i, (kind, _dtype, intent, gid) in enumerate(plan):
+    # A scalar crossing by address takes it from a cell of the call body holding its value.
+    scalar_cells: list[str] = []
+    for i, (kind, _dtype, intent, gid, by_pointer) in enumerate(plan):
         name = names[i]
         if kind is ArgKind.NONE:  # an absent optional: a null pointer, nothing connected
             logical_terms.append(CallTerm(TermKind.LITERAL, "nullptr"))
             prev_gid = None
+            continue
+        if by_pointer:
+            prev_gid = None
+            if not name:  # absent at this call site
+                logical_terms.append(CallTerm(TermKind.LITERAL, "nullptr"))
+                continue
+            value = name
+            if name in ctx.sdfg.arrays:
+                value = f"_a{i}"
+                in_conns.append(value)
+                edges.append(CallEdge(name, value, False))
+            ctype = C_TYPES[_dtype]
+            scalar_cells.append(f"{ctype} _pv{i} = ({ctype})({value});")
+            logical_terms.append(CallTerm(TermKind.LITERAL, f"&_pv{i}"))
             continue
         if gid is not None:
             desc = ctx.sdfg.arrays.get(name)
@@ -1915,7 +1934,7 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     #     buffer, no pack/unpack copy.  Used for sibling-SDFG callees
     #     that already speak SoA (their ``bind_c_shim`` receives the
     #     per-member slots the marshal pass produced).
-    body_lines: list = []
+    body_lines: list = list(scalar_cells)
     call_args_c: list = []
     bufname: dict = {}
     for term_index, (term_kind, val) in enumerate(logical_terms):
@@ -2086,7 +2105,7 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     last_gid_seen = None
     last_member_idx = -1
     plan_term_index = -1  # mirrors ``logical_terms`` indexing for non-aos
-    for _kind, _dtype, _intent, gid in plan:
+    for _kind, _dtype, _intent, gid, _by_pointer in plan:
         if gid is None:
             plan_term_index += 1
             term_shape = array_shape_at_term.get(plan_term_index)

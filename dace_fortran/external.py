@@ -135,7 +135,10 @@ class Arg:
 
         * ``ARRAY`` -- a flat array dummy.  C ABI defaults to a
           pointer (``<ctype> *``).
-        * ``SCALAR`` -- a scalar dummy.  C ABI defaults to by-value.
+        * ``SCALAR`` -- a scalar dummy.  C ABI defaults to by-value;
+          with ``c_abi=POINTER`` it crosses by address, as a Fortran
+          ``optional`` scalar of a ``bind(c)`` procedure does: a null
+          pointer where the call site leaves it absent.
         * ``AOS`` -- a whole derived-type dummy that
           ``hlfir-marshal-external-structs`` expanded into per-member
           slots.  The :ivar:`c_abi` choice picks how those slots
@@ -230,7 +233,8 @@ class Arg:
         base = C_TYPES.get(self.dtype)
         if base is None:
             raise ValueError(f"external Arg: unsupported dtype {self.dtype!r}; known: {sorted(C_TYPES)}")
-        return f"{base} *" if self.kind is ArgKind.ARRAY else base
+        by_pointer = self.kind is ArgKind.ARRAY or self.resolved_c_abi() is CAbi.POINTER
+        return f"{base} *" if by_pointer else base
 
 
 #: The natural C ABI of each argument kind.

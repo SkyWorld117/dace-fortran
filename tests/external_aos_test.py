@@ -968,6 +968,42 @@ end module
         clear_external_registry()
 
 
+def test_an_optional_scalar_of_a_kept_call_crosses_by_address(tmp_path):
+    """An optional integer (``c_abi=POINTER``) reaches the callee as the address of its value where the call passes
+    it, and as a null pointer where the call leaves it absent (Fortran's own ABI for an optional bind(c) scalar)."""
+    so = _build_c_so(tmp_path, "ext_stage", "void ext_stage(double* x, const int* s){x[0] += s ? *s : 10;}")
+    src = """
+module m_stage
+  use iso_c_binding
+  implicit none
+contains
+  subroutine kern(x)
+    real(c_double), intent(inout) :: x(4)
+    interface
+      subroutine ext_stage(x, s) bind(c, name="ext_stage")
+        import :: c_double, c_int
+        real(c_double), intent(inout) :: x(*)
+        integer(c_int), intent(in), optional :: s
+      end subroutine
+    end interface
+    call ext_stage(x, 2)
+    call ext_stage(x)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_stage", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                         Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN,
+                                             c_abi=CAbi.POINTER)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_stage::kern").build()
+        x = np.array([1.0, 0.0, 0.0, 0.0])
+        sdfg(x=x)
+        np.testing.assert_allclose(x[0], 1.0 + 2 + 10)
+    finally:
+        clear_external_registry()
+
+
 def test_a_kept_call_forwards_the_values_the_sdfg_was_specialised_to():
     from dace_fortran.external import ExternalCall
 

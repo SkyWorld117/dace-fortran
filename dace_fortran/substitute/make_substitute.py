@@ -1133,7 +1133,7 @@ def baked_values(records: list[Path], values: dict | None) -> list:
 
 def external_signature(spec: str) -> tuple[str, dict]:
     """``NAME=C_NAME(KIND,...)`` of --external as ``keep_external``'s name and keywords."""
-    from dace_fortran.external import Arg, ArgKind, Intent
+    from dace_fortran.external import Arg, ArgKind, CAbi, Intent
 
     name, rest = spec.split("=", 1)
     c_name, kinds = rest.rstrip(")").split("(", 1)
@@ -1143,10 +1143,12 @@ def external_signature(spec: str) -> tuple[str, dict]:
             args.append(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT))
         elif kind in ("int", "real"):
             args.append(Arg(kind=ArgKind.SCALAR, dtype="int32" if kind == "int" else "float64", intent=Intent.IN))
+        elif kind == "int?":  # an optional integer: by address, null where a call leaves it absent
+            args.append(Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN, c_abi=CAbi.POINTER))
         elif kind == "none":
             args.append(Arg(kind=ArgKind.NONE, intent=Intent.IN))
         else:
-            raise SystemExit(f"--external {spec}: no argument kind {kind!r} (array, int, real or none)")
+            raise SystemExit(f"--external {spec}: no argument kind {kind!r} (array, int, int?, real or none)")
     return name.strip(), {"c_name": c_name.strip(), "args": tuple(args)}
 
 
