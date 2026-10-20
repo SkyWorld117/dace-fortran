@@ -161,6 +161,43 @@ SEQUENTIAL_IFS_SRC = ZONES_SRC.replace("zones(", "zones2(").replace("end subrout
     "  else\n    do i = 1, n", "  end if\n  if (idir == 2) then\n    do i = 1, n")
 assert SEQUENTIAL_IFS_SRC.count("if (idir == 2)") == 1
 
+# Two nests that both run, each writing ``t`` and ``w`` under one test of ``small`` and reading them under another.
+CORRELATED_SRC = """
+subroutine correlated(n, a, b, c)
+  implicit none
+  integer, intent(in) :: n
+  real(8), intent(in) :: a(n)
+  real(8), intent(inout) :: b(n), c(n)
+  real(8) :: t, w(2)
+  logical :: small
+  integer :: i
+  do i = 1, n
+    small = abs(a(i)) < 1.0d0
+    if (.not. small) t = 1.0d0/a(i)
+    if (small) then
+      w(1) = a(i)
+      w(2) = 1.0d0
+    else if (.not. small) then
+      w(1) = t
+      w(2) = 2.0d0
+    end if
+    b(i) = w(1)*w(2)
+  end do
+  do i = 1, n
+    small = a(i) < 0.0d0
+    if (.not. small) t = sqrt(a(i))
+    if (small) then
+      w(1) = -a(i)
+      w(2) = 3.0d0
+    else if (.not. small) then
+      w(1) = t*t
+      w(2) = 4.0d0
+    end if
+    c(i) = w(1) + w(2)
+  end do
+end subroutine correlated
+"""
+
 
 def _loops(sdfg) -> list[LoopRegion]:
     return [r for r in sdfg.all_control_flow_regions(recursive=True) if isinstance(r, LoopRegion)]
@@ -323,3 +360,25 @@ def test_nests_under_contradicting_conditions_are_both_parallel(tmp_path, direct
     sdfg(n=9, idir=direction, a=a, b=b)
     ref.zones2(direction, a, b_ref)
     np.testing.assert_array_equal(b, b_ref)
+
+
+def test_reads_prepared_on_correlated_paths_are_local(tmp_path):
+    """No path through an iteration writes ``t`` or ``w`` for certain (the writes sit under one IF, the reads under
+    another), yet every read follows a write on some path: the nests run one after the other and still get their
+    own copies."""
+    sdfg = build_sdfg(CORRELATED_SRC, tmp_path / "sdfg", name="correlated").build()
+    assert {"t", "w"} <= privatize_loop_local_arrays(sdfg).keys()
+    sdfg.validate()
+
+
+def test_nests_reading_on_correlated_paths_are_both_parallel(tmp_path):
+    sdfg = build_sdfg(CORRELATED_SRC, tmp_path / "sdfg", name="correlated").build()
+    optimize(sdfg)
+    assert _loops(sdfg) == [], "a nest stayed a loop"
+    ref = f2py_compile(CORRELATED_SRC, tmp_path / "ref", "correlated_ref")
+    a = np.linspace(-2.0, 3.0, 9).copy()
+    b, c, b_ref, c_ref = np.zeros(9), np.zeros(9), np.zeros(9), np.zeros(9)
+    sdfg(n=9, a=a, b=b, c=c)
+    ref.correlated(a, b_ref, c_ref)
+    np.testing.assert_array_equal(b, b_ref)
+    np.testing.assert_array_equal(c, c_ref)

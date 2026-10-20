@@ -12,10 +12,14 @@ is covered by a write earlier in the same iteration: then the loops cannot excha
 is local to its loop for ``LoopToMap`` to privatise.  The same holds for an array that one loop uses this way and
 that code outside the loops only writes: nothing outside reads what the loop leaves in it (the copy-in of a callee's
 ``intent(out)`` argument the bridge stages before the loop, say).  Scalars are covered too: ``ScalarFission`` splits a scalar only
-where one write dominates its reads and leaves it whole otherwise.  The check is conservative -- a write counts once
-every path through the iteration makes it and names constant elements, a read (in dataflow or on an interstate edge)
-only if it names constant elements already written, or any element once the whole array is -- and an array it cannot
-decide is left as it is.  Loops that can never both run -- the branches of one conditional, or blocks of one region
+where one write dominates its reads and leaves it whole otherwise.  A write counts once some path through the iteration
+makes it and names constant elements, a read (in dataflow or on an interstate edge) only if it names constant elements
+already written, or any element once the whole array is; an array the check cannot decide is left as it is.  Some
+path, not every one: the walk cannot see conditions that correlate (``flag = test`` before ``if (.not. flag)``), so a
+read is taken to lie on the paths that prepare it, as ``LoopToMap`` takes it of a transient one loop uses.  A loop
+that carries a value through a local only some paths write would be split wrongly; a read that no path prepares (what
+an earlier loop or iteration left) keeps the array whole.  Loops that can never both run -- the branches of one
+conditional, or blocks of one region
 with no path between them -- cannot exchange values either, whatever the loops do with the array, as long as nothing
 outside the loops touches it: each of those gets its own copy too.
 """
@@ -219,8 +223,8 @@ def _elements(subset: subsets.Subset | None) -> set[tuple[int, ...]] | None:
 
 
 def _iteration_local(name: str, loop: LoopRegion, blocks: list[ControlFlowBlock]) -> bool:
-    """Is every read of ``name`` in ``loop`` covered by a write earlier in the same iteration of the innermost loop
-    that holds all its accesses (``blocks``: the states and edge sources accessing it)?"""
+    """Is every read of ``name`` in ``loop`` covered by a write earlier in the same iteration, on some path, of the
+    innermost loop that holds all its accesses (``blocks``: the states and edge sources accessing it)?"""
     chains = [_loop_chain(block, loop) for block in blocks]
     common = set(chains[0])
     for chain in chains[1:]:
@@ -230,10 +234,9 @@ def _iteration_local(name: str, loop: LoopRegion, blocks: list[ControlFlowBlock]
 
 
 def _written_after(region: ControlFlowRegion, name: str, written: set) -> set | None:
-    """The elements of ``name`` certainly written once ``region`` has run, given those written before it; ``None``
-    when some read in it is not covered.  A conditional's branches each start from ``written``, and only what every
-    path writes counts after it (all of them with an ``else``, otherwise none beyond ``written``); an inner loop's
-    reads must be covered, its writes do not count after it, as it may run no iteration."""
+    """The elements of ``name`` written on some path once ``region`` has run, given those written before it; ``None``
+    when some read in it is not covered.  A conditional's branches each start from ``written``, and what any of them
+    writes counts after it; so do an inner loop's writes, whose reads must be covered within its iteration."""
     if any(not e.data.is_unconditional() for e in region.edges()):
         return None  # branches as conditional edges: which blocks run is not plain to see
     whole = _whole(region.sdfg, name)
@@ -242,17 +245,18 @@ def _written_after(region: ControlFlowRegion, name: str, written: set) -> set | 
             if not _state_covered(block, name, written):
                 return None
         elif isinstance(block, ConditionalBlock):
-            after = []
+            after = set(written)
             for _condition, branch in block.branches:
                 branch_written = _written_after(branch, name, set(written))
                 if branch_written is None:
                     return None
-                after.append(branch_written)
-            if any(condition is None for condition, _branch in block.branches):
-                written = set.intersection(*after)
+                after |= branch_written
+            written = after
         elif isinstance(block, LoopRegion):
-            if _written_after(block, name, set(written)) is None:
+            inner = _written_after(block, name, set(written))
+            if inner is None:
                 return None
+            written = inner
         elif isinstance(block, ControlFlowRegion):
             inner = _written_after(block, name, written)
             if inner is None:
