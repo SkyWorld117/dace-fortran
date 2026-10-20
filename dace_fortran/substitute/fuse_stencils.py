@@ -208,20 +208,40 @@ def stencil_pairs(sdfg: dace.SDFG, fusion: type = OTFStencilFusion
     return pairs
 
 
-def fuse_stencil_pairs(sdfg: dace.SDFG, tile: bool = False) -> list[str]:
+def body_tasklets(state: dace.SDFGState, entry: nodes.MapEntry) -> int:
+    """The tasklets of the map ``entry``'s body, those of the nested SDFGs in it included: what a kernel computes per
+    point."""
+    count = 0
+    for node in state.scope_subgraph(entry, include_entry=False, include_exit=False).nodes():
+        if isinstance(node, nodes.Tasklet):
+            count += 1
+        elif isinstance(node, nodes.NestedSDFG):
+            count += sum(1 for n, _parent in node.sdfg.all_nodes_recursive() if isinstance(n, nodes.Tasklet))
+    return count
+
+
+def fuse_stencil_pairs(sdfg: dace.SDFG, tile: bool = False, max_tasklets: int = 0) -> list[str]:
     """Apply :class:`OTFStencilFusion` (``tile``: :class:`TileStencilFusion`, the producer once per tile of the
     consumer into shared memory, every output of it the consumer reads at once) to every stencil pair until none is
-    left; returns the fused arrays' names."""
+    left; returns the fused arrays' names, and the pairs kept apart. ``max_tasklets``: a pair whose producer and
+    consumer bodies hold more tasklets together stays apart (0: no limit) -- one kernel then holds both bodies'
+    registers at once and runs slower than the two (a WENO reconstruction of 489 tasklets into an HLLD solver of 558:
+    14% slower fused)."""
     propagate_memlets_sdfg(sdfg)
-    fused = []
+    fused, apart = [], set()
     # The tile fusion takes the pairs it can (constant offsets along the parameters, no range reads); the
     # recomputing fusion takes what is left.
     for fusion in ([TileStencilFusion, OTFStencilFusion] if tile else [OTFStencilFusion]):
         while True:
-            pairs = stencil_pairs(sdfg, fusion)
+            pairs = [p for p in stencil_pairs(sdfg, fusion) if (p[1], p[3]) not in apart]
             if not pairs:
                 break
             state, pexit, node, centry = pairs[0]
+            size = body_tasklets(state, state.entry_node(pexit)) + body_tasklets(state, centry)
+            if max_tasklets and size > max_tasklets:
+                apart.add((pexit, centry))
+                fused.append(f"{node.data} (kept apart: {size} tasklets)")
+                continue
             fusion.apply_to(sdfg, first_map_exit=pexit, array=node, second_map_entry=centry, verify=False)
             fused.append(f"{node.data} ({'tile' if fusion is TileStencilFusion else 'recompute'})")
     return fused

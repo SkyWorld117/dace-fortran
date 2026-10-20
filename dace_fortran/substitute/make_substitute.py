@@ -803,7 +803,7 @@ def straighten_bodies(sdfg: dace.SDFG) -> None:
 def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements: dict | None = None,
            scratch_images: dict[str, dict] | None = None, combine_divisions: bool = False,
            scalarise: bool = False, map_heavy_loops: int = 0, heavy_launch: int = 0,
-           host_work_limit: int = 0, fuse_small: int = 0, tile_fuse: bool = False,
+           host_work_limit: int = 0, fuse_small: int = 0, tile_fuse: bool = False, fuse_max_tasklets: int = 0,
            members_first: bool = True, extents: dict | None = None, forward_skip: Iterable[str] = (),
            plan: FlattenPlan | None = None) -> list[str]:
     """Parallelise ``sdfg`` and turn it into CUDA kernels over device-resident argument arrays.
@@ -819,7 +819,8 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
     many iterations and those maps with each other (small_kernels.fuse_small_maps); 0: off.
 
     ``fuse``: recompute every stencil producer inside its consumer (fuse_stencils.fuse_stencil_pairs); ``tile_fuse``:
-    fuse through a shared-memory tile instead (the producer once per tile, explicit thread-block maps); ``forward``:
+    fuse through a shared-memory tile instead (the producer once per tile, explicit thread-block maps);
+    ``fuse_max_tasklets``: pairs whose two bodies hold more tasklets together stay apart (0: no limit); ``forward``:
     drop the copies that only mirror an argument array in a scratch one (fuse_stencils.forward_copies);
     ``elements``: recorded constant elements of arrays (fuse_stencils.fold_control_flow_constants), folded again once
     the loops are unrolled: a loop body that subscripts them with the loop variable does so with constants only
@@ -853,7 +854,7 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
             # stencil fusion recomputes a producer whose body is one nested SDFG.
             straighten_bodies(sdfg)
         if fuse:
-            fused_maps = fuse_stencil_pairs(sdfg, tile=tile_fuse)
+            fused_maps = fuse_stencil_pairs(sdfg, tile=tile_fuse, max_tasklets=fuse_max_tasklets)
             print(f"stencil fusion: {'tiled' if tile_fuse else 'recomputed'} {fused_maps}", flush=True)
         if forward:
             print(f"copy forwarding: {forward_copies(sdfg, known=extents, skip=forward_skip)}", flush=True)
@@ -1262,6 +1263,9 @@ def main() -> int:
     ap.add_argument("--fuse", action="store_true", help="recompute stencil producers inside their consumers (GPU)")
     ap.add_argument("--tile-fuse", action="store_true",
                     help="with --fuse: fuse through a shared-memory tile (the producer once per tile) instead")
+    ap.add_argument("--fuse-max-tasklets", type=int, default=0, metavar="N",
+                    help="with --fuse: keep a stencil pair apart whose producer and consumer bodies hold more than N "
+                         "tasklets together (one heavy kernel runs slower than the two; default 0: no limit)")
     ap.add_argument("--instrument", action="store_true",
                     help="time every GPU kernel with CUDA events (DaCe GPU_Events instrumentation): the report lands in "
                          "<out>/.dacecache/<sdfg>/perf/ when the program exits; summarise with rhs/perf_report.py")
@@ -1396,6 +1400,7 @@ def main() -> int:
                                scalarise=args.scalarise, map_heavy_loops=args.map_heavy_loops,
                                heavy_launch=args.heavy_launch, host_work_limit=args.host_work_limit,
                                fuse_small=args.fuse_small_maps, tile_fuse=args.tile_fuse,
+                               fuse_max_tasklets=args.fuse_max_tasklets,
                                members_first=not args.records_first,
                                extents=recorded, forward_skip=args.forward_skip, plan=plan)
     elif values:
