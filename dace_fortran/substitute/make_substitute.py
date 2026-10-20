@@ -385,6 +385,21 @@ def recorded_elements(records: list[Path], sdfg: dace.SDFG) -> dict[str, list]:
     return elements
 
 
+def recorded_rank_elements(records: list[Path], sdfg: dace.SDFG) -> list[dict]:
+    """Per rank of a run (its records ``<record>.<rank>``, in the order of ``recorded_rank_values``): the elements of
+    the arrays :func:`recorded_elements` leaves out because they differ between the ranks, named as the in-call
+    analysis names a read of one before any write (``idwint_end[0]@0``); empty dicts when none differ."""
+    common = recorded_elements(records, sdfg)
+    ranks = sorted({f.name.rsplit(".", 1)[1]
+                    for rec in map(Path, records) for f in rec.parent.glob(f"{rec.name}.[0-9]*")})
+    out = []
+    for rank in ranks:
+        mine = recorded_elements([Path(f"{rec}.{rank}") for rec in records if Path(f"{rec}.{rank}").is_file()], sdfg)
+        out.append({f"{name}[{i}]@0": v for name, values in mine.items() if name not in common
+                    for i, v in enumerate(values)})
+    return out
+
+
 def make_scratch_transient(sdfg: dace.SDFG, names: list[str], values: dict | None = None) -> tuple[list[str], dict[str, dict]]:
     """Turn the module arrays ``names`` (``module::variable``) into transients of ``sdfg``: state the routine only
     uses as scratch within one call need not come from, or go back to, the caller. A variable may be a module array
@@ -1317,9 +1332,14 @@ def main() -> int:
     rank_values = [{n: r[n] for n in value_sets} for r in recorded_rank_values(args.specialize)] if value_sets else []
     if value_sets:
         print(f"values that differ between the ranks, kept with their sets: {value_sets}", flush=True)
+    # The in-call analysis also decides over each rank's elements of the module arrays of records that differ between
+    # the ranks (grid bounds on unequal shares), which recorded_elements does not fold.
+    rank_elements = recorded_rank_elements(args.globals, sdfg) if rank_values and args.globals else []
+    analysis_cases = [{**case, **mine} for case, mine in zip(rank_values, rank_elements, strict=True)] \
+        if any(rank_elements) else rank_values
     scratch_names = list(args.scratch)
     if args.auto_scratch:
-        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, rank_values)
+        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, analysis_cases)
     scratch, scratch_images = [], {}
     if scratch_names:
         scratch, scratch_images = make_scratch_transient(sdfg, scratch_names, recorded)
