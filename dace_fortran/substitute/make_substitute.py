@@ -341,24 +341,31 @@ def recorded_elements(records: list[Path], sdfg: dace.SDFG) -> dict[str, list]:
     """The recorded elements of module arrays of records (``module::name(k)%member value``) as the contents of their
     SDFG images (``name_member``), and those of module arrays of scalars (``module::name(k) value``) as the contents of
     the arrays themselves, for every one the SDFG takes whose every element the records have. Their reads in control
-    flow (bounds symbols assigned from them, a branch on ``flags[d]`` once ``d`` is known) can then be folded."""
+    flow (bounds symbols assigned from them, a branch on ``flags[d]`` once ``d`` is known) can then be folded. An array
+    an element of which the records hold with different values -- the ranks of a run (one record each, or all in one)
+    with unequal shares of the grid -- is left out."""
     found: dict[str, dict[int, object]] = {}
     plain: dict[str, dict[int, object]] = {}  # arrays of scalars, by their own (Fortran) subscripts
+    varying: set[str] = set()
     lines = [line for record in records for line in Path(record).read_text().splitlines()]
 
     def number(value: str):
         return int(value) if re.fullmatch(r"-?\d+", value) else float(value)
+
+    def note(into: dict, name: str, index: int, value) -> None:
+        if into.setdefault(name, {}).setdefault(index, value) != value:
+            varying.add(name)
 
     for line in lines:
         if not line.strip() or not startup_constant(line.split()[0]):
             continue
         m = re.match(r"\S+::(\w+)\((-?\d+)\)%(\w+)\s+(\S+)$", line)
         if m and f"{m.group(1)}_{m.group(3)}" in sdfg.arrays:
-            found.setdefault(f"{m.group(1)}_{m.group(3)}", {})[int(m.group(2)) - 1] = number(m.group(4))
+            note(found, f"{m.group(1)}_{m.group(3)}", int(m.group(2)) - 1, number(m.group(4)))
             continue
         m = re.match(r"\S+::(\w+)\((-?\d+)\)\s+(\S+)$", line)
         if m and m.group(1) in sdfg.arrays and not sdfg.arrays[m.group(1)].transient:
-            plain.setdefault(m.group(1), {})[int(m.group(2))] = number(m.group(3))
+            note(plain, m.group(1), int(m.group(2)), number(m.group(3)))
     # The SDFG numbers an array of scalars from 0 at its lower bound: the lowest subscript recorded, once every element
     # is (a recorder records all elements of an array read at a runtime subscript).
     for name, by_subscript in plain.items():
@@ -366,6 +373,8 @@ def recorded_elements(records: list[Path], sdfg: dace.SDFG) -> dict[str, list]:
         found[name] = {k - lower: v for k, v in by_subscript.items()}
     elements = {}
     for name, by_index in found.items():
+        if name in varying:
+            continue
         desc = sdfg.arrays[name]
         try:
             size = int(desc.shape[0])
