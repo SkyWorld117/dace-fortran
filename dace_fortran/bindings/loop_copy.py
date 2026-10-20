@@ -265,14 +265,20 @@ def _device_pack_loop(recipe: FlattenRecipe, member_at_i: str, assign: str) -> l
     return lines
 
 
-def aos_pack_subscripts(recipe: FlattenRecipe) -> tuple[str, str]:
+def _buffer_order(records: list[str], members: list[str], members_first: bool) -> str:
+    """The subscripts or extents of a buffer: the record dimensions before the member's, or after them
+    (``members_first``: the member dimensions fastest, see :mod:`dace_fortran.bindings.record_layout`)."""
+    return ", ".join([*members, *records] if members_first else [*records, *members])
+
+
+def aos_pack_subscripts(recipe: FlattenRecipe, members_first: bool = False) -> tuple[str, str]:
     """``(buffer subscripts, member subscripts)`` of one element's value in a device pack loop: ``i1, off1 + i2,
     off2 + i3`` and ``lb1 + off1 + i2 - 1, lb2 + off2 + i3 - 1`` for a rank-2 member of a rank-1 array of records,
     with the recipe's lower-bound symbols (the buffer's) and the element's offsets in the buffer."""
     outer = aos_outer_rank(recipe)
     dims = range(1, len(recipe.cap_symbols) + 1)
     offsets = aos_pack_offset_locals(recipe)
-    buffer = ", ".join([*_element_indices(recipe), *(f"{offsets[k - 1]} + i{outer + k}" for k in dims)])
+    buffer = _buffer_order(_element_indices(recipe), [f"{offsets[k - 1]} + i{outer + k}" for k in dims], members_first)
     member = ", ".join(
         f"{lb} + {offsets[k - 1]} + i{outer + k} - 1" for k, lb in zip(dims, recipe.lb_symbols, strict=True)
     )
@@ -287,7 +293,9 @@ def _own_range(recipe: FlattenRecipe, member_at_i: str) -> str:
     )
 
 
-def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: bool = False) -> list[str]:
+def render_aos_alloc_pack_in(
+    recipe: FlattenRecipe, outer_expr: str, device: bool = False, members_first: bool = False
+) -> list[str]:
     """Take the elements' common lower bounds, compute each member dim's
     cap, allocate the buffer, pack each present element's live region.
     ``recipe.aos_alloc`` must be True.
@@ -299,19 +307,20 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
     allocatable): they are set up again (allocated, created, zeroed) only when the layout changes, the array of
     records, the caps, the common lower bounds or an element's presence or bounds; every call packs the members.
     The padding is never written after the setup, so a kept image holds what a fresh one would.
+    ``members_first``: the buffer is laid out with the member dimensions first (:func:`_buffer_order`).
     """
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_pack_in called on non-aos_alloc recipe")
     flat = recipe.flat_names[0]
     caps = recipe.cap_symbols
-    shape = ", ".join([*_aos_alloc_extents(recipe, outer_expr), *caps])
-    elements = ", ".join(_element_indices(recipe))
+    shape = _buffer_order(_aos_alloc_extents(recipe, outer_expr), list(caps), members_first)
+    elements = _element_indices(recipe)
     member_at_i = _aos_alloc_member_at_i(recipe)
     present = _aos_alloc_presence(recipe, member_at_i)
     dims = range(1, len(caps) + 1)
     live = _own_range(recipe, member_at_i)
     if device:
-        buffer_idx, member_idx = aos_pack_subscripts(recipe)
+        buffer_idx, member_idx = aos_pack_subscripts(recipe, members_first)
         padded = " .or. ".join(
             f"size({member_at_i}, {k}) < {cap} .or. lbound({member_at_i}, {k}) /= {lb}"
             for k, cap, lb in zip(dims, caps, recipe.lb_symbols, strict=True)
@@ -365,7 +374,11 @@ def render_aos_alloc_pack_in(recipe: FlattenRecipe, outer_expr: str, device: boo
             *_over_elements(
                 recipe,
                 outer_expr,
-                [f"      if ({present}) then", f"        {flat}({elements}, {live}) = {member_at_i}", "      end if"],
+                [
+                    f"      if ({present}) then",
+                    f"        {flat}({_buffer_order(elements, [live], members_first)}) = {member_at_i}",
+                    "      end if",
+                ],
             ),
         ]
     return [
@@ -509,23 +522,25 @@ def render_aos_alloc_members(
     return lines
 
 
-def render_aos_alloc_pack_out(recipe: FlattenRecipe, outer_expr: str, device: bool = False) -> list[str]:
+def render_aos_alloc_pack_out(
+    recipe: FlattenRecipe, outer_expr: str, device: bool = False, members_first: bool = False
+) -> list[str]:
     """Copy each present element's live region back from the buffer, free
     the scratch.  No reallocation -- 5c-B kernels don't change
-    per-instance sizes (reserved for 5c-C).  ``device`` mirrors
+    per-instance sizes (reserved for 5c-C).  ``device`` and ``members_first`` mirror
     :func:`render_aos_alloc_pack_in`: OpenACC loops; the buffer and its device copy stay for the next call."""
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_pack_out called on non-aos_alloc recipe")
     flat = recipe.flat_names[0]
-    elements = ", ".join(_element_indices(recipe))
+    elements = _element_indices(recipe)
     member_at_i = _aos_alloc_member_at_i(recipe)
     present = _aos_alloc_presence(recipe, member_at_i)
     live = _own_range(recipe, member_at_i)
     if device:
-        buffer_idx, member_idx = aos_pack_subscripts(recipe)
+        buffer_idx, member_idx = aos_pack_subscripts(recipe, members_first)
         unpack = _device_pack_loop(recipe, member_at_i, f"{member_at_i}({member_idx}) = {flat}({buffer_idx})")
     else:
-        unpack = [f"        {member_at_i} = {flat}({elements}, {live})"]
+        unpack = [f"        {member_at_i} = {flat}({_buffer_order(elements, [live], members_first)})"]
     return [
         f"    ! ----- AoS pack-out: {flat} -> {outer_expr}{' on the device' if device else ''} -----",
         *_over_elements(recipe, outer_expr, [f"      if ({present}) then", *unpack, "      end if"]),

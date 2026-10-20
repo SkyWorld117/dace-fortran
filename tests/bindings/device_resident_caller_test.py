@@ -170,6 +170,86 @@ def test_a_kept_image_is_repacked_and_set_up_again_only_on_a_new_layout(tmp_path
     assert [float(x) for x in out] == [0.0, 1.0, 1.0, -7.0, 5.0, 0.0, 0.0, 5.0, 1.0]
 
 
+_MEMBERS_FIRST_HARNESS = """module packed
+  use iso_c_binding
+  implicit none
+  type :: rec
+    real(c_double), pointer :: sf(:, :) => null()
+  end type
+contains
+  subroutine pack(q, probe)
+    type(rec), intent(inout) :: q(:)
+    real(c_double), intent(out) :: probe(4)
+    real(c_double), allocatable, target, save :: q_sf(:, :, :)
+    integer(c_int64_t), allocatable, save :: q_sf_layout(:)
+    integer(c_int64_t), allocatable :: q_sf_layout_now(:)
+    integer(c_int64_t) :: q_sf_layout_k
+    logical :: q_sf_fresh, q_sf_lb_taken, q_sf_padded
+    integer(c_int64_t) :: q_sf_ext1, q_sf_ext2, q_sf_off1, q_sf_off2
+    integer(c_int64_t) :: cap_q_sf_d0, cap_q_sf_d1, lb_q_sf_d0, lb_q_sf_d1
+    integer :: i1, i2, i3
+{pack_in}
+    ! members first: q_sf(row, column, element); element 2 has two rows, its third is padding
+    probe = [q_sf(1, 1, 1), q_sf(4, 3, 1), q_sf(2, 3, 2), q_sf(3, 3, 2)]
+    q_sf(1, 1, 2) = 9.0_c_double
+{pack_out}
+  end subroutine
+end module
+
+program main
+  use packed
+  implicit none
+  type(rec) :: q(2)
+  real(c_double) :: p(4)
+  allocate(q(1)%sf(4, 3), q(2)%sf(2, 3))
+  q(1)%sf = 1.0_c_double
+  q(1)%sf(4, 3) = 5.0_c_double
+  q(2)%sf = 2.0_c_double
+  call pack(q, p)
+  print '(5f6.1)', p, q(2)%sf(1, 1)
+end program
+"""
+
+
+def test_a_packed_image_laid_out_members_first(tmp_path: Path):
+    """Compiled and run (OpenACC on the host): with ``members_first`` the packed image of a dummy array of records
+    holds each element's member at its own place in ``q_sf(row, column, element)``, and the unpack reads it back
+    from there."""
+    if not _gfortran_compiles_openacc():
+        pytest.skip("needs gfortran with OpenACC directives (-fopenacc)")
+    recipe = FlattenRecipe(
+        flat_names=("q_sf",),
+        read_exprs=("q($i1)%sf($i2, $i3)",),
+        rank=3,
+        shape_exprs=("size(q, dim=1)", "cap_q_sf_d0", "cap_q_sf_d1"),
+        aos_alloc=True,
+        cap_symbols=("cap_q_sf_d0", "cap_q_sf_d1"),
+        lb_symbols=("lb_q_sf_d0", "lb_q_sf_d1"),
+        member_pointer=True,
+    )
+    pack_in = "\n".join(render_aos_alloc_pack_in(recipe, "q", device=True, members_first=True))
+    pack_out = "\n".join(render_aos_alloc_pack_out(recipe, "q", device=True, members_first=True))
+    assert "allocate(q_sf(cap_q_sf_d0, cap_q_sf_d1, size(q, dim=1)))" in pack_in
+    (tmp_path / "packed.f90").write_text(_MEMBERS_FIRST_HARNESS.format(pack_in=pack_in, pack_out=pack_out))
+    subprocess.run(["gfortran", "-fopenacc", "-ffree-line-length-none", "packed.f90", "-o", "packed"], cwd=tmp_path,
+                   check=True, capture_output=True, text=True)
+    out = subprocess.run(["./packed"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.split()
+    assert [float(x) for x in out] == [1.0, 5.0, 2.0, 0.0, 9.0]
+
+
+def test_record_buffers_include_the_images_packed_from_dummies():
+    from dace_fortran.bindings.record_layout import record_buffers
+
+    recipe = FlattenRecipe(flat_names=("q_sf",), read_exprs=("q($i1)%sf($i2, $i3)",), rank=3,
+                           shape_exprs=("size(q, dim=1)", "cap_q_sf_d0", "cap_q_sf_d1"), aos_alloc=True,
+                           cap_symbols=("cap_q_sf_d0", "cap_q_sf_d1"), lb_symbols=("lb_q_sf_d0", "lb_q_sf_d1"))
+    plan = FlattenPlan(entries=(FlattenEntry(outer_expr="q", outer_type="type(rec)", writeback_intent="inout",
+                                             recipe=recipe),))
+    frozen = FrozenSignature(entry="kernel", mangled="_QPkernel", args=())
+    assert record_buffers(frozen) == {}
+    assert record_buffers(frozen, plan) == {"q_sf": 1}
+
+
 def test_host_pack_is_unchanged():
     text = "\n".join(render_aos_alloc_pack_in(_rank3_pointer_member(), "q"))
     assert "!$acc" not in text

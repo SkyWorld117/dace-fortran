@@ -776,7 +776,8 @@ def build_wrapper_body(
         # stack). Guard the marshal; ABSENT branch gives the flat a degenerate binding.
         guard = _recipe_presence_guard(iface, r)
         if r.aos_alloc:
-            copyin.extend(render_aos_alloc_pack_in(r, entry.outer_expr, device=r.flat_names[0] in device_pack))
+            copyin.extend(render_aos_alloc_pack_in(r, entry.outer_expr, device=r.flat_names[0] in device_pack,
+                                                   members_first=r.flat_names[0] in members_first))
         elif r.aliasable:
             lines = render_alias_calls(r)
             if guard:
@@ -1049,7 +1050,8 @@ def build_wrapper_tail(
         if r.aos_alloc:
             device = r.flat_names[0] in device_pack
             if entry.writeback_intent in ("out", "inout"):
-                copy_out_lines.extend(render_aos_alloc_pack_out(r, entry.outer_expr, device=device))
+                copy_out_lines.extend(render_aos_alloc_pack_out(r, entry.outer_expr, device=device,
+                                                                members_first=r.flat_names[0] in members_first))
             else:
                 # intent(in): no copy-back, but pack-in's scratch still needs releasing.
                 copy_out_lines.extend(render_aos_alloc_release(r, device))
@@ -2455,7 +2457,7 @@ def _build_symbol_assigns(
                 alias, guard = module_array_extents.get(target, (target, ""))
                 out.extend(_guarded_assign(sym, f"size({alias}, dim={dim})", guard, absent="1"))
             continue
-        if m and m.group(1) in members_first:
+        if m and m.group(1) in members_first and _aos_lead(arg_by_sdfg[m.group(1)]):  # a module record image
             buf = arg_by_sdfg[m.group(1)]
             query = ExtentQuery.LBOUND if _OFFSET_SYM_RE.match(sym) else ExtentQuery.SIZE
             dim = buffer_dim(buf, int(m.group(2)), True)

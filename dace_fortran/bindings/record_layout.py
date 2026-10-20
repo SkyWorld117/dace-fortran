@@ -18,7 +18,9 @@ import dace
 from dace import data, nodes
 
 from dace_fortran.bindings.block_builders import _aos_lead, keepable
+from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.frozen_signature import FrozenSignature
+from dace_fortran.bindings.loop_copy import aos_outer_rank
 
 
 def members_first_order(lead: int, rank: int) -> list[int]:
@@ -38,10 +40,13 @@ def members_first_strides(shape, lead: int) -> list:
     return [dace.symbolic.pystr_to_symbolic(str(x)) for x in strides]
 
 
-def record_buffers(frozen: FrozenSignature) -> dict[str, int]:
-    """The buffers of deferred-shape members of module arrays of records among ``frozen``'s arguments, with the number
-    of their record dimensions: the buffers :func:`lay_out_members_first` lays out."""
-    return {a.sdfg_name: _aos_lead(a) for a in frozen.args if keepable(a)}
+def record_buffers(frozen: FrozenSignature, plan: FlattenPlan | None = None) -> dict[str, int]:
+    """The buffers of deferred-shape members of module arrays of records among ``frozen``'s arguments, and those the
+    wrapper packs from a dummy array of records (``plan``'s ``aos_alloc`` recipes), with the number of their record
+    dimensions: the buffers :func:`lay_out_members_first` lays out."""
+    packed = {e.recipe.flat_names[0]: aos_outer_rank(e.recipe) for e in plan.entries if e.recipe.aos_alloc} \
+        if plan else {}
+    return {a.sdfg_name: _aos_lead(a) for a in frozen.args if keepable(a)} | packed
 
 
 def lay_out_members_first(sdfg: dace.SDFG, buffers: Mapping[str, int]) -> list[str]:

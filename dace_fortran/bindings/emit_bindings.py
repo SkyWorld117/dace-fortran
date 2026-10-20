@@ -117,9 +117,9 @@ def emit_bindings(
     else reads or writes their members between its calls): the wrapper packs such a buffer once, keeps it (and its
     device copy) for the next call and never copies it back, so the routine's state lives in the buffer instead of the
     members.  A call that finds the members reallocated to another shape packs the buffer afresh.
-    ``members_first``: buffers of module arrays of records the SDFG reads with the member dimensions fastest
-    (:func:`dace_fortran.bindings.record_layout.lay_out_members_first`): the wrapper allocates, packs, measures and
-    unpacks them with the member dimensions before the record dimensions.
+    ``members_first``: buffers of arrays of records (module variables' or dummies') the SDFG reads with the member
+    dimensions fastest (:func:`dace_fortran.bindings.record_layout.lay_out_members_first`): the wrapper allocates,
+    packs, measures and unpacks them with the member dimensions before the record dimensions.
     """
     from dace_fortran.bindings.acc_transfers import plan_frozen_transfers
 
@@ -132,10 +132,11 @@ def emit_bindings(
             f"takes: {sorted(kept - eligible)}"
         )
     first = frozenset(members_first)
-    if first - eligible:
+    packed = {e.recipe.flat_names[0] for e in plan.entries if e.recipe.aos_alloc}
+    if first - eligible - packed:
         raise ValueError(
-            "members_first: not buffers of deferred-shape members of module arrays of records the SDFG "
-            f"takes: {sorted(first - eligible)}"
+            "members_first: not buffers of deferred-shape members of arrays of records the SDFG "
+            f"takes: {sorted(first - eligible - packed)}"
         )
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)

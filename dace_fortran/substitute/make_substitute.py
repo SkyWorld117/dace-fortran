@@ -780,13 +780,15 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
            scratch_images: dict[str, dict] | None = None, combine_divisions: bool = False,
            scalarise: bool = False, map_heavy_loops: int = 0, heavy_launch: int = 0,
            host_work_limit: int = 0, fuse_small: int = 0, tile_fuse: bool = False,
-           members_first: bool = True, extents: dict | None = None, forward_skip: Iterable[str] = ()) -> list[str]:
+           members_first: bool = True, extents: dict | None = None, forward_skip: Iterable[str] = (),
+           plan: FlattenPlan | None = None) -> list[str]:
     """Parallelise ``sdfg`` and turn it into CUDA kernels over device-resident argument arrays.
 
-    ``members_first``: the buffers of module arrays of records the SDFG takes as arguments are laid out with the
-    member (field) dimensions fastest instead of the record indices (``record_layout.lay_out_members_first``), so that
-    the threads of a kernel read neighbouring points from neighbouring addresses.  Returns the buffers laid out that
-    way, for ``emit_bindings(members_first=...)``.
+    ``members_first``: the buffers of arrays of records the SDFG takes as arguments (module variables', and with
+    ``plan`` those the wrapper packs from a dummy) are laid out with the member (field) dimensions fastest instead of
+    the record indices (``record_layout.lay_out_members_first``), so that the threads of a kernel read neighbouring
+    points from neighbouring addresses, and a kept call receives every field array alike.  Returns the buffers laid
+    out that way, for ``emit_bindings(members_first=...)``.
 
     ``host_work_limit``: maps and free tasklets over arrays of at most this many elements that no kernel touches
     stay on the host (small_kernels.host_small_work); ``fuse_small``: fuse the states around maps of at most this
@@ -838,7 +840,7 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
     if members_first:
         from dace_fortran.bindings.record_layout import lay_out_members_first, record_buffers
 
-        laid_out = lay_out_members_first(sdfg, record_buffers(get_frozen_signature(sdfg)))
+        laid_out = lay_out_members_first(sdfg, record_buffers(get_frozen_signature(sdfg), plan))
         print(f"record images laid out with the member dimensions fastest: {laid_out}", flush=True)
     if combine_divisions:
         # After the fusion: a recomputed stencil body is one more copy of the normalisations to rewrite.
@@ -1366,7 +1368,7 @@ def main() -> int:
                                heavy_launch=args.heavy_launch, host_work_limit=args.host_work_limit,
                                fuse_small=args.fuse_small_maps, tile_fuse=args.tile_fuse,
                                members_first=not args.records_first,
-                               extents=recorded, forward_skip=args.forward_skip)
+                               extents=recorded, forward_skip=args.forward_skip, plan=plan)
     elif values:
         refreeze(sdfg)
     if args.record_only and not args.gpu:
