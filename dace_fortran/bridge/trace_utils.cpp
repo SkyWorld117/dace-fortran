@@ -429,6 +429,28 @@ mlir::Value presentBranchOfRuntimeOptional(fir::IfOp ifOp, mlir::Value result) {
   return {};
 }
 
+namespace {
+
+bool isConstZero(mlir::Value v) {
+  auto* d = v.getDefiningOp();
+  auto c = d ? mlir::dyn_cast<mlir::arith::ConstantOp>(d) : nullptr;
+  auto ia = c ? mlir::dyn_cast<mlir::IntegerAttr>(c.getValue()) : nullptr;
+  return ia && ia.getInt() == 0;
+}
+
+// Flang's clamp of an extent to non-negative, select(x > 0, x, 0) (or x >= 0): its operand x, else null. A select on
+// any other condition with a zero arm (a MERGE such as merge(n, 0, i == 1)) stands for neither arm.
+mlir::Value clampedExtent(mlir::arith::SelectOp s) {
+  auto* cdef = s.getCondition().getDefiningOp();
+  auto cmp = cdef ? mlir::dyn_cast<mlir::arith::CmpIOp>(cdef) : nullptr;
+  if (!cmp || cmp.getLhs() != s.getTrueValue() || !isConstZero(cmp.getRhs()) || !isConstZero(s.getFalseValue()))
+    return {};
+  using P = mlir::arith::CmpIPredicate;
+  return cmp.getPredicate() == P::sgt || cmp.getPredicate() == P::sge ? s.getTrueValue() : mlir::Value{};
+}
+
+}  // namespace
+
 std::string traceToDecl(mlir::Value val, int max) {
   for (int i = 0; i < max && val; ++i) {
     auto* d = val.getDefiningOp();
@@ -514,15 +536,11 @@ std::string traceToDecl(mlir::Value val, int max) {
       continue;
     }
     if (auto s = mlir::dyn_cast<mlir::arith::SelectOp>(d)) {
-      // Follow the select ONLY for the extent CLAMP idiom (select(cmp(x,0), x, 0), one branch a constant 0); a genuine
-      // MIN/MAX select is NOT an alias to one branch (following it would drop the other operand and any subscript) and
-      // is left for the min/max idiom in buildIndexExpr/buildExpr.
-      auto trueC = traceConstInt(s.getTrueValue());
-      auto falseC = traceConstInt(s.getFalseValue());
-      bool const trueZero = trueC && *trueC == 0;
-      bool const falseZero = falseC && *falseC == 0;
-      if (trueZero != falseZero) {
-        val = trueZero ? s.getFalseValue() : s.getTrueValue();
+      // Follow the select ONLY for the extent clamp; a genuine MIN/MAX select is NOT an alias to one branch (following
+      // it would drop the other operand and any subscript) and is left for the min/max idiom in
+      // buildIndexExpr/buildExpr, as is a MERGE.
+      if (auto x = clampedExtent(s)) {
+        val = x;
         continue;
       }
       break;
@@ -542,17 +560,11 @@ std::optional<int64_t> traceConstInt(mlir::Value v) {
       v = cv.getValue();
       continue;
     }
-    // Flang wraps each static extent in a select(extent>0, extent, 0) clamp; follow the true branch, but only when the
-    // false value is the constant 0 -- else it might be a genuine Fortran MAX/MIN, not a clamp.
+    // Flang wraps each static extent in a select(extent > 0, extent, 0) clamp: follow it to the extent. Not any other
+    // select with a zero arm -- a genuine Fortran MAX/MIN, or a MERGE that is 0 on some iterations.
     if (auto s = mlir::dyn_cast<mlir::arith::SelectOp>(d)) {
-      auto* fdef = s.getFalseValue().getDefiningOp();
-      bool false_is_zero = false;
-      if (fdef) {
-        if (auto c = mlir::dyn_cast<mlir::arith::ConstantOp>(fdef))
-          if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue())) false_is_zero = (ia.getInt() == 0);
-      }
-      if (false_is_zero) {
-        v = s.getTrueValue();
+      if (auto x = clampedExtent(s)) {
+        v = x;
         continue;
       }
     }
