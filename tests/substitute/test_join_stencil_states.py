@@ -81,3 +81,22 @@ def test_an_assignment_of_a_value_read_from_data_keeps_the_states_apart():
     sdfg.edges_between(first, second)[0].data.assignments = {"iend": "n"}
     assert join_stencil_states(sdfg) == 0
     assert sdfg.edges_between(first, second)[0].data.assignments == {"iend": "n"}
+
+
+def test_a_state_before_the_producer_with_nothing_assigned_between_stays_apart():
+    """A state filling what the producer's state reads, nothing assigned between them, is not joined with it: that
+    join would take the producer's state out of the list the pass walks, and the pair would stay apart (MHD's y and z
+    reconstructions on several ranks)."""
+    sdfg = _split_pair()
+    produce_state = next(s for s in sdfg.states() if s.label == "produce_state")
+    sdfg.add_transient("pre", [16], dace.float64)
+    sdfg.add_array("d", [16], dace.float64)
+    fill = sdfg.add_state_before(produce_state, "fill_state", is_start_block=True)
+    fill.add_mapped_tasklet("fill", {"i": "0:16"}, {"x": dace.Memlet("a[i]")}, "y = x", {"y": dace.Memlet("pre[i]")},
+                            external_edges=True)
+    produce_state.add_mapped_tasklet("use_pre", {"i": "0:16"}, {"x": dace.Memlet("pre[i]")}, "y = x",
+                                     {"y": dace.Memlet("d[i]")}, external_edges=True)
+    assert join_stencil_states(sdfg) == 1
+    maps = {n.map.label: s for s in sdfg.states() for n in s.nodes() if isinstance(n, dace.nodes.MapEntry)}
+    assert maps["produce"] is maps["consume"]
+    assert maps["fill_map"] is not maps["produce"]

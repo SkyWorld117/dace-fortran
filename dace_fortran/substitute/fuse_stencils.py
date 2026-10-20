@@ -245,15 +245,14 @@ def join_stencil_states(sdfg: dace.SDFG) -> int:
         if not isinstance(after, dace.SDFGState) or not any(n.data in written and after.out_degree(n)
                                                             for n in after.data_nodes()):
             continue
-        if edge.data.assignments:
-            if not _movable_past(edge, sdfg):
-                continue
-            values = dict(edge.data.assignments)
-            after.replace_dict(values)
-            for out in graph.out_edges(after):
-                out.data.replace_dict(values, replace_keys=False)
-                out.data.assignments = {**values, **out.data.assignments}
-            edge.data.assignments = {}
+        if not _movable_past(edge, sdfg):
+            continue  # states nothing is assigned between are the simplification's to fuse
+        values = dict(edge.data.assignments)
+        after.replace_dict(values)
+        for out in graph.out_edges(after):
+            out.data.replace_dict(values, replace_keys=False)
+            out.data.assignments = {**values, **out.data.assignments}
+        edge.data.assignments = {}
         fusion = StateFusion()
         fusion.first_state, fusion.second_state = state, after
         if fusion.can_be_applied(graph, 0, sdfg):
