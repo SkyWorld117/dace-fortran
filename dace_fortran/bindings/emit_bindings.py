@@ -59,6 +59,8 @@ def emit_bindings(
     private_imports: Sequence[str] = (),
     kept_images: Collection[str] = (),
     members_first: Collection[str] = (),
+    prologue: Sequence[str] = (),
+    prologue_uses: Sequence[str] = (),
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -113,6 +115,10 @@ def emit_bindings(
     (:func:`dace_fortran.bindings.specialization.render_symbol_record`).
     ``extra_procedures``: Fortran module procedures appended to the binding module as they are, e.g. a ``bind(c)``
     shim an external call of the SDFG reaches, which may use the module's buffers and private-variable pointers.
+    ``prologue``: Fortran statements the wrapper runs once it has taken the call (after the specialisation and storage
+    guards, before it hands anything to the SDFG), in the scope of the routine's dummies -- e.g. a call the routine
+    starts with, dropped from the SDFG (``stub``) and made here in Fortran on the caller's own data;
+    ``prologue_uses``: the ``use`` lines they need (``module, only: names``).
     ``kept_images``: arguments of the SDFG that are buffers of module arrays of records only the routine uses (nothing
     else reads or writes their members between its calls): the wrapper packs such a buffer once, keeps it (and its
     device copy) for the next call and never copies it back, so the routine's state lives in the buffer instead of the
@@ -185,6 +191,9 @@ def emit_bindings(
     }
     blocks = splice_acc_staging(blocks, iface.entry, acc_residency, directive)
     # A sizing run declines every call once it has recorded it: the SDFG never runs, whatever the members share.
+    if prologue:
+        blocks["wrapper_body"] = "\n".join(["    ! ----- Prologue: run once the call is taken, before the SDFG -----",
+                                            *(f"    {line}" for line in prologue), "", blocks["wrapper_body"]])
     storage = [] if record_only else build_storage_guard(frozen, iface, plan, declinable=specialization is not None)
     if storage:
         blocks["wrapper_body"] = "\n".join([*storage, "", blocks["wrapper_body"]])
@@ -217,6 +226,7 @@ def emit_bindings(
             private_access=private_access,
             private_imports=private_imports,
             extra_procedures=extra_procedures,
+            uses=prologue_uses,
         )
     )
     return out_file

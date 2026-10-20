@@ -1287,9 +1287,11 @@ def assemble_module(
     private_access: Mapping[str, Mapping[str, ExposedVariable]] | None = None,
     private_imports: Sequence[str] = (),
     extra_procedures: str = "",
+    uses: Sequence[str] = (),
 ) -> str:
     """Stitch the rendered blocks into the complete Fortran module
-    (template: templates/module.f90.in).  ``extra_procedures``: module procedures appended as they are.
+    (template: templates/module.f90.in).  ``extra_procedures``: module procedures appended as they are; ``uses``:
+    further use statements of the module (``module, only: names``).
 
     ``extra_sources``: module variables of symbols the SDFG no longer takes but the wrapper still reads (those of a
     specialisation guard), imported alongside ``frozen``'s.
@@ -1338,6 +1340,7 @@ def assemble_module(
         use_lines.append(f"  use {mod}, only: {', '.join(sorted(structs))}")
     if pointers:
         use_lines += [line if line.startswith("  ") else f"  {line}" for line in private_imports]
+    use_lines += [f"  use {line}" for line in uses]
     use_statements = "\n".join(use_lines)
     handle_state = blocks["handle_state"]
     associations = ""

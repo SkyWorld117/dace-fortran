@@ -1237,6 +1237,11 @@ def main() -> int:
                     "procedures are appended to the binding module, e.g. the bind(c) shim of an external call "
                     "(repeatable)")
     ap.add_argument("--stub", action="append", default=[], help="procedure whose calls are dropped (repeatable)")
+    ap.add_argument("--binding-prologue", action="append", default=[], help="Fortran statement the binding runs once it "
+                    "has taken a call, before the SDFG, in the scope of the routine's dummies: e.g. a call the routine "
+                    "starts with, dropped from the SDFG by --stub and made here on the caller's own data (repeatable)")
+    ap.add_argument("--binding-use", action="append", default=[], help="use statement (MODULE, only: NAMES) of the "
+                    "binding module, for --binding-prologue (repeatable)")
     ap.add_argument("--external", action="append", default=[], help="procedure whose calls stay calls, of a bind(c) "
                     "function: NAME=C_NAME(KIND,...), one KIND per argument of the call site: array (a real(8) "
                     "array, read and written), int or real (a scalar, read); the function comes from --binding-extra "
@@ -1453,6 +1458,8 @@ def main() -> int:
         extra_procedures="\n\n".join(config_path(f, args.config).read_text() for f in args.binding_extra),
         kept_images=kept_images,
         members_first=members_first,
+        prologue=tuple(args.binding_prologue),
+        prologue_uses=tuple(args.binding_use),
     )
     try:
         emit()

@@ -200,6 +200,8 @@ def build_fortran_library(
     record_symbols_to: str | Path | None = None,
     record_per_rank: bool = False,
     extra_procedures: str = "",
+    prologue: Sequence[str] = (),
+    prologue_uses: Sequence[str] = (),
 ) -> FortranLibrary:
     """Emit + verify + link a Fortran-callable library for ``sdfg``.
 
@@ -219,7 +221,8 @@ def build_fortran_library(
     ``extra_flags`` (``amdflang`` with ``--offload-arch=gfx942``, say).
 
     ``specialization`` and ``record_symbols_to`` go to :func:`emit_bindings`: the guard of an SDFG specialised to
-    the values of its symbols and scalar inputs, and the file a general binding records those values to.
+    the values of its symbols and scalar inputs, and the file a general binding records those values to; so do
+    ``prologue`` and ``prologue_uses``, the statements the wrapper runs once it has taken a call.
 
     :raises SignatureDriftError: live SDFG drifted from the snapshot.
     """
@@ -290,6 +293,8 @@ def build_fortran_library(
         record_symbols_to=record_symbols_to,
         record_per_rank=record_per_rank,
         extra_procedures=extra_procedures,
+        prologue=prologue,
+        prologue_uses=prologue_uses,
     )
 
     # Threaded between the binding (which the shim USEs) and extra_sources

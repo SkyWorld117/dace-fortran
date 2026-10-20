@@ -370,3 +370,45 @@ def test_a_binding_built_for_the_ranks_of_a_run_runs_their_values_only(tmp_path)
     y, declined = run(nv=4)
     assert declined
     np.testing.assert_array_equal(y, -1.0)
+
+
+def test_a_prologue_runs_once_the_call_is_taken_and_before_the_sdfg(tmp_path):
+    """Statements the wrapper runs once it has taken a call -- a call the routine starts with, made in Fortran on the
+    caller's data instead of in the SDFG, say: a call the guard declines leaves them out, and they come before the
+    SDFG gets its arguments."""
+    sdfg, iface, plan, src = _build(tmp_path, "scale_pro")
+    src.write_text(src.read_text() + """
+module probe_scale_pro
+  implicit none
+contains
+  subroutine mark_last(y)
+    real(8), intent(inout) :: y(:)
+    y(size(y)) = 99
+  end subroutine mark_last
+end module probe_scale_pro
+""")
+    before = get_frozen_signature(sdfg)
+    values = {"nv": 3, "scaled": 1, "factor": 2.0}
+    symbols = {s: v for s, v in values.items() if s in before.free_symbols}
+    specialize(sdfg, symbols=symbols, scalars={s: v for s, v in values.items() if s not in symbols})
+    refreeze(sdfg)
+    run = _library(
+        tmp_path,
+        sdfg,
+        iface,
+        plan,
+        src,
+        "call {entry}_dace(xin, yout, dace_declined=declined)",
+        specialization=Specialization(values, before),
+        prologue=["call mark_last(y)"],
+        prologue_uses=["probe_scale_pro, only: mark_last"],
+    )
+    y, declined = run()
+    assert not declined
+    np.testing.assert_array_equal(y, [2, 4, 6, -1, -1, 99])  # the SDFG's elements, and the prologue's
+    y, declined = run(nv=4)
+    assert declined
+    np.testing.assert_array_equal(y, -1.0)  # declined before the prologue
+    text = next((tmp_path / "lib").glob("*_bindings.f90")).read_text()
+    prologue = text.index("call mark_last(y)")
+    assert text.rindex("dace_declined = .true.", 0, prologue) < prologue < text.index("call dace_program_")
