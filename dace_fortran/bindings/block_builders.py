@@ -1759,10 +1759,11 @@ def _aos_root_and_segment(a: FrozenArg) -> tuple[str, str]:
 def _shape_only_source(a: FrozenArg, dim: int, lower: bool) -> tuple[str, str] | None:
     """The Fortran expression reading extent ``dim`` (its lower bound when ``lower``) of the image ``a`` the SDFG
     allocates itself off the record on the host, and the guard that the record and its member exist. The image's
-    leading dims are the record array's, the others a member's, read off the record array's first element. None
-    under a root that is itself an array of records."""
+    leading dims are the record array's, the others a member's, read off the record array's first element. Under a
+    root that is itself an array of records (``field(j) % comp(i) % data``) the root's dims come first, then the
+    segment's, read off the root's first element, then the member's, read off the first element of both."""
     if a.aos_root_rank:
-        return None
+        return _shape_only_source_under_root(a, dim, lower)
     struct, query, lead = a.aos_origin_struct, "lbound" if lower else "size", _aos_lead(a)
     present = "" if a.aos_struct_static else _present(struct, a.aos_struct_pointer)
     if dim < lead:
@@ -1771,6 +1772,25 @@ def _shape_only_source(a: FrozenArg, dim: int, lower: bool) -> tuple[str, str] |
     elem = f"{struct}({first})%{a.aos_member_path}" if lead else f"{struct}%{a.aos_member_path}"
     member = "" if _aos_member_is_static(a) else _present(elem, a.aos_member_pointer)
     return f"{query}({elem}, dim={dim - lead + 1})", " .and. ".join(g for g in (present, member) if g)
+
+
+def _shape_only_source_under_root(a: FrozenArg, dim: int, lower: bool) -> tuple[str, str]:
+    """:func:`_shape_only_source` of an image under a root array of records. The segment's extent is the first
+    element's (the packing takes the largest over the elements: the same where the elements match, as MFC's do)."""
+    query, lead = "lbound" if lower else "size", _aos_lead(a)
+    root, segment = _aos_root_and_segment(a)
+    root_present = "" if a.aos_struct_static else f"allocated({root})"
+    if dim < a.aos_root_rank:
+        return f"{query}({root}, dim={dim + 1})", root_present
+    element_segment = f"{root}({', '.join(f'lbound({root}, {k + 1})' for k in range(a.aos_root_rank))})%{segment}"
+    guards = [g for g in (root_present, _present(element_segment, a.aos_struct_pointer)) if g]
+    if dim < lead:
+        return f"{query}({element_segment}, dim={dim - a.aos_root_rank + 1})", " .and. ".join(guards)
+    first = ", ".join(f"lbound({element_segment}, {k + 1})" for k in range(a.aos_outer_rank))
+    elem = f"{element_segment}({first})%{a.aos_member_path}"
+    if not _aos_member_is_static(a):
+        guards.append(_present(elem, a.aos_member_pointer))
+    return f"{query}({elem}, dim={dim - lead + 1})", " .and. ".join(guards)
 
 
 def _aos_loop_pieces(a: FrozenArg) -> AosLoopPieces:
