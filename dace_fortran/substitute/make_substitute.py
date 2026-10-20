@@ -532,7 +532,7 @@ def heavy_innermost_loop(min_tasklets: int, limit: int = UNROLL_LIMIT):
 
 def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scalars: dict,
                          keep_heavy_loops: int = 0, arrays: dict | None = None,
-                         value_sets: dict | None = None) -> dict[str, dict[int, str]]:
+                         rank_values: list[dict] | None = None) -> dict[str, dict[int, str]]:
     """Specialise ``sdfg`` and split the arrays of records its element loops then index by constants.
 
     Constant propagation and dead-branch elimination come first: a loop bound computed from a specialised value is a
@@ -540,6 +540,8 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
     ``keep_heavy_loops``: innermost short loops with bodies of at least this many tasklets stay loops (0: none).
     ``arrays``: small integer module arrays and their elements (recorded_arrays): once the short loops are unrolled,
     their element reads in control flow are literals (an equation index ``rs(k)`` the loop over ``k`` reads).
+    ``rank_values``: each rank's combination of the values that differ between the ranks (the binding admits these
+    only).
     """
     specialize(sdfg, symbols=symbols, scalars=scalars)
     for node, _ in sdfg.all_nodes_recursive():
@@ -548,14 +550,14 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
     # Until the dead branches are gone, accesses in them may fall outside arrays the case left degenerate (a
     # boundary condition's coefficients for a direction without it): validate once they are.
     sdfg.simplify(validate=False, validate_all=False)
-    # A value that differs between the ranks of a run stays a symbol, but the conditions that come out the same for
-    # every value it takes (a boundary condition no rank has) still fold: once the simplification has promoted the
-    # scalars the conditions read to symbols, and with their branches dropped by another.
-    if value_sets:
-        from dace_fortran.substitute.fuse_stencils import fold_conditions_over_value_sets  # noqa: PLC0415
+    # A value that differs between the ranks of a run stays a symbol, but the conditions that come out the same on
+    # every rank (a boundary condition no rank has) still fold: once the simplification has promoted the scalars the
+    # conditions read to symbols, and with their branches dropped by another.
+    if rank_values:
+        from dace_fortran.substitute.fuse_stencils import fold_conditions_over_cases  # noqa: PLC0415
 
-        decided = fold_conditions_over_value_sets(sdfg, value_sets)
-        print(f"conditions decided over the values of {sorted(value_sets)}: {decided}", flush=True)
+        decided = fold_conditions_over_cases(sdfg, rank_values)
+        print(f"conditions decided over each rank's values of {sorted(rank_values[0])}: {decided}", flush=True)
         if decided:
             sdfg.simplify(validate=False, validate_all=False)
     if DUMP_DIR != Path("."):  # the tool's output directory (not a test's working directory)
@@ -1048,7 +1050,7 @@ def recorded_arrays(recorded: dict, frozen, iface, plan: FlattenPlan) -> dict[st
 
 
 def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scalars: dict, dropped: list[str],
-                  recorded: dict, arrays: dict, value_sets: dict | None = None, rank_values: list | None = None) -> list[str]:
+                  recorded: dict, arrays: dict, rank_values: list | None = None) -> list[str]:
     """--auto-scratch: what make_scratch_transient is to match for the module variables auto_scratch.infer finds
     scratch, those given with --scratch left out. The in-call analysis runs on a copy specialised as this build
     specialises the SDFG (the branches the recorded configuration never takes are gone); ``dropped``: the procedures
@@ -1060,7 +1062,7 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
     folded: list[tuple[str, int, str, int]] = []  # the member aliases the analysed copy holds as one storage
 
     def specialise(copy: dace.SDFG) -> dict:
-        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops, arrays, value_sets) \
+        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops, arrays, rank_values) \
             if symbols or scalars else {}
         if member_aliases:
             folded.extend(fold_member_aliases(copy, member_aliases, recorded))
@@ -1306,8 +1308,7 @@ def main() -> int:
         print(f"values that differ between the ranks, kept with their sets: {value_sets}", flush=True)
     scratch_names = list(args.scratch)
     if args.auto_scratch:
-        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, value_sets,
-                                       rank_values)
+        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, rank_values)
     scratch, scratch_images = [], {}
     if scratch_names:
         scratch, scratch_images = make_scratch_transient(sdfg, scratch_names, recorded)
@@ -1327,7 +1328,7 @@ def main() -> int:
         print(f"specialised to {len(values)} of {len(recorded)} invariant values: "
               f"{values}", flush=True)
     if values:
-        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops, arrays, value_sets)
+        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops, arrays, rank_values)
         print(f"arrays of records handed over per element: {split}", flush=True)
     if args.specialize:
         # A member of an element of a module array of records that IS another array of the SDFG (the sizing run's

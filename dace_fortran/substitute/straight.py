@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import math
 import re
 
 import dace
@@ -138,7 +139,7 @@ def unroll_small_maps(sdfg: dace.SDFG, limit: int = 8) -> int:
                     if entry.map.schedule in dace.dtypes.GPU_SCHEDULES:
                         continue
                     ranges = _constant_ranges(entry)
-                    if ranges is None or len(list(itertools.product(*ranges))) > limit:
+                    if ranges is None or math.prod(len(r) for r in ranges) > limit:
                         continue
                     inner = state.scope_subgraph(entry, include_entry=False, include_exit=False).nodes()
                     if not all(isinstance(n, (nodes.Tasklet, nodes.AccessNode)) for n in inner):

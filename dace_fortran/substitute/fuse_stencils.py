@@ -85,16 +85,14 @@ def _fold_conditional_expressions(text: str) -> str:
     return ast.unparse(tree) if fold.changed else text
 
 
-def fold_conditions_over_value_sets(sdfg: dace.SDFG, sets: dict[str, list]) -> int:
-    """Replace every branch and interstate condition that reads only names of ``sets`` and comes out the same for
-    every combination of their values by that literal (``bc <= -5`` with ``bc`` one of 0 and -3 is false whichever
-    the rank has); conditions that differ between the values stay.  Returns the number of conditions replaced."""
-    import itertools
-
-    names = sorted(sets)
-    combinations = list(itertools.product(*(sets[n] for n in names)))
-
+def fold_conditions_over_cases(sdfg: dace.SDFG, cases: list[dict]) -> int:
+    """Replace every branch and interstate condition that reads only names the ``cases`` give values to and comes
+    out the same in every case by that literal (``bc <= -5`` with ``bc`` 0 on one rank and -3 on the other is false
+    on both); conditions that differ between the cases stay.  ``cases``: the combinations of values the SDFG may
+    run with, one per rank (each case gives the same names).  Returns the number of conditions replaced."""
     import ast
+
+    names = set(cases[0]) if cases else set()
 
     functions = {"Min": min, "Max": max, "abs": abs, "int": int}
 
@@ -109,13 +107,13 @@ def fold_conditions_over_value_sets(sdfg: dace.SDFG, sets: dict[str, list]) -> i
         except SyntaxError:
             return None
         read = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        if not read & set(names) or not read <= set(names) | set(functions):
+        if not read & names or not read <= names | set(functions):
             return None
         results = set()
-        for values in combinations:
+        for case in cases:
             try:
                 value = eval(compile(tree, "<condition>", "eval"), {"__builtins__": {}},  # noqa: S307 -- our own text
-                             {**functions, **dict(zip(names, values, strict=True))})
+                             {**functions, **case})
             except Exception:  # noqa: BLE001 -- not decidable this way
                 return None
             results.add(bool(value))

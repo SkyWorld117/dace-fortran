@@ -65,11 +65,11 @@ def _branch_on_symbol(condition: str) -> dace.SDFG:
     return sdfg
 
 
-def test_a_condition_the_same_for_every_value_of_a_set_folds_and_one_that_differs_stays():
-    from dace_fortran.substitute.fuse_stencils import fold_conditions_over_value_sets
+def test_a_condition_the_same_on_every_rank_folds_and_one_that_differs_stays():
+    from dace_fortran.substitute.fuse_stencils import fold_conditions_over_cases
 
     sdfg = _branch_on_symbol("bc <= -5")  # a boundary condition no rank has: bc is 0 on one rank, -3 on the other
-    assert fold_conditions_over_value_sets(sdfg, {"bc": [0, -3]}) == 1
+    assert fold_conditions_over_cases(sdfg, [{"bc": 0}, {"bc": -3}]) == 1
     sdfg.simplify()
     assert not any(isinstance(b, ConditionalBlock) for b in sdfg.all_control_flow_blocks(recursive=True))
     x, out = np.arange(8, dtype=np.float64), np.zeros(8)
@@ -77,7 +77,7 @@ def test_a_condition_the_same_for_every_value_of_a_set_folds_and_one_that_differ
     np.testing.assert_array_equal(out, 3.0 * x)
 
     kept = _branch_on_symbol("bc >= 0")  # the exchange with a neighbour: one rank has it, the other has not
-    assert fold_conditions_over_value_sets(kept, {"bc": [0, -3]}) == 0
+    assert fold_conditions_over_cases(kept, [{"bc": 0}, {"bc": -3}]) == 0
     kept.simplify()
     assert any(isinstance(b, ConditionalBlock) for b in kept.all_control_flow_blocks(recursive=True))
     out = np.zeros(8)
@@ -85,3 +85,16 @@ def test_a_condition_the_same_for_every_value_of_a_set_folds_and_one_that_differ
     np.testing.assert_array_equal(out, 3.0 * x)
     kept(x=x, out=out, bc=0)
     np.testing.assert_array_equal(out, 2.0 * x)
+
+
+def test_a_condition_is_decided_over_the_ranks_combinations_not_every_combination_of_their_values():
+    """Each rank has a neighbour on one side, so ``bc >= 0 or bd >= 0`` holds on every rank, though not for every
+    combination of the two sets of values; and many values that differ between the ranks cost one evaluation per
+    rank (4 ranks, 40 names: 4, not 4**40)."""
+    from dace_fortran.substitute.fuse_stencils import fold_conditions_over_cases
+
+    sdfg = _branch_on_symbol("(bc >= 0) or (bd >= 0)")
+    sdfg.add_symbol("bd", dace.int64)
+    others = {f"v{k}": 0 for k in range(40)}
+    cases = [{"bc": b, "bd": d, **{n: r for n in others}} for r, (b, d) in enumerate([(0, -3), (-3, 1), (2, -3), (-3, 0)])]
+    assert fold_conditions_over_cases(sdfg, cases) == 1
