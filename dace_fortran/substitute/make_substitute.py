@@ -1019,6 +1019,9 @@ def expose_private_imports(
         public = public_variables(sources[mod], mod)
         for item in m.group(2).split(","):
             name = item.split("=>")[-1].strip().lower()
+            if re.search(rf"^\s*(?:[\w()]+\s+)*(?:subroutine|function)\s+{name}\b", sources[mod],
+                         re.IGNORECASE | re.MULTILINE):
+                continue  # a module procedure (a call of a --binding-prologue, say), reached as it is
             declared = re.search(rf"::[^!\n]*\b{name}\b", sources[mod], re.IGNORECASE)
             if name and name not in public and declared and name not in wanted.get(mod, []):
                 wanted.setdefault(mod, []).append(name)
