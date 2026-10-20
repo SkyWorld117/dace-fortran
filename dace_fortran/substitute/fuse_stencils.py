@@ -27,6 +27,7 @@ from dace.sdfg.state import ConditionalBlock, LoopRegion
 from dace.subsets import Range
 from dace.transformation.dataflow.otf_stencil_fusion import OTFStencilFusion
 from dace.transformation.dataflow.tile_stencil_fusion import TileStencilFusion
+from dace.transformation.interstate import StateFusion
 from dace.transformation.passes.constant_propagation import ConstantPropagation
 from dace.transformation.passes.dead_state_elimination import DeadStateElimination
 
@@ -208,6 +209,62 @@ def stencil_pairs(sdfg: dace.SDFG, fusion: type = OTFStencilFusion
     return pairs
 
 
+def _movable_past(edge, sdfg: dace.SDFG) -> bool:
+    """Whether ``edge``'s symbol assignments can move onto the edges out of its destination state unchanged in effect:
+    the edge is unconditional and the state's only way in, the state reads none of the symbols, their values read no
+    data (a state changes no symbol, but may change a container), and no edge out of the state reads one of them (in
+    its condition or an assignment, which see the values of before the edge's own assignments)."""
+    state, graph = edge.dst, edge.dst.parent_graph
+    assigned = set(edge.data.assignments)
+    if not assigned or not edge.data.is_unconditional() or not isinstance(state, dace.SDFGState):
+        return False
+    if graph.in_degree(state) != 1 or not graph.out_degree(state) or assigned & set(state.free_symbols):
+        return False
+    if any(set(map(str, symbolic.free_symbols_and_functions(v))) & set(sdfg.arrays)
+           for v in edge.data.assignments.values()):
+        return False
+    for out in graph.out_edges(state):
+        reads = set(out.data.condition.get_free_symbols()) | {
+            str(x) for v in out.data.assignments.values() for x in symbolic.free_symbols_and_functions(v)}
+        if reads & assigned:
+            return False
+    return True
+
+
+def join_stencil_states(sdfg: dace.SDFG) -> int:
+    """Fuse each state holding a stencil's consumer into its producer's state where only symbol assignments the
+    consumer's state does not read keep them apart (loop bounds of later code a source sets between the two, say: a
+    value it knows only at run time stays an assignment, a constant would have been propagated): the assignments
+    move onto the edges out of the consumer's state (one of those that assigns a symbol again keeps its own value),
+    the two states fuse, and the stencil fusion sees the pair. Returns the number of states joined."""
+    joined = 0
+    for state in list(sdfg.states()):
+        graph = state.parent_graph
+        tops = set(_top_maps(state))
+        written = {n.data for n in state.data_nodes() if sdfg.arrays[n.data].transient and state.in_degree(n) == 1
+                   and isinstance(state.in_edges(n)[0].src, nodes.MapExit)
+                   and state.entry_node(state.in_edges(n)[0].src) in tops}
+        if not written or graph.out_degree(state) != 1:
+            continue
+        edge = graph.out_edges(state)[0]
+        after = edge.dst
+        if not isinstance(after, dace.SDFGState) or not any(n.data in written and after.out_degree(n)
+                                                            for n in after.data_nodes()):
+            continue
+        if edge.data.assignments:
+            if not _movable_past(edge, sdfg):
+                continue
+            for out in graph.out_edges(after):
+                out.data.assignments = {**edge.data.assignments, **out.data.assignments}
+            edge.data.assignments = {}
+        fusion = StateFusion()
+        fusion.first_state, fusion.second_state = state, after
+        if fusion.can_be_applied(graph, 0, sdfg):
+            StateFusion.apply_to(sdfg, first_state=state, second_state=after, verify=False)
+            joined += 1
+    return joined
+
+
 def body_tasklets(state: dace.SDFGState, entry: nodes.MapEntry) -> int:
     """The tasklets of the map ``entry``'s body, those of the nested SDFGs in it included: what a kernel computes per
     point."""
@@ -227,6 +284,7 @@ def fuse_stencil_pairs(sdfg: dace.SDFG, tile: bool = False, max_tasklets: int = 
     consumer bodies hold more tasklets together stays apart (0: no limit) -- one kernel then holds both bodies'
     registers at once and runs slower than the two (a WENO reconstruction of 489 tasklets into an HLLD solver of 558:
     14% slower fused)."""
+    join_stencil_states(sdfg)
     propagate_memlets_sdfg(sdfg)
     fused, apart = [], set()
     # The tile fusion takes the pairs it can (constant offsets along the parameters, no range reads); the

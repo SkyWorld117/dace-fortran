@@ -1,0 +1,64 @@
+"""join_stencil_states: a stencil's producer and consumer in two states that only symbol assignments keep apart (loop
+bounds of later code a source sets between them) fuse into one state, the assignments moving past the consumer, so
+the stencil fusion sees the pair."""
+import dace
+import numpy as np
+
+from dace_fortran.substitute.fuse_stencils import fuse_stencil_pairs, join_stencil_states
+from tests.substitute.test_fuse_limit import _body
+
+
+def _split_pair(consumer_range: str = "1:14") -> dace.SDFG:
+    """tmp[i] = 2 * a[i] + 1 over 1..14, then iend = p, then b[j] = tmp[j + 1] - 1 over ``consumer_range``, then
+    c[0] = iend."""
+    sdfg = dace.SDFG("split_pair")
+    sdfg.add_symbol("p", dace.int64)
+    sdfg.add_symbol("iend", dace.int64)
+    for name, size in (("a", 16), ("b", 16), ("c", 1)):
+        sdfg.add_array(name, [size], dace.float64)
+    sdfg.add_transient("tmp", [16], dace.float64)
+    first = sdfg.add_state("produce_state", is_start_block=True)
+    pentry, pexit = first.add_map("produce", {"i": "1:15"})
+    produce = first.add_nested_sdfg(_body("produce", {"x": "a[i]"}, ("tmp", "tmp[i]"), ["o = 2 * x", "o = x + 1"]),
+                                    {"a"}, {"tmp"}, {"i": "i"})
+    first.add_memlet_path(first.add_read("a"), pentry, produce, dst_conn="a", memlet=dace.Memlet("a[0:16]"))
+    first.add_memlet_path(produce, pexit, first.add_write("tmp"), src_conn="tmp", memlet=dace.Memlet("tmp[i]"))
+    second = sdfg.add_state("consume_state")
+    centry, cexit = second.add_map("consume", {"j": consumer_range})
+    consume = second.add_nested_sdfg(_body("consume", {"r": "tmp[i + 1]"}, ("b", "b[i]"), ["o = r - 1"]),
+                                     {"tmp"}, {"b"}, {"i": "j"})
+    second.add_memlet_path(second.add_read("tmp"), centry, consume, dst_conn="tmp", memlet=dace.Memlet("tmp[j + 1]"))
+    second.add_memlet_path(consume, cexit, second.add_write("b"), src_conn="b", memlet=dace.Memlet("b[j]"))
+    third = sdfg.add_state("use_state")
+    tasklet = third.add_tasklet("use", {}, {"o"}, "o = iend")
+    third.add_edge(tasklet, "o", third.add_write("c"), None, dace.Memlet("c[0]"))
+    sdfg.add_edge(first, second, dace.InterstateEdge(assignments={"iend": "p"}))
+    sdfg.add_edge(second, third, dace.InterstateEdge())
+    return sdfg
+
+
+def test_an_assignment_the_consumer_does_not_read_moves_past_it_and_the_pair_fuses(tmp_path):
+    sdfg = _split_pair()
+    assert join_stencil_states(sdfg) == 1
+    assert len(list(sdfg.states())) == 2
+    (edge,) = sdfg.edges()
+    assert edge.data.assignments == {"iend": "p"}  # now after the consumer, before the state that reads it
+    # The joined SDFG computes what the split one does (the fused one is not built: the recomputing fusion of these
+    # hand-made bodies leaves their parameter symbol free, joined or not).
+    sdfg.build_folder = str(tmp_path / "build")
+    a = np.arange(16, dtype=np.float64)
+    b = np.zeros(16)
+    c = np.zeros(1)
+    sdfg(a=a, b=b, c=c, p=7)
+    expected = np.zeros(16)
+    expected[1:14] = 2 * a[2:15] + 1 - 1
+    np.testing.assert_array_equal(b, expected)
+    assert c[0] == 7
+    assert fuse_stencil_pairs(_split_pair()) == ["tmp (recompute)"]  # joined first, then fused
+
+
+def test_an_assignment_the_consumer_reads_keeps_the_states_apart():
+    sdfg = _split_pair(consumer_range="1:iend")
+    assert join_stencil_states(sdfg) == 0
+    assert len(list(sdfg.states())) == 3
+    assert sdfg.edges_between(*list(sdfg.states())[:2])[0].data.assignments == {"iend": "p"}
