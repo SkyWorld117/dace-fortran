@@ -972,9 +972,10 @@ std::string dtypeName(mlir::Type t) {
     unsigned const w = it.getWidth();
     return (w == 8 || w == 16 || w == 32 || w == 64) ? "int" + std::to_string(w) : "";
   }
-  if (auto lt = mlir::dyn_cast<fir::LogicalType>(t)) {
-    int const k = lt.getFKind();
-    return (k == 1 || k == 2 || k == 4 || k == 8) ? "uint" + std::to_string(8 * k) : "";
+  if (mlir::isa<fir::LogicalType>(t)) {
+    // Fortran LOGICAL is carried as ``bool`` throughout the builder (our extract_vars uses the same spelling):
+    // ``uint32`` has no Fortran spelling, so the ABI/manifest writer refuses it (non_hydrostatic/top_lid).
+    return "bool";
   }
   if (auto ct = mlir::dyn_cast<mlir::ComplexType>(t)) {
     mlir::Type const et = ct.getElementType();
