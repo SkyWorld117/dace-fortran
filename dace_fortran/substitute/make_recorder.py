@@ -11,6 +11,7 @@ substitute.json). Candidates whose module source is not found, or whose variable
 as not recordable.
 
 Usage: make_recorder.py [--fypp <dir> ...] <file.hlfir> <module::procedure> <fypp dir> <out dir> [<record>]
+  --fortran-compiler gfortran: GNU caller linker names (default nvfortran); compile the stand-in with the caller.
   <record>: a record of an earlier recorder of the same entry: its values prune the code first, so variables passed on
   only in branches this configuration never runs become recordable too.
   <fypp dir>: the build's preprocessed sources (build/staging/<slug>/fypp/simulation), searched for the modules.
@@ -26,6 +27,7 @@ import re
 import sys
 from pathlib import Path
 
+from dace_fortran.substitute.link_symbols import procedure_symbol
 from dace_fortran.substitute.module_copies import access_entries, module_files, write_access_copies
 
 
@@ -41,6 +43,8 @@ def _prefix_pipeline() -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--fortran-compiler", choices=("nvfortran", "gfortran"), default="nvfortran",
+                    help="compiler of the caller, generated stand-in and bindings (default nvfortran)")
     ap.add_argument("--fypp", type=Path, action="append", default=[], help="more source directories (repeatable)")
     ap.add_argument("--record-per-rank", action="store_true", help="a process MPI launched records to "
                     "<record>.<rank> (the records of all ranks together are the values equal on every rank)")
@@ -136,8 +140,7 @@ def main() -> int:
             {
                 "shim": str(shim),
                 "shim_symbol": standin_name("record", procedure) + "_",
-                # nvfortran's name of a module procedure.
-                "wrap_symbol": f"{module_name}_{procedure}_",
+                "wrap_symbol": procedure_symbol(module_name, procedure, args.fortran_compiler),
                 "original_symbol": standin_name("original", procedure) + "_",
                 "record": str(record),
                 # Copies of the modules whose private variables the stand-in reads, linked in place of the originals.

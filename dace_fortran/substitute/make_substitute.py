@@ -9,6 +9,9 @@ link step needs to put the substitute in place of the routine -- the routine's s
 with the routine's own interface that calls the binding, and runs the original routine (``dace_original_<routine>``)
 when the binding declines the call (generated, or hand-written with --shim).
 
+--fortran-compiler gfortran selects GNU module linker names; the default is nvfortran.
+Compile the generated binding and stand-in with the same compiler as the caller.
+
 --config <file.toml>: defaults of these options from the file's [make_substitute] table (substitute.config).
 
 --record <file>: the binding appends the integer symbols and scalar inputs of every call to <file>.  --specialize <file>:
@@ -60,6 +63,7 @@ from dace_fortran.external import ExternalCall, keep_external
 from dace_fortran import pipelines as P
 from dace_fortran.pipelines import num_maps, specialize
 from dace_fortran.substitute.config import parse_with_config
+from dace_fortran.substitute.link_symbols import procedure_symbol
 from dace_fortran.substitute.module_copies import access_entries, module_files, write_access_copies
 from dace_fortran.substitute.wcr_accumulations import accumulations_to_wcr
 
@@ -1197,6 +1201,8 @@ def config_path(path, config) -> Path:
 def main() -> int:
     global DUMP_DIR, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH, STARTUP
     ap = argparse.ArgumentParser()
+    ap.add_argument("--fortran-compiler", choices=("nvfortran", "gfortran"), default="nvfortran",
+                    help="compiler of the caller, generated stand-in and bindings (default nvfortran)")
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--combine-divisions", action="store_true",
                     help="opt-in numerics: compute each normalisation of quotients (w_k = a_k / sum_j a_j with "
@@ -1522,7 +1528,7 @@ def main() -> int:
         "sdfg_name": sdfg.name,
         "entry": iface.entry,
         "gpu": args.gpu,
-        "wrap_symbol": f"{module}_{routine}_",
+        "wrap_symbol": procedure_symbol(module, routine, args.fortran_compiler),
         "shim": str(shim),
         "shim_symbol": f"dace_sub_{routine}_",
         "original_symbol": f"dace_original_{routine}_",

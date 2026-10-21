@@ -39,3 +39,12 @@ def test_make_substitute_parses_its_flags():
     assert not ap.parse_args(["x.hlfir", "m::r", "out"]).fma  # no FMA by default
     assert not ap.parse_args(["--no-fma", "x.hlfir", "m::r", "out"]).fma
     assert ap.parse_args(["x.hlfir", "m::r", "out"]).scalarise
+
+
+def test_both_tools_select_the_caller_compiler():
+    root = Path(__file__).resolve().parents[2] / "dace_fortran" / "substitute"
+    for tool, positional in (("make_substitute.py", ["x.hlfir", "m::r", "out"]),
+                             ("make_recorder.py", ["x.hlfir", "m::r", "fypp", "out"])):
+        ap = _parser_of(root / tool)
+        assert ap.parse_args(positional).fortran_compiler == "nvfortran"
+        assert ap.parse_args(["--fortran-compiler", "gfortran", *positional]).fortran_compiler == "gfortran"
