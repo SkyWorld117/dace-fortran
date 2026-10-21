@@ -1025,10 +1025,22 @@ def build_wrapper_tail(
     # C interface declares every array arg as type(c_ptr), value: wrap the actual
     # with c_loc(...) explicitly -- implicit pointer->c_ptr conversion only applies
     # to intent-typed dummies, not value dummies (gfortran rejects otherwise).
+    def _symbol_actual(name: str, actual: str | None = None) -> str:
+        """Convert a caller's integer dummy when shape lowering widened its C ABI symbol."""
+        actual = actual or name
+        declaration = _init_symbol_decl(name, frozen).split(",", 1)[0]
+        outer = next((a for a in iface.args if a.name.lower() == actual.lower()), None)
+        if (outer is not None and outer.rank == 0 and declaration.startswith("integer(")
+                and outer.fortran_type.lower().startswith("integer")
+                and outer.fortran_type.lower().replace(" ", "") != declaration):
+            kind = declaration[len("integer("):-1]
+            return f"int({actual}, kind={kind})"
+        return actual
+
     def _call_actual(a: FrozenArg | str) -> str:
         if isinstance(a, str):
             # Free symbol: wrapper-local DaCe sees by value (declared+populated earlier).
-            return a
+            return _symbol_actual(a)
         actual = name_override.get(a.sdfg_name, a.sdfg_name)
         if a.kind is FrozenArgKind.MPI_COMM:
             # The C ``MPI_Comm`` (f2c result), not the integer dummy.
@@ -1037,11 +1049,14 @@ def build_wrapper_tail(
             return _device_address_local(a.sdfg_name)
         if a.kind is FrozenArgKind.ARRAY or a.rank > 0:
             return f"c_loc({actual})"
+        if a.kind is FrozenArgKind.SYMBOL:
+            return _symbol_actual(a.sdfg_name, actual)
         return actual
 
     call_args = ",  &\n".join(f"      {_call_actual(a)}" for a in _dace_call_order(frozen, dace_arglist))
     call_block = tpl.format(
-        entry=iface.entry, call_arg_list=call_args, init_call_args=", ".join(_init_sym_names(frozen, init_symbols))
+        entry=iface.entry, call_arg_list=call_args,
+        init_call_args=", ".join(_symbol_actual(s) for s in _init_sym_names(frozen, init_symbols))
     )
 
     copy_out_lines: list[str] = []
