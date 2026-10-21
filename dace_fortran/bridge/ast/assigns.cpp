@@ -2076,7 +2076,7 @@ std::vector<ASTNode> evaluateBeforeAssigning(ASTNode nest, mlir::Type elementTyp
 
   // Every element of the right-hand side lands in a transient over the same iteration space first, then the transient
   // is assigned to the target.
-  std::string const dtype = dtypeName(elementType);
+  std::string const dtype = dtypeName(elementType, /*logical_as_bool=*/false);  // an array element keeps its width
   std::string const tmp = "_rhs_" + std::to_string(kSynthTransientCounter++);
   if (dtype.empty())
     throw UnsupportedConstruct("assignment to \"" + inner.target +

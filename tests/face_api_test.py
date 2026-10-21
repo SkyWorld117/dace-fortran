@@ -15,6 +15,18 @@ PACKAGE = Path(__file__).resolve().parents[1] / "dace_fortran"
 #: The emitters bind the node modules to these local names with ``importlib.import_module``.
 NODE_MODULES = {"blas_nodes": "dace.libraries.blas.nodes", "lapack_nodes": "dace.libraries.lapack.nodes"}
 
+#: Imports this fork deliberately leaves unresolved: each is lazy (inside the function that needs the
+#: feature) and the module raises a clear error only when that feature is actually used.  The key is
+#: ``(path relative to the package, module, name)``; the value says what has to land first.
+DEFERRED = {
+    ("substitute/fold_aliases.py", "dace.sdfg", "dealias"):
+        "the No-View-NSDFG dealias pass, deferred with the OTF/Tile stencil-fusion batch",
+    ("substitute/fuse_stencils.py", "dace.transformation.dataflow.otf_stencil_fusion", "OTFStencilFusion"):
+        "the OTF stencil-fusion family, not ported",
+    ("substitute/fuse_stencils.py", "dace.transformation.dataflow.tile_stencil_fusion", "TileStencilFusion"):
+        "the Tile stencil-fusion family, not ported",
+}
+
 
 def python_files() -> Iterator[Path]:
     return (path for path in sorted(PACKAGE.rglob("*.py")) if "build" not in path.relative_to(PACKAGE).parts)
@@ -49,6 +61,8 @@ def resolves(module: str, name: str) -> bool:
 def test_every_dace_import_resolves():
     missing = []
     for path, line, module, name in dace_imports():
+        if (path.relative_to(PACKAGE).as_posix(), module, name) in DEFERRED:
+            continue
         try:
             ok = resolves(module, name)
         except ImportError as exc:

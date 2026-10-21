@@ -246,8 +246,12 @@ fir::RecordType allocOrPtrArrayOfRecordsMember(mlir::Type t);
 mlir::Value presentBranchOfRuntimeOptional(fir::IfOp ifOp, mlir::Value result);
 
 /// The DaCe dtype name of a scalar element type, "" for a type with no DaCe dtype.  ``LOGICAL(KIND=k)`` is the
-/// unsigned integer of its width (``uint8`` .. ``uint64``): the SDFG works on the caller's LOGICAL storage, reads it as
-/// ``!= 0`` and writes 0 / 1 (flang's and gfortran's .FALSE. / .TRUE.).  MLIR's ``i1`` is ``bool``.
-std::string dtypeName(mlir::Type t);
+/// unsigned integer of its width (``uint8`` .. ``uint64``) -- what an ARRAY crosses as, so the SDFG works on the
+/// caller's LOGICAL storage, reads it as ``!= 0`` and writes 0 / 1 (flang's and gfortran's .FALSE. / .TRUE.).
+/// A LOGICAL *SCALAR* uses ``bool`` instead when ``logical_as_bool`` (the default): the WRF ABI spells that
+/// ``logical(c_bool)`` in the manifest/shim pair, while ``uint32`` has no Fortran spelling at all and was refused
+/// for non_hydrostatic / top_lid.  Pass ``false`` at an array-element call site to keep the element width.
+/// MLIR's ``i1`` is always ``bool``.
+std::string dtypeName(mlir::Type t, bool logical_as_bool = true);
 
 }  // namespace hlfir_bridge

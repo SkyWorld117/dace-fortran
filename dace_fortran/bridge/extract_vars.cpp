@@ -2368,7 +2368,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
     }
 
     // Element type string.
-    if (std::string dt = dtypeName(ty); !dt.empty())
+    if (std::string dt = dtypeName(ty, /*logical_as_bool=*/false); !dt.empty())
       v.dtype = dt;
     else if (mlir::isa<mlir::ComplexType>(ty)) {
       std::string s;
@@ -2666,7 +2666,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
                     bool const staticExtent = !ext.empty() && ext.find_first_not_of("0123456789") == std::string::npos;
                     mv.lower_bounds.emplace_back(staticExtent ? "1" : "?");
                   }
-                  std::string dtype = dtypeName(elemTy);
+                  std::string dtype = dtypeName(elemTy, /*logical_as_bool=*/false);
                   if (dtype.empty()) continue;
                   mv.dtype = dtype;
                   // Marshalling provenance: this flat array is the SoA image of
@@ -4507,7 +4507,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
         // DIRECT struct array member is split by the flatten pass into a flat
         // declare; the nested one is left as a designate chain, so the memlet
         // names ``<flat>`` with no backing array.
-        std::string const dt = dtypeName(seq.getEleTy());
+        std::string const dt = dtypeName(seq.getEleTy(), /*logical_as_bool=*/false);
         if (dt.empty()) continue;  // unsupported element type
         int const memberRank = static_cast<int>(seq.getShape().size());
         // Record dims: ``expandDesignateChain`` PREPENDS the record-array
@@ -4881,7 +4881,7 @@ FortranInterfaceInfo extractFortranInterface(mlir::ModuleOp module, const std::s
             }
             mt = seq.getEleTy();
           }
-          if (std::string dt = dtypeName(mt); !dt.empty() && !mlir::isa<mlir::ComplexType>(mt))
+          if (std::string dt = dtypeName(mt, /*logical_as_bool=*/false); !dt.empty() && !mlir::isa<mlir::ComplexType>(mt))
             m.dtype = dt;
           else if (auto nested_rec = mlir::dyn_cast<fir::RecordType>(mt)) {
             // Nested derived-type member: register its name + module
@@ -4991,7 +4991,7 @@ FortranInterfaceInfo extractFortranInterface(mlir::ModuleOp module, const std::s
       // pointer) keep empty dtype + empty struct_name so the
       // Python side can flag them clearly.
       if (!a.struct_name.empty()) recordStructLayoutRecursive(rec, a.struct_module, a.struct_name);
-    } else if (std::string dt = dtypeName(ty); !dt.empty()) {
+    } else if (std::string dt = dtypeName(ty, /*logical_as_bool=*/a.rank == 0); !dt.empty()) {
       a.dtype = dt;
     } else {
       // Unknown element (e.g. character) -- leave dtype empty so the

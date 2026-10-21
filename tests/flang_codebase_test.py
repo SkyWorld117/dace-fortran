@@ -22,6 +22,11 @@ from dace_fortran.flang_codebase import (
     prepare_flang_translation_unit,
 )
 from tests._util import flang_binary
+from dace_fortran.flang_codebase import find_openmpi_include
+
+#: The MPI-stub tests need OpenMPI's include directory (``mpif-config.h``); a system without it must
+#: skip, not fail.
+_HAVE_OPENMPI = find_openmpi_include() is not None
 
 # ICON source: in-repo submodule by default, override with ICON_SRC. Build dir is owned
 # by the icon_build fixture (root conftest.py), built into TMP storage on demand.
@@ -56,6 +61,7 @@ def test_flang_bug_patches_registry_keys():
     assert "mpi_sizeof" in FLANG_BUG_PATCHES
 
 
+@pytest.mark.skipif(not _HAVE_OPENMPI, reason="OpenMPI include not on this system")
 def test_mpi_stub_source_and_flags():
     """The MPI stub source is plain Fortran and the include flag
     points at a directory containing ``mpif-config.h``."""

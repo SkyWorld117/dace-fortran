@@ -150,13 +150,20 @@ def pytest_collection_modifyitems(config, items):
 def icon_build():
     """Configure + build the ICON submodule on demand; return the build dir.
 
-    ``ICON_SRC``/``ICON_BUILD`` override source/build location. A missing submodule fails the test.
+    ``ICON_SRC``/``ICON_BUILD`` override source/build location. Only SKIPS when the submodule isn't
+    checked out (a developer clone without it must not fail); otherwise it always builds.
     """
     from tests.icon.full._icon_build import default_build_dir, ensure_icon_built
 
     icon_src = Path(os.environ.get("ICON_SRC", str(Path(__file__).resolve().parent / "icon" / "full" / "icon-model")))
+    if not (icon_src / "configure").is_file():
+        pytest.skip("icon-model submodule not checked out (run "
+                    "`git submodule update --init tests/icon/full/icon-model`)")
     # builds into TMP by default (no repo-tree pollution); ICON_BUILD overrides to a persistent location
-    return ensure_icon_built(icon_src, default_build_dir())
+    build = ensure_icon_built(icon_src, default_build_dir())
+    if build is None:
+        pytest.skip("icon-model submodule not checked out")
+    return build
 
 
 # --- f2py-reference teardown-crash guard ---------------------------------

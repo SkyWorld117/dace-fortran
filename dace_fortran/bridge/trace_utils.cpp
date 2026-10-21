@@ -962,7 +962,7 @@ fir::RecordType allocOrPtrArrayOfRecordsMember(mlir::Type t) {
   return mlir::dyn_cast<fir::RecordType>(seq.getEleTy());
 }
 
-std::string dtypeName(mlir::Type t) {
+std::string dtypeName(mlir::Type t, bool logical_as_bool) {
   if (auto ft = mlir::dyn_cast<mlir::FloatType>(t)) {
     unsigned const w = ft.getWidth();
     return (w == 16 || w == 32 || w == 64) ? "float" + std::to_string(w) : "";
@@ -972,10 +972,15 @@ std::string dtypeName(mlir::Type t) {
     unsigned const w = it.getWidth();
     return (w == 8 || w == 16 || w == 32 || w == 64) ? "int" + std::to_string(w) : "";
   }
-  if (mlir::isa<fir::LogicalType>(t)) {
-    // Fortran LOGICAL is carried as ``bool`` throughout the builder (our extract_vars uses the same spelling):
-    // ``uint32`` has no Fortran spelling, so the ABI/manifest writer refuses it (non_hydrostatic/top_lid).
-    return "bool";
+  if (auto lt = mlir::dyn_cast<fir::LogicalType>(t)) {
+    // A LOGICAL *SCALAR* is the WRF ABI's ``bool``: the manifest/shim pair spells it ``logical(c_bool)`` (a
+    // 1-byte element), while ``uint32`` has no Fortran spelling at all and was refused for non_hydrostatic /
+    // top_lid.  An ARRAY keeps the caller's element width (the call sites that unwrap an array pass
+    // ``false``): a 4-byte LOGICAL read one byte per element would corrupt the stride.
+    unsigned const k = lt.getFKind();  // bytes
+    if (logical_as_bool && k <= 4) return "bool";
+    if (k == 1 || k == 2 || k == 4 || k == 8) return "uint" + std::to_string(k * 8);
+    return "";
   }
   if (auto ct = mlir::dyn_cast<mlir::ComplexType>(t)) {
     mlir::Type const et = ct.getElementType();
