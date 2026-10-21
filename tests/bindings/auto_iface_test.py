@@ -8,21 +8,17 @@ a human would have written (arg order, iso-c types, rank/shape, intent, and
 the ``use`` list for derived-type dummies), and that it drives a compilable
 binding end-to-end.
 """
+
 from pathlib import Path
 
-import pytest
-
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings import build_fortran_library
 from dace_fortran.bindings.fortran_interface import (
-    DerivedType,
     Member,
     OriginalArg,
     OriginalInterface,
     build_auto_interface,
 )
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def _auto(src: str, tmp_path: Path, name: str, entry: str) -> OriginalInterface:
@@ -41,10 +37,13 @@ def test_auto_iface_flat_matches_handwritten(tmp_path):
     assert auto.entry == "kernel"
     assert auto.used_modules == {}
     assert auto.args == (
-        OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, shape=(), intent="in"),
-        OriginalArg(name="a", fortran_type="complex(c_double)", rank=1, shape=("1", ), intent="in"),
-        OriginalArg(name="x", fortran_type="complex(c_double)", rank=1, shape=("n", ), intent="in"),
-        OriginalArg(name="y", fortran_type="complex(c_double)", rank=1, shape=("n", ), intent="inout"),
+        OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, shape=(), intent="in", passing="address"),
+        OriginalArg(name="a", fortran_type="complex(c_double_complex)", rank=1, shape=("1",), intent="in",
+                    passing="address"),
+        OriginalArg(name="x", fortran_type="complex(c_double_complex)", rank=1, shape=("n",), intent="in",
+                    passing="address"),
+        OriginalArg(name="y", fortran_type="complex(c_double_complex)", rank=1, shape=("n",), intent="inout",
+                    passing="address"),
     )
 
 
@@ -110,7 +109,7 @@ end module kern_aos_mod
     arg = auto.args[0]
     assert arg.name == "pts" and arg.fortran_type == "type(point)"
     assert arg.struct_type == "point" and arg.rank == 1
-    assert auto.used_modules == {"mo_pt": ("point", )}
+    assert auto.used_modules == {"mo_pt": ("point",)}
 
 
 def test_auto_iface_drives_compilable_binding(tmp_path):
@@ -171,11 +170,10 @@ end module kern_fld_mod
 """
     auto = _auto(src, tmp_path, "kern", "kern_fld_mod::kern")
 
-    assert auto.args == (OriginalArg(name="fld",
-                                     fortran_type="type(t_auto_fld)",
-                                     rank=0,
-                                     intent="inout",
-                                     struct_type="t_auto_fld"), )
+    assert auto.args == (
+        OriginalArg(name="fld", fortran_type="type(t_auto_fld)", rank=0, intent="inout", struct_type="t_auto_fld",
+                    passing="address"),
+    )
     assert "t_auto_fld" in auto.struct_types
     st = auto.struct_types["t_auto_fld"]
     assert st.name == "t_auto_fld"
@@ -186,5 +184,11 @@ end module kern_fld_mod
     # literals the bridge sees post-resolution).
     assert st.members == (
         Member(name="a", fortran_type="real(c_double)", rank=2, shape=("4", "5")),
-        Member(name="tag", fortran_type="integer(c_int)", rank=1, shape=("4", )),
+        Member(name="tag", fortran_type="integer(c_int)", rank=1, shape=("4",)),
     )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

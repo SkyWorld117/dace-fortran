@@ -2,7 +2,7 @@
 
 import pytest
 
-from _util import build_sdfg, have_flang
+from tests._util import build_sdfg, have_flang
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
@@ -54,4 +54,8 @@ subroutine main(d)
   d(i + 1) = 5.5 + ptr_patch%w(3, 3, 3)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    build_sdfg(src, tmp_path, name="main", entry="main").build()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

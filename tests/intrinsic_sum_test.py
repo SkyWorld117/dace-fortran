@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/intrinsic_sum_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_sum2loop_1d_without_offset(tmp_path):
@@ -20,7 +17,7 @@ res(3) = SUM(d(2:6))
 
 END SUBROUTINE intrinsic_sum_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_sum_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_sum_function").build()
 
     size = 7
     d = np.full([size], 0, order="F", dtype=np.float64)
@@ -45,7 +42,7 @@ res(3) = SUM(d(3:5))
 
 END SUBROUTINE intrinsic_sum_offset_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_sum_offset_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_sum_offset_function").build()
 
     size = 5
     d = np.full([size], 0, order="F", dtype=np.float64)
@@ -71,7 +68,7 @@ res(4) = SUM(d(2:4, 2:3))
 
 END SUBROUTINE intrinsic_sum2d_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_sum2d_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_sum2d_function").build()
 
     sizes = [5, 3]
     d = np.full(sizes, 42, order="F", dtype=np.float64)
@@ -100,7 +97,7 @@ res(3) = SUM(d(3:5, 8:9))
 
 END SUBROUTINE intrinsic_sum2d_offset_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_sum2d_offset_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_sum2d_offset_function").build()
 
     sizes = [5, 4]
     d = np.full(sizes, 42, order="F", dtype=np.float64)
@@ -114,3 +111,9 @@ END SUBROUTINE intrinsic_sum2d_offset_function
     assert res[0] == 190
     assert res[1] == 190
     assert res[2] == 57
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

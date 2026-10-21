@@ -5,12 +5,10 @@ to ``REAL(z,kind)``/``AIMAG(z)``, with LHS support), not struct field
 accesses -- the bridge must not scope-qualify them and must preserve the
 COMPLEX dtype on the SDFG signature rather than splitting into ``_re``/``_im``.
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 # ===========================================================================
@@ -143,8 +141,9 @@ SUBROUTINE cplx_re_vs_real(z, out_field, out_intr)
 END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path / "sdfg", name="cplx_re_vs_real",
-                      entry="cplx_re_vs_real_mod::cplx_re_vs_real").build()
+    sdfg = build_sdfg(
+        src, tmp_path / "sdfg", name="cplx_re_vs_real", entry="cplx_re_vs_real_mod::cplx_re_vs_real"
+    ).build()
     z = np.array([2.5 - 1.5j], dtype=np.complex128, order="F")
     field = np.zeros(1, dtype=np.float64)
     intr = np.zeros(1, dtype=np.float64)
@@ -166,8 +165,9 @@ SUBROUTINE cplx_im_vs_aimag(z, out_field, out_intr)
 END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path / "sdfg", name="cplx_im_vs_aimag",
-                      entry="cplx_im_vs_aimag_mod::cplx_im_vs_aimag").build()
+    sdfg = build_sdfg(
+        src, tmp_path / "sdfg", name="cplx_im_vs_aimag", entry="cplx_im_vs_aimag_mod::cplx_im_vs_aimag"
+    ).build()
     z = np.array([2.5 - 1.5j], dtype=np.complex128, order="F")
     field = np.zeros(1, dtype=np.float64)
     intr = np.zeros(1, dtype=np.float64)
@@ -194,16 +194,17 @@ END MODULE
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="cplx_signature", entry="cplx_signature_mod::cplx_signature").build()
     arglist = sdfg.arglist()
-    assert 'z' in arglist
+    assert "z" in arglist
     # No spurious split arrays
-    assert 'z_re' not in arglist
-    assert 'z_im' not in arglist
-    assert 're' not in arglist
-    assert 'im' not in arglist
+    assert "z_re" not in arglist
+    assert "z_im" not in arglist
+    assert "re" not in arglist
+    assert "im" not in arglist
     # dtype is complex128 (16-byte)
     import dace
-    z_arr = arglist['z']
-    assert z_arr.dtype == dace.complex128, (f"expected dace.complex128, got {z_arr.dtype}")
+
+    z_arr = arglist["z"]
+    assert z_arr.dtype == dace.complex128, f"expected dace.complex128, got {z_arr.dtype}"
 
 
 # ===========================================================================
@@ -233,7 +234,7 @@ END MODULE
 
 
 # ===========================================================================
-# User ``im`` INTEGER var vs COMPLEX ``%im`` accessor: _RESERVED_DACE_NAMES
+# User ``im`` INTEGER var vs COMPLEX ``%im`` accessor: RESERVED_DACE_NAMES
 # shield handles the SymPy collision; the two paths must stay independent.
 # ===========================================================================
 def test_user_integer_im_does_not_conflict_with_complex_im_accessor(tmp_path):
@@ -260,3 +261,9 @@ END MODULE
     sums = np.zeros(1, dtype=np.float64)
     sdfg(z=z, sums=sums, n=np.int32(3))
     assert sums[0] == 12.0  # 2 + 4 + 6
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

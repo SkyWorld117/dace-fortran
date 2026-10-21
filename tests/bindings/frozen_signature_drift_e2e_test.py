@@ -11,10 +11,8 @@ from pathlib import Path
 import dace
 import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings import SignatureDriftError, build_fortran_library
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module axpy_mod
@@ -41,8 +39,9 @@ def _build(tmp_path: Path):
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     sdfg = build_sdfg(_SRC, sdfg_dir, name="axpy", entry="axpy_mod::axpy").build()
     sdfg.validate()
-    assert getattr(sdfg, "_frozen_signature",
-                   None) is not None, ("SDFGBuilder.build() must auto-attach a frozen signature")
+    assert getattr(sdfg, "_frozen_signature", None) is not None, (
+        "SDFGBuilder.build() must auto-attach a frozen signature"
+    )
     return sdfg
 
 
@@ -66,7 +65,7 @@ def test_added_arg_after_freeze_raises(tmp_path: Path):
     """Adding a non-transient array after freeze drifts ``sdfg.arglist()``;
     the builder must reject it instead of linking an uncallable library."""
     sdfg = _build(tmp_path)
-    sdfg.add_array("z_drift", shape=(dace.symbol("n"), ), dtype=dace.float64, transient=False)
+    sdfg.add_array("z_drift", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
     with pytest.raises(SignatureDriftError, match="signature drift"):
         _build_lib(sdfg, tmp_path)
 
@@ -90,3 +89,7 @@ def test_extra_free_symbol_after_freeze_raises(tmp_path: Path):
     sdfg.add_edge(sink, tail, dace.InterstateEdge(condition="drift_sym > 0"))
     with pytest.raises(SignatureDriftError):
         _build_lib(sdfg, tmp_path)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

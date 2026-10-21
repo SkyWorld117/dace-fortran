@@ -9,11 +9,8 @@ REDUCE(...)`` for two distinct ``i`` and checks both elements are populated.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_minval_two_targets(tmp_path: Path):
@@ -27,7 +24,7 @@ subroutine main(d, res)
   res(2) = MINVAL(d(:))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     d = np.array([3.0, 1.0, 5.0, 2.0, 4.0, 7.0, 6.0], dtype=np.float64)
     res = np.zeros(2, dtype=np.float64)
     sdfg(d=d, res=res)
@@ -45,7 +42,7 @@ subroutine main(d, res)
   res(2) = SUM(d(:))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     d = np.array([3.0, 1.0, 5.0, 2.0, 4.0, 7.0, 6.0], dtype=np.float64)
     res = np.zeros(2, dtype=np.float64)
     sdfg(d=d, res=res)
@@ -63,7 +60,7 @@ subroutine main(d, res)
   res(3) = PRODUCT(d(5:6))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     d = np.array([2, 3, 4, 5, 6, 7], dtype=np.int32)
     res = np.zeros(3, dtype=np.int32)
     sdfg(d=d, res=res)
@@ -81,8 +78,14 @@ subroutine main(d, res)
   res(2) = MAXVAL(d)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     d = np.array([3.0, 1.0, 5.0, 2.0, 4.0, 7.0, 6.0], dtype=np.float64)
     res = np.zeros(2, dtype=np.float64)
     sdfg(d=d, res=res)
     np.testing.assert_array_equal(res, [d.min(), d.max()])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

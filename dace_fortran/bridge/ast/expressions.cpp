@@ -39,8 +39,7 @@ namespace hlfir_bridge {
 // #include "bridge/ast/expressions.cpp" and shares that translation
 // unit's namespace, includes, and file-static state.  It MUST NOT be
 // added to the build's compile list  --  CMakeLists.txt deliberately omits
-// it.  The split is purely for readability: the AST builder used to
-// be a single 2800-line file.
+// it.  The split is purely for readability.
 std::vector<std::pair<mlir::Value, std::string>>& indexStack() {
   static thread_local std::vector<std::pair<mlir::Value, std::string>> s;
   return s;
@@ -234,6 +233,36 @@ std::string lowerIsPresent(mlir::Value operand) {
 ///      ``i`` needs ``(lb_outer - 1)`` added so the final memlet
 ///      ``(i + lb_outer - 1) - offset_outer_d0`` collapses to
 ///      ``i - 1`` after specialise (correct for the callee's view).
+mlir::Value declaredLowerBound(hlfir::DeclareOp decl, unsigned dim) {
+  mlir::Value const shape = decl.getShape();
+  if (!shape) return {};
+  if (auto shapeShift = shape.getDefiningOp<fir::ShapeShiftOp>()) {
+    auto origins = shapeShift.getOrigins();  // a fresh vector per call
+    return dim < origins.size() ? origins[dim] : mlir::Value{};
+  }
+  if (auto shift = shape.getDefiningOp<fir::ShiftOp>()) {
+    auto origins = shift.getOrigins();
+    return dim < origins.size() ? origins[dim] : mlir::Value{};
+  }
+  return {};
+}
+
+std::string fortranIndexAt(const std::string& pos, mlir::Value lb, int depth) {
+  if (!lb) return pos;
+  if (auto c = traceConstInt(lb)) {
+    int64_t const adjust = *c - 1;
+    if (adjust > 0) return "(" + pos + " + " + std::to_string(adjust) + ")";
+    if (adjust < 0) return "(" + pos + " - " + std::to_string(-adjust) + ")";
+    return pos;
+  }
+  std::string const lbExpr = buildIndexExpr(lb, depth + 1);
+  // A lower bound we cannot render must NOT poison the whole expression with ``?``: leave the index
+  // unadjusted (the conservative behaviour this code used before symbolic bounds were supported).  A ``?``
+  // here reaches ``emit_scalar_assign`` as an unresolved operand (e.g. a MAXVAL in a do-loop EXIT).
+  if (lbExpr.empty() || lbExpr == "?") return pos;
+  return "(" + pos + " + " + lbExpr + " - 1)";
+}
+
 std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::Value idx, int depth) {
   std::string raw = buildIndexExpr(idx, depth);
   auto memref = dg.getMemref();
@@ -304,6 +333,16 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
         }
       }
       auto idxOps = parentDg.getIndices();
+      // A strided section ``w(lo:hi:st)``: position ``i`` of the view is base subscript ``lo + (i - 1) * st``.
+      // The start-only rebase below would read ``w(lo + i - 1)``, the contiguous elements from ``lo``.
+      auto const stride = found && cursor + 2 < idxOps.size() ? traceConstInt(idxOps[cursor + 2]) : std::nullopt;
+      if (found && cursor + 2 < idxOps.size() && (!stride || *stride != 1)) {
+        auto const lo = traceConstInt(idxOps[cursor]);
+        std::string const loExpr = lo ? std::to_string(*lo) : buildIndexExpr(idxOps[cursor], depth + 1);
+        std::string const stExpr = stride ? std::to_string(*stride) : buildIndexExpr(idxOps[cursor + 2], depth + 1);
+        if (loExpr.empty() || loExpr == "?" || stExpr.empty() || stExpr == "?") return "?";
+        return "(" + loExpr + " + (" + raw + " - 1) * " + stExpr + ")";
+      }
       if (found && cursor < idxOps.size()) {
         if (auto lo = traceConstInt(idxOps[cursor])) {
           int64_t const adjust = *lo - 1;
@@ -325,33 +364,35 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
     return raw;
   }
 
-  // Assumed-shape alias contribution.  The inlined callee's own view has a
-  // LOWER BOUND of its own: 1 for a bare assumed-shape dummy (the Fortran
-  // default), but something else for a callee dummy that declares an explicit
-  // bound (``dimension(0:1000)``, or ``dimension(0:)``, both of which stay
-  // boxes through ``hlfir-inline-all``).  The resolved outer array's offset is
-  // the CALLER's lb, so the callee iter ``i`` must be rebased by
-  // ``(lb_outer - lb_callee)`` for the final memlet
-  // ``(i + lb_outer - lb_callee) - offset_outer`` to collapse to
-  // ``i - lb_callee`` -- the callee view's storage offset.  Using the literal
-  // ``1`` here read one element low whenever the callee dummy declared a lower
-  // bound other than 1 (measured: ``tab(5)`` inside an inlined helper whose
-  // ``tab`` is ``dimension(0:1000)`` lowered to ``tab[4]``; the same access
-  // written inline -- where the callee/outer distinction does not arise --
-  // lowered correctly).
+  // Inlined-callee alias contribution: the callee's subscripts are
+  // relative to its dummy's lower bound (1 by default for assumed
+  // shape; ``a(0:n)`` / ``a(0:)`` declare their own), the resolved outer
+  // array's offset is the caller's lb.  Add ``(lb_outer - lb_inner)`` so
+  // the memlet form gives the right element after specialise.
   auto declOp = mlir::dyn_cast<hlfir::DeclareOp>(defOp);
   if (!declOp) return raw;
   auto outer = asAssumedShapeAlias(declOp);
   if (!outer) return raw;
-  auto outerLbs = declareLowerBounds(outer);
-  if (dim >= outerLbs.size()) return raw;
-  auto const& outerLb = outerLbs[dim];
-  if (!outerLb) return raw;
-  // The callee (inlined alias) view's lower bound, per dim; Fortran default 1
-  // when the declare carries no per-dim bound (bare assumed-shape).
-  auto calleeLbs = declareLowerBounds(declOp);
-  int64_t const lbCallee = (dim < calleeLbs.size() && calleeLbs[dim]) ? *calleeLbs[dim] : 1;
-  int64_t const adjust = *outerLb - lbCallee;
+  auto lbs = declareLowerBounds(outer);
+  if (dim >= lbs.size()) return raw;
+  auto const& lb = lbs[dim];
+  if (!lb) return raw;
+  int64_t adjust = *lb - 1;
+  if (mlir::Value const innerLb = declaredLowerBound(declOp, dim)) {
+    auto innerC = traceConstInt(innerLb);
+    if (!innerC) {
+      std::string const innerExpr = buildIndexExpr(innerLb, depth + 1);
+      // A symbolic inner bound we cannot render must NOT poison the whole expression with ``?`` -- that leaves
+      // an unresolved operand in a condition (e.g. a MAXVAL in a do-loop EXIT).  Fall back to the conservative
+      // constant default this code used before symbolic inner bounds were supported.
+      if (innerExpr.empty() || innerExpr == "?") {
+        adjust = *lb - 1;
+      } else {
+        return "(" + raw + " + " + std::to_string(*lb) + " - " + innerExpr + ")";
+      }
+    }
+    adjust = *lb - *innerC;
+  }
   if (adjust == 0) return raw;
   if (adjust > 0) return "(" + raw + " + " + std::to_string(adjust) + ")";
   return "(" + raw + " - " + std::to_string(-adjust) + ")";
@@ -383,10 +424,8 @@ void captureElementDesignateWrite(mlir::Value dest, ASTNode& node) {
       // and DON'T treat it as an array write (no AccessInfo
       // indexed loop is needed -- the target is a scalar / whole
       // field that downstream emit_assign treats by its own
-      // descriptor classification).  Previously
-      // ``traceToDecl(dg.getMemref())`` returned the struct base
-      // ``g``, leaking ``g`` as the target name and forcing an
-      // array-style write that ``KeyError``ed at arglist lookup.
+      // descriptor classification).  ``traceToDecl(dg.getMemref())``
+      // would return the struct base ``g`` and leak it as the target.
       if (dg.getComponentAttr() && dg.getIndices().empty()) {
         node.target = traceToDecl(dg.getResult());
         // Whole-field write -- target_is_array reflects the field's
@@ -488,6 +527,32 @@ std::string internPosSymbol(const std::string& array, const std::vector<int64_t>
 
 std::string internPosSymbol(const std::string& array, int64_t one_based_idx) {
   return internPosSymbol(array, std::vector<int64_t>{one_based_idx});
+}
+
+BoxDimsSource traceBoxDimsSource(mlir::Value box) {
+  BoxDimsSource src{box, {}};
+  for (int hop = 0; hop < limits::kTraceToDeclMax && src.array; ++hop) {
+    auto* def = src.array.getDefiningOp();
+    if (!def) break;
+    if (auto cv = mlir::dyn_cast<fir::ConvertOp>(def)) {
+      src.array = cv.getValue();
+    } else if (auto ld = mlir::dyn_cast<fir::LoadOp>(def)) {
+      src.array = ld.getMemref();
+    } else if (auto rb = mlir::dyn_cast<fir::ReboxOp>(def);
+               rb && !rb.getSlice() && (!rb.getShape() || rb.getShape().getDefiningOp<fir::ShiftOp>())) {
+      if (!src.boundsRebox) src.boundsRebox = rb;
+      src.array = rb.getBox();
+    } else {
+      break;
+    }
+  }
+  return src;
+}
+
+std::string reboxLowerBound(fir::ReboxOp rebox, unsigned dim, int d) {
+  auto shift = rebox.getShape() ? rebox.getShape().getDefiningOp<fir::ShiftOp>() : fir::ShiftOp{};
+  if (!shift) return "1";
+  return dim < shift->getNumOperands() ? buildIndexExpr(shift->getOperand(dim), d + 1) : "?";
 }
 
 std::string buildExpr(mlir::Value val, int d) {
@@ -709,8 +774,10 @@ std::string buildExpr(mlir::Value val, int d) {
   // ``<arr>_allocated`` scalar that ``extract_vars`` registers and
   // the AST builder maintains at ALLOCATE / DEALLOCATE sites.
   if (auto cmp = mlir::dyn_cast<mlir::arith::CmpIOp>(def)) {
-    if (mlir::Value const src = matchAssociatedStatusBoxRef(cmp))
-      if (auto arrName = traceToDecl(src); !arrName.empty()) return arrName + "_allocated";
+    bool negated = false;
+    if (mlir::Value const src = matchAssociatedStatusBoxRef(cmp, &negated))
+      if (auto arrName = traceToDecl(src); !arrName.empty())
+        return negated ? "(" + arrName + "_allocated == 0)" : arrName + "_allocated";
   }
 
   // ``fir.box_dims %arr_decl, %dim``  --  Flang's lowering for SIZE /
@@ -739,20 +806,9 @@ std::string buildExpr(mlir::Value val, int d) {
     // Walk operand 0 back to the underlying ``hlfir.declare`` so we
     // can read its shape (for explicit-shape) or fall back to the
     // assumed-shape symbol form.
-    mlir::Value arrayVal = def->getOperand(0);
-    for (int hop = 0; hop < limits::kTraceToDeclMax && arrayVal; ++hop) {
-      auto* adef = arrayVal.getDefiningOp();
-      if (!adef) break;
-      if (auto cv = mlir::dyn_cast<fir::ConvertOp>(adef)) {
-        arrayVal = cv.getValue();
-        continue;
-      }
-      if (auto ld = mlir::dyn_cast<fir::LoadOp>(adef)) {
-        arrayVal = ld.getMemref();
-        continue;
-      }
-      break;
-    }
+    BoxDimsSource const src = traceBoxDimsSource(def->getOperand(0));
+    mlir::Value const arrayVal = src.array;
+    fir::ReboxOp const boundsRebox = src.boundsRebox;
     std::string arrName = traceToDecl(arrayVal);
     // ``fir.box_dims`` reads the *box* result (#1) of an
     // ``hlfir.declare``; ``traceToDecl`` keys on the addr result
@@ -783,7 +839,7 @@ std::string buildExpr(mlir::Value val, int d) {
       } else if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(adef)) {
         // A sectioned designate carries the RESULT's per-dim extents on its own
         // ``shape`` operand -- most importantly the LiftAos concat SLICE-BOX
-        // (``concat(idx, 1:d1, 1:d2, ...)`` replacing ``recv_dp(idx)%p``).  That
+        // (``concat(idx, lb1:lb1+d1-1, ...)`` replacing ``recv_dp(idx)%p``).  That
         // slice already dropped the concat's leading N dim, so its dim ``k`` is
         // the concat's dim ``k+1``; ``SIZE`` / ``UBOUND`` on it must read THIS
         // shape (yielding the rebind target's real extent, e.g. ``recv1_dp_d1``
@@ -842,6 +898,7 @@ std::string buildExpr(mlir::Value val, int d) {
     };
 
     // Lower bound (#0):
+    if (resIdx == 0 && boundsRebox) return reboxLowerBound(boundsRebox, dim, d);
     if (resIdx == 0) {
       if (shapeVal) {
         if (auto ss = mlir::dyn_cast<fir::ShapeShiftOp>(shapeVal.getDefiningOp())) {
@@ -929,7 +986,10 @@ std::string buildExpr(mlir::Value val, int d) {
       {"arith.muli", " * "},
       {"arith.addi", " + "},
       {"arith.subi", " - "},
-      {"arith.divsi", " // "},
+      // Fortran integer division truncates: C++ ``/`` on the integer connectors. ``truncatedDivision`` would name
+      // each operand twice, and every operand occurrence here is its own connector.
+      {"arith.divsi", " / "},
+      // Unsigned: floored and truncated division agree.
       {"arith.divui", " // "},
       // Fortran COMPLEX arithmetic  --  flang emits dedicated ops on
       // ``complex<f32>`` / ``complex<f64>`` operands.
@@ -1068,6 +1128,9 @@ std::string buildExpr(mlir::Value val, int d) {
       {"math.sinh", "sinh"},
       {"math.cosh", "cosh"},
       {"math.tanh", "tanh"},
+      {"math.asinh", "asinh"},
+      {"math.acosh", "acosh"},
+      {"math.atanh", "atanh"},
       {"math.exp", "exp"},
       {"math.log", "log"},
       {"math.log10", "log10"},
@@ -1142,10 +1205,9 @@ std::string buildExpr(mlir::Value val, int d) {
   // Notable cases:
   //   * ``math.sinh`` / ``math.cosh`` / ``math.tanh`` exist but Flang
   //     occasionally still emits ``fir.call @sinh``  --  recognise both.
-  //   * Fortran ``MOD`` / ``MODULO`` lower to ``_FortranAMod*Real{4,8}``
-  //     runtime calls; the Python ``math.fmod`` matches Fortran ``MOD``
-  //     (truncated quotient) and a ``(a - b * floor(a/b))`` formula
-  //     matches ``MODULO`` (floored quotient).
+  //   * Fortran ``MOD`` / ``MODULO`` on reals lower to ``_FortranAMod*`` /
+  //     ``_FortranAModulo*`` runtime calls: ``FtnMod`` (truncated) and
+  //     ``FtnModulo`` (floored).
   //   * ``NINT(x)`` lowers to ``llvm.lround``; ``AINT(x)`` to
   //     ``llvm.trunc``; both are supported by DaCe's tasklet codegen
   //     when surfaced as ``round`` / ``trunc`` Python calls.
@@ -1231,31 +1293,6 @@ std::string buildExpr(mlir::Value val, int d) {
           {"clogf", "log"},
           {"csqrtf", "sqrt"},
           {"cabsf", "abs"},
-          // Fortran GAMMA / LOG_GAMMA.  ``GAMMA`` lowers to the C99
-          // runtime ``tgamma[f]`` (Flang emits ``fir.call @tgammaf``
-          // on the f32 path); ``LOG_GAMMA`` lowers to ``lgamma[f]``.
-          // The legacy BSD spelling ``gamma`` is accepted too.  All
-          // map onto the bare ``tgamma`` / ``lgamma`` identifiers,
-          // which DaCe's tasklet codegen rewrites to
-          // ``dace::math::tgamma`` / ``dace::math::lgamma`` (float
-          // overloads, so a real(4) argument is not computed in
-          // double and narrowed).
-          {"tgamma", "tgamma"},
-          {"tgammaf", "tgamma"},
-          {"gamma", "tgamma"},
-          {"gammaf", "tgamma"},
-          {"lgamma", "lgamma"},
-          {"lgammaf", "lgamma"},
-          {"log_gamma", "lgamma"},
-          {"log_gammaf", "lgamma"},
-          // Flang's runtime-library spellings of the same intrinsics
-          // (the ``_FortranA<Name>{4,8}`` convention), in case the
-          // math-to-runtime lowering picks the libm shim instead of
-          // the C99 name.
-          {"_FortranAGamma4", "tgamma"},
-          {"_FortranAGamma8", "tgamma"},
-          {"_FortranALogGamma4", "lgamma"},
-          {"_FortranALogGamma8", "lgamma"},
           // AINT / ANINT  --  same-kind real return, value-only round/trunc.
           {"llvm.trunc.f64", "trunc"},
           {"llvm.trunc.f32", "trunc"},
@@ -1335,12 +1372,10 @@ std::string buildExpr(mlir::Value val, int d) {
       if (cname == "atan2" && call.getNumOperands() >= 2) {
         return "atan2(" + buildExpr(call.getOperand(0), d + 1) + ", " + buildExpr(call.getOperand(1), d + 1) + ")";
       }
-      // Fortran MOD on real operands  --  truncated-quotient
-      // remainder.  Maps directly to ``std::fmod`` (in ``<cmath>``,
-      // pulled in via ``<dace/dace.h>``); integer MOD lowers to
-      // ``arith.remsi`` and never reaches this fir.call branch.
+      // Fortran MOD on real operands: truncated remainder (sign of the dividend), the SDFG's ``FtnMod``.
+      // Integer MOD lowers to ``arith.remsi`` and never reaches this fir.call branch.
       if ((cname == "_FortranAModReal4" || cname == "_FortranAModReal8") && call.getNumOperands() >= 2) {
-        return "fmod(" + buildExpr(call.getOperand(0), d + 1) + ", " + buildExpr(call.getOperand(1), d + 1) + ")";
+        return "FtnMod(" + buildExpr(call.getOperand(0), d + 1) + ", " + buildExpr(call.getOperand(1), d + 1) + ")";
       }
       // Fortran SCALE(x, n)  --  returns ``x * 2^n``.  Maps to
       // ``dace::math::ldexp`` (templated; ``std::ldexp``
@@ -1360,9 +1395,7 @@ std::string buildExpr(mlir::Value val, int d) {
           call.getNumOperands() >= 1) {
         return "ilogb(" + buildExpr(call.getOperand(0), d + 1) + ")";
       }
-      // Fortran MODULO  --  floored-quotient remainder.  ``FtnModulo``
-      // is its SDFG spelling (C++ ``ftn_modulo``); a bare ``%`` in an
-      // SDFG is C's truncating remainder.
+      // Fortran MODULO: floored remainder (sign of the divisor), the SDFG's ``FtnModulo``.
       if ((cname == "_FortranAModuloReal4" || cname == "_FortranAModuloReal8" || cname == "_FortranAModuloInteger4" ||
            cname == "_FortranAModuloInteger8") &&
           call.getNumOperands() >= 2) {
@@ -1387,8 +1420,7 @@ std::string buildExpr(mlir::Value val, int d) {
       // through ``std::pow`` overloads at codegen time -- one handler
       // suffices for every variant.  QE's
       // ``(0.D0, -1.D0) ** nhtol(ih, nt)`` surfaces this as
-      // ``_FortranAzpowi`` and previously yielded a ``?`` tasklet
-      // body because the ``fir.call`` had no handler.
+      // ``_FortranAzpowi``.
       if ((cname == "_FortranAzpowi" || cname == "_FortranAzpowk" || cname == "_FortranAcpowi" ||
            cname == "_FortranAcpowk" || cname == "_FortranAdpowi" || cname == "_FortranAdpowk" ||
            cname == "_FortranAspowi" || cname == "_FortranAspowk") &&
@@ -1409,6 +1441,12 @@ std::string buildExpr(mlir::Value val, int d) {
   if (auto conv = mlir::dyn_cast<fir::ConvertOp>(def)) {
     auto inT = conv.getValue().getType();
     auto outT = conv.getRes().getType();
+    // A LOGICAL read as a truth value, as another LOGICAL kind or as an integer is normalised to 0 / 1; a same-kind
+    // copy keeps the stored bytes and a boolean (i1) stored into a LOGICAL is 0 / 1 already.
+    if (mlir::isa<fir::LogicalType>(inT) && inT != outT) {
+      NoSubscriptGuard const _g;
+      return logicalTruth(conv.getValue(), d + 1, &buildExpr);
+    }
     bool const inIsInt = inT.isInteger(8) || inT.isInteger(16) || inT.isInteger(32) || inT.isInteger(64);
     bool const outIsInt = outT.isInteger(8) || outT.isInteger(16) || outT.isInteger(32) || outT.isInteger(64);
     bool const inIsFloat = mlir::isa<mlir::FloatType>(inT);
@@ -1456,7 +1494,17 @@ std::string buildExpr(mlir::Value val, int d) {
   // we mint for scf.if results already hold 0 / 1, and Python handles
   // ``0 != 0`` as False / ``1 != 0`` as True uniformly.
   if (nm == "arith.trunci" || nm == "arith.extui" || nm == "arith.extsi") {
-    if (def->getNumOperands() == 1) return buildExpr(def->getOperand(0), d + 1);
+    if (def->getNumOperands() == 1) {
+      mlir::Value const src = def->getOperand(0);
+      // A boolean widened to an integer -- what ``merge(1, 0, c)`` (``arith.select %c, 1, 0``) canonicalises to once
+      // its operands are constants -- is that integer, not the boolean: Python compares ``(i == 1) > 0`` either way,
+      // but a symbolic expression of it (an interstate condition, a loop bound) does not, and ``extsi`` makes true -1.
+      if (nm != "arith.trunci" && src.getType().isInteger(1)) {
+        std::string const b = buildBoolExpr(src, d + 1);
+        if (b != "?") return "(" + std::string(nm == "arith.extsi" ? "-1" : "1") + " if " + b + " else 0)";
+      }
+      return buildExpr(src, d + 1);
+    }
   }
 
   // ``fir.is_present``  --  Fortran's ``present(x)`` on an OPTIONAL dummy.
@@ -1542,10 +1590,9 @@ std::string buildExpr(mlir::Value val, int d) {
            ")";
   }
 
-  // Integer remainder  --  ``arith.remsi`` / ``arith.remui``  --  used by some
-  // Fortran ``mod`` lowerings on integers.
+  // Integer Fortran MOD lowers to ``arith.remsi`` / ``arith.remui``: the SDFG's truncated ``FtnMod``.
   if ((nm == "arith.remsi" || nm == "arith.remui") && def->getNumOperands() == 2) {
-    return "(" + buildExpr(def->getOperand(0), d + 1) + " % " + buildExpr(def->getOperand(1), d + 1) + ")";
+    return "FtnMod(" + buildExpr(def->getOperand(0), d + 1) + ", " + buildExpr(def->getOperand(1), d + 1) + ")";
   }
 
   // Scalar min / max idiom: Flang lowers ``min(a, b)`` on f32/f64 to
@@ -1678,11 +1725,9 @@ std::string buildExpr(mlir::Value val, int d) {
     // It walks through ``hlfir.designate`` correctly: section /
     // element designates fall through to the parent name, struct-
     // field designates (component attr set) build the flattened
-    // ``<parent>_<member>`` name (the fix at trace_utils.cpp from
-    // commit 25f8e83).  Previously this branch short-circuited
-    // with ``traceToDecl(dg.getMemref())`` which BYPASSED the
-    // component-aware walk and returned the struct base name
-    // ``g`` instead of ``g_c`` for ``g % c`` scalar reads --
+    // ``<parent>_<member>`` name.  ``traceToDecl(dg.getMemref())``
+    // would bypass the component-aware walk and return the struct
+    // base ``g`` instead of ``g_c`` for a ``g % c`` scalar read,
     // leaking ``g`` as a free symbol into the generated tasklet.
     auto n = traceToDecl(mem);
     if (!n.empty()) {
@@ -1811,7 +1856,11 @@ std::string buildExpr(mlir::Value val, int d) {
       if (isF32 && !kSuppressFloatCast) return "float32(" + lit + ")";
       return lit;
     }
-    if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue())) return std::to_string(i.getInt());
+    if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue())) {
+      // An i1 ``true`` reads back as -1 (all bits set); a LOGICAL stores flang's .TRUE., which is 1.
+      if (i.getType().isInteger(1)) return i.getValue().isZero() ? "False" : "True";
+      return std::to_string(i.getInt());
+    }
   }
 
   // hlfir.apply %elem, %i  --  read one element of an hlfir.elemental expr
@@ -1903,7 +1952,8 @@ std::string buildExpr(mlir::Value val, int d) {
       auto parent = traceToDecl(dg.getMemref());
       if (!parent.empty()) return parent + "_" + comp.getValue().str();
     }
-    auto name = traceToDecl(dg.getMemref());
+    // ``s % lb(1)``: the member names the element, not the record.
+    auto name = traceToDecl(comp ? dg.getResult() : dg.getMemref());
     if (name.empty()) name = traceToDecl(dg.getResult());
     if (name.empty()) return "?";
     auto indices = dg.getIndices();
@@ -2018,12 +2068,8 @@ std::string buildExpr(mlir::Value val, int d) {
     return "any(" + buildExpr(anyOp.getMask(), d + 1) + ")";
   }
 
-  // Unhandled HLFIR op falls through to ``?``.  Logs the op-name +
-  // location to stderr (always-on, previous DACE_FORTRAN_DEBUG_BUILDEXPR
-  // gate is gone) so the missing case is visible without breaking the
-  // ``?``-as-sentinel protocol many tests still rely on for legitimate
-  // fallback paths.  Migration to explicit throws is captured in
-  // ``tasks/audit_question_mark_emissions.md``.
+  // Unhandled HLFIR op falls through to the ``?`` sentinel, which callers use for legitimate fallback paths.
+  // The op name and location go to stderr so a missing case is visible.
   // Cache + log ONCE per op (insert().second is true only on first insertion); re-visits short-circuit at the top.
   if (kUnrenderableOps.insert(def).second) {
     std::string const op_name = def->getName().getStringRef().str();

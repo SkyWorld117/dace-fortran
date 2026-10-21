@@ -4,10 +4,9 @@ inliner engines: the fparser pipeline (:func:`inline_to_ast`) and the regex text
 (:func:`merge_used_modules`).
 
 ``external_functions``/``do_not_emit`` name procedures that stay declared but get their
-executable body emptied (halo/MPI/I/O internals never enter the TU). The deprecated
-``keep_external=`` (fparser only) is a thin shim -- these tests assert byte-identical output
-plus a warning.
+executable body emptied (halo/MPI/I/O internals never enter the TU).
 """
+
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,7 +16,7 @@ import pytest
 
 from dace_fortran.external_functions import ExternalFunction
 from dace_fortran.fparser_inliner import inline_to_ast
-from dace_fortran.preprocess import merge_used_modules, preprocess_fortran_source
+from dace_fortran.preprocess import MergeEngine, merge_used_modules, preprocess_fortran_source
 
 
 def _have_gfortran() -> bool:
@@ -28,10 +27,9 @@ def _gfortran_compiles(src_text: str) -> bool:
     with TemporaryDirectory() as td:
         f = Path(td) / "tu.f90"
         f.write_text(src_text)
-        r = subprocess.run(["gfortran", "-fsyntax-only", "-ffree-line-length-none",
-                            str(f)],
-                           cwd=td,
-                           capture_output=True)
+        r = subprocess.run(
+            ["gfortran", "-fsyntax-only", "-ffree-line-length-none", str(f)], check=False, cwd=td, capture_output=True
+        )
         if r.returncode != 0:
             print(r.stderr.decode())
         return r.returncode == 0
@@ -87,20 +85,11 @@ def test_fparser_external_functions_stub_body():
     assert "a(i)=a(i)*2.0" in out, "the kernel's own body must remain"
 
 
-def test_fparser_external_functions_do_not_emit_keep_external_are_identical():
-    """All three spellings drive the same ``make_noop`` -- byte-identical TUs (the inliner only needs the name; emit-vs-drop is the bridge's concern)."""
+def test_fparser_external_functions_and_do_not_emit_are_identical():
+    """Both spellings drive the same ``make_noop`` -- byte-identical TUs (the inliner only needs the name; emit-vs-drop is the bridge's concern)."""
     via_ext = _fparser_out(external_functions=[ExternalFunction("halo_exchange")])
     via_dne = _fparser_out(do_not_emit=["halo_exchange"])
-    with pytest.warns(DeprecationWarning):
-        via_legacy = _fparser_out(keep_external=["halo_exchange"])
-    assert via_ext == via_dne == via_legacy
-
-
-def test_fparser_keep_external_warns_but_works():
-    """The deprecated ``keep_external=`` still stubs the body, with a warning."""
-    with pytest.warns(DeprecationWarning, match="deprecated"):
-        out = _fparser_out(keep_external=["halo_exchange"]).replace(" ", "")
-    assert "a(i)=a(i)+1.0" not in out
+    assert via_ext == via_dne
 
 
 def test_fparser_validate_rejects_name_in_both():
@@ -172,12 +161,14 @@ contains
 end module mo_sync
 """
     (tmp_path / "mo_sync.f90").write_text(mod)
-    caller = ("module mo_c\n  use mo_sync, only: sync_patch_array_3d_dp\n"
-              "contains\n  subroutine r(a)\n    real, intent(inout) :: a(:)\n"
-              "    call sync_patch_array_3d_dp(a)\n  end subroutine r\nend module mo_c\n")
-    merged = merge_used_modules(caller,
-                                search_dirs=[tmp_path],
-                                external_functions=[ExternalFunction("sync_patch_array")])
+    caller = (
+        "module mo_c\n  use mo_sync, only: sync_patch_array_3d_dp\n"
+        "contains\n  subroutine r(a)\n    real, intent(inout) :: a(:)\n"
+        "    call sync_patch_array_3d_dp(a)\n  end subroutine r\nend module mo_c\n"
+    )
+    merged = merge_used_modules(
+        caller, search_dirs=[tmp_path], external_functions=[ExternalFunction("sync_patch_array")]
+    )
     flat = merged.replace(" ", "").lower()
     assert "subroutinesync_patch_array_3d_dp" in flat
     assert "a=a+1.0" not in flat, "the generic specific's body must be stubbed"
@@ -209,10 +200,12 @@ contains
 end module mo_wrap
 """
     (tmp_path / "mo_wrap.f90").write_text(mod)
-    caller = ("module mo_c\n  use mo_wrap, only: halo_via_c\n  use iso_c_binding\n"
-              "contains\n  subroutine r(tag, d0, p)\n    integer(c_int), value :: tag, d0\n"
-              "    type(c_ptr), value :: p\n    call halo_via_c(tag, d0, p)\n"
-              "  end subroutine r\nend module mo_c\n")
+    caller = (
+        "module mo_c\n  use mo_wrap, only: halo_via_c\n  use iso_c_binding\n"
+        "contains\n  subroutine r(tag, d0, p)\n    integer(c_int), value :: tag, d0\n"
+        "    type(c_ptr), value :: p\n    call halo_via_c(tag, d0, p)\n"
+        "  end subroutine r\nend module mo_c\n"
+    )
     merged = merge_used_modules(caller, search_dirs=[tmp_path], external_functions=[ExternalFunction("halo_via_c")])
     flat = merged.replace(" ", "").lower()
     assert "subroutinehalo_via_c" in flat, "the procedure stays declared"
@@ -222,7 +215,6 @@ end module mo_wrap
         assert _gfortran_compiles(merged), "stubbed TU with an interface-in-spec must compile"
 
 
-@pytest.mark.skipif(not _have_gfortran(), reason="gfortran not on PATH")
 def test_regex_merge_stubbed_tu_compiles(tmp_path):
     """The stubbed single-TU is still valid Fortran: an empty-bodied ``halo_exchange`` with its dummy argument declared compiles standalone."""
     _write_halo(tmp_path)
@@ -239,10 +231,13 @@ def test_regex_merge_stubbed_tu_compiles(tmp_path):
 def test_preprocess_source_threads_external_names_regex(tmp_path):
     """``preprocess_fortran_source`` forwards ``external_names`` to the regex merge -- the spliced external body is stubbed."""
     _write_halo(tmp_path)
-    out = preprocess_fortran_source(_CALLER,
-                                    search_dirs=[tmp_path],
-                                    merge_engine="regex",
-                                    external_names=["halo_exchange"]).replace(" ", "").lower()
+    out = (
+        preprocess_fortran_source(
+            _CALLER, search_dirs=[tmp_path], merge_engine=MergeEngine.REGEX, external_names=["halo_exchange"]
+        )
+        .replace(" ", "")
+        .lower()
+    )
     assert "subroutinehalo_exchange" in out
     assert "a(i)=a(i)+1.0" not in out, "regex merge must stub the external body"
 
@@ -250,11 +245,17 @@ def test_preprocess_source_threads_external_names_regex(tmp_path):
 def test_preprocess_source_threads_external_names_fparser(tmp_path):
     """Same through the fparser engine (``make_noop`` path)."""
     _write_halo(tmp_path)
-    out = preprocess_fortran_source(_CALLER,
-                                    search_dirs=[tmp_path],
-                                    merge_engine="fparser",
-                                    merge_entry="mo_user::run",
-                                    external_names=["halo_exchange"]).replace(" ", "").lower()
+    out = (
+        preprocess_fortran_source(
+            _CALLER,
+            search_dirs=[tmp_path],
+            merge_engine=MergeEngine.FPARSER,
+            merge_entry="mo_user::run",
+            external_names=["halo_exchange"],
+        )
+        .replace(" ", "")
+        .lower()
+    )
     assert "callhalo_exchange" in out, "the external call must survive"
     assert "a(i)=a(i)+1.0" not in out, "fparser merge must stub the external body"
 
@@ -262,7 +263,11 @@ def test_preprocess_source_threads_external_names_fparser(tmp_path):
 def test_preprocess_source_no_external_names_keeps_body(tmp_path):
     """Default (no policy) keeps the spliced body -- the threading is opt-in."""
     _write_halo(tmp_path)
-    out = preprocess_fortran_source(_CALLER, search_dirs=[tmp_path], merge_engine="regex").replace(" ", "").lower()
+    out = (
+        preprocess_fortran_source(_CALLER, search_dirs=[tmp_path], merge_engine=MergeEngine.REGEX)
+        .replace(" ", "")
+        .lower()
+    )
     assert "a(i)=a(i)+1.0" in out
 
 
@@ -284,3 +289,7 @@ def test_build_path_sources_external_names_from_registry():
         assert names2.count("sync_patch_array") == 1
     finally:
         clear_external_registry()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

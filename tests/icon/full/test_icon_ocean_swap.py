@@ -11,19 +11,20 @@ against the real submodule source, ``mo_ocean_diff.f90`` compiled first for its 
 
 Wrapper-aware but doesn't require the SDFG ``.so`` to exist; runtime resolution is
 separate (mirrors the atmosphere swap test)."""
+
 import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from icon.full._fc import (
+from tests.icon.full._fc import (
     FORTRAN_COMPILERS,
     cpp_flag,
     fortran_compiler_flags,
     syntax_check_argv,
 )
-from icon.full._icon_ocean_patch import (
+from tests.icon.full._icon_ocean_patch import (
     OCEAN_WRAPPER_NAME,
     apply_ocean_solve_patch,
     write_patched_ocean_solve,
@@ -47,22 +48,30 @@ def _real_source() -> Path:
     return _PRISTINE_BAK if _PRISTINE_BAK.is_file() else _PRISTINE
 
 
-_HAVE_ICON = _real_source().is_file()
-
 # reads ICON's real source via the icon-model submodule; only the heavy CI lane checks it out
 pytestmark = pytest.mark.long
 
 #: The 11 dummies of ``solve_free_sfc_ab_mimetic``, in call order.  The driver must
 #: forward every one to the DUT wrapper -- a dropped one would silently default-init.
-_DUMMIES = ("patch_3d", "ocean_state", "p_ext_data", "p_as", "p_oce_sfc", "p_phys_param", "timestep", "op_coeffs",
-            "solverCoeff_sp", "ret_status", "lacc")
+_DUMMIES = (
+    "patch_3d",
+    "ocean_state",
+    "p_ext_data",
+    "p_as",
+    "p_oce_sfc",
+    "p_phys_param",
+    "timestep",
+    "op_coeffs",
+    "solverCoeff_sp",
+    "ret_status",
+    "lacc",
+)
 
 # ---------------------------------------------------------------------------
 # Patch-side tests (no compiler required).
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_patch_preserves_signature():
     """Patched file's header + INTENT dummy declarations are byte-for-byte identical
     to pristine -- a change would break ICON's ``mo_ocean_ab_timestepping`` call site."""
@@ -77,9 +86,9 @@ def test_patch_preserves_signature():
         end = start
         while lines[end].rstrip().endswith("&"):
             end += 1
-        surface = list(lines[start:end + 1])
+        surface = list(lines[start : end + 1])
         # collect INTENT(...) lines up to the first INTERFACE block -- the patch's inner
-        # INTERFACE declares the wrapper's own c_bool/c_int dummies, not part of the ABI
+        # INTERFACE declares the wrapper's own dummies, not part of the ABI
         for i in range(end + 1, len(lines)):
             stripped = lines[i].lstrip().upper()
             if stripped.startswith("END SUBROUTINE SOLVE_FREE_SFC_AB_MIMETIC"):
@@ -92,28 +101,28 @@ def test_patch_preserves_signature():
 
     pristine_sig = "\n".join(_signature_surface(pristine))
     patched_sig = "\n".join(_signature_surface(patched))
-    assert pristine_sig == patched_sig, ("patched signature drifted from pristine -- ICON callers "
-                                         "would see a different surface.\nFirst differing chars:\n"
-                                         f"  pristine: {pristine_sig[:200]!r}\n"
-                                         f"  patched:  {patched_sig[:200]!r}")
+    assert pristine_sig == patched_sig, (
+        "patched signature drifted from pristine -- ICON callers "
+        "would see a different surface.\nFirst differing chars:\n"
+        f"  pristine: {pristine_sig[:200]!r}\n"
+        f"  patched:  {patched_sig[:200]!r}"
+    )
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_patched_body_calls_wrapper():
-    """Driver forwards to ``solve_free_sfc_dace_icon`` with all 11 dummies (``lacc`` via
-    the resolved ``lzacc__dace`` cast since the original dummy is OPTIONAL)."""
+    """Driver forwards to ``solve_free_sfc_dace_icon`` with all 11 dummies (``lacc`` as the
+    resolved ``lzacc__dace`` since the original dummy is OPTIONAL)."""
     patched = apply_ocean_solve_patch(_real_source().read_text())
     assert f"CALL {OCEAN_WRAPPER_NAME}(" in patched
-    dut_call = patched[patched.index(f"CALL {OCEAN_WRAPPER_NAME}("):]
-    dut_call = dut_call[:dut_call.index("\n\n")]
+    dut_call = patched[patched.index(f"CALL {OCEAN_WRAPPER_NAME}(") :]
+    dut_call = dut_call[: dut_call.index("\n\n")]
     for arg in _DUMMIES[:-2]:
         assert arg in dut_call, f"forwarded arg {arg!r} missing from the DUT call"
-    # ret_status forwarded raw; lacc goes through set_acc_host_or_device + a 1-byte cast
+    # ret_status forwarded raw; lacc goes through set_acc_host_or_device
     assert "ret_status" in dut_call
-    assert "LOGICAL(lzacc__dace, kind=1)" in dut_call
+    assert "lzacc__dace)" in dut_call
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_differential_driver_injected():
     """Patch keeps the original body as REF (renamed ``solve_free_sfc_ref``) and injects
     the driver (clone -> snapshot -> DUT -> park/restore -> REF -> compare -> free) as the
@@ -152,14 +161,17 @@ def test_differential_driver_injected():
     # rules out the body having been duplicated twice
     pristine_n = len(pristine.splitlines())
     patched_n = len(patched.splitlines())
-    assert patched_n > pristine_n, ("the differential patch keeps the body as the REF, so the file must "
-                                    f"GROW: patched={patched_n} pristine={pristine_n}")
+    assert patched_n > pristine_n, (
+        "the differential patch keeps the body as the REF, so the file must "
+        f"GROW: patched={patched_n} pristine={pristine_n}"
+    )
     growth = patched_n - pristine_n
-    assert growth < pristine_n // 2, (f"patched grew by {growth} lines -- far more than the injected driver; "
-                                      "the original body may have been duplicated instead of renamed")
+    assert growth < pristine_n // 2, (
+        f"patched grew by {growth} lines -- far more than the injected driver; "
+        "the original body may have been duplicated instead of renamed"
+    )
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_write_patched_ocean_solve(tmp_path: Path):
     """Round-trip the patch through the disk-writing helper."""
     out = tmp_path / "mo_ocean_ab_timestepping_mimetic.f90"
@@ -914,7 +926,6 @@ end module mo_fortran_tools
 """
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 @pytest.mark.parametrize("fc", GFORTRAN_COMPILERS)
 def test_patched_source_parses_through_fortran_compiler(fc, tmp_path: Path):
     """Fortran compiler accepts the patched file (syntax-only) against the stand-in
@@ -931,11 +942,20 @@ def test_patched_source_parses_through_fortran_compiler(fc, tmp_path: Path):
 
     # order matters: stand-ins first (provide every .mod read), then the diff module
     # (compiled against stand-in types), then the patched source
-    subprocess.check_call([
-        fc_path, *syntax_check_argv(fc_name, tmp_path),
-        cpp_flag(fc_name), *fortran_compiler_flags(fc_name), *include_flags,
-        str(tmp_path / "standins.f90"),
-        str(_DIFF_F90),
-        str(out)
-    ],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        [
+            fc_path,
+            *syntax_check_argv(fc_name, tmp_path),
+            cpp_flag(fc_name),
+            *fortran_compiler_flags(fc_name),
+            *include_flags,
+            str(tmp_path / "standins.f90"),
+            str(_DIFF_F90),
+            str(out),
+        ],
+        cwd=str(tmp_path),
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

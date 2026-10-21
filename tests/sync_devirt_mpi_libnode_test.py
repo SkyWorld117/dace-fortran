@@ -6,13 +6,10 @@ externalising the whole sync: ``monomorphize`` the abstract pattern to its concr
 (dispatch becomes a static call), then let ``build_sdfg``'s inline-all splice the exchange
 body in -- the bridge auto-recognises the MPI calls and lowers them to
 ``dace.libraries.mpi`` nodes."""
-import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.inliner.ast_desugaring.monomorphize import parse_program
-from dace_fortran.inliner.ast_desugaring.monomorphize_rewrite import (AxisSpec, monomorphize, MonomorphizationSpec)
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from dace_fortran.inliner.ast_desugaring.monomorphize_rewrite import AxisSpec, MonomorphizationSpec, monomorphize
+from tests._util import build_sdfg
 
 #: Abstract comm_pattern (deferred exchange) + concrete comm_orig whose exchange packs then
 #: issues raw MPI. `external` MPI decls so it lowers with no mpi.mod (bridge recognises the
@@ -73,7 +70,8 @@ def test_devirtualized_sync_inlines_pack_keeps_only_mpi_libnodes(tmp_path):
     # Devirtualize the comm-pattern vtable: CLASS(comm_pattern) -> TYPE(comm_orig).
     prog = parse_program(_SRC)
     stats = monomorphize(
-        prog, MonomorphizationSpec(axes=[AxisSpec(base="comm_pattern", strategy="retype", concrete="comm_orig")]))
+        prog, MonomorphizationSpec(axes=[AxisSpec(base="comm_pattern", strategy="retype", concrete="comm_orig")])
+    )
     assert stats.declarations_retyped >= 1
     mono = str(prog)
     # the dispatch object is now concrete (the abstract dummy keeps CLASS in the
@@ -86,8 +84,9 @@ def test_devirtualized_sync_inlines_pack_keeps_only_mpi_libnodes(tmp_path):
     mpi = sorted({type(n).__name__ for n, _ in sdfg.all_nodes_recursive() if isinstance(n, MPINode)})
     assert mpi == ["CommF2c", "Irecv", "Isend", "Wait"], f"expected Isend/Irecv/Wait libnodes, got {mpi}"
     # The pack loop (buf*2) is inlined as real SDFG compute, not externalised.
-    assert any(isinstance(n, dace.nodes.Tasklet) for n, _ in sdfg.all_nodes_recursive()), \
+    assert any(isinstance(n, dace.nodes.Tasklet) for n, _ in sdfg.all_nodes_recursive()), (
         "expected the pack-loop compute inlined as tasklets"
+    )
 
 
 #: Closer to the real ICON atmosphere layering: sync_patch_array -> generic exchange_data
@@ -157,7 +156,8 @@ def _devirt_build_atmo(tmp_path):
     prog = parse_program(_ATMO_SRC)
     monomorphize(
         prog,
-        MonomorphizationSpec(axes=[AxisSpec(base="t_comm_pattern", strategy="retype", concrete="t_comm_pattern_orig")]))
+        MonomorphizationSpec(axes=[AxisSpec(base="t_comm_pattern", strategy="retype", concrete="t_comm_pattern_orig")]),
+    )
     return build_sdfg(str(prog), tmp_path / "sdfg", name="atmo_sync", entry="sync_patch_array").build()
 
 
@@ -171,8 +171,9 @@ def test_atmosphere_sync_patch_array_devirtualized_to_mpi_libnodes(tmp_path):
     sdfg = _devirt_build_atmo(tmp_path)
     mpi = sorted({type(n).__name__ for n, _ in sdfg.all_nodes_recursive() if isinstance(n, MPINode)})
     assert mpi == ["CommF2c", "Irecv", "Isend", "Wait"], f"expected Isend/Irecv/Wait libnodes, got {mpi}"
-    assert any(isinstance(n, dace.nodes.Tasklet) for n, _ in sdfg.all_nodes_recursive()), \
+    assert any(isinstance(n, dace.nodes.Tasklet) for n, _ in sdfg.all_nodes_recursive()), (
         "expected the pack compute inlined as tasklets"
+    )
 
 
 #: A dycore substep: a stencil update on a field, a halo exchange via
@@ -260,20 +261,23 @@ def test_dycore_step_inlines_sync_and_devirtualizes(tmp_path):
     ``dace.libraries.mpi`` nodes -- no ExternalCall for the sync."""
     import dace
     from dace.libraries.mpi.nodes.node import MPINode
+
     from dace_fortran.external import ExternalCall
 
     prog = parse_program(_DYCORE_STEP_SRC)
     monomorphize(
         prog,
-        MonomorphizationSpec(axes=[AxisSpec(base="t_comm_pattern", strategy="retype", concrete="t_comm_pattern_orig")]))
+        MonomorphizationSpec(axes=[AxisSpec(base="t_comm_pattern", strategy="retype", concrete="t_comm_pattern_orig")]),
+    )
     sdfg = build_sdfg(str(prog), tmp_path / "sdfg", name="dycore_step", entry="dycore_step").build()
 
     # The sync's MPI primitives are libnodes; the sync itself is not external.
     mpi = sorted({type(n).__name__ for n, _ in sdfg.all_nodes_recursive() if isinstance(n, MPINode)})
     assert mpi == ["CommF2c", "Irecv", "Isend", "Wait"], f"expected MPI libnodes, got {mpi}"
     ext = {n.name.lower() for n, _ in sdfg.all_nodes_recursive() if isinstance(n, ExternalCall)}
-    assert not any("sync" in nm or "exchange" in nm for nm in ext), \
+    assert not any("sync" in nm or "exchange" in nm for nm in ext), (
         f"sync must be inlined, not external; got ExternalCall names {sorted(ext)}"
+    )
     # the dycore stencil compute is in the SDFG
     assert any(isinstance(n, dace.nodes.Tasklet) for n, _ in sdfg.all_nodes_recursive())
 
@@ -282,7 +286,9 @@ def test_dycore_step_inlines_sync_and_devirtualizes(tmp_path):
 #: vn using h) + halo sync -- multiple fields/exchange rounds, the shape of ICON's
 #: mo_solve_nonhydro substep sequence. Real solve_nonhydro is the production target (needs
 #: the atmosphere extraction harness + monomorphize pre-pass); this is the controlled stand-in.
-_DYCORE_TIMESTEP_SRC = _DYCORE_STEP_SRC.split("end module", 1)[0] + """end module
+_DYCORE_TIMESTEP_SRC = (
+    _DYCORE_STEP_SRC.split("end module", 1)[0]
+    + """end module
 
 subroutine dycore_timestep(p_pat, h, vn, tmp, n, partner, tag)
   use mo_comm
@@ -306,6 +312,7 @@ subroutine dycore_timestep(p_pat, h, vn, tmp, n, partner, tag)
   end do
 end subroutine dycore_timestep
 """
+)
 
 
 def test_full_dycore_timestep_sync_not_external(tmp_path):
@@ -315,22 +322,25 @@ def test_full_dycore_timestep_sync_not_external(tmp_path):
     for any sync, only MPI primitives external (>=2 Isend/Irecv/Wait each). Controlled
     stand-in for ICON's ``mo_solve_nonhydro``."""
     import dace
-    from dace.libraries.mpi.nodes.node import MPINode
-    from dace.libraries.mpi.nodes.isend import Isend
     from dace.libraries.mpi.nodes.irecv import Irecv
+    from dace.libraries.mpi.nodes.isend import Isend
+    from dace.libraries.mpi.nodes.node import MPINode
+
     from dace_fortran.external import ExternalCall
 
     prog = parse_program(_DYCORE_TIMESTEP_SRC)
     monomorphize(
         prog,
-        MonomorphizationSpec(axes=[AxisSpec(base="t_comm_pattern", strategy="retype", concrete="t_comm_pattern_orig")]))
+        MonomorphizationSpec(axes=[AxisSpec(base="t_comm_pattern", strategy="retype", concrete="t_comm_pattern_orig")]),
+    )
     sdfg = build_sdfg(str(prog), tmp_path / "sdfg", name="dycore_timestep", entry="dycore_timestep").build()
 
     nodes = [n for n, _ in sdfg.all_nodes_recursive()]
     # NO sync / exchange is an external call.
     ext = {n.name.lower() for n in nodes if isinstance(n, ExternalCall)}
-    assert not any("sync" in nm or "exchange" in nm for nm in ext), \
+    assert not any("sync" in nm or "exchange" in nm for nm in ext), (
         f"no sync may be external; got ExternalCall names {sorted(ext)}"
+    )
     # Two exchange rounds -> at least two Isend and two Irecv MPI library nodes.
     assert sum(isinstance(n, Isend) for n in nodes) >= 2, "expected >=2 Isend (two sync rounds)"
     assert sum(isinstance(n, Irecv) for n in nodes) >= 2, "expected >=2 Irecv (two sync rounds)"
@@ -344,12 +354,21 @@ def test_sync_patch_array_is_not_external_anymore(tmp_path):
     inlined, no ``ExternalCall`` node for them. Only external boundary is the MPI
     primitives, as MPI library nodes (not opaque external calls)."""
     from dace.libraries.mpi.nodes.node import MPINode
+
     from dace_fortran.external import ExternalCall
 
     sdfg = _devirt_build_atmo(tmp_path)
     ext_names = {n.name.lower() for n, _ in sdfg.all_nodes_recursive() if isinstance(n, ExternalCall)}
-    assert not any("sync" in nm or "exchange" in nm for nm in ext_names), \
+    assert not any("sync" in nm or "exchange" in nm for nm in ext_names), (
         f"sync_patch_array / exchange_data must NOT be external; got ExternalCall names {sorted(ext_names)}"
+    )
     # the only external boundary is MPI, and it is a real MPI library node
-    assert any(isinstance(n, MPINode) for n, _ in sdfg.all_nodes_recursive()), \
+    assert any(isinstance(n, MPINode) for n, _ in sdfg.all_nodes_recursive()), (
         "the MPI primitives should remain, as dace.libraries.mpi library nodes"
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

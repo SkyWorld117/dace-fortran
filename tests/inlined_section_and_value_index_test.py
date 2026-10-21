@@ -20,14 +20,10 @@
     ``offset_<arr>_d<i>`` free on purpose for dummy ALLOC/POINTER bounds the
     bindings emitter fills via ``lbound``, e.g. ICON's ``end_block(min_rl:)``).
 """
-from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # (a) -------------------------------------------------------------------
 _SRC_SECTION = """
@@ -107,3 +103,9 @@ def test_value_symbol_index_on_pointer_member_is_one_based(tmp_path):
     # out(j) = data(i,i,i) with i = j -> numpy data[j-1, j-1, j-1].
     expected = np.array([data[j - 1, j - 1, j - 1] for j in range(1, n + 1)])
     np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

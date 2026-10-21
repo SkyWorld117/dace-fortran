@@ -8,12 +8,10 @@ extent into memlet subsets and loop schedules. Two paths: static
 extent) and dynamic (``bridge/ast/expressions.cpp``~525 emits the bridge-minted
 shape symbol).
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_size_on_explicit_shape_array_folds_to_constant(tmp_path):
@@ -35,7 +33,7 @@ contains
 end module m
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="fill", entry="m::fill").build()
-    arr = np.full((8, ), -1.0, dtype=np.float64, order='F')
+    arr = np.full((8,), -1.0, dtype=np.float64, order="F")
     sdfg(arr=arr)
     np.testing.assert_array_equal(arr, np.arange(1, 9, dtype=np.float64))
 
@@ -65,7 +63,7 @@ end module m
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="outer", entry="m::outer").build()
     # bridge mints arr_d0 (or similar) as a shape symbol the caller binds via runtime n;
     # SDFG accepts n as a scalar arg and the extent symbol is specialised from it
-    arr = np.full((6, ), -1.0, dtype=np.float64, order='F')
+    arr = np.full((6,), -1.0, dtype=np.float64, order="F")
     sdfg(arr=arr, n=np.int32(6))
     np.testing.assert_array_equal(arr, np.arange(1, 7, dtype=np.float64))
 
@@ -90,6 +88,12 @@ contains
 end module m
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="fill", entry="m::fill").build()
-    arr = np.full((5, ), -1.0, dtype=np.float64, order='F')
+    arr = np.full((5,), -1.0, dtype=np.float64, order="F")
     sdfg(arr=arr)
     np.testing.assert_array_equal(arr, np.array([3.0, 6.0, 9.0, 12.0, 15.0]))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

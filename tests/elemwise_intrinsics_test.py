@@ -7,37 +7,18 @@ into a nested loop/assign AST, and the emitter produces a ``LoopRegion`` tasklet
 ``numpy.f2py``; both run on seeded random input, matched to ``1e-12``.
 """
 
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 _HERE = Path(__file__).resolve().parent
 _SRC_PATH = _HERE / "elemwise_intrinsics.f90"
 
 
-def _f2py(src: Path, out_dir: Path, mod_name: str):
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call([sys.executable, "-m", "numpy.f2py", "-c", str(src), "-m", mod_name, "--quiet"], cwd=out_dir)
-    if str(out_dir) not in sys.path:
-        sys.path.insert(0, str(out_dir))
-    __import__(mod_name)
-    return sys.modules[mod_name]
-
-
 def test_elemwise_sin_numerical(tmp_path):
-    mod = _f2py(_SRC_PATH, tmp_path / "ref", "elemwise_sin_ref")
+    mod = f2py_compile(_SRC_PATH, tmp_path / "ref", "elemwise_sin_ref")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     sdfg = build_sdfg(_SRC_PATH.read_text(), sdfg_dir, name="elemwise_sin", pipeline="hlfir-propagate-shapes").build()
@@ -64,6 +45,7 @@ def test_elemwise_sin_structure(tmp_path):
     sdfg = build_sdfg(_SRC_PATH.read_text(), sdfg_dir, name="elemwise_sin", pipeline="hlfir-propagate-shapes").build()
 
     from dace.sdfg.state import LoopRegion, SDFGState
+
     loops = [n for n in sdfg.nodes() if isinstance(n, LoopRegion)]
     assert len(loops) >= 1, "expected at least one LoopRegion"
 
@@ -75,6 +57,13 @@ def test_elemwise_sin_structure(tmp_path):
             elif isinstance(n, SDFGState):
                 yield n
 
-    tasklets = [t for s in walk(sdfg) for t in s.nodes() if isinstance(t, nd := __import__('dace').sdfg.nodes.Tasklet)]
-    assert any("sin(" in t.code.as_string
-               for t in tasklets), ("no tasklet body calls sin; got: " + repr([t.code.as_string for t in tasklets]))
+    tasklets = [t for s in walk(sdfg) for t in s.nodes() if isinstance(t, _nd := __import__("dace").sdfg.nodes.Tasklet)]
+    assert any("sin(" in t.code.as_string for t in tasklets), "no tasklet body calls sin; got: " + repr(
+        [t.code.as_string for t in tasklets]
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

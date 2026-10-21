@@ -3,17 +3,14 @@
 - Hyperbolic: sinh/cosh/tanh (sinh lowers to a fir.call runtime call, not math.*).
 - Inverse trig: asin/acos/atan/atan2 (math.* ops).
 - Conversion: int/nint/aint/anint/floor -- nint via llvm.lround, aint via llvm.trunc; bridge maps to dace::int{32,64} casts and trunc/round.
-- Modulo: mod (truncated) / modulo (floored) -- both lower to fir.call @_FortranAMod*Real8, both map to Python %, C++ codegen picks semantics per operand type.
+- Modulo: mod (truncated) / modulo (floored) -- real operands lower to the _FortranAMod* / _FortranAModulo* runtime calls, bridged to FtnMod / FtnModulo.
 """
 
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_hyperbolic(tmp_path: Path):
@@ -27,7 +24,7 @@ subroutine probe(x, out)
   out(3) = tanh(x)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     out = np.zeros(3, dtype=np.float64)
     sdfg(x=0.7, out=out)
     np.testing.assert_allclose(out, [np.sinh(0.7), np.cosh(0.7), np.tanh(0.7)], rtol=1e-12)
@@ -74,7 +71,7 @@ subroutine probe(x, y, out)
   out(4) = atan2(y, x)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     out = np.zeros(4, dtype=np.float64)
     sdfg(x=0.5, y=0.3, out=out)
     np.testing.assert_allclose(out, [np.arcsin(0.5), np.arccos(0.5), np.arctan(0.5), np.arctan2(0.3, 0.5)], rtol=1e-12)
@@ -90,7 +87,7 @@ subroutine probe(x, out)
   out(2) = aint(x)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     for v in (3.7, -3.7, 0.5):
         out = np.zeros(2, dtype=np.float64)
         sdfg(x=v, out=out)
@@ -108,7 +105,7 @@ subroutine probe(x, out_int, out_nint)
   out_nint = nint(x)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     for v, expected_int, expected_nint in [(3.4, 3, 3), (3.6, 3, 4), (-3.4, -3, -3), (-3.6, -3, -4)]:
         out_int = np.zeros(1, dtype=np.int32)
         out_nint = np.zeros(1, dtype=np.int32)
@@ -118,7 +115,7 @@ end subroutine
 
 
 def test_mod_modulo(tmp_path: Path):
-    """Fortran MOD (truncated) and MODULO (floored) -- both are Python % at the bridge level; C++ codegen picks the right semantics per type."""
+    """Fortran MOD (truncated, FtnMod) and MODULO (floored, FtnModulo) on real operands."""
     src = """
 subroutine probe(a, b, out)
   real(8), intent(in)  :: a, b
@@ -127,10 +124,15 @@ subroutine probe(a, b, out)
   out(2) = modulo(a, b)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     # MOD truncated, MODULO floored: (-7,3) -> mod=-7-3*int(-7/3)=-1, modulo=-7-3*floor(-7/3)=2
     out = np.zeros(2, dtype=np.float64)
     sdfg(a=-7.0, b=3.0, out=out)
-    # both bridge to %; codegen lowers it to fmod (truncated) for MOD positions and a floor-helper for MODULO positions -- verify against the floored numpy result.
     np.testing.assert_allclose(out[0], np.fmod(-7.0, 3.0), rtol=1e-12)
     np.testing.assert_allclose(out[1], -7.0 - 3.0 * np.floor(-7.0 / 3.0), rtol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

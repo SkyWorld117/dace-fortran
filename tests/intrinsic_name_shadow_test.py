@@ -18,12 +18,11 @@ covered in ``design_failures_test.py`` (Latent #8): reduction names, the
 symbol-context path, rename scope-locality, dead-shadow/genuine coexistence,
 and the dummy diagnostic.
 """
+
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_reduction_name_variables_build_and_compute(tmp_path):
@@ -231,3 +230,7 @@ END MODULE dummy_mod
 """
     with pytest.raises(RuntimeError, match=r"collide with bridge-rendered intrinsics"):
         build_sdfg(src, tmp_path / "sdfg", name="find_max", entry="dummy_mod::find_max").build()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

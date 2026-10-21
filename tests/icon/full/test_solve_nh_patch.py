@@ -6,16 +6,13 @@ original body preserved as ``solve_nh_ref``.  Pins the transform structurally AN
 checks the emitted module compiles (``gfortran -fsyntax-only``) against minimal
 stand-in types -- catches a Fortran error in the driver without a full ICON build.
 """
+
 import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
-from icon.full._icon_solve_nh_patch import apply_solve_nh_patch
-from icon.full._solve_nh_min_types import MIN_GEOMETRY_TYPES_F90, MIN_STATE_TYPES_F90
-
-pytestmark = pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
+from tests.icon.full._icon_solve_nh_patch import apply_solve_nh_patch
+from tests.icon.full._solve_nh_min_types import MIN_GEOMETRY_TYPES_F90, MIN_STATE_TYPES_F90
 
 _HERE = Path(__file__).resolve().parent
 _DIFF_F90 = _HERE / "mo_solve_nh_diff.f90"
@@ -83,7 +80,15 @@ def test_solve_nh_patch_structure_and_compiles(tmp_path: Path):
     # the patched module which USEs it).
     r = subprocess.run(
         ["gfortran", "-fsyntax-only", "-ffree-line-length-none", "types.f90", "mo_solve_nh_diff.f90", "patched.f90"],
+        check=False,
         cwd=str(tmp_path),
         capture_output=True,
-        text=True)
+        text=True,
+    )
     assert r.returncode == 0, f"patched solve_nh did not compile:\n{r.stderr}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

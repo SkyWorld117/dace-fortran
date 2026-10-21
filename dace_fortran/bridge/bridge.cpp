@@ -29,6 +29,7 @@
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 
 // Standard MLIR dialects needed by Flang's HLFIR output
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -220,21 +221,22 @@ class HLFIRModule {
     auto planDict = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
     if (!planDict) return out;
 
+    // A key a recipe does not carry (``get`` returns null) reads as the default.
     auto asStr = [](mlir::Attribute a) -> std::string {
-      if (auto s = mlir::dyn_cast<mlir::StringAttr>(a)) return s.str();
+      if (auto s = mlir::dyn_cast_or_null<mlir::StringAttr>(a)) return s.str();
       return "";
     };
     auto asInt = [](mlir::Attribute a) -> int64_t {
-      if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(a)) return i.getInt();
+      if (auto i = mlir::dyn_cast_or_null<mlir::IntegerAttr>(a)) return i.getInt();
       return 0;
     };
     auto asBool = [](mlir::Attribute a) -> bool {
-      if (auto b = mlir::dyn_cast<mlir::BoolAttr>(a)) return b.getValue();
+      if (auto b = mlir::dyn_cast_or_null<mlir::BoolAttr>(a)) return b.getValue();
       return false;
     };
     auto asStrList = [&](mlir::Attribute a) -> nb::list {
       nb::list out;
-      if (auto arr = mlir::dyn_cast<mlir::ArrayAttr>(a))
+      if (auto arr = mlir::dyn_cast_or_null<mlir::ArrayAttr>(a))
         for (auto e : arr) out.append(asStr(e));
       return out;
     };
@@ -276,8 +278,9 @@ class HLFIRModule {
         recipeDict["aliasable"] = asBool(recipe.get("aliasable"));
         recipeDict["scratch_dtype"] = asStr(recipe.get("scratch_dtype"));
         recipeDict["aos_alloc"] = asBool(recipe.get("aos_alloc"));
-        recipeDict["cap_symbol"] = asStr(recipe.get("cap_symbol"));
-        recipeDict["source_logical_kind"] = asInt(recipe.get("source_logical_kind"));
+        recipeDict["cap_symbols"] = asStrList(recipe.get("cap_symbols"));
+        recipeDict["lb_symbols"] = asStrList(recipe.get("lb_symbols"));
+        recipeDict["member_pointer"] = asBool(recipe.get("member_pointer"));
       }
       entryDict["recipe"] = recipeDict;
       entries.append(entryDict);
@@ -311,6 +314,7 @@ class HLFIRModule {
       d["is_struct"] = a.is_struct;
       d["struct_name"] = a.struct_name;
       d["struct_module"] = a.struct_module;
+      d["passing"] = a.passing;
       args.append(d);
     }
     for (auto& kv : info.used_modules) {
@@ -446,6 +450,28 @@ class HLFIRModule {
     module_->getOperation()->setAttr("hlfir.stub_symbols", mlir::ArrayAttr::get(&ctx_, attrs));
   }
 
+  /// The module scalars hlfir-specialize-globals found the module reads and never writes, before it applied any
+  /// value: ``"module::name"`` -> Fortran type.
+  nb::dict get_configuration_candidates() {
+    nb::dict out;
+    if (!module_) return out;
+    if (auto attr = module_->getOperation()->getAttrOfType<mlir::DictionaryAttr>("hlfir.configuration_candidates"))
+      for (mlir::NamedAttribute entry : attr)
+        if (auto type = mlir::dyn_cast<mlir::StringAttr>(entry.getValue()))
+          out[nb::str(entry.getName().str().c_str())] = type.str();
+    return out;
+  }
+
+  /// Records module variables and the values hlfir-specialize-globals bakes into the code that reads them
+  /// (``"module::name"`` or a mangled symbol -> value text).
+  void set_specialized_globals(const std::map<std::string, std::string>& values) {
+    if (!module_) throw std::runtime_error("set_specialized_globals: no module parsed");
+    llvm::SmallVector<mlir::NamedAttribute, 8> attrs;
+    for (const auto& [name, value] : values)
+      attrs.emplace_back(mlir::StringAttr::get(&ctx_, name), mlir::StringAttr::get(&ctx_, value));
+    module_->getOperation()->setAttr("hlfir.specialized_globals", mlir::DictionaryAttr::get(&ctx_, attrs));
+  }
+
  private:
   mlir::DialectRegistry registry_;
   mlir::MLIRContext ctx_;
@@ -465,6 +491,8 @@ NB_MODULE(hlfir_bridge, m) {
   // repeatedly.
   registerAllBridgePasses();
 
+  nb::exception<UnsupportedConstruct>(m, "UnsupportedConstruct", PyExc_NotImplementedError);
+
   nb::class_<VarInfo>(m, "VarInfo")
       .def_ro("fortran_name", &VarInfo::fortran_name)
       .def_ro("mangled_name", &VarInfo::mangled_name)
@@ -475,6 +503,7 @@ NB_MODULE(hlfir_bridge, m) {
       .def_ro("is_written", &VarInfo::is_written)
       .def_ro("shape_symbols", &VarInfo::shape_symbols)
       .def_ro("lower_bounds", &VarInfo::lower_bounds)
+      .def_ro("lower_bound_floors", &VarInfo::lower_bound_floors)
       .def_ro("role", &VarInfo::role)
       .def_ro("const_data", &VarInfo::const_data)
       .def_ro("view_source", &VarInfo::view_source)
@@ -493,6 +522,8 @@ NB_MODULE(hlfir_bridge, m) {
       .def_ro("aos_origin_struct", &VarInfo::aos_origin_struct)
       .def_ro("aos_member_path", &VarInfo::aos_member_path)
       .def_ro("aos_outer_rank", &VarInfo::aos_outer_rank)
+      .def_ro("aos_root_rank", &VarInfo::aos_root_rank)
+      .def_ro("aos_struct_static", &VarInfo::aos_struct_static)
       .def_ro("global_alloc_inside", &VarInfo::global_alloc_inside)
       .def_ro("aos_struct_pointer", &VarInfo::aos_struct_pointer)
       .def_ro("aos_member_pointer", &VarInfo::aos_member_pointer)
@@ -609,6 +640,12 @@ NB_MODULE(hlfir_bridge, m) {
            "Record do_not_emit (stub) symbol names so hlfir-drop-stub-calls "
            "erases their calls up front -- a known-dead call is still an opaque "
            "use that blocks later rewrites")
+      .def("set_specialized_globals", &HLFIRModule::set_specialized_globals,
+           "Record module variables and their values for hlfir-specialize-globals to bake into the code that "
+           "reads them before inlining (\"module::name\" or a mangled symbol -> value text)")
+      .def("get_configuration_candidates", &HLFIRModule::get_configuration_candidates,
+           "The module scalars hlfir-specialize-globals found the module reads and never writes, before it applied "
+           "any value (\"module::name\" -> Fortran type)")
       .def("get_fortran_interface", &HLFIRModule::get_fortran_interface,
            "Describe the entry's dummies (pre-flatten) for auto-iface")
       .def("get_flatten_plan", &HLFIRModule::get_flatten_plan,

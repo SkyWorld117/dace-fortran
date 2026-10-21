@@ -9,16 +9,27 @@ refused (box/pointer/allocatable/dynamic-shape) -- these stay in
 ``get_used_data`` to find genuinely dead names; ``binding_names`` keeps ones
 the bindings layer still needs.
 """
+
 from __future__ import annotations
 
-from typing import Set
+from collections.abc import Set as AbstractSet
 
 import dace
+from dace.properties import CodeBlock
 from dace.sdfg import nodes as _nodes
 from dace.sdfg.sdfg import SDFG
 
 
-def _collect_live_names(sdfg: SDFG) -> Set[str]:
+def _code_text(code: CodeBlock | str | None) -> str:
+    """Source text of a code property (``CodeBlock``, plain string, or unset)."""
+    if code is None:
+        return ""
+    if isinstance(code, CodeBlock):
+        return code.as_string or ""
+    return str(code)
+
+
+def _collect_live_names(sdfg: SDFG) -> set[str]:
     """Every array name referenced anywhere on this SDFG.  Two surfaces:
     DaCe's ``get_used_data`` per state (AccessNodes/memlets/read-write sets),
     and an identifier-grep over tasklet code / interstate assignments+conditions
@@ -26,14 +37,16 @@ def _collect_live_names(sdfg: SDFG) -> Set[str]:
     symbol is only referenced textually).  The grep is over-broad in the safe
     direction -- may keep a dead array, never over-prunes."""
     import re
+
     _IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*\b")
     from dace.sdfg.utils import get_used_data
-    live: Set[str] = set()
+
+    live: set[str] = set()
     for state in sdfg.all_states():
         live |= get_used_data(state)
     array_names = set(sdfg.arrays.keys())
 
-    def _grep(text: str):
+    def _grep(text: str) -> None:
         if text:
             live.update(set(_IDENT_RE.findall(text)) & array_names)
 
@@ -41,39 +54,37 @@ def _collect_live_names(sdfg: SDFG) -> Set[str]:
         for n in state.nodes():
             if isinstance(n, _nodes.Tasklet):
                 for cb in (n.code, n.code_global, n.code_init, n.code_exit):
-                    _grep(getattr(cb, 'as_string', None) or str(cb or ""))
+                    _grep(_code_text(cb))
     for isedge in sdfg.all_interstate_edges():
         # assignments map target -> CodeBlock-or-string RHS; condition is its own CodeBlock.
         for v in isedge.data.assignments.values():
             _grep(str(v) if v is not None else "")
         cond = isedge.data.condition
-        _grep(getattr(cond, 'as_string', None) or str(cond or ""))
+        _grep(_code_text(cond))
     # Control-flow regions (LoopRegion/ConditionalBlock) carry their own
     # conditions naming SDFG arrays directly -- interstate edges don't have them.
     from dace.sdfg.state import ConditionalBlock, LoopRegion
+
     for region in sdfg.all_control_flow_regions():
         if isinstance(region, LoopRegion):
-            for attr in ('loop_condition', 'init_statement', 'update_statement'):
-                cb = getattr(region, attr, None)
-                if cb is not None:
-                    _grep(getattr(cb, 'as_string', None) or str(cb))
+            for cb in (region.loop_condition, region.init_statement, region.update_statement):
+                _grep(_code_text(cb))
         elif isinstance(region, ConditionalBlock):
             for cond, _branch in region.branches:
-                if cond is not None:
-                    _grep(getattr(cond, 'as_string', None) or str(cond))
-    for cb in (sdfg.init_code.get('frame'), sdfg.exit_code.get('frame')):
-        _grep(getattr(cb, 'as_string', None) or str(cb or ""))
+                _grep(_code_text(cond))
+    for cb in (sdfg.init_code.get("frame"), sdfg.exit_code.get("frame")):
+        _grep(_code_text(cb))
     return live
 
 
-def _prune_one(sdfg: SDFG, binding_names: Set[str]) -> Set[str]:
+def _prune_one(sdfg: SDFG, binding_names: AbstractSet[str]) -> set[str]:
     """Drop every non-persistent, non-globally-scoped descriptor with no live
     reference and no bindings-layer reference.  Returns the set of pruned names."""
     live = _collect_live_names(sdfg)
     live |= set(sdfg.symbols.keys())  # symbol-promoted scalars
     live |= {str(s) for s in sdfg.free_symbols}  # free symbol references
     live |= binding_names  # FlattenPlan + arglist keepers
-    dropped: Set[str] = set()
+    dropped: set[str] = set()
     for name in list(sdfg.arrays.keys()):
         if name in live:
             continue
@@ -87,15 +98,14 @@ def _prune_one(sdfg: SDFG, binding_names: Set[str]) -> Set[str]:
             continue
         # Persistent/Global lifetime descriptors are kept regardless of dataflow
         # visibility -- the runtime allocator manages them; dropping breaks codegen.
-        lifetime = getattr(desc, 'lifetime', None)
-        if lifetime in (dace.AllocationLifetime.Persistent, dace.AllocationLifetime.Global):
+        if desc.lifetime in (dace.AllocationLifetime.Persistent, dace.AllocationLifetime.Global):
             continue
         del sdfg.arrays[name]
         dropped.add(name)
     return dropped
 
 
-def prune_unused_arrays(sdfg: SDFG, binding_names: Set[str] = frozenset()) -> Set[str]:
+def prune_unused_arrays(sdfg: SDFG, binding_names: AbstractSet[str] = frozenset()) -> set[str]:
     """Recursively prune dead-descriptor arrays from ``sdfg`` and every
     NestedSDFG body reachable from it (mutated in place).  ``binding_names``
     keeps names the bindings layer needs regardless of dataflow visibility

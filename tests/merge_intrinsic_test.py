@@ -8,11 +8,8 @@ bridge's generic arith.select fallback in buildExpr emits Python `(t if cond els
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_merge_scalar(tmp_path: Path):
@@ -25,7 +22,7 @@ subroutine probe(a, b, mask, out)
   out = merge(a, b, mask)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     for mask_val in (True, False):
         out = np.zeros(1, dtype=np.float64)
         sdfg(a=1.5, b=2.5, mask=mask_val, out=out)
@@ -42,7 +39,7 @@ subroutine probe(a, b, out)
   out = merge(a, b, a > b)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     for a_in, b_in, expected in [(3.0, 2.0, 3.0), (1.0, 5.0, 5.0), (4.0, 4.0, 4.0)]:
         out = np.zeros(1, dtype=np.float64)
         sdfg(a=a_in, b=b_in, out=out)
@@ -62,14 +59,14 @@ subroutine main(t, f, mask, out, n)
   out = MERGE(t, f, mask)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(0)
     n = 12
     t = np.ascontiguousarray(rng.standard_normal(n, dtype=np.float64))
     f = np.ascontiguousarray(rng.standard_normal(n, dtype=np.float64))
     mask = np.ascontiguousarray(rng.random(n) > 0.5)
     out = np.zeros(n, dtype=np.float64)
-    sdfg(t=t, f=f, mask=mask, out=out, n=n)
+    sdfg(t=t, f=f, mask=mask.astype(np.uint32), out=out, n=n)
     np.testing.assert_array_equal(out, np.where(mask, t, f))
 
 
@@ -77,6 +74,7 @@ def test_merge_array_verifies_libnode_present(tmp_path: Path):
     """Same as above, but also asserts a MergeLibraryNode is present in the
     built SDFG -- pins bridge->library-node routing so a silent fallback to per-element tasklets trips this test."""
     from dace.libraries.standard.nodes import MergeLibraryNode
+
     src = """
 subroutine main(t, f, mask, out, n)
   integer, intent(in)  :: n
@@ -86,6 +84,12 @@ subroutine main(t, f, mask, out, n)
   out = MERGE(t, f, mask)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     libnodes = [n for state in sdfg.all_states() for n in state.nodes() if isinstance(n, MergeLibraryNode)]
     assert len(libnodes) == 1, f"expected exactly one MergeLibraryNode, got {len(libnodes)}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

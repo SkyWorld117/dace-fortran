@@ -4,21 +4,15 @@ once; the bridge derives the arg plan (array->inout pointer, scalar->by-value) f
 HLFIR call site and lowers to a CPP tasklet calling ``extern "C" foo``, no re-authored
 signature. SDFG ``.so`` links ``libfoo.so`` via rpath (no LD_PRELOAD). Contract: target must
 be ``bind(c)`` -- the only portable way to call Fortran from generated C++."""
-import shutil
+
 import subprocess
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.external import ExternalCall, apply_external_functions, clear_external_registry
 from dace_fortran.external_functions import ExternalFunction
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from tests._util import build_sdfg
 
 # Separately-compiled external function: increments a whole array by 1.
 # ``bind(c, name="foo")`` -> stable, unmangled C symbol callable from
@@ -110,3 +104,9 @@ def test_external_default_intent_is_inout(tmp_path: Path):
     expected = a + 1.0
     sdfg(a=a, n=n)
     np.testing.assert_allclose(a, expected, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -21,6 +21,19 @@
 
 namespace hlfir_bridge {
 
+/// Integer floor division ``int_floor(a, b)``. Every integer division in a symbolic expression (index, extent,
+/// condition, interstate) goes through ``int_floor``, never ``//``. Tasklets keep C++ ``/`` on integer connectors.
+inline std::string floorDivision(const std::string& a, const std::string& b) {
+  return "int_floor(" + a + ", " + b + ")";
+}
+
+/// Fortran integer ``a / b`` (``arith.divsi``) truncates toward zero. The dividend minus its truncated remainder
+/// ``FtnMod`` is an exact multiple of ``b``, where flooring and truncating agree. Symbolic expressions only: a
+/// tasklet numbers every textual array access as its own connector, so repeating an operand would add one.
+inline std::string truncatedDivision(const std::string& a, const std::string& b) {
+  return floorDivision("(" + a + " - FtnMod(" + a + ", " + b + "))", b);
+}
+
 /// Recursion/walk-length budgets for SSA tracing; defensive guards against pathological IR -- bumping them never
 /// changes semantics, only reduces false-``?`` fallbacks.
 namespace limits {
@@ -71,6 +84,8 @@ std::string extractName(const std::string& mangled);
 /// Register mangled -> shortName override for extractName, used by extract_vars to break short-name collisions between
 /// caller and inlined-callee dummy declares. Per thread.
 void setManglingOverride(const std::string& mangled, const std::string& shortName);
+/// Names the inlined-callee alias declare ``aliasMangled`` after its root declare ``rootMangled`` in ``extractName``.
+void setAliasRoot(const std::string& aliasMangled, const std::string& rootMangled);
 
 /// Drop every mangling-override binding; called at the start of each extractVariables/extractAST so prior-module
 /// overrides don't leak.
@@ -109,13 +124,19 @@ std::optional<int64_t> traceConstInt(mlir::Value v);
 /// Recognise Flang's ASSOCIATED(ptr)/ALLOCATED(arr) lowering (arith.cmpi ne, fir.convert*(fir.box_addr(fir.load?
 /// %boxref)), 0) and return %boxref, to which callers append "_allocated"; null if cmp isn't that shape. Shared by
 /// buildExpr/buildBoolExpr and extract_vars.
-mlir::Value matchAssociatedStatusBoxRef(mlir::arith::CmpIOp cmp);
+/// With ``negated`` given, also matches the ``cmpi eq`` form (``.NOT. ALLOCATED(x)``) and sets ``*negated``.
+mlir::Value matchAssociatedStatusBoxRef(mlir::arith::CmpIOp cmp, bool* negated = nullptr);
 
 /// Render an integer SSA value as a Python expression of Fortran scalar names/literals/operators (e.g. Flang's clamped
 /// ub-lb+1 -> "max((endcol - startcol) + 1, 0)") for a symbolic shape dim; leaf scalars must be separately promoted to
 /// SDFG symbols (extract_vars::symbolNames). Empty string if unrecognised -- callers fall back to the "?"
 /// synthetic-symbol path.
 std::string traceExtentExpr(mlir::Value v);
+
+/// The extent of dimension ``dim`` of a box as traceExtentExpr renders it: the shape operand of the fir.embox that
+/// built it (a dummy or local with an explicit shape), else the ``<name>_d<dim>`` symbol of the array it boxes; empty
+/// if neither resolves.
+std::string boxExtentExpr(mlir::Value box, int64_t dim);
 
 /// Walk the same SSA chain traceExtentExpr recognises, appending every leaf scalar-declare name to out; used by
 /// extract_vars Pass 2 to promote those scalars so traceExtentExpr's expression string doesn't reference undeclared
@@ -170,6 +191,10 @@ mlir::Value peelBoxReinterpret(mlir::Value v, int maxDepth = limits::kAliasMemre
 /// block-arg/alloca). Callers walk through to the caller-side member (gate #11 in traceToDecl; reused as gate #12 by
 /// rootedAtStructDummy/walkMemberChain).
 bool leadsToComponentDesignate(mlir::Value mr);
+/// True when an inlined dummy's declare is bound to a struct-COMPONENT actual, directly (``leadsToComponentDesignate``
+/// of its memref) or through the declares of the inlined dummies it is passed on as (``twice(w)`` called from
+/// ``mid(w)``, itself called with ``fl(id) % vf``).
+bool dummyChainLeadsToComponent(hlfir::DeclareOp dc);
 
 /// If v peels to a PURE array-of-records SECTION designate (triplet/scalar subscripts, no component selector,
 /// RecordType element) whose base leads to a struct COMPONENT, return that section, else null. Narrow gate for the
@@ -184,6 +209,14 @@ hlfir::DesignateOp asInlinedSectionOverComponent(hlfir::DeclareOp decl);
 /// Number of SCALAR (non-triplet) subscript dims of a section designate -- the fixed record indices the AoR section
 /// pins. vec_in over p_vn(:,:,blockno) -> 1.
 unsigned countScalarSectionDims(hlfir::DesignateOp sec);
+
+/// The rank of a declare's own view (its array type), 0 for a scalar.
+unsigned declaredRank(hlfir::DeclareOp decl);
+
+/// An ELEMENT actual (every subscript scalar, no triplet) bound to a RANK-1 dummy: sequence association,
+/// ``call recon(q%vf(e), ...)`` with ``v_vf(lb:ub)`` -- the dummy's subscript counts from that element on, so the
+/// element's last subscript composes with it instead of standing beside it as a record dimension of its own.
+bool isElementActualOfRank1Dummy(hlfir::DeclareOp decl, hlfir::DesignateOp sec);
 
 /// If decl is a LOCAL pointer to a whole derived-type object rebound once via ptr => <source>, return the source value
 /// (peeled to its declare/component designate); null if not a local record-object pointer, rebind is ambiguous, or
@@ -211,5 +244,10 @@ fir::RecordType allocOrPtrArrayOfRecordsMember(mlir::Type t);
 /// Given that select's result value, return the NON-absent (present) branch's yielded value; {} when the op isn't this
 /// two-branch present/absent idiom. Lets memref walks (traceToDecl, the view-alias peel) reach the source declare.
 mlir::Value presentBranchOfRuntimeOptional(fir::IfOp ifOp, mlir::Value result);
+
+/// The DaCe dtype name of a scalar element type, "" for a type with no DaCe dtype.  ``LOGICAL(KIND=k)`` is the
+/// unsigned integer of its width (``uint8`` .. ``uint64``): the SDFG works on the caller's LOGICAL storage, reads it as
+/// ``!= 0`` and writes 0 / 1 (flang's and gfortran's .FALSE. / .TRUE.).  MLIR's ``i1`` is ``bool``.
+std::string dtypeName(mlir::Type t);
 
 }  // namespace hlfir_bridge

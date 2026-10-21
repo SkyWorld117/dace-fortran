@@ -6,11 +6,8 @@ against an f2py/gfortran reference."""
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _build(src: str, tmp: Path, name: str = "main"):
@@ -120,3 +117,9 @@ end subroutine main
     sdfg(out=out)
     np.testing.assert_array_equal(out, out_ref)
     np.testing.assert_array_equal(out, [1, 0])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

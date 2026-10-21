@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from _util import build_sdfg, have_flang
+from tests._util import build_sdfg, have_flang
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
@@ -26,7 +26,6 @@ pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"
 
 def test_placeholder_for_future_unsupported_cases(tmp_path: Path):
     """Stub -- add bail-out tests here when new deliberately-unsupported patterns are introduced."""
-    pass
 
 
 def test_virtual_dispatch_bails_loudly(tmp_path: Path):
@@ -84,8 +83,12 @@ subroutine main(p, out)
 end subroutine main
 """
     with pytest.raises(RuntimeError) as exc:
-        build_sdfg(src, tmp_path, name='main', entry='main').build()
+        build_sdfg(src, tmp_path, name="main", entry="main").build()
     msg = str(exc.value)
     assert "pipeline failed" in msg or "polymorphism" in msg, (
-        f"expected a pipeline-failed message naming polymorphism, "
-        f"got: {msg}")
+        f"expected a pipeline-failed message naming polymorphism, got: {msg}"
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

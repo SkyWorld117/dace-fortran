@@ -1,12 +1,10 @@
 """Complex-constant lowering + 1j/variable-j disambiguation. Two invariants: (1) whole-array assignment
 of a complex constant lowers to a mapped fill, not a scalar write; (2) the rendered `1j` must never be
 confused with a real scalar/loop iterator literally named `j` (spurious _in_j connector)."""
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_complex_2d_zero_fill(tmp_path):
@@ -95,3 +93,9 @@ END MODULE
     res = np.zeros(1, dtype=np.complex128)
     sdfg(j=3.0, res=res)
     np.testing.assert_allclose(res[0], 3.0 + 1.0j)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

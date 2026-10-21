@@ -9,11 +9,8 @@ FlattenStructs.cpp:2199, the flat companion ``h_data`` was synthesised without
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module mo_holder
@@ -53,26 +50,35 @@ def test_pointer_array_member_dummy_arg_flattens(tmp_path: Path):
     sdfg.validate()
 
     # flat companion must be rank-3 Array, not Scalar (the pre-fix classification)
-    desc = sdfg.arrays.get('h_data')
-    assert desc is not None, (f"expected flat companion `h_data` in SDFG; arrays: {sorted(sdfg.arrays.keys())}")
-    assert type(desc).__name__ == 'Array', (f"`h_data` must classify as rank-3 Array (not Scalar) after pointer-attr "
-                                            f"propagation; got {type(desc).__name__}")
-    assert len(desc.shape) == 3, (f"`h_data` rank must be 3, got shape={desc.shape}")
+    desc = sdfg.arrays.get("h_data")
+    assert desc is not None, f"expected flat companion `h_data` in SDFG; arrays: {sorted(sdfg.arrays.keys())}"
+    assert type(desc).__name__ == "Array", (
+        f"`h_data` must classify as rank-3 Array (not Scalar) after pointer-attr propagation; got {type(desc).__name__}"
+    )
+    assert len(desc.shape) == 3, f"`h_data` rank must be 3, got shape={desc.shape}"
 
     n = 4
     rng = np.random.default_rng(0)
     data = np.asfortranarray(rng.standard_normal((n, n, n)))
-    out = np.zeros((n, n, n), dtype=np.float64, order='F')
+    out = np.zeros((n, n, n), dtype=np.float64, order="F")
 
     # dummy-arg deferred-shape POINTER: bridge leaves the per-dim offset as a free symbol
     # with no literal-index hint in the body -- pass the actual 1-based lower bound here.
-    sdfg(h_data=data,
-         out=out,
-         n=np.int32(n),
-         h_data_d0=np.int64(n),
-         h_data_d1=np.int64(n),
-         offset_h_data_d0=np.int64(1),
-         offset_h_data_d1=np.int64(1),
-         offset_h_data_d2=np.int64(1))
+    sdfg(
+        h_data=data,
+        out=out,
+        n=np.int32(n),
+        h_data_d0=np.int64(n),
+        h_data_d1=np.int64(n),
+        offset_h_data_d0=np.int64(1),
+        offset_h_data_d1=np.int64(1),
+        offset_h_data_d2=np.int64(1),
+    )
 
     np.testing.assert_array_equal(out, data)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -3,17 +3,17 @@
 The bridge renames Fortran identifiers matching a sympy module-level
 ``LazyFunction`` attribute (``test``, ``doctest``) to ``program_<name>``; without
 it, any interstate-edge expression mentioning the array crashes sympy with
-``SympifyError: cannot sympify object of type LazyFunction``.
+``SympifyError: cannot sympify object of type LazyFunction``.  Identifiers naming
+a Python builtin callable (``iter``, ``max``, ...) are renamed for the same reason:
+sympy's parser evaluates them to the builtin instead of a symbol.
 """
 
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from dace_fortran.bindings.frozen_signature import FrozenArgKind
+from tests._util import build_sdfg
 
 
 def _build(src: str, tmp: Path, name: str = "main", entry: str | None = None):
@@ -75,7 +75,8 @@ subroutine main(d)
   d(2) = test(2)
 end subroutine main
 """
-    from _util import build_sdfg as _bs
+    from tests._util import build_sdfg as _bs
+
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     builder = _bs(src, sdfg_dir, name="main")
@@ -98,7 +99,8 @@ subroutine main(d, test)
   d(2) = test(2)
 end subroutine main
 """
-    from _util import build_sdfg as _bs
+    from tests._util import build_sdfg as _bs
+
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     builder = _bs(src, sdfg_dir, name="main")
@@ -123,28 +125,32 @@ def test_reserved_name_binding_wrapper_emits(tmp_path: Path):
     wrapper file -- the surface downstream Fortran callers see; without it the
     SDFG side is fixed but the binding side stays broken."""
     from dace_fortran.bindings import emit_bindings
-    from dace_fortran.bindings.frozen_signature import FrozenArg, FrozenSignature
-    from dace_fortran.bindings.fortran_interface import OriginalArg, OriginalInterface
     from dace_fortran.bindings.flatten_plan import FlattenPlan
+    from dace_fortran.bindings.fortran_interface import OriginalArg, OriginalInterface
+    from dace_fortran.bindings.frozen_signature import FrozenArg, FrozenSignature
 
     fs = FrozenSignature(
         entry="main",
         mangled="_QPmain",
         args=(
-            FrozenArg(fortran_name="d",
-                      sdfg_name="d",
-                      kind="array",
-                      dtype="float64",
-                      rank=1,
-                      shape=("2", ),
-                      intent="inout"),
-            FrozenArg(fortran_name="test",
-                      sdfg_name="program_test",
-                      kind="array",
-                      dtype="int32",
-                      rank=1,
-                      shape=("2", ),
-                      intent="in"),
+            FrozenArg(
+                fortran_name="d",
+                sdfg_name="d",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=1,
+                shape=("2",),
+                intent="inout",
+            ),
+            FrozenArg(
+                fortran_name="test",
+                sdfg_name="program_test",
+                kind=FrozenArgKind.ARRAY,
+                dtype="int32",
+                rank=1,
+                shape=("2",),
+                intent="in",
+            ),
         ),
         free_symbols=(),
     )
@@ -162,3 +168,108 @@ def test_reserved_name_binding_wrapper_emits(tmp_path: Path):
     # Wrapper exposes the original ``test`` to the caller; renamed ``program_test`` is the bind(C) param to the SDFG.
     assert "test" in text
     assert "program_test" in text
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))
+
+
+def test_python_builtin_name_as_loop_counter_survives_simplify(tmp_path: Path):
+    """A counted DO with an EXIT whose counter is called ``iter`` is lifted to a loop that updates the counter on an
+    interstate edge; ``simplify`` parses that expression, which fails on the builtin unless the name is renamed."""
+    src = """
+subroutine main(n, maxit, c, w)
+  implicit none
+  integer, intent(in) :: n, maxit
+  real(8), intent(in) :: c(n)
+  real(8), intent(inout) :: w(n)
+  real(8) :: x, dx
+  integer :: j, iter
+  do j = 1, n
+    x = c(j) + 1.0d0
+    do iter = 1, maxit
+      dx = -(x*x - c(j))/(2.0d0*x)
+      x = x + dx
+      if (abs(dx) < 1.0d-12*x) exit
+    end do
+    w(j) = x
+  end do
+end subroutine main
+"""
+    sdfg = _build(src, tmp_path)
+    assert "iter" not in sdfg.arrays and "iter" not in sdfg.symbols
+    sdfg.simplify()
+    c = np.linspace(1.0, 4.0, 8).copy()
+    w = np.zeros(8)
+    sdfg(n=8, maxit=50, c=c, w=w)
+    np.testing.assert_allclose(w, np.sqrt(c), rtol=1e-12)
+
+
+def test_python_builtin_name_as_dummy_argument(tmp_path: Path):
+    """A dummy called ``input`` is ``program_input`` on the SDFG and stays ``input`` for the binding.  (A name the
+    bridge renders as an intrinsic, ``max``, is refused by the bridge itself.)"""
+    src = """
+subroutine main(d, input)
+  double precision, intent(inout) :: d(2)
+  integer, intent(in) :: input(2)
+  d(1) = input(1)
+  d(2) = input(2) + d(2)
+end subroutine main
+"""
+    from tests._util import build_sdfg as _bs
+
+    sdfg_dir = tmp_path / "sdfg"
+    sdfg_dir.mkdir(parents=True, exist_ok=True)
+    builder = _bs(src, sdfg_dir, name="main")
+    sdfg = builder.build()
+    assert "program_input" in sdfg.arrays and "input" not in sdfg.arrays
+    sdfg.simplify()
+    d = np.array([0.0, 0.5])
+    sdfg(d=d, program_input=np.array([3, 4], dtype=np.int32))
+    assert d.tolist() == [3.0, 4.5]
+    frozen = sdfg._frozen_signature
+    arg = next(a for a in frozen.args if a.sdfg_name == "program_input")
+    assert arg.fortran_name == "input"
+
+
+def test_sympy_function_name_as_local_survives_simplify(tmp_path: Path):
+    """A local called ``denom`` (SymPy's ``denom()``) that an IF tests: the condition is an interstate-edge expression,
+    which DaCe's parser read as SymPy's function ("cannot sympify object of type function") while only the listed
+    names were renamed.  A local is renamed whenever the parser misreads it; the caller never sees its name."""
+    src = """
+subroutine main(n, a, b)
+  implicit none
+  integer, intent(in) :: n
+  real(8), intent(in) :: a(n)
+  real(8), intent(out) :: b(n)
+  real(8) :: denom
+  integer :: j
+  do j = 1, n
+    denom = a(j) - 1.0d0
+    if (denom > 0.0d0) then
+      b(j) = 1.0d0 / denom
+    else
+      b(j) = 0.0d0
+    end if
+  end do
+end subroutine main
+"""
+    sdfg = _build(src, tmp_path)
+    sdfg.simplify()
+    a = np.array([0.5, 2.0, 3.0, 1.0])
+    b = np.zeros(4)
+    sdfg(n=4, a=a, b=b)
+    np.testing.assert_allclose(b, [0.0, 1.0, 0.5, 0.0])
+    assert "denom" not in sdfg.arrays and "denom" not in sdfg.symbols
+
+
+def test_names_the_symbolic_parser_misreads():
+    """SymPy's functions, classes and constants and Python's builtins are misread; plain identifiers are not."""
+    from dace_fortran.builder import misread_by_symbolic_parser
+
+    for name in ("denom", "sign", "exp", "field", "nan", "test", "iter"):
+        assert misread_by_symbolic_parser(name), name
+    for name in ("q_cons_vf", "i", "n", "x1", "program_denom", "_loop_it_3"):
+        assert not misread_by_symbolic_parser(name), name

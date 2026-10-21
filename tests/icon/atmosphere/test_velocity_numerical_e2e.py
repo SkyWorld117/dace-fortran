@@ -30,26 +30,21 @@ Bit-exactness holds because the harness pins ``-ffp-contract=off`` on both sides
 (DaCe defaults to ``-ffast-math``, which would FMA-contract the rbf / cells2verts
 dot products and round ~1 ulp off the reference).
 """
-import shutil
 
 import pytest
 
-from _util import have_flang
-from icon.atmosphere._atmo_harness import VELOCITY_TU_VARIANTS
-from icon.ocean._ocean_e2e import run_kernel_e2e
+from tests.icon.atmosphere._atmo_harness import VELOCITY_TU_VARIANTS
+from tests.icon.ocean._ocean_e2e import run_kernel_e2e
 
 _HERE = __import__("pathlib").Path(__file__).resolve().parent
 
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
-
 
 @pytest.mark.xdist_group("atmo_velocity_fparser")
-@pytest.mark.parametrize("tu_name,loop_exchange",
-                         VELOCITY_TU_VARIANTS,
-                         ids=[("loopexch" if le else "noloopexch") for _, le in VELOCITY_TU_VARIANTS])
+@pytest.mark.parametrize(
+    "tu_name,loop_exchange",
+    VELOCITY_TU_VARIANTS,
+    ids=[("loopexch" if le else "noloopexch") for _, le in VELOCITY_TU_VARIANTS],
+)
 def test_velocity_tendencies_numerical_e2e(tu_name, loop_exchange):
     """SDFG binding output == original-kernel reference, bit-exact, on a single
     in-domain block with a real vertical column.
@@ -63,18 +58,15 @@ def test_velocity_tendencies_numerical_e2e(tu_name, loop_exchange):
         "mo_velocity_advection::velocity_tendencies",
         int_fill=1,  # one in-domain block; every connectivity index -> element 1
         # nflatlev is a DO lower bound; BSS 0 would start jk at 0 -> OOB.
-        module_seeds={
-            "nproma": 8,
-            "nflatlev": 1,
-            "nrdmax": 1
-        },
+        module_seeds={"nproma": 8, "nflatlev": 1, "nrdmax": 1},
         # real vertical column within the n=8 buffers so the vertical loops run
         # and fully initialise the kernel's automatic transients.
-        array_overrides={
-            "p_patch_nlev": 7,
-            "p_patch_nlevp1": 8
-        },
+        array_overrides={"p_patch_nlev": 7, "p_patch_nlevp1": 8},
     )
     assert res["passed"], f"velocity_tendencies build/lower/run failed:\n{res['output'][-3500:]}"
     assert res["n_changed"] > 0, "no output buffer changed -- the kernel did no work (test is vacuous)"
     assert res["max_diff"] == 0.0, f"SDFG binding diverged from reference, max|d|={res['max_diff']:.3e} (must be 0)"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

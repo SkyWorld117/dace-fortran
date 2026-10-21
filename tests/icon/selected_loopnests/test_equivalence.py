@@ -14,8 +14,6 @@ _HERE = Path(__file__).resolve().parent
 _GFORTRAN = shutil.which("gfortran")
 _KERNELS = sorted(_HERE.glob("icon_loopnest_*.f90"))
 
-pytestmark = pytest.mark.skipif(_GFORTRAN is None, reason="gfortran not on PATH")
-
 
 @pytest.mark.parametrize("src", _KERNELS, ids=lambda p: p.stem)
 def test_struct_flat_equivalence(src: Path, tmp_path: Path):
@@ -25,7 +23,10 @@ def test_struct_flat_equivalence(src: Path, tmp_path: Path):
     compile_cmd = [_GFORTRAN, "-O2", "-fcheck=bounds", str(src), "-o", str(exe)]
     subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
     result = subprocess.run([str(exe)], check=False, capture_output=True, text=True)
-    assert result.returncode == 0, \
-        f"{src.name} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.returncode == 0, f"{src.name} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     # Keep the "OK max_err=..." line visible in -s mode for quick scanning.
     print(f"[{src.stem}] {result.stdout.strip()}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

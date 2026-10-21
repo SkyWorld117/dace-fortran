@@ -8,20 +8,30 @@ A polymorphic ``CLASS(base)`` local with a factory ``ALLOCATE`` and a
 result with zero ``fir.dispatch`` (the property the bridge needs), and (c) the
 rewrite is behaviour-preserving under gfortran.
 """
-import shutil
+
 import subprocess
 from pathlib import Path
 
-import pytest
-
 import fparser.two.Fortran2003 as f03
+import pytest
 from fparser.two.utils import walk
 
-from _util import _FLANG, have_flang
-from dace_fortran.inliner.ast_desugaring.monomorphize import analyze, parse_program, UnsupportedProgram
+from dace_fortran.inliner.ast_desugaring.monomorphize import UnsupportedProgram, analyze, parse_program
 from dace_fortran.inliner.ast_desugaring.monomorphize_rewrite import (
-    AxisSpec, clone_shared_interposers, discover_axes, LADDER, monomorphize, monomorphize_auto, MonomorphizationSpec,
-    MonomorphizationStats, monomorphize_component_dispatch, monomorphize_local_dispatch, RETYPE, retype_to_concrete)
+    LADDER,
+    RETYPE,
+    AxisSpec,
+    MonomorphizationSpec,
+    MonomorphizationStats,
+    clone_shared_interposers,
+    discover_axes,
+    monomorphize,
+    monomorphize_auto,
+    monomorphize_component_dispatch,
+    monomorphize_local_dispatch,
+    retype_to_concrete,
+)
+from tests._util import _FLANG
 
 SRC = """
 module m
@@ -96,7 +106,6 @@ def test_rewrite_removes_dispatch_and_emits_all_arms():
     assert "CALL cg_apply(s__t_cg, x)" in text
 
 
-@pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 def test_rewritten_fir_has_no_dispatch(tmp_path: Path):
     src = tmp_path / "rw.f90"
     src.write_text(str(_rewritten()))
@@ -107,15 +116,16 @@ def test_rewritten_fir_has_no_dispatch(tmp_path: Path):
     assert text.count("fir.select_type") == 0
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_rewrite_is_behaviour_preserving(tmp_path: Path):
     (tmp_path / "rw.f90").write_text(str(_rewritten()))
-    (tmp_path / "drive.f90").write_text("program drive\n"
-                                        "  use m\n"
-                                        "  real :: x\n"
-                                        "  x = 10.0; call run(1, x); if (abs(x - 20.0) > 1e-5) stop 1\n"
-                                        "  x = 10.0; call run(2, x); if (abs(x - 30.0) > 1e-5) stop 2\n"
-                                        "end program\n")
+    (tmp_path / "drive.f90").write_text(
+        "program drive\n"
+        "  use m\n"
+        "  real :: x\n"
+        "  x = 10.0; call run(1, x); if (abs(x - 20.0) > 1e-5) stop 1\n"
+        "  x = 10.0; call run(2, x); if (abs(x - 30.0) > 1e-5) stop 2\n"
+        "end program\n"
+    )
     subprocess.check_call(["gfortran", "rw.f90", "drive.f90", "-o", "rw_run"], cwd=str(tmp_path))
     subprocess.check_call([str(tmp_path / "rw_run")], cwd=str(tmp_path))
 
@@ -203,7 +213,6 @@ def test_data_member_access_is_routed_per_arm():
     assert "this % act__t_gmres % b => this % rhs" in text
 
 
-@pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 def test_data_member_rewritten_fir_has_no_dispatch(tmp_path: Path):
     src = tmp_path / "rw.f90"
     src.write_text(str(_rewritten_datamember()))
@@ -212,18 +221,19 @@ def test_data_member_rewritten_fir_has_no_dispatch(tmp_path: Path):
     assert fir.read_text().count("fir.dispatch") == 0
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_data_member_rewrite_is_behaviour_preserving(tmp_path: Path):
     (tmp_path / "rw.f90").write_text(str(_rewritten_datamember()))
-    (tmp_path / "drive.f90").write_text("program drive\n"
-                                        "  use m\n"
-                                        "  type(container) :: c\n"
-                                        "  real, target :: r\n"
-                                        "  real :: x\n"
-                                        "  c%rhs => r\n"
-                                        "  call c%setup(1); x = 5.0; call c%run(x); if (abs(x - 20.0) > 1e-5) stop 1\n"
-                                        "  call c%setup(2); x = 5.0; call c%run(x); if (abs(x - 25.0) > 1e-5) stop 2\n"
-                                        "end program\n")
+    (tmp_path / "drive.f90").write_text(
+        "program drive\n"
+        "  use m\n"
+        "  type(container) :: c\n"
+        "  real, target :: r\n"
+        "  real :: x\n"
+        "  c%rhs => r\n"
+        "  call c%setup(1); x = 5.0; call c%run(x); if (abs(x - 20.0) > 1e-5) stop 1\n"
+        "  call c%setup(2); x = 5.0; call c%run(x); if (abs(x - 25.0) > 1e-5) stop 2\n"
+        "end program\n"
+    )
     subprocess.check_call(["gfortran", "rw.f90", "drive.f90", "-o", "rw_run"], cwd=str(tmp_path))
     subprocess.check_call([str(tmp_path / "rw_run")], cwd=str(tmp_path))
 
@@ -328,7 +338,6 @@ def test_component_rewrite_expands_slot_and_removes_dispatch():
     assert "CALL this % act__t_cg % solve(x)" in text
 
 
-@pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 def test_component_rewritten_fir_has_no_dispatch(tmp_path: Path):
     src = tmp_path / "rw.f90"
     src.write_text(str(_rewritten_component()))
@@ -339,17 +348,18 @@ def test_component_rewritten_fir_has_no_dispatch(tmp_path: Path):
     assert text.count("fir.select_type") == 0
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_component_rewrite_is_behaviour_preserving(tmp_path: Path):
     # the tag is stored in the container, so it must survive setup -> run.
     (tmp_path / "rw.f90").write_text(str(_rewritten_component()))
-    (tmp_path / "drive.f90").write_text("program drive\n"
-                                        "  use m\n"
-                                        "  type(container) :: c\n"
-                                        "  real :: x\n"
-                                        "  call c%setup(1); x = 5.0; call c%run(x); if (abs(x - 10.0) > 1e-5) stop 1\n"
-                                        "  call c%setup(2); x = 5.0; call c%run(x); if (abs(x - 15.0) > 1e-5) stop 2\n"
-                                        "end program\n")
+    (tmp_path / "drive.f90").write_text(
+        "program drive\n"
+        "  use m\n"
+        "  type(container) :: c\n"
+        "  real :: x\n"
+        "  call c%setup(1); x = 5.0; call c%run(x); if (abs(x - 10.0) > 1e-5) stop 1\n"
+        "  call c%setup(2); x = 5.0; call c%run(x); if (abs(x - 15.0) > 1e-5) stop 2\n"
+        "end program\n"
+    )
     subprocess.check_call(["gfortran", "rw.f90", "drive.f90", "-o", "rw_run"], cwd=str(tmp_path))
     subprocess.check_call([str(tmp_path / "rw_run")], cwd=str(tmp_path))
 
@@ -445,7 +455,6 @@ def test_shared_interposer_cloned_per_arm_and_original_dropped():
     assert "CALL base_run__t_cg(this % act__t_cg, x)" in text
 
 
-@pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 def test_interposer_clone_resolves_buried_dispatch(tmp_path: Path):
     # the whole point: the buried `this%doit` inside the shared interposer is now
     # a static bind, so the FIR carries zero dispatch.
@@ -456,16 +465,17 @@ def test_interposer_clone_resolves_buried_dispatch(tmp_path: Path):
     assert fir.read_text().count("fir.dispatch") == 0
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_interposer_clone_is_behaviour_preserving(tmp_path: Path):
     (tmp_path / "rw.f90").write_text(str(_rewritten_interposer()))
-    (tmp_path / "drive.f90").write_text("program drive\n"
-                                        "  use m\n"
-                                        "  type(container) :: c\n"
-                                        "  real :: x\n"
-                                        "  call c%setup(1); x = 5.0; call c%go(x); if (abs(x - 10.0) > 1e-5) stop 1\n"
-                                        "  call c%setup(2); x = 5.0; call c%go(x); if (abs(x - 15.0) > 1e-5) stop 2\n"
-                                        "end program\n")
+    (tmp_path / "drive.f90").write_text(
+        "program drive\n"
+        "  use m\n"
+        "  type(container) :: c\n"
+        "  real :: x\n"
+        "  call c%setup(1); x = 5.0; call c%go(x); if (abs(x - 10.0) > 1e-5) stop 1\n"
+        "  call c%setup(2); x = 5.0; call c%go(x); if (abs(x - 15.0) > 1e-5) stop 2\n"
+        "end program\n"
+    )
     subprocess.check_call(["gfortran", "rw.f90", "drive.f90", "-o", "rw_run"], cwd=str(tmp_path))
     subprocess.check_call([str(tmp_path / "rw_run")], cwd=str(tmp_path))
 
@@ -542,7 +552,6 @@ def test_retype_specialises_component_and_dummy_but_not_interface():
     assert "CLASS(t_transfer), INTENT(IN) :: this" in text
 
 
-@pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 def test_retype_makes_dispatch_static(tmp_path: Path):
     src = tmp_path / "rw.f90"
     src.write_text(str(_rewritten_retype()))
@@ -551,16 +560,17 @@ def test_retype_makes_dispatch_static(tmp_path: Path):
     assert fir.read_text().count("fir.dispatch") == 0
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_retype_is_behaviour_preserving(tmp_path: Path):
     (tmp_path / "rw.f90").write_text(str(_rewritten_retype()))
-    (tmp_path / "drive.f90").write_text("program drive\n"
-                                        "  use m\n"
-                                        "  type(backend) :: b\n"
-                                        "  type(t_trivial), target :: tr\n"
-                                        "  real :: x\n"
-                                        "  call setup(b, tr); x = 5.0; call b%use(x); if (abs(x - 6.0) > 1e-5) stop 1\n"
-                                        "end program\n")
+    (tmp_path / "drive.f90").write_text(
+        "program drive\n"
+        "  use m\n"
+        "  type(backend) :: b\n"
+        "  type(t_trivial), target :: tr\n"
+        "  real :: x\n"
+        "  call setup(b, tr); x = 5.0; call b%use(x); if (abs(x - 6.0) > 1e-5) stop 1\n"
+        "end program\n"
+    )
     subprocess.check_call(["gfortran", "rw.f90", "drive.f90", "-o", "rw_run"], cwd=str(tmp_path))
     subprocess.check_call([str(tmp_path / "rw_run")], cwd=str(tmp_path))
 
@@ -668,10 +678,12 @@ contains
 end module
 """
 
-COMBINED_SPEC = MonomorphizationSpec(axes=[
-    AxisSpec(base="t_transfer", strategy="retype", concrete="t_trivial"),
-    AxisSpec(base="base", strategy="ladder"),
-])
+COMBINED_SPEC = MonomorphizationSpec(
+    axes=[
+        AxisSpec(base="t_transfer", strategy="retype", concrete="t_trivial"),
+        AxisSpec(base="base", strategy="ladder"),
+    ]
+)
 
 
 def _rewritten_combined() -> f03.Program:
@@ -701,7 +713,6 @@ def test_driver_collapses_both_nested_axes():
     assert "run => base_run" not in text
 
 
-@pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 def test_driver_result_fir_has_no_dispatch(tmp_path: Path):
     src = tmp_path / "rw.f90"
     src.write_text(str(_rewritten_combined()))
@@ -712,7 +723,6 @@ def test_driver_result_fir_has_no_dispatch(tmp_path: Path):
     assert text.count("fir.select_type") == 0
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_driver_result_is_behaviour_preserving(tmp_path: Path):
     # gmres arm: into(+1) then doit(*2): 5 -> 6 -> 12;  cg arm: +1 then *3: 5 -> 6 -> 18.
     (tmp_path / "rw.f90").write_text(str(_rewritten_combined()))
@@ -724,7 +734,8 @@ def test_driver_result_is_behaviour_preserving(tmp_path: Path):
         "  real :: x\n"
         "  call c%setup(1, tr); x = 5.0; call c%go(x); if (abs(x - 12.0) > 1e-5) stop 1\n"
         "  call c%setup(2, tr); x = 5.0; call c%go(x); if (abs(x - 18.0) > 1e-5) stop 2\n"
-        "end program\n")
+        "end program\n"
+    )
     subprocess.check_call(["gfortran", "rw.f90", "drive.f90", "-o", "rw_run"], cwd=str(tmp_path))
     subprocess.check_call([str(tmp_path / "rw_run")], cwd=str(tmp_path))
 
@@ -886,7 +897,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_driver_imports_cross_module_clone_at_call_site(tmp_path: Path):
     """When the ladder redirects a dispatch to a per-arm clone in the interposer's
     module but the call site is in a DIFFERENT module, the direct call needs an
@@ -912,12 +922,14 @@ def test_driver_rewrites_allocated_guard_on_laddered_component():
     prog = parse_program(COMBINED_SRC)
     # add a construct/solve pair with the canonical init guards on the component
     src = COMBINED_SRC.replace(
-        "  subroutine container_go(this, x)", "  subroutine container_check(this)\n"
+        "  subroutine container_go(this, x)",
+        "  subroutine container_check(this)\n"
         "    class(container), intent(inout) :: this\n"
         "    if (allocated(this%act)) return\n"
         "    if (.not. allocated(this%act)) return\n"
         "  end subroutine\n"
-        "  subroutine container_go(this, x)")
+        "  subroutine container_go(this, x)",
+    )
     prog = parse_program(src)
     monomorphize(prog, COMBINED_SPEC)
     text = str(prog)
@@ -1020,8 +1032,9 @@ def test_discover_multi_arm_without_construction_is_skipped():
     """Two arms but NO in-unit construction: the runtime arm cannot be inferred, so
     the axis is left polymorphic (an explicit spec must pin it) rather than guessed."""
     # strip the only construction site (container_setup's ALLOCATEs)
-    no_ctor = COMBINED_SRC.replace("      allocate(t_gmres :: this%act)",
-                                   "      continue").replace("      allocate(t_cg :: this%act)", "      continue")
+    no_ctor = COMBINED_SRC.replace("      allocate(t_gmres :: this%act)", "      continue").replace(
+        "      allocate(t_cg :: this%act)", "      continue"
+    )
     prog = parse_program(no_ctor)
     axes = discover_axes(prog)
     assert all(a.base != "base" for a in axes), "multi-arm axis with no construction must not be auto-collapsed"
@@ -1061,3 +1074,7 @@ def test_discover_skips_base_without_concrete_arm():
     prog = parse_program(_NO_ARM_SRC)
     assert discover_axes(prog) == []
     assert monomorphize_auto(prog) == MonomorphizationStats()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

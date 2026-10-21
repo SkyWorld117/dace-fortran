@@ -10,22 +10,27 @@ Genuine array dimension symbols are untouched (every extent stays a required
 SDFG input).  Keeps any symbol still referenced by some array's shape/offset;
 recurses into nested SDFGs.
 """
+
+from __future__ import annotations
+
 import re
 
 import dace
 from dace import properties
-from dace.transformation import pass_pipeline as ppl, transformation
+from dace.transformation import pass_pipeline as ppl
+
+from dace_fortran.dace_types import explicit_cf_compatible
 
 
 @properties.make_properties
-@transformation.explicit_cf_compatible
+@explicit_cf_compatible
 class RemoveScalarFortranShapeSymbols(ppl.Pass):
     """Remove the bridge's ``<scalar>_d<i>``/``offset_<scalar>_d<i>`` symbols
     (a ``Scalar`` has neither shape nor offset)."""
 
     recursive = properties.Property(dtype=bool, default=True, desc="Recurse into nested SDFGs.")
 
-    def __init__(self, recursive: bool = True):
+    def __init__(self, recursive: bool = True) -> None:
         super().__init__()
         self.recursive = recursive
 
@@ -41,15 +46,16 @@ class RemoveScalarFortranShapeSymbols(ppl.Pass):
         # Symbols referenced by some array's shape/offset are kept even if the name pattern matches.
         referenced: set = set()
         for desc in sdfg.arrays.values():
-            for s in getattr(desc, 'shape', ()):
-                referenced.update(str(x) for x in dace.symbolic.symlist(s).values())
-            for s in getattr(desc, 'offset', ()):
+            extents = list(desc.shape)
+            if isinstance(desc, dace.data.Array):
+                extents += list(desc.offset)
+            for s in extents:
                 referenced.update(str(x) for x in dace.symbolic.symlist(s).values())
 
         removed: set = set()
         scalars = [n for n, d in sdfg.arrays.items() if isinstance(d, dace.data.Scalar)]
         for s in scalars:
-            pat = re.compile(rf'^(offset_)?{re.escape(s)}_d\d+$')
+            pat = re.compile(rf"^(offset_)?{re.escape(s)}_d\d+$")
             for sym in list(sdfg.symbols):
                 if sym in referenced:
                     continue
@@ -64,7 +70,7 @@ class RemoveScalarFortranShapeSymbols(ppl.Pass):
                         self._rewrite(node.sdfg)
         return removed
 
-    def apply_pass(self, sdfg: dace.SDFG, _: dict):
+    def apply_pass(self, sdfg: dace.SDFG, pipeline_results: dict) -> set[str] | None:
         """Returns the set of removed symbol names, or ``None`` if none."""
         removed = self._rewrite(sdfg)
         return removed or None

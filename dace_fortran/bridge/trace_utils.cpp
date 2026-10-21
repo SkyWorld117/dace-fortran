@@ -24,6 +24,15 @@ void setManglingOverride(const std::string& mangled, const std::string& shortNam
   kManglingOverride[mangled] = shortName;
 }
 
+// Inlined-callee alias declare uniq_name -> its root declare's uniq_name (see buildCollisionSet); ``extractName``
+// names an alias by its root, resolved at lookup time so later renames of the root carry over. The key stands for one
+// root only because runMultiCallsiteDisambiguation renames inlined alias copies bound to different variables.
+static thread_local std::unordered_map<std::string, std::string> kAliasRoot;
+
+void setAliasRoot(const std::string& aliasMangled, const std::string& rootMangled) {
+  kAliasRoot[aliasMangled] = rootMangled;
+}
+
 // Per-thread entry F-scope, set once by setEntryScope; extractName consults it to scope-qualify non-entry-scope
 // declares. Empty means skip qualification (back-compat).
 static thread_local std::string kEntryScope;
@@ -55,6 +64,7 @@ static bool funcHasDeclareTail(mlir::Operation* func, llvm::StringRef tail) {
 
 void clearManglingOverrides() {
   kManglingOverride.clear();
+  kAliasRoot.clear();
   kEntryScope.clear();
   kShortNameCollisions.clear();
   kModuleDeclUniqs.clear();
@@ -77,6 +87,7 @@ std::string getFScope(const std::string& uniq) {
 }
 
 std::string extractName(const std::string& m) {
+  if (auto root = kAliasRoot.find(m); root != kAliasRoot.end()) return extractName(root->second);
   auto it = kManglingOverride.find(m);
   if (it != kManglingOverride.end()) return it->second;
   auto p = m.rfind('E');
@@ -183,6 +194,17 @@ bool leadsToComponentDesignate(mlir::Value mr) {
   return dg && static_cast<bool>(dg.getComponentAttr());
 }
 
+bool dummyChainLeadsToComponent(hlfir::DeclareOp dc) {
+  mlir::Value mr = dc.getMemref();
+  for (int i = 0; i < limits::kAliasMemrefWalkDepth && mr; ++i) {
+    if (leadsToComponentDesignate(mr)) return true;
+    auto outer = peelBoxReinterpret(mr).getDefiningOp<hlfir::DeclareOp>();
+    if (!outer || !outer.getDummyScope()) return false;
+    mr = outer.getMemref();
+  }
+  return false;
+}
+
 // Peel a section's base through box reinterprets, inlined whole-array-dummy aliases, and nested non-component
 // designates; true iff it reaches a struct-COMPONENT designate. Stricter-peeling variant of leadsToComponentDesignate,
 // which stops at the intermediate inlined dummy declare.
@@ -241,6 +263,27 @@ unsigned countScalarSectionDims(hlfir::DesignateOp sec) {
   return n;
 }
 
+unsigned declaredRank(hlfir::DeclareOp decl) {
+  mlir::Type t = decl.getResult(0).getType();
+  for (int hop = 0; hop < 8; ++hop) {
+    if (auto rt = mlir::dyn_cast<fir::ReferenceType>(t)) { t = rt.getEleTy(); continue; }
+    if (auto bt = mlir::dyn_cast<fir::BoxType>(t)) { t = bt.getEleTy(); continue; }
+    if (auto ht = mlir::dyn_cast<fir::HeapType>(t)) { t = ht.getEleTy(); continue; }
+    if (auto pt = mlir::dyn_cast<fir::PointerType>(t)) { t = pt.getEleTy(); continue; }
+    break;
+  }
+  if (auto seq = mlir::dyn_cast<fir::SequenceType>(t)) return seq.getDimension();
+  return 0;
+}
+
+bool isElementActualOfRank1Dummy(hlfir::DeclareOp decl, hlfir::DesignateOp sec) {
+  if (!decl || !sec || !decl.getDummyScope()) return false;
+  if (sec.getIndices().empty()) return false;
+  for (bool const t : sec.getIsTriplet())
+    if (t) return false;
+  return declaredRank(decl) == 1;
+}
+
 mlir::Value traceLocalPointerRebindSource(hlfir::DeclareOp decl) {
   // Gate 1: a LOCAL Fortran POINTER (pointer attribute set, no dummy scope -- an entry/inlined-callee pointer dummy is
   // bound by its caller, not rebound here).
@@ -277,9 +320,11 @@ mlir::Value traceLocalPointerRebindSource(hlfir::DeclareOp decl) {
   return {};
 }
 
-mlir::Value matchAssociatedStatusBoxRef(mlir::arith::CmpIOp cmp) {
-  // The intrinsic lowers to a NE-against-null comparison.
-  if (cmp.getPredicate() != mlir::arith::CmpIPredicate::ne) return {};
+mlir::Value matchAssociatedStatusBoxRef(mlir::arith::CmpIOp cmp, bool* negated) {
+  // The intrinsic lowers to a NE-against-null comparison; its negation folds to EQ.
+  bool const isEq = cmp.getPredicate() == mlir::arith::CmpIPredicate::eq;
+  if (cmp.getPredicate() != mlir::arith::CmpIPredicate::ne && !(isEq && negated)) return {};
+  if (negated) *negated = isEq;
   bool rhsZero = false;
   if (auto c = traceConstInt(cmp.getRhs())) rhsZero = (*c == 0);
   if (!rhsZero) return {};
@@ -384,6 +429,28 @@ mlir::Value presentBranchOfRuntimeOptional(fir::IfOp ifOp, mlir::Value result) {
   return {};
 }
 
+namespace {
+
+bool isConstZero(mlir::Value v) {
+  auto* d = v.getDefiningOp();
+  auto c = d ? mlir::dyn_cast<mlir::arith::ConstantOp>(d) : nullptr;
+  auto ia = c ? mlir::dyn_cast<mlir::IntegerAttr>(c.getValue()) : nullptr;
+  return ia && ia.getInt() == 0;
+}
+
+// Flang's clamp of an extent to non-negative, select(x > 0, x, 0) (or x >= 0): its operand x, else null. A select on
+// any other condition with a zero arm (a MERGE such as merge(n, 0, i == 1)) stands for neither arm.
+mlir::Value clampedExtent(mlir::arith::SelectOp s) {
+  auto* cdef = s.getCondition().getDefiningOp();
+  auto cmp = cdef ? mlir::dyn_cast<mlir::arith::CmpIOp>(cdef) : nullptr;
+  if (!cmp || cmp.getLhs() != s.getTrueValue() || !isConstZero(cmp.getRhs()) || !isConstZero(s.getFalseValue()))
+    return {};
+  using P = mlir::arith::CmpIPredicate;
+  return cmp.getPredicate() == P::sgt || cmp.getPredicate() == P::sge ? s.getTrueValue() : mlir::Value{};
+}
+
+}  // namespace
+
 std::string traceToDecl(mlir::Value val, int max) {
   for (int i = 0; i < max && val; ++i) {
     auto* d = val.getDefiningOp();
@@ -469,15 +536,11 @@ std::string traceToDecl(mlir::Value val, int max) {
       continue;
     }
     if (auto s = mlir::dyn_cast<mlir::arith::SelectOp>(d)) {
-      // Follow the select ONLY for the extent CLAMP idiom (select(cmp(x,0), x, 0), one branch a constant 0); a genuine
-      // MIN/MAX select is NOT an alias to one branch (following it would drop the other operand and any subscript) and
-      // is left for the min/max idiom in buildIndexExpr/buildExpr.
-      auto trueC = traceConstInt(s.getTrueValue());
-      auto falseC = traceConstInt(s.getFalseValue());
-      bool const trueZero = trueC && *trueC == 0;
-      bool const falseZero = falseC && *falseC == 0;
-      if (trueZero != falseZero) {
-        val = trueZero ? s.getFalseValue() : s.getTrueValue();
+      // Follow the select ONLY for the extent clamp; a genuine MIN/MAX select is NOT an alias to one branch (following
+      // it would drop the other operand and any subscript) and is left for the min/max idiom in
+      // buildIndexExpr/buildExpr, as is a MERGE.
+      if (auto x = clampedExtent(s)) {
+        val = x;
         continue;
       }
       break;
@@ -497,17 +560,11 @@ std::optional<int64_t> traceConstInt(mlir::Value v) {
       v = cv.getValue();
       continue;
     }
-    // Flang wraps each static extent in a select(extent>0, extent, 0) clamp; follow the true branch, but only when the
-    // false value is the constant 0 -- else it might be a genuine Fortran MAX/MIN, not a clamp.
+    // Flang wraps each static extent in a select(extent > 0, extent, 0) clamp: follow it to the extent. Not any other
+    // select with a zero arm -- a genuine Fortran MAX/MIN, or a MERGE that is 0 on some iterations.
     if (auto s = mlir::dyn_cast<mlir::arith::SelectOp>(d)) {
-      auto* fdef = s.getFalseValue().getDefiningOp();
-      bool false_is_zero = false;
-      if (fdef) {
-        if (auto c = mlir::dyn_cast<mlir::arith::ConstantOp>(fdef))
-          if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue())) false_is_zero = (ia.getInt() == 0);
-      }
-      if (false_is_zero) {
-        v = s.getTrueValue();
+      if (auto x = clampedExtent(s)) {
+        v = x;
         continue;
       }
     }
@@ -550,7 +607,8 @@ std::optional<std::pair<std::string, std::vector<int64_t>>> constIndexedElementL
     if (!c) return std::nullopt;
     consts.push_back(*c);
   }
-  auto arr = traceToDecl(dg.getMemref());
+  // ``s % lb(1)`` is one designate carrying both the component and the index: name the member, not the record.
+  auto arr = traceToDecl(dg.getComponentAttr() ? dg.getResult() : dg.getMemref());
   if (arr.empty()) return std::nullopt;
   return std::make_pair(arr, std::move(consts));
 }
@@ -654,13 +712,14 @@ static std::string traceExtentExprMemo(mlir::Value v, llvm::DenseMap<mlir::Opera
     // MAX/MIN lowering (vs the select-over-cmp form above).
     auto nm = def->getName().getStringRef();
     static const std::map<llvm::StringRef, std::string> bin = {
-        {"arith.addi", " + "},   {"arith.subi", " - "},   {"arith.muli", " * "},
-        {"arith.divsi", " // "}, {"arith.divui", " // "},
+        {"arith.addi", " + "}, {"arith.subi", " - "}, {"arith.muli", " * "}, {"arith.divsi", ""}, {"arith.divui", ""},
     };
     if (auto it = bin.find(nm); it != bin.end() && def->getNumOperands() == 2) {
       auto l = traceExtentExprMemo(def->getOperand(0), memo);
       auto r = traceExtentExprMemo(def->getOperand(1), memo);
       if (l.empty() || r.empty()) return "";
+      if (nm == "arith.divsi") return truncatedDivision(l, r);
+      if (nm == "arith.divui") return floorDivision(l, r);
       return "(" + l + it->second + r + ")";
     }
     if ((nm == "arith.maxsi" || nm == "arith.maxui" || nm == "arith.minsi" || nm == "arith.minui") &&
@@ -681,6 +740,37 @@ static std::string traceExtentExprMemo(mlir::Value v, llvm::DenseMap<mlir::Opera
 std::string traceExtentExpr(mlir::Value v) {
   llvm::DenseMap<mlir::Operation*, std::string> memo;
   return traceExtentExprMemo(v, memo);
+}
+
+std::string boxExtentExpr(mlir::Value box, int64_t dim) {
+  mlir::Value v = box;
+  for (int i = 0; i < limits::kConvertChainDepth && v; ++i) {
+    auto* d = v.getDefiningOp();
+    if (!d) break;
+    if (auto cv = mlir::dyn_cast<fir::ConvertOp>(d)) {
+      v = cv.getValue();
+      continue;
+    }
+    if (auto eb = mlir::dyn_cast<fir::EmboxOp>(d)) {
+      mlir::Value extent;
+      if (mlir::Value const shp = eb.getShape()) {
+        auto* sd = shp.getDefiningOp();
+        if (auto so = mlir::dyn_cast_or_null<fir::ShapeOp>(sd)) {
+          if (dim < static_cast<int64_t>(so.getExtents().size())) extent = so.getExtents()[dim];
+        } else if (auto sso = mlir::dyn_cast_or_null<fir::ShapeShiftOp>(sd)) {
+          auto pairs = sso.getPairs();
+          if (2 * dim + 1 < static_cast<int64_t>(pairs.size())) extent = pairs[2 * dim + 1];
+        }
+      }
+      if (extent) {
+        std::string ext = traceExtentExpr(extent);
+        if (!ext.empty()) return ext;
+      }
+    }
+    break;
+  }
+  std::string const base = traceToDecl(box);
+  return base.empty() ? std::string() : base + "_d" + std::to_string(dim);
 }
 
 // Extent expressions form a DAG; without a visited set the operand recursion re-explores shared subtrees (exponential).
@@ -870,6 +960,28 @@ fir::RecordType allocOrPtrArrayOfRecordsMember(mlir::Type t) {
   auto seq = mlir::dyn_cast<fir::SequenceType>(inner);
   if (!seq) return {};
   return mlir::dyn_cast<fir::RecordType>(seq.getEleTy());
+}
+
+std::string dtypeName(mlir::Type t) {
+  if (auto ft = mlir::dyn_cast<mlir::FloatType>(t)) {
+    unsigned const w = ft.getWidth();
+    return (w == 16 || w == 32 || w == 64) ? "float" + std::to_string(w) : "";
+  }
+  if (t.isInteger(1)) return "bool";
+  if (auto it = mlir::dyn_cast<mlir::IntegerType>(t)) {
+    unsigned const w = it.getWidth();
+    return (w == 8 || w == 16 || w == 32 || w == 64) ? "int" + std::to_string(w) : "";
+  }
+  if (auto lt = mlir::dyn_cast<fir::LogicalType>(t)) {
+    int const k = lt.getFKind();
+    return (k == 1 || k == 2 || k == 4 || k == 8) ? "uint" + std::to_string(8 * k) : "";
+  }
+  if (auto ct = mlir::dyn_cast<mlir::ComplexType>(t)) {
+    mlir::Type const et = ct.getElementType();
+    if (et.isF32()) return "complex64";
+    if (et.isF64()) return "complex128";
+  }
+  return "";
 }
 
 }  // namespace hlfir_bridge

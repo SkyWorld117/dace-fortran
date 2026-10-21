@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/cond_type_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_cond_type(tmp_path):
@@ -35,9 +32,15 @@ subroutine main(d)
   end if
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     a = np.full([5, 5], 42, order="F", dtype=np.float32)
     sdfg(d=a)
-    assert (a[0, 0] == 42)
-    assert (a[1, 0] == 11)
-    assert (a[2, 0] == 42)
+    assert a[0, 0] == 42
+    assert a[1, 0] == 11
+    assert a[2, 0] == 42
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "flang/Optimizer/Dialect/FIROps.h"
+#include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "mlir/IR/BuiltinOps.h"
 
 namespace hlfir_bridge {
@@ -25,6 +26,10 @@ struct VarInfo {
   bool is_written = false;
   std::vector<std::string> shape_symbols;
   std::vector<std::string> lower_bounds;
+  /// Per dim, the smallest literal subscript the code uses on an array whose lower bound only the caller knows
+  /// (lower_bounds "?"), or "" -- a floor the bound must be at or below, not the bound itself: the builder takes it
+  /// as the default of the free offset for a direct call, a binding passes the real bound.
+  std::vector<std::string> lower_bound_floors;
   std::string role;
   /// Compile-time constant data for the read-only pool (Flang's ``_QQro.<shape>x<dtype>.<counter>`` globals); non-empty
   /// triggers an SDFG init state. Row-major doubles, one per element; Python narrows to actual dtype, booleans as
@@ -69,6 +74,13 @@ struct VarInfo {
   std::string aos_origin_struct;
   std::string aos_member_path;
   int aos_outer_rank = 0;
+  /// Subscripts of a module root that is itself an array of records (``field(id) % comp(i) % data``: 1); the
+  /// companion's leading dims, ahead of the ``aos_outer_rank`` record dims of the member segment. 0 for a scalar
+  /// record root.
+  int aos_root_rank = 0;
+  /// The record array at the root of the AoS path has a fixed size (``bounds(1:3)``): always present, so the binding
+  /// guards it with neither ``allocated`` nor ``associated``.
+  bool aos_struct_static = false;
   bool global_alloc_inside = false;
   /// aos_struct_pointer/aos_member_pointer flag a Fortran POINTER (vs ALLOCATABLE) struct/component; binding must guard
   /// with associated() not allocated() (wrong intrinsic is a hard type error), falling back to a degenerate buffer
@@ -121,6 +133,10 @@ struct FortranArgInfo {
   bool is_struct = false;                  // derived-type dummy
   std::string struct_name;                 // ``point`` when ``is_struct``
   std::string struct_module;               // defining module (``mo_pt``) or ``""``
+  /// How the caller passes it (the entry block argument's type): ``address`` (scalar, explicit-shape or
+  /// assumed-size), ``descriptor`` (assumed-shape or polymorphic), ``allocatable`` / ``pointer`` (the descriptor of
+  /// an allocatable / pointer dummy), ``value`` (VALUE), ``character``.
+  std::string passing;
 };
 
 /// One field of a Fortran derived-type entry dummy, populated alongside FortranArgInfo; extractFortranInterface walks
@@ -173,6 +189,27 @@ FortranInterfaceInfo extractFortranInterface(mlir::ModuleOp module, const std::s
 /// Index of every fir.allocmem keyed by uniq_name, built with one module walk; passing it to the helpers below turns
 /// their per-variable module.walk into an O(1) lookup (O(module+variables) vs O(variables x module)).
 using AllocSitesIndex = std::map<std::string, std::vector<fir::AllocMemOp>>;
+
+/// One module walk: every fir.allocmem keyed by uniq_name.
+AllocSitesIndex buildAllocSitesIndex(mlir::ModuleOp module);
+
+/// An allocation the Fortran runtime sizes from another array: ``ALLOCATE(x, SOURCE=y)`` lowers to
+/// ``_FortranAAllocatableAllocateSource(x_box, y_box, ...)`` and ``MOLD=y`` to ``_FortranAAllocatableApplyMold(x_box,
+/// y_box, rank)`` instead of a fir.allocmem; ``x`` takes the extents of ``y``.
+struct RuntimeShapedAllocation {
+  hlfir::DeclareOp target;    ///< the allocatable's declare
+  mlir::Value shape;          ///< the box of the SOURCE / MOLD array
+  bool copiesValues = false;  ///< SOURCE= (also copies the values), not MOLD= (only the shape)
+};
+
+/// The runtime-shaped allocation a call performs, if it is one (null ``target`` otherwise).
+RuntimeShapedAllocation runtimeShapedAllocation(fir::CallOp call);
+
+/// One module walk: the uniq_names of the allocatables some runtime-shaped allocation sizes.
+std::set<std::string> buildRuntimeShapedIndex(mlir::ModuleOp module);
+
+/// One module walk: the short names with an ALLOCATED()/ASSOCIATED() reader (a fir.box_addr of their box).
+std::set<std::string> buildAllocatedReaderNames(mlir::ModuleOp module);
 
 /// True iff allocatable/pointer declName needs the per-variable ``<declName>_allocated`` int32 tracker (body
 /// ALLOCATEs/DEALLOCATEs it, or an ALLOCATED()/ASSOCIATED() reader exists); already-allocated dummies never queried by

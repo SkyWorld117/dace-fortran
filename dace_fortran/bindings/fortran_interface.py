@@ -16,14 +16,15 @@ is only needed for a dummy shape the snapshot can't name (e.g.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
 
-# SDFG dtype -> iso_c_binding Fortran type.  bool is the uniform image for
-# any LOGICAL(KIND) (bridge converts kind width at the boundary).  No
-# unsigned entries -- Fortran <2023 has none; flang lowers to signless ints.
-_DTYPE_TO_FORTRAN_C = {
-    "complex128": "complex(c_double)",
-    "complex64": "complex(c_float)",
+from dace_fortran.bindings.frozen_signature import ModuleOrigin
+
+#: SDFG dtype -> iso_c_binding Fortran type.  The unsigned dtypes are LOGICAL(KIND=1/2/4/8): the SDFG works on the
+#: caller's LOGICAL storage (Fortran before 2023 has no unsigned integers, so nothing else maps to them).  flang and
+#: gfortran number LOGICAL kinds by their byte width.
+FORTRAN_C_TYPE = {
+    "complex128": "complex(c_double_complex)",
+    "complex64": "complex(c_float_complex)",
     "float64": "real(c_double)",
     "float32": "real(c_float)",
     "int8": "integer(c_int8_t)",
@@ -31,67 +32,92 @@ _DTYPE_TO_FORTRAN_C = {
     "int32": "integer(c_int)",
     "int64": "integer(c_int64_t)",
     "bool": "logical(c_bool)",
+    "uint8": "logical(1)",
+    "uint16": "logical(2)",
+    "uint32": "logical(4)",
+    "uint64": "logical(8)",
 }
 
+#: The SDFG dtypes whose Fortran type is a LOGICAL.
+LOGICAL_DTYPES = frozenset(dtype for dtype, ftype in FORTRAN_C_TYPE.items() if ftype.startswith("logical"))
 
-@dataclass(frozen=True)
+
+def fortran_c_type(dtype: str) -> str:
+    """The iso_c_binding Fortran type of the SDFG dtype ``dtype``.
+
+    :raises ValueError: for a dtype with no Fortran counterpart.
+    """
+    if dtype not in FORTRAN_C_TYPE:
+        raise ValueError(f"no iso_c_binding Fortran type for SDFG dtype {dtype!r}")
+    return FORTRAN_C_TYPE[dtype]
+
+
+@dataclass(frozen=True, slots=True)
 class Member:
     """One field of a Fortran derived type."""
+
     name: str  # 'u'
     fortran_type: str  # 'real(c_double)' | 'complex(c_double)' | 'integer(c_int)'
     rank: int
     # Extents as declared; assumed-shape falls back to '?' (wrapper uses
     # size(st%u, dim=d) at call time).
-    shape: Tuple[str, ...] = field(default_factory=tuple)
+    shape: tuple[str, ...] = field(default_factory=tuple)
     # Nested-derived-type member: names the type so bind_c_shim can look
     # up its layout in OriginalInterface.struct_types and recurse.  Empty
     # for scalar/box-of-array/inline-flat members.
-    struct_name: Optional[str] = None
+    struct_name: str | None = None
     # 'allocatable' | 'pointer' | ''.  Unallocated/disassociated bounds are
     # undefined, so every marshal of this member must be presence-guarded --
     # gfortran's internal_pack at an unguarded site reads the garbage
     # descriptor and smashes the stack (ICON Held-Suarez: disassociated
     # t_nh_diag%ddt_ua_* pointers).
-    alloc: str = ''
+    alloc: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DerivedType:
     """Layout of one Fortran derived type referenced by the entry."""
+
     name: str  # 't_state'
-    module: Optional[str]  # 'mo_state' if defined in a module
-    members: Tuple[Member, ...] = field(default_factory=tuple)
+    module: str | None  # 'mo_state' if defined in a module
+    members: tuple[Member, ...] = field(default_factory=tuple)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OriginalArg:
     """One dummy argument of the entry subroutine, outer view."""
+
     name: str  # 'st'  --  Fortran-source name
     fortran_type: str  # 'real(c_double)' / 'type(t_state)' / 'logical' / ...
     rank: int
-    shape: Tuple[str, ...] = field(default_factory=tuple)
-    intent: str = ''  # 'in' | 'out' | 'inout' | ''
+    shape: tuple[str, ...] = field(default_factory=tuple)
+    intent: str = ""  # 'in' | 'out' | 'inout' | ''
     # OPTIONAL dummy: wrapper forwards present(<name>) into the kernel's
     # <name>_present symbol, rather than defaulting it absent.
     optional: bool = False
     # fortran_type == 'type(<name>)' -> points at OriginalInterface.struct_types.
-    struct_type: Optional[str] = None
+    struct_type: str | None = None
+    # How the caller passes it: 'address' (scalar, explicit-shape or assumed-size), 'descriptor' (assumed-shape),
+    # 'allocatable' / 'pointer' (the descriptor of such a dummy), 'value', 'character'; '' when not known (a
+    # hand-written interface).
+    passing: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OriginalInterface:
     """Caller-facing surface of the entry subroutine plus every
     derived type referenced by its dummies (transitively)."""
+
     entry: str  # 'compute_tendencies'
-    args: Tuple[OriginalArg, ...]
-    struct_types: Dict[str, DerivedType] = field(default_factory=dict)
+    args: tuple[OriginalArg, ...]
+    struct_types: dict[str, DerivedType] = field(default_factory=dict)
     # Modules to `use <mod>, only: <syms>` so derived types resolve at compile time.
-    used_modules: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    used_modules: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # Free SDFG symbols the kernel reads from Fortran module data (e.g.
     # ICON's mo_parallel_config::nproma) rather than a dummy arg.  Maps
     # sym -> (module, member); emitter imports as <sym>__mod => <member>
     # and assigns <sym> = int(<sym>__mod, c_int).  Empty = no-op for flat kernels.
-    module_symbol_sources: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    module_symbol_sources: dict[str, ModuleOrigin] = field(default_factory=dict)
 
 
 def build_auto_interface(raw: dict, entry: str) -> OriginalInterface:
@@ -116,10 +142,10 @@ def build_auto_interface(raw: dict, entry: str) -> OriginalInterface:
             fortran_type = f"type({a['struct_name']})"
             struct_type = a["struct_name"]
         else:
-            fortran_type = _DTYPE_TO_FORTRAN_C.get(a["dtype"])
-            if fortran_type is None:
-                raise ValueError(f"auto-iface: unsupported dtype {a['dtype']!r} "
-                                 f"for argument {a['name']!r}")
+            mapped_type = FORTRAN_C_TYPE.get(a["dtype"])
+            if mapped_type is None:
+                raise ValueError(f"auto-iface: unsupported dtype {a['dtype']!r} for argument {a['name']!r}")
+            fortran_type = mapped_type
             struct_type = None
         rank = int(a["rank"])
         shape = tuple(a["shape"])
@@ -127,28 +153,28 @@ def build_auto_interface(raw: dict, entry: str) -> OriginalInterface:
         # rank-length ':' tuple (matches the hand-authored interface shape
         # used by the velocity_full e2e).
         if rank > 0 and not shape:
-            shape = (":", ) * rank
+            shape = (":",) * rank
         args.append(
-            OriginalArg(name=a["name"],
-                        fortran_type=fortran_type,
-                        rank=rank,
-                        shape=shape,
-                        intent=a["intent"],
-                        optional=bool(a.get("optional", False)),
-                        struct_type=struct_type))
+            OriginalArg(
+                name=a["name"],
+                fortran_type=fortran_type,
+                rank=rank,
+                shape=shape,
+                intent=a["intent"],
+                optional=bool(a.get("optional", False)),
+                struct_type=struct_type,
+                passing=a.get("passing", ""),
+            )
+        )
     used_modules = {mod: tuple(syms) for mod, syms in raw["used_modules"].items()}
     struct_types = {}
     for sname, st in raw.get("struct_types", {}).items():
         members = []
         for m in st["members"]:
             nested_name = m.get("struct_name") or ""
-            if nested_name:
-                # Nested derived-type member: declared type(<nested>),
-                # consistent with a top-level derived-type arg; bind_c_shim
-                # follows struct_name to recurse.
-                fortran_type = f"type({nested_name})"
-            else:
-                fortran_type = _DTYPE_TO_FORTRAN_C.get(m["dtype"], "??")
+            # Nested derived-type member: declared type(<nested>), consistent with a top-level derived-type arg;
+            # bind_c_shim follows struct_name to recurse.
+            fortran_type = f"type({nested_name})" if nested_name else FORTRAN_C_TYPE.get(m["dtype"], "??")
             members.append(
                 Member(
                     name=m["name"],
@@ -158,6 +184,7 @@ def build_auto_interface(raw: dict, entry: str) -> OriginalInterface:
                     struct_name=nested_name or None,
                     # .get: pre-alloc-field bridge snapshots deserialise with no guard.
                     alloc=m.get("alloc", ""),
-                ))
+                )
+            )
         struct_types[sname] = DerivedType(name=st["name"], module=st["module"] or None, members=tuple(members))
     return OriginalInterface(entry=entry, args=tuple(args), struct_types=struct_types, used_modules=used_modules)

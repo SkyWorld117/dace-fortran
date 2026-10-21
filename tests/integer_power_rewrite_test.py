@@ -32,7 +32,7 @@ def test_simple_identifier_cube():
 
 
 def test_parenthesised_base_keeps_its_parens():
-    assert (rewrite_integer_powers("z = (a - b)**2.0") == "z = ((a - b)*(a - b))")
+    assert rewrite_integer_powers("z = (a - b)**2.0") == "z = ((a - b)*(a - b))"
 
 
 def test_pure_designator_chain_base():
@@ -48,7 +48,7 @@ def test_double_exponent_form():
 
 
 def test_multiple_on_one_line():
-    assert (rewrite_integer_powers("r = a**2.0 + b**3.0") == "r = (a*a) + (b*b*b)")
+    assert rewrite_integer_powers("r = a**2.0 + b**3.0") == "r = (a*a) + (b*b*b)"
 
 
 # --- things the pass must NOT touch ---------------------------------
@@ -70,7 +70,8 @@ def test_multiple_on_one_line():
         "z = foealfa(ptare)**3.0",
         "z = a%b(i)%c**2.0",
         "d = custom_sum(d)**2.0",
-    ])
+    ],
+)
 def test_left_untouched(expr: str):
     assert rewrite_integer_powers(expr) == expr
 
@@ -89,17 +90,20 @@ def test_idempotent():
 # --- precedence preserved (numeric proof via Python eval) -----------
 
 
-@pytest.mark.parametrize("expr", [
-    "2*x**2.0",
-    "a/b**2.0",
-    "-x**2.0",
-    "c + x**3.0 + d",
-    "a*b**2.0 + c",
-    "(p - q)**2.0 / r",
-    "x**2.0 * y**3.0",
-    "1.0/(t - k)**2.0",
-    "-(a - b)**3.0",
-])
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "2*x**2.0",
+        "a/b**2.0",
+        "-x**2.0",
+        "c + x**3.0 + d",
+        "a*b**2.0 + c",
+        "(p - q)**2.0 / r",
+        "x**2.0 * y**3.0",
+        "1.0/(t - k)**2.0",
+        "-(a - b)**3.0",
+    ],
+)
 def test_eval_equivalent(expr: str):
     """Original ``**`` and rewritten ``*`` forms must be numerically close under arbitrary
     bindings -- catches a missing parenthesis flipping operator precedence.
@@ -112,8 +116,9 @@ def test_eval_equivalent(expr: str):
     rng = np.random.default_rng(0)
     env = {n: float(rng.uniform(1.5, 4.0)) for n in "abcdklpqrtxy"}
     rewritten = rewrite_integer_powers(expr)
-    assert math.isclose(eval(rewritten, {}, env), eval(expr, {}, env),
-                        rel_tol=1e-9), (f"{expr!r} -> {rewritten!r} changed the value")
+    assert math.isclose(eval(rewritten, {}, env), eval(expr, {}, env), rel_tol=1e-9), (
+        f"{expr!r} -> {rewritten!r} changed the value"
+    )
 
 
 # --- e2e: bridge vs gfortran on a base that needs wrapping ----------
@@ -122,10 +127,7 @@ def test_eval_equivalent(expr: str):
 def test_e2e_parenthesised_base_matches_gfortran(tmp_path: Path):
     """``(t(i) - k)**2.0`` (parenthesised base in a quotient) plus ``s**3.0`` must stay
     numerically identical after the rewrite: bridge build vs gfortran reference."""
-    from _util import build_sdfg, f2py_compile, have_flang
-
-    if not have_flang():
-        pytest.skip("no LLVM flang on PATH")
+    from tests._util import build_sdfg, f2py_compile
 
     src = """
 module pw_mod
@@ -163,3 +165,7 @@ end module pw_mod
     ref.pw_mod.pw(t, k, s, o_ref)  # n auto-derived from shape(t)
     sdfg(n=np.int32(16), t=t, k=k, s=s, out=o_sdfg)
     np.testing.assert_array_equal(o_sdfg, o_ref)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

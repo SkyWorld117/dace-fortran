@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/nested_array_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_nested_array_access(tmp_path):
@@ -21,7 +18,7 @@ subroutine main(d)
   d(test(2, 3, 1)) = 5.5
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     a = np.full([4], 42, order="F", dtype=np.float64)
     sdfg(d=a)
     assert np.allclose(a, [42, 5.5, 42, 42])
@@ -50,7 +47,7 @@ subroutine main(d, test, indices)
   d(internal_test(2, 3, 1)) = 5.5
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     d = np.full([4], 42, order="F", dtype=np.float64)
     test = np.full([3, 4, 5], 42, order="F", dtype=np.int32)
     indices = np.full([3, 4, 5], 42, order="F", dtype=np.int32)
@@ -77,7 +74,7 @@ subroutine main(d, test, indices)
   d(test(2, 3, 1)) = 5.5
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     d = np.full([4], 42, order="F", dtype=np.float64)
     test = np.full([3, 4, 5], 42, order="F", dtype=np.int32)
     indices = np.full([3, 4, 5], 42, order="F", dtype=np.int32)
@@ -87,3 +84,9 @@ end subroutine main
     # exprs reference them outside any shape-binding context) -- pass explicitly.
     sdfg(d=d, program_test=test, indices=indices, indices_d0=3, indices_d1=4, test_d0=3, test_d1=4)
     assert np.allclose(d, [42, 5.5, 42, 42])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

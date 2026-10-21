@@ -16,14 +16,12 @@ FlattenStructs.cpp); fully-static path unchanged.
 Closed form: each element writes x = [s, 2s, 3s] for s = src(i,jb), reads
 back sum(x) = 6*s, so out = 6*src.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module lib
@@ -72,3 +70,9 @@ def test_runtime_local_cartesian_aos_flattens_to_soa(tmp_path: Path):
     sdfg(src=src, out=out, n=np.int32(n), nb=np.int32(nb), src_d0=n, src_d1=nb, out_d0=n, out_d1=nb)
 
     np.testing.assert_allclose(out, 6.0 * src, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

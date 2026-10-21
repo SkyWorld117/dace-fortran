@@ -4,12 +4,9 @@ with cst%rg reads lowered to the flat cst_rg scalar. Passing this means the brid
 upstream cloudsc's derived-type bundles directly, without manual ASSOCIATE flattening."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings import FlattenPlan
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module mo_consts
@@ -58,8 +55,8 @@ def test_dt_of_scalar_constants_flattens_per_member(tmp_path):
     for member, e in entries_by_outer.items():
         assert e.recipe.rank == 0, f"{member}: scalar member should be rank 0, got {e.recipe.rank}"
         assert e.recipe.scratch_dtype == "float64", f"{member}: dtype {e.recipe.scratch_dtype}"
-        assert e.recipe.flat_names == (member.replace("%", "_"), ), e.recipe.flat_names
-        assert e.recipe.read_exprs == (member, ), e.recipe.read_exprs
+        assert e.recipe.flat_names == (member.replace("%", "_"),), e.recipe.flat_names
+        assert e.recipe.read_exprs == (member,), e.recipe.read_exprs
 
     # SDFG arglist carries the flat per-member names.
     arglist = list(sdfg.arglist().keys())
@@ -86,6 +83,7 @@ def test_dt_of_scalar_constants_numerical(tmp_path):
 
     # bridge surfaces scalar struct members as length-1 Array(1,) rather than Scalar; route accordingly.
     from dace.data import Scalar
+
     arglist = sdfg.arglist()
 
     def _route(name, value):
@@ -103,3 +101,9 @@ def test_dt_of_scalar_constants_numerical(tmp_path):
         out=out_sdfg,
     )
     np.testing.assert_array_equal(out_sdfg, out_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

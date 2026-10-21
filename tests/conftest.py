@@ -1,9 +1,7 @@
-"""Puts the HLFIR test dir on sys.path (``from _util import ...``) and isolates DaCe's build cache per pytest-xdist worker so parallel runs don't race on shared ``.dacecache/<sdfg_name>/build`` (most tests reuse SDFG name ``main``)."""
-import os
-import sys
-from pathlib import Path
+"""Isolates DaCe's build cache per pytest-xdist worker so parallel runs don't race on shared ``.dacecache/<sdfg_name>/build`` (most tests reuse SDFG name ``main``)."""
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import os
+from pathlib import Path
 
 # hwloc's GL/X11 probe (run during MPI_Init, before any mpi4py import) hangs forever on
 # GNOME-on-Wayland: gnome-shell's abstract X11 socket accepts the connection but never
@@ -30,6 +28,7 @@ os.environ.setdefault("PMIX_MCA_gds", "hash")
 # pre-pipeline IR walks run on the main thread (not the bridge's 2GB-stack worker thread).
 try:
     import resource
+
     _soft, _hard = resource.getrlimit(resource.RLIMIT_STACK)
     if _hard != resource.RLIM_INFINITY and (_soft == resource.RLIM_INFINITY or _soft < _hard):
         resource.setrlimit(resource.RLIMIT_STACK, (_hard, _hard))
@@ -57,7 +56,7 @@ if _worker:
     # the env var itself so both the caller's isolation and the per-worker split survive.
     _base = os.environ.get("DACE_default_build_folder")
     if _base:
-        os.environ["DACE_default_build_folder"] = f"{_base}_{_worker}"
+        os.environ["DACE_DEFAULT_BUILD_FOLDER"] = f"{_base}_{_worker}"
     Config.set("default_build_folder", value=f".dacecache_{_worker}")
 else:
     # Master-only: force the hlfir_bridge .so build/staleness-check here, single-threaded,
@@ -65,9 +64,9 @@ else:
     # CMake build into the shared output path and one loads a partial .so (ImportError).
     import dace_fortran.build_bridge  # noqa: F401
 
-import pytest
+import contextlib
 
-from dace_fortran.external import clear_external_registry
+import pytest
 
 # --- generated-C++ sanity check ------------------------------------------
 # Every SDFG a test compiles gets its generated C++ scanned for the UB-class warnings in
@@ -77,7 +76,8 @@ from dace_fortran.external import clear_external_registry
 # that compiled the offending TU hundreds of times without ever reading a warning.
 from dace.sdfg import SDFG
 
-from dace_fortran.codegen_check import NONCRITICAL_NOISE, analyze, critical_tags
+from dace_fortran.external import clear_external_registry
+from tests.codegen_check import NONCRITICAL_NOISE, analyze, critical_tags
 
 compile_without_check = SDFG.compile
 
@@ -93,8 +93,9 @@ def compile_and_check_generated_code(self, *args, **kwargs):
         ln for ln in diagnostics if ln not in critical and not any(f"[-W{n}]" in ln for n in NONCRITICAL_NOISE)
     ]
     if informational:
-        print(f"[codegen-check] '{self.name}' non-critical warnings ({len(informational)}):\n" +
-              "\n".join(informational))
+        print(
+            f"[codegen-check] '{self.name}' non-critical warnings ({len(informational)}):\n" + "\n".join(informational)
+        )
     if critical:
         raise AssertionError(f"generated C++ for SDFG '{self.name}' emits critical warnings:\n" + "\n".join(critical))
     return result
@@ -147,23 +148,15 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(scope="session")
 def icon_build():
-    """Configure + build the ICON submodule on demand; yield the build dir.
+    """Configure + build the ICON submodule on demand; return the build dir.
 
-    ``ICON_SRC``/``ICON_BUILD`` override source/build location. Only SKIPS when the submodule
-    isn't checked out; otherwise it always builds (never silently skips).
+    ``ICON_SRC``/``ICON_BUILD`` override source/build location. A missing submodule fails the test.
     """
-    here = Path(__file__).resolve().parent
-    icon_src = Path(os.environ.get("ICON_SRC", str(here / "icon" / "full" / "icon-model")))
-    if not (icon_src / "configure").is_file():
-        pytest.skip("icon-model submodule not checked out (run "
-                    "`git submodule update --init tests/icon/full/icon-model`)")
-    from icon.full._icon_build import ensure_icon_built, default_build_dir
+    from tests.icon.full._icon_build import default_build_dir, ensure_icon_built
+
+    icon_src = Path(os.environ.get("ICON_SRC", str(Path(__file__).resolve().parent / "icon" / "full" / "icon-model")))
     # builds into TMP by default (no repo-tree pollution); ICON_BUILD overrides to a persistent location
-    icon_build_dir = default_build_dir()
-    build = ensure_icon_built(icon_src, icon_build_dir)
-    if build is None:
-        pytest.skip("icon-model submodule not checked out")
-    return build
+    return ensure_icon_built(icon_src, default_build_dir())
 
 
 # --- f2py-reference teardown-crash guard ---------------------------------
@@ -186,10 +179,8 @@ def _clean_stray_mods():
     crashed run's residue) and at session finish.
     """
     for mod in _REPO_ROOT.glob("*.mod"):
-        try:
+        with contextlib.suppress(OSError):
             mod.unlink()
-        except OSError:
-            pass
 
 
 # defensive pre-clean: a prior crashed/os._exit-ed run may have left poison .mod files
@@ -199,6 +190,28 @@ _clean_stray_mods()
 def pytest_sessionfinish(session, exitstatus):
     _pytest_exitstatus[0] = int(exitstatus)
     _clean_stray_mods()
+
+
+#: Environment variables an MPI launcher (Open MPI's prterun/mpirun, PMIx) sets in every rank.
+_MPI_LAUNCHER_ENV = ("OMPI_COMM_WORLD_SIZE", "PMIX_RANK")
+
+
+def _under_mpi_launcher() -> bool:
+    return any(k in os.environ for k in _MPI_LAUNCHER_ENV)
+
+
+def pytest_configure(config):
+    """Under an MPI launcher, initialise MPI if mpi4py did not.
+
+    The multi-rank tests call ``COMM_WORLD`` straight away and rely on mpi4py's import-time ``MPI_Init``. An
+    environment exporting ``MPI4PY_RC_INITIALIZE=0`` (the node suite does, for its single-process lanes) turns that
+    off, and the first ``Get_rank`` then aborts the rank ("MPI_Comm_rank() was called before MPI_INIT", exit 14).
+    """
+    if _under_mpi_launcher():
+        from mpi4py import MPI
+
+        if not MPI.Is_initialized():
+            MPI.Init()
 
 
 @pytest.hookimpl(trylast=True)
@@ -215,9 +228,10 @@ def pytest_unconfigure(config):
     # launcher, skip finalising entirely: on this host OpenMPI's own MPI_Finalize corrupts the
     # heap (SIGABRT, uncatchable, fires before os._exit) -- leaving MPI unfinalised is harmless
     # there and avoids the crash.
-    if any(k in os.environ for k in ("OMPI_COMM_WORLD_SIZE", "PMIX_RANK")):
+    if _under_mpi_launcher():
         try:
             from mpi4py import MPI
+
             if MPI.Is_initialized() and not MPI.Is_finalized():
                 MPI.Finalize()
         except Exception:

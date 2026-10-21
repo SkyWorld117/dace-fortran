@@ -1,13 +1,10 @@
 """Repro for an IF-block elision bug (bisected from NPB LU's ``ssor``): inside a do-loop, an
 ``if (<cond>) then ... end if`` followed by ``if (<other-cond>) return`` silently drops the IF body's writes."""
-import numpy as np
-import pytest
-
-from _util import build_sdfg, have_flang
 
 import dace.data
+import numpy as np
 
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """\
 module m
@@ -50,14 +47,14 @@ def _run(sdfg, itmax_v: int):
     kw = {}
     for nm, desc in sdfg.arglist().items():
         is_scalar = isinstance(desc, dace.data.Scalar)
-        is_int = 'int' in str(desc.dtype).lower()
+        is_int = "int" in str(desc.dtype).lower()
         if is_scalar:
-            kw[nm] = np.int32(itmax_v) if nm == 'itmax' else (np.int32(0) if is_int else np.float64(0))
+            kw[nm] = np.int32(itmax_v) if nm == "itmax" else (np.int32(0) if is_int else np.float64(0))
         else:
             shape = tuple(int(s) for s in desc.shape)
-            kw[nm] = np.zeros(shape, dtype=(np.int32 if is_int else np.float64), order='F')
+            kw[nm] = np.zeros(shape, dtype=(np.int32 if is_int else np.float64), order="F")
     sdfg(**kw)
-    return float(kw['rsdnm'][0])
+    return float(kw["rsdnm"][0])
 
 
 def test_if_then_return_in_loop_does_not_elide_if_body(tmp_path):
@@ -65,3 +62,9 @@ def test_if_then_return_in_loop_does_not_elide_if_body(tmp_path):
     by 1/iter from 0).  If the IF block is elided, rsdnm stays 0."""
     sdfg = build_sdfg(_SRC, tmp_path / "sdfg", name="dolu", entry="m::dolu").build()
     assert _run(sdfg, 3) == 3.0, "IF body elided: rsdnm(1) should be u(1)=3.0 at istep==itmax"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

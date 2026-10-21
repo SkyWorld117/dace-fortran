@@ -11,14 +11,11 @@ iteration ran; ODD values give the correct total.
 Matches LU's ``dolu``: ``call ssor(1)`` (always 1 iter) then ``call ssor(itmax)``, with
 the multi-element convergence matching LU's ``rsdnm(1)<tolrsd(1) .and. ...`` shape.
 Isolates the bug from LU's full 1041-state SDFG for fast iteration."""
-import numpy as np
-import pytest
-
-from _util import build_sdfg, have_flang
 
 import dace.data
+import numpy as np
 
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """\
 module m
@@ -61,14 +58,14 @@ def _run(sdfg, itmax_v: int) -> float:
     kw = {}
     for nm, desc in sdfg.arglist().items():
         is_scalar = isinstance(desc, dace.data.Scalar)
-        is_int = 'int' in str(desc.dtype).lower()
+        is_int = "int" in str(desc.dtype).lower()
         if is_scalar:
-            kw[nm] = np.int32(itmax_v) if nm == 'itmax' else (np.int32(0) if is_int else np.float64(0))
+            kw[nm] = np.int32(itmax_v) if nm == "itmax" else (np.int32(0) if is_int else np.float64(0))
         else:
             shape = tuple(int(s) for s in desc.shape)
-            kw[nm] = np.zeros(shape, dtype=(np.int32 if is_int else np.float64), order='F')
+            kw[nm] = np.zeros(shape, dtype=(np.int32 if is_int else np.float64), order="F")
     sdfg(**kw)
-    return float(kw['u'][0])
+    return float(kw["u"][0])
 
 
 def test_lu_two_call_convergence_repro_itmax_2(tmp_path):
@@ -76,3 +73,9 @@ def test_lu_two_call_convergence_repro_itmax_2(tmp_path):
     on top of ssor(1)'s 1 iteration)."""
     sdfg = build_sdfg(_SRC, tmp_path / "sdfg", name="dolu", entry="m::dolu").build()
     assert _run(sdfg, 2) == 3.0, "itmax=2 should give u[0]=3, not 2 (one iter only)"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

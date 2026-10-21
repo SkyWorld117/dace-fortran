@@ -11,11 +11,8 @@ based (state shared with earlier blocks), not in this block itself.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC_PATH = Path(__file__).resolve().parent / "velocity_zekinh_block.f90"
 _ENTRY = "mo_velocity_zekinh::zekinh_block"
@@ -72,8 +69,8 @@ def test_velocity_zekinh_block_builds_and_calls(tmp_path: Path):
     edge_blk = ii(nblks_e, nproma, nblks_c, 3)
     # 33-element bounds buffer to cover ICON's [-16, 16] refined-cell-tag range.
     # start_block(4) -> first valid block; end_block(-5) -> last cell block.
-    start_block = np.zeros(33, dtype=np.int32, order='F')
-    end_block = np.zeros(33, dtype=np.int32, order='F')
+    start_block = np.zeros(33, dtype=np.int32, order="F")
+    end_block = np.zeros(33, dtype=np.int32, order="F")
     # offset_d0 specialises to 1 for start_block (only positive literal seen)
     # and -5 for end_block (negative-literal inference fires).  So
     # buf[3]=start_block(4) and buf[0]=end_block(-5).
@@ -81,8 +78,8 @@ def test_velocity_zekinh_block_builds_and_calls(tmp_path: Path):
     end_block[0] = nblks_c
     e_bln_c_s = rr(nproma, 3, nblks_c)
     z_kin_hor_e = rr(nproma, nlev, nblks_e)
-    z_ekinh = np.zeros((nproma, nlev, nblks_c), dtype=np.float64, order='F')
-    z_ekinh_ref = z_ekinh.copy(order='F')
+    z_ekinh = np.zeros((nproma, nlev, nblks_c), dtype=np.float64, order="F")
+    z_ekinh_ref = z_ekinh.copy(order="F")
 
     sdfg(
         p_patch_cells_edge_idx=edge_idx,
@@ -114,16 +111,15 @@ def test_velocity_zekinh_block_builds_and_calls(tmp_path: Path):
         offset_p_patch_cells_edge_blk_d1=np.int64(1),
     )
 
-    _numpy_reference(edge_idx,
-                     edge_blk,
-                     e_bln_c_s,
-                     z_kin_hor_e,
-                     z_ekinh_ref,
-                     nproma,
-                     nlev,
-                     nblks_c,
-                     i_startblk=1,
-                     i_endblk=nblks_c)
+    _numpy_reference(
+        edge_idx, edge_blk, e_bln_c_s, z_kin_hor_e, z_ekinh_ref, nproma, nlev, nblks_c, i_startblk=1, i_endblk=nblks_c
+    )
     # 3-term FMA-reorderable sum -- bridge and numpy may pick different
     # accumulation orders.  Hold a tight rel/abs but not bit-exact.
     np.testing.assert_allclose(z_ekinh, z_ekinh_ref, rtol=1e-13, atol=1e-13)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

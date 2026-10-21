@@ -6,6 +6,8 @@
 The .so is symlinked next to this file (as dace_fortran.hlfir_bridge) so no PYTHONPATH manipulation is needed.
 """
 
+from __future__ import annotations
+
 import fcntl
 import importlib
 import os
@@ -15,21 +17,43 @@ import subprocess
 import sys
 import sysconfig
 from pathlib import Path
+from types import ModuleType
 
-from dace_fortran.llvm_toolchain import (SUPPORTED_LLVM_VERSIONS, candidate_versions, find_flang, llvm_prefix,
-                                         requested_version)
+from dace_fortran.llvm_toolchain import (
+    SUPPORTED_LLVM_VERSIONS,
+    build_parallelism,
+    candidate_versions,
+    find_flang,
+    llvm_prefix,
+    requested_version,
+)
 
 # --- Configuration: override via env vars ---
 
 _HERE = Path(__file__).resolve().parent
 _BUILD_DIR = Path(os.environ.get("DACE_FORTRAN_BUILD_DIR", _HERE / "build"))
 
-# Pinned by the LLVM_VERSION env var; empty means "auto-detect over SUPPORTED_LLVM_VERSIONS".
-_LLVM_VERSION = requested_version()
 
-# Override with env var; only needed if cmake's LLVM auto-detect misses.
-# No MLIR_DIR needed: CMakeLists.txt finds MLIR via the LLVM prefix, bypassing MLIR's broken cmake config.
-_LLVM_DIR = os.environ.get("LLVM_DIR", "")
+class LlvmSelection:
+    """The LLVM install the bridge is built against.
+
+    ``version`` is pinned by the ``LLVM_VERSION`` env var; empty means "auto-detect over
+    SUPPORTED_LLVM_VERSIONS".  ``cmake_dir`` is the ``LLVM_DIR`` env override, only needed if cmake's LLVM
+    auto-detect misses (no MLIR_DIR needed: CMakeLists.txt finds MLIR via the LLVM prefix, bypassing MLIR's
+    broken cmake config).  :func:`_detect_dirs` fills in whichever the environment left empty.
+    """
+
+    __slots__ = ("cmake_dir", "version")
+
+    version: str
+    cmake_dir: str
+
+    def __init__(self, version: str, cmake_dir: str) -> None:
+        self.version = version
+        self.cmake_dir = cmake_dir
+
+
+_LLVM = LlvmSelection(version=requested_version(), cmake_dir=os.environ.get("LLVM_DIR", ""))
 
 _CMAKE_MAJOR_RE = re.compile(r"set\(LLVM_VERSION_MAJOR (\d+)\)")
 
@@ -110,11 +134,10 @@ def _prefix_builds_the_bridge(prefix: str, version: str) -> bool:
     return (root / "lib" / "cmake" / "mlir").is_dir() or (root / "include" / "mlir").is_dir()
 
 
-def _detect_dirs():
-    """Populate _LLVM_DIR / _LLVM_VERSION: explicit env vars win, else probe the supported majors."""
-    global _LLVM_DIR, _LLVM_VERSION
-    if _LLVM_DIR:
-        _LLVM_VERSION = _LLVM_VERSION or _cmake_dir_major(_LLVM_DIR) or SUPPORTED_LLVM_VERSIONS[0]
+def _detect_dirs() -> None:
+    """Populate _LLVM.cmake_dir / _LLVM.version: explicit env vars win, else probe the supported majors."""
+    if _LLVM.cmake_dir:
+        _LLVM.version = _LLVM.version or _cmake_dir_major(_LLVM.cmake_dir) or SUPPORTED_LLVM_VERSIONS[0]
         return
 
     searched: list = []
@@ -127,18 +150,23 @@ def _detect_dirs():
             incomplete.append(f"{prefix} (LLVM {version}: no flang and/or no MLIR)")
             continue
         if found:
-            _LLVM_VERSION, _LLVM_DIR = version, found
+            _LLVM.version, _LLVM.cmake_dir = version, found
             return
 
     if incomplete:
-        raise RuntimeError("No LLVM prefix can build the HLFIR bridge.  Rejected as incomplete: " +
-                           "; ".join(incomplete) + ".  Install the matching flang and MLIR development "
-                           "packages, or set LLVM_DIR (and optionally LLVM_VERSION) to a complete prefix.")
+        raise RuntimeError(
+            "No LLVM prefix can build the HLFIR bridge.  Rejected as incomplete: "
+            + "; ".join(incomplete)
+            + ".  Install the matching flang and MLIR development "
+            "packages, or set LLVM_DIR (and optionally LLVM_VERSION) to a complete prefix."
+        )
 
     majors = "/".join(candidate_versions())
-    raise RuntimeError(f"Cannot find LLVMConfig.cmake for LLVM {majors}.  Looked in: "
-                       f"{', '.join(dict.fromkeys(searched))}.  Set LLVM_DIR (and "
-                       "optionally LLVM_VERSION) to override.")
+    raise RuntimeError(
+        f"Cannot find LLVMConfig.cmake for LLVM {majors}.  Looked in: "
+        f"{', '.join(dict.fromkeys(searched))}.  Set LLVM_DIR (and "
+        "optionally LLVM_VERSION) to override."
+    )
 
 
 # --- Build logic ---
@@ -225,34 +253,39 @@ def _cache_conflicts(expected: dict) -> list:
     return [f"{k}: {cached[k]!r} -> {v!r}" for k, v in expected.items() if k in cached and cached[k] != v]
 
 
-def build(clean: bool = False, verbose: bool = True):
+def build(clean: bool = False, verbose: bool = True) -> None:
     """Run cmake + make.  Raises on failure."""
     if rebuild_forbidden():
-        raise RuntimeError(f"{NO_REBUILD_ENV} is set -- refusing to build the HLFIR bridge.\n"
-                           f"  expected a prebuilt extension at: {_local_so()}\n"
-                           "Something requested a build (missing or stale .so).  Doing it here would\n"
-                           "compile into the shared source tree, typically from a compute node.\n"
-                           "Build once on the login node with:\n"
-                           "  python -c 'import dace_fortran.build_bridge as b; b.build()'\n"
-                           f"then resubmit -- or unset {NO_REBUILD_ENV} to allow this process to build.")
+        raise RuntimeError(
+            f"{NO_REBUILD_ENV} is set -- refusing to build the HLFIR bridge.\n"
+            f"  expected a prebuilt extension at: {_local_so()}\n"
+            "Something requested a build (missing or stale .so).  Doing it here would\n"
+            "compile into the shared source tree, typically from a compute node.\n"
+            "Build once on the login node with:\n"
+            "  python -c 'import dace_fortran.build_bridge as b; b.build()'\n"
+            f"then resubmit -- or unset {NO_REBUILD_ENV} to allow this process to build."
+        )
     _detect_dirs()
 
     python = sys.executable
     # Pin the flang this resolution picked, so cmake does not run its own probe and land on a
     # different major than the LLVM_DIR passed beside it.
-    flang = find_flang(_LLVM_VERSION) or ""
-    conflicts = _cache_conflicts({
-        "LLVM_DIR": _LLVM_DIR,
-        "LLVM_VERSION": _LLVM_VERSION,
-        "FLANG_BIN": flang,
-        "Python_EXECUTABLE": python,
-    })
+    flang = find_flang(_LLVM.version) or ""
+    conflicts = _cache_conflicts(
+        {
+            "LLVM_DIR": _LLVM.cmake_dir,
+            "LLVM_VERSION": _LLVM.version,
+            "FLANG_BIN": flang,
+            "Python_EXECUTABLE": python,
+        }
+    )
     if conflicts and not clean:
         if verbose:
             print(
                 f"[build_bridge] build dir was configured differently ({'; '.join(conflicts)}); "
                 "reconfiguring from scratch",
-                file=sys.stderr)
+                file=sys.stderr,
+            )
         clean = True
 
     if clean and _BUILD_DIR.exists():
@@ -262,14 +295,14 @@ def build(clean: bool = False, verbose: bool = True):
 
     _BUILD_DIR.mkdir(exist_ok=True)
 
-    nproc = os.cpu_count() or 4
+    nproc = build_parallelism()
 
     # --- cmake configure ---
     cmake_args = [
         "cmake",
         str(_HERE),
-        f"-DLLVM_VERSION={_LLVM_VERSION}",
-        f"-DLLVM_DIR={_LLVM_DIR}",
+        f"-DLLVM_VERSION={_LLVM.version}",
+        f"-DLLVM_DIR={_LLVM.cmake_dir}",
         *([f"-DFLANG_BIN={flang}"] if flang else []),
         f"-DPython_EXECUTABLE={python}",
         *_python_cmake_hints(),
@@ -293,8 +326,7 @@ def build(clean: bool = False, verbose: bool = True):
         if candidates:
             target = candidates[0]
         else:
-            raise RuntimeError(f"Build succeeded but cannot find {_so_name()} "
-                               f"under {_BUILD_DIR}")
+            raise RuntimeError(f"Build succeeded but cannot find {_so_name()} under {_BUILD_DIR}")
     link.unlink(missing_ok=True)
     link.symlink_to(target)
     if verbose:
@@ -306,7 +338,7 @@ def build(clean: bool = False, verbose: bool = True):
 _BRIDGE_MODULE = "dace_fortran.hlfir_bridge"
 
 
-def ensure_bridge():
+def ensure_bridge() -> ModuleType:
     """Import the compiled bridge, building first if necessary.
 
     Imported as dace_fortran.hlfir_bridge (build() symlinks the .so into the package dir) -- no sys.path hacking.
@@ -322,7 +354,7 @@ def ensure_bridge():
     return importlib.import_module(_BRIDGE_MODULE)
 
 
-def ensure_fresh():
+def ensure_fresh() -> ModuleType:
     """Import hlfir_bridge, rebuilding if any source is newer than the .so.
 
     flock-serialized: concurrent processes (e.g. parallel pytest runs) racing an unlocked
@@ -337,7 +369,7 @@ def ensure_fresh():
     return ensure_bridge()
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> ModuleType:
     """Resolve ``hb`` on first use, which is what the README promises and what the CLI needs.
 
     Binding it at import made ``python -m dace_fortran.build_bridge`` load the extension before
@@ -354,6 +386,7 @@ def __getattr__(name: str):
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Build the hlfir_bridge nanobind extension.")
     parser.add_argument("--clean", action="store_true", help="Wipe build dir before building.")
     parser.add_argument("--quiet", action="store_true")

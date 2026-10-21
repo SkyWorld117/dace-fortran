@@ -10,6 +10,7 @@ parse can't OOM the host. Prints RESULT: PASS, TU_PATH: <path>, TU_LINES: <n> on
 
 Usage: _extract_single_tu.py <source_relpath> <module::entry> <out_dir> [mem_gb]
 """
+
 import os
 import re
 import resource
@@ -35,9 +36,9 @@ def main(argv):
     os.environ.setdefault("UCX_VFS_ENABLE", "n")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    from icon.ocean._ocean_harness import ocean_config, SRC, ocean_search_dirs
     from dace_fortran import inline_to_single_tu
     from dace_fortran.preprocess import merge_used_modules
+    from tests.icon.ocean._ocean_harness import SRC, ocean_config, ocean_search_dirs
 
     cfg = ocean_config(halo_mode)
 
@@ -69,28 +70,32 @@ def main(argv):
                 use_lines.append(f"  USE {m.group(1)}")
             log(f"  force-included {rel} (module {m.group(1) if m else '?'})")
         if use_lines:
-            merged, nsub = re.subn(rf"(?im)^(\s*MODULE\s+{re.escape(entry_mod)}\s*$)",
-                                   lambda mm: mm.group(1) + "\n" + "\n".join(use_lines),
-                                   merged,
-                                   count=1)
+            merged, nsub = re.subn(
+                rf"(?im)^(\s*MODULE\s+{re.escape(entry_mod)}\s*$)",
+                lambda mm: mm.group(1) + "\n" + "\n".join(use_lines),
+                merged,
+                count=1,
+            )
             sources[str(mp)] = merged
             log(f"  injected {len(use_lines)} force-include USE(s) into module {entry_mod} (matched {nsub})")
 
         log(f"inline_to_single_tu(expand_cpp, tolerate_external_uses, monomorphize) [halo={halo_mode}]")
-        tu = inline_to_single_tu(sources,
-                                 entry=entry,
-                                 out_dir=out_dir,
-                                 name="kernel_tu",
-                                 expand_cpp=True,
-                                 defines=cfg["defines"],
-                                 include_dirs=[SRC / "include"],
-                                 external_functions=cfg["external_functions"],
-                                 do_not_emit=cfg["do_not_emit"],
-                                 make_return_false=cfg["make_return_false"],
-                                 rename_specifics=cfg["rename_specifics"],
-                                 tolerate_external_uses=True)
+        tu = inline_to_single_tu(
+            sources,
+            entry=entry,
+            out_dir=out_dir,
+            name="kernel_tu",
+            expand_cpp=True,
+            defines=cfg["defines"],
+            include_dirs=[SRC / "include"],
+            external_functions=cfg["external_functions"],
+            do_not_emit=cfg["do_not_emit"],
+            make_return_false=cfg["make_return_false"],
+            rename_specifics=cfg["rename_specifics"],
+            tolerate_external_uses=True,
+        )
         n = len(Path(tu).read_text().splitlines())
-        log(f"  single TU: {n} lines in {time.time()-t0:.0f}s")
+        log(f"  single TU: {n} lines in {time.time() - t0:.0f}s")
         print(f"TU_PATH: {tu}", flush=True)
         print(f"TU_LINES: {n}", flush=True)
 
@@ -104,22 +109,24 @@ def main(argv):
         # buffer arg type varies across wrappers -- the same flag every real MPI build needs.
         r = subprocess.run(
             ["gfortran", "-fsyntax-only", "-ffree-line-length-none", "-fallow-argument-mismatch", cf.name],
+            check=False,
             cwd=str(cdir),
             capture_output=True,
-            text=True)
+            text=True,
+        )
         if r.returncode != 0:
             print(r.stderr[-4000:], flush=True)
-            print(f"RESULT: FAIL compile after {time.time()-t0:.0f}s", flush=True)
+            print(f"RESULT: FAIL compile after {time.time() - t0:.0f}s", flush=True)
             return 1
-        log(f"  COMPILES in {time.time()-t0:.0f}s total")
+        log(f"  COMPILES in {time.time() - t0:.0f}s total")
         print("RESULT: PASS", flush=True)
         return 0
     except MemoryError:
-        print(f"RESULT: FAIL MemoryError (hit {mem_gb}GB cap) after {time.time()-t0:.0f}s", flush=True)
+        print(f"RESULT: FAIL MemoryError (hit {mem_gb}GB cap) after {time.time() - t0:.0f}s", flush=True)
         return 2
     except Exception:
         traceback.print_exc()
-        print(f"RESULT: FAIL after {time.time()-t0:.0f}s", flush=True)
+        print(f"RESULT: FAIL after {time.time() - t0:.0f}s", flush=True)
         return 1
 
 

@@ -28,15 +28,16 @@ passes to handle -- never silently miscompiled.
 Entry point: :func:`specialize_at_source` (runs the subprogram-call + function-ref
 inliners to a fixpoint).
 """
-import re
-from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import logging
+import re
+from collections.abc import Iterable
+from typing import NamedTuple, Union
 
 from fparser.two import Fortran2003 as f03
 from fparser.two.utils import walk
 
-from dace_fortran.inliner.ast_desugaring import analysis, pruning, utils
+from dace_fortran.inliner.ast_desugaring import analysis, pruning, types, utils
 from dace_fortran.inliner.ast_desugaring.monomorphize import parse_program
 from dace_fortran.inliner.ast_utils import children_of_type
 
@@ -57,7 +58,7 @@ _MAX_ROUNDS = 256
 _ABSENT = "f2dace_absent_arg"
 
 
-def _subprogram_of(stmt: f03.Base) -> Optional[f03.Base]:
+def _subprogram_of(stmt: f03.Base) -> f03.Base | None:
     """The ``Subroutine_Subprogram`` / ``Function_Subprogram`` enclosing a
     Subroutine_Stmt / Function_Stmt (its parent), or None."""
     par = stmt.parent
@@ -66,22 +67,12 @@ def _subprogram_of(stmt: f03.Base) -> Optional[f03.Base]:
     return None
 
 
-def _dummy_arg_names(sub_stmt: f03.Base) -> List[str]:
+def _dummy_arg_names(sub_stmt: f03.Base) -> list[str]:
     """The dummy-argument names of a Subroutine_Stmt / Function_Stmt, in order."""
     dal = next(children_of_type(sub_stmt, (f03.Dummy_Arg_List, f03.Dummy_Arg_Name_List)), None)
     if dal is None:
         return []
     return [str(c) for c in dal.children]
-
-
-def _entity_names(spec: f03.Base) -> Set[str]:
-    """Every entity name DECLARED in a Specification_Part (lower-cased)."""
-    names: Set[str] = set()
-    for ed in walk(spec, (f03.Entity_Decl, f03.Component_Decl)):
-        nm = next(children_of_type(ed, f03.Name), None)
-        if nm is not None:
-            names.add(str(nm).lower())
-    return names
 
 
 #: A keyword-argument NAME position: ``(kw =`` or ``, kw =`` (but not ``==``).  The
@@ -101,7 +92,7 @@ _KW_AFTER = re.compile(r"^\s*=(?!=)")
 _COMP_BEFORE = re.compile(r"%\s*$")
 
 
-def _subst(text: str, mapping: Dict[str, str]) -> str:
+def _subst(text: str, mapping: dict[str, str]) -> str:
     """Replace every whole-word occurrence of a key (case-insensitive) with its
     value, in a single pass so substitutions never cascade into one another.
 
@@ -117,8 +108,8 @@ def _subst(text: str, mapping: Dict[str, str]) -> str:
     pat = re.compile(_IDENT.format(names="|".join(re.escape(k) for k in lower)), re.IGNORECASE)
 
     def repl(m: "re.Match") -> str:
-        before = text[max(0, m.start() - 16):m.start()]
-        if _KW_BEFORE.search(before) and _KW_AFTER.match(text[m.end():m.end() + 4]):
+        before = text[max(0, m.start() - 16) : m.start()]
+        if _KW_BEFORE.search(before) and _KW_AFTER.match(text[m.end() : m.end() + 4]):
             return m.group(1)  # keyword-argument name: preserve verbatim
         if _COMP_BEFORE.search(before):
             return m.group(1)  # struct component / type-bound name after ``%``
@@ -131,7 +122,7 @@ def _subst(text: str, mapping: Dict[str, str]) -> str:
 _OPTIONAL_ATTR = re.compile(r"(?i)(?:^|,)\s*OPTIONAL\s*(?:,|$)")
 
 
-def _optional_dummy_names(callee_spec: Optional[f03.Base], dummies: Set[str]) -> Set[str]:
+def _optional_dummy_names(callee_spec: f03.Base | None, dummies: set[str]) -> set[str]:
     """The subset of ``dummies`` declared ``OPTIONAL`` in the callee spec.
 
     The attribute is matched from the declaration text (the attribute list left of
@@ -139,7 +130,7 @@ def _optional_dummy_names(callee_spec: Optional[f03.Base], dummies: Set[str]) ->
     dynamically-built ``Attr_Spec_List`` class identity does not always match a
     statically-imported reference, so an ``isinstance`` filter silently misses it.
     """
-    opt: Set[str] = set()
+    opt: set[str] = set()
     if callee_spec is None:
         return opt
     for decl in children_of_type(callee_spec, f03.Type_Declaration_Stmt):
@@ -153,8 +144,12 @@ def _optional_dummy_names(callee_spec: Optional[f03.Base], dummies: Set[str]) ->
     return opt
 
 
-def _bind_actuals_to_dummies(call: f03.Call_Stmt, dummies: List[str],
-                             optionals: Set[str]) -> Optional[Tuple[Dict[str, str], Set[str]]]:
+class DummyBinding(NamedTuple):
+    present: dict[str, str]
+    absent: set[str]
+
+
+def _bind_actuals_to_dummies(call: f03.Call_Stmt, dummies: list[str], optionals: set[str]) -> DummyBinding | None:
     """Map each dummy to its actual argument text at ``call``, classifying omitted
     optionals as ABSENT.
 
@@ -166,7 +161,7 @@ def _bind_actuals_to_dummies(call: f03.Call_Stmt, dummies: List[str],
     """
     _, arglist = call.children
     actuals = list(arglist.children) if arglist is not None else []
-    present: Dict[str, str] = {}
+    present: dict[str, str] = {}
     pos = 0
     for a in actuals:
         if isinstance(a, f03.Actual_Arg_Spec):
@@ -177,7 +172,7 @@ def _bind_actuals_to_dummies(call: f03.Call_Stmt, dummies: List[str],
                 return None
             present[dummies[pos].lower()] = str(a)
             pos += 1
-    absent: Set[str] = set()
+    absent: set[str] = set()
     for d in dummies:
         dl = d.lower()
         if dl not in present:
@@ -188,11 +183,10 @@ def _bind_actuals_to_dummies(call: f03.Call_Stmt, dummies: List[str],
             # A forwarded optional that was itself omitted upstream.
             del present[dl]
             absent.add(dl)
-    return present, absent
+    return DummyBinding(present, absent)
 
 
-def _statically_present(bound: Dict[str, str], caller_sub: Optional[f03.Base],
-                        caller_spec: Optional[f03.Base]) -> Set[str]:
+def _statically_present(bound: dict[str, str], caller_sub: f03.Base | None, caller_spec: f03.Base | None) -> set[str]:
     """Of the supplied dummies in ``bound``, those whose ``PRESENT`` is statically
     ``.TRUE.`` at this call -- i.e. all of them EXCEPT any bound to a bare reference
     to one of the CALLER's own OPTIONAL dummies.
@@ -224,7 +218,7 @@ def _statically_present(bound: Dict[str, str], caller_sub: Optional[f03.Base],
     return {d for d, actual in bound.items() if actual.strip().lower() not in caller_optionals}
 
 
-def _fold_optionals(text: str, present: Set[str], absent: Set[str]) -> str:
+def _fold_optionals(text: str, present: set[str], absent: set[str]) -> str:
     """Resolve ``PRESENT`` / ``SIZE`` queries on dummies whose presence is now
     statically known, BEFORE the dummy names are substituted away.
 
@@ -248,8 +242,7 @@ def _drop_absent_actuals(text: str) -> str:
     s = _ABSENT
     text = re.sub(r",\s*\w+\s*=\s*" + s + r"\b", "", text)  # ", kw=absent" (not first)
     text = re.sub(r"\b\w+\s*=\s*" + s + r"\s*,\s*", "", text)  # "kw=absent, " (first)
-    text = re.sub(r"\(\s*\w+\s*=\s*" + s + r"\s*\)", "()", text)  # sole arg
-    return text
+    return re.sub(r"\(\s*\w+\s*=\s*" + s + r"\s*\)", "()", text)  # sole arg
 
 
 def _drop_calls_passing_absent(text: str) -> str:
@@ -275,7 +268,7 @@ def _drop_calls_passing_absent(text: str) -> str:
     return "\n".join(kept)
 
 
-def _carry_uses(callee_sub: f03.Base) -> List[str]:
+def _carry_uses(callee_sub: f03.Base) -> list[str]:
     """Source text of the USE statements the spliced body needs to keep resolving in
     the caller (a DIFFERENT module):
 
@@ -289,7 +282,7 @@ def _carry_uses(callee_sub: f03.Base) -> List[str]:
         type" / "requires explicit interface".
 
     Deduplicated by the caller-side merge."""
-    uses: List[str] = []
+    uses: list[str] = []
     spec = next(iter(children_of_type(callee_sub, f03.Specification_Part)), None)
     if spec is not None:
         uses.extend(str(u) for u in children_of_type(spec, f03.Use_Stmt))
@@ -307,12 +300,12 @@ def _carry_uses(callee_sub: f03.Base) -> List[str]:
     return uses
 
 
-def _local_decls(callee_spec: Optional[f03.Base], dummies: Set[str]) -> List[f03.Base]:
+def _local_decls(callee_spec: f03.Base | None, dummies: set[str]) -> list[f03.Base]:
     """The callee's NON-dummy local Type_Declaration_Stmt nodes (the ones the
     spliced body needs declared in the caller)."""
     if callee_spec is None:
         return []
-    out: List[f03.Base] = []
+    out: list[f03.Base] = []
     for decl in children_of_type(callee_spec, f03.Type_Declaration_Stmt):
         decl_names = {str(n).lower() for ed in walk(decl, f03.Entity_Decl) for n in children_of_type(ed, f03.Name)}
         if decl_names and decl_names.isdisjoint(dummies):
@@ -337,8 +330,8 @@ def _fold_logical_literal_locals(exec_text: str) -> str:
     (harmlessly unused).  Alias-map-free, so it runs on a fragment whose ``USE``d
     modules are absent.
     """
-    counts: Dict[str, int] = {}
-    lit: Dict[str, str] = {}
+    counts: dict[str, int] = {}
+    lit: dict[str, str] = {}
     for m in _LOGICAL_LIT_ASSIGN.finditer(exec_text):
         nm = m.group(1).lower()
         counts[nm] = counts.get(nm, 0) + 1
@@ -347,13 +340,19 @@ def _fold_logical_literal_locals(exec_text: str) -> str:
     if not const:
         return exec_text
     kept = [
-        line for line in exec_text.splitlines()
-        if not ((m := _LOGICAL_LIT_ASSIGN.match(line)) and m.group(1).lower() in const)
+        line
+        for line in exec_text.splitlines()
+        if not ((assign := _LOGICAL_LIT_ASSIGN.match(line)) and assign.group(1).lower() in const)
     ]
     return _subst("\n".join(kept), const)
 
 
-def _reparse_fragment(uses: List[str], decls: List[str], exec_text: str) -> Tuple[List[f03.Base], List[f03.Base]]:
+class ReparsedFragment(NamedTuple):
+    specification: list[f03.Base]
+    execution: list[f03.Base]
+
+
+def _reparse_fragment(uses: list[str], decls: list[str], exec_text: str) -> ReparsedFragment:
     """Reparse a substituted body fragment (carried USEs + renamed local decls +
     substituted executable text) and return ``(spec_children, exec_children)``."""
     # An omitted optional makes ``PRESENT(it)`` fold to ``.FALSE.`` and ``PRESENT`` of
@@ -371,19 +370,19 @@ def _reparse_fragment(uses: List[str], decls: List[str], exec_text: str) -> Tupl
     # left for the downstream const-eval/prune loop.
     exec_text = _fold_logical_literal_locals(exec_text)
     # Fortran statement order: USE, then IMPLICIT, then declarations, then body.
-    head = "\n".join(uses + ["implicit none"] + decls)
+    head = "\n".join([*uses, "implicit none", *decls])
     text = f"module zz_inl_m\ncontains\nsubroutine zz_inl_s\n{head}\n{exec_text}\nend subroutine\nend module\n"
     prog = parse_program(text)
     pruning.prune_branches(prog, alias_map={})
-    sub = next(iter(walk(prog, (f03.Subroutine_Subprogram, ))))
+    sub = next(iter(walk(prog, (f03.Subroutine_Subprogram,))))
     spec = next(iter(children_of_type(sub, f03.Specification_Part)), None)
     expart = next(iter(children_of_type(sub, f03.Execution_Part)), None)
     spec_children = list(spec.children) if spec is not None else []
     exec_children = list(expart.children) if expart is not None else []
-    return spec_children, exec_children
+    return ReparsedFragment(spec_children, exec_children)
 
 
-def _fragment_has_absent(frag_spec: List[f03.Base], frag_exec: List[f03.Base]) -> bool:
+def _fragment_has_absent(frag_spec: list[f03.Base], frag_exec: list[f03.Base]) -> bool:
     """True when the ``_ABSENT`` marker survives the (already dead-branch-pruned)
     fragment -- a genuine use of an omitted optional in LIVE code that this
     specialization cannot express, so the inline must be abandoned rather than emit an
@@ -391,7 +390,7 @@ def _fragment_has_absent(frag_spec: List[f03.Base], frag_exec: List[f03.Base]) -
     return any(_ABSENT in str(c) for c in frag_exec) or any(_ABSENT in str(c) for c in frag_spec)
 
 
-def _enclosing_module_name(node: f03.Base) -> Optional[str]:
+def _enclosing_module_name(node: f03.Base) -> str | None:
     """Lower-cased name of the MODULE lexically containing ``node`` (None if it is
     a free program unit)."""
     mod = node.parent
@@ -403,7 +402,7 @@ def _enclosing_module_name(node: f03.Base) -> Optional[str]:
     return str(mstmt.children[1]).lower() if mstmt is not None else None
 
 
-def _merge_into_caller_spec(caller_spec: f03.Base, frag_spec: List[f03.Base]) -> None:
+def _merge_into_caller_spec(caller_spec: f03.Base, frag_spec: list[f03.Base]) -> None:
     """Merge the fragment's USE + declaration statements into the caller's
     Specification_Part: USEs prepended (deduplicated by text), decls appended.
 
@@ -431,7 +430,7 @@ def _merge_into_caller_spec(caller_spec: f03.Base, frag_spec: List[f03.Base]) ->
 def _inline_one_call(call: f03.Call_Stmt, callee_sub: f03.Base, counter: int) -> bool:
     """Splice ``callee_sub``'s body into ``call``'s site with the actuals bound.
     Returns True on success, False when the call shape is left untouched."""
-    callee_stmt = next(iter(children_of_type(callee_sub, (f03.Subroutine_Stmt, ))), None)
+    callee_stmt = next(iter(children_of_type(callee_sub, (f03.Subroutine_Stmt,))), None)
     if callee_stmt is None:
         return False
     dummies = _dummy_arg_names(callee_stmt)
@@ -444,7 +443,8 @@ def _inline_one_call(call: f03.Call_Stmt, callee_sub: f03.Base, counter: int) ->
 
     caller_sub = call
     while caller_sub is not None and not isinstance(
-            caller_sub, (f03.Subroutine_Subprogram, f03.Function_Subprogram, f03.Main_Program)):
+        caller_sub, (f03.Subroutine_Subprogram, f03.Function_Subprogram, f03.Main_Program)
+    ):
         caller_sub = caller_sub.parent
     if caller_sub is None:
         return False
@@ -462,12 +462,12 @@ def _inline_one_call(call: f03.Call_Stmt, callee_sub: f03.Base, counter: int) ->
     dummy_set = {d.lower() for d in dummies}
     local_decls = _local_decls(callee_spec, dummy_set)
     # Rename every callee local uniquely so it cannot clash with a caller name.
-    rename: Dict[str, str] = {}
+    rename: dict[str, str] = {}
     for decl in local_decls:
         for ed in walk(decl, f03.Entity_Decl):
             nm = next(iter(children_of_type(ed, f03.Name)), None)
             if nm is not None:
-                rename[str(nm)] = f"{str(nm)}_inl{counter}"
+                rename[str(nm)] = f"{nm!s}_inl{counter}"
 
     # Resolve PRESENT / SIZE queries on now-known optional dummies BEFORE the
     # names are substituted away.  A dummy forwarded the caller's own optional
@@ -476,8 +476,8 @@ def _inline_one_call(call: f03.Call_Stmt, callee_sub: f03.Base, counter: int) ->
 
     # One combined substitution: present dummies -> actual text, omitted optionals
     # -> the absent marker, locals -> unique names.
-    mapping: Dict[str, str] = dict(bound)
-    mapping.update({d: _ABSENT for d in absent})
+    mapping: dict[str, str] = dict(bound)
+    mapping.update(dict.fromkeys(absent, _ABSENT))
     mapping.update(rename)
     exec_text = _subst(exec_text, mapping)
 
@@ -514,7 +514,7 @@ def _function_result_name(func_stmt: f03.Function_Stmt) -> str:
     return utils.find_name_of_stmt(func_stmt) or ""
 
 
-def _enclosing_exec_stmt(node: f03.Base) -> Optional[f03.Base]:
+def _enclosing_exec_stmt(node: f03.Base) -> f03.Base | None:
     """The ancestor of ``node`` that is a direct statement of an Execution_Part
     (so the inlined function body can be spliced in just before it)."""
     cur = node
@@ -533,7 +533,7 @@ def _inline_one_funcref(ref: f03.Base, callee_sub: f03.Base, counter: int) -> bo
     is bound and the ladder folds, the reference becomes a single-source rebind in
     the caller.
     """
-    func_stmt = next(iter(children_of_type(callee_sub, (f03.Function_Stmt, ))), None)
+    func_stmt = next(iter(children_of_type(callee_sub, (f03.Function_Stmt,))), None)
     if func_stmt is None:
         return False
     dummies = _dummy_arg_names(func_stmt)
@@ -553,7 +553,8 @@ def _inline_one_funcref(ref: f03.Base, callee_sub: f03.Base, counter: int) -> bo
     exec_part = enclosing.parent
     caller_sub = enclosing
     while caller_sub is not None and not isinstance(
-            caller_sub, (f03.Subroutine_Subprogram, f03.Function_Subprogram, f03.Main_Program)):
+        caller_sub, (f03.Subroutine_Subprogram, f03.Function_Subprogram, f03.Main_Program)
+    ):
         caller_sub = caller_sub.parent
     caller_spec = next(iter(children_of_type(caller_sub, f03.Specification_Part)), None) if caller_sub else None
     if caller_spec is None:
@@ -562,12 +563,12 @@ def _inline_one_funcref(ref: f03.Base, callee_sub: f03.Base, counter: int) -> bo
     result_name = _function_result_name(func_stmt)
     dummy_set = {d.lower() for d in dummies}
     local_decls = _local_decls(callee_spec, dummy_set)
-    rename: Dict[str, str] = {}
+    rename: dict[str, str] = {}
     for decl in local_decls:
         for ed in walk(decl, f03.Entity_Decl):
             nm = next(iter(children_of_type(ed, f03.Name)), None)
             if nm is not None:
-                rename[str(nm)] = f"{str(nm)}_fn{counter}"
+                rename[str(nm)] = f"{nm!s}_fn{counter}"
     result_repl = rename.get(result_name)
     if result_repl is None:
         # The result variable must be among the callee's declarations to rename +
@@ -576,8 +577,8 @@ def _inline_one_funcref(ref: f03.Base, callee_sub: f03.Base, counter: int) -> bo
         return False
 
     exec_text = _fold_optionals(str(callee_exec), _statically_present(bound, caller_sub, caller_spec), absent)
-    mapping: Dict[str, str] = dict(bound)
-    mapping.update({d: _ABSENT for d in absent})
+    mapping: dict[str, str] = dict(bound)
+    mapping.update(dict.fromkeys(absent, _ABSENT))
     mapping.update(rename)
     exec_text = _drop_calls_passing_absent(_drop_absent_actuals(_subst(exec_text, mapping)))
 
@@ -599,7 +600,7 @@ def _inline_one_funcref(ref: f03.Base, callee_sub: f03.Base, counter: int) -> bo
     return True
 
 
-def _target_defs(ast: f03.Program, want: Set[str], stmt_type) -> Dict[str, f03.Base]:
+def _target_defs(ast: f03.Program, want: set[str], stmt_type: Union[type, tuple[type, ...]]) -> dict[str, f03.Base]:
     """Map each target NAME to its (unique) subprogram definition.  A fallback for
     resolving a target call whose CALLER-LOCAL alias scope does not reach it -- once
     an outer wrapper is inlined, its forwarded ``CALL mixprec`` lands in the caller's
@@ -608,7 +609,7 @@ def _target_defs(ast: f03.Program, want: Set[str], stmt_type) -> Dict[str, f03.B
     cannot resolve it.  Matching the call's own name against the target definitions
     closes that gap; targets are specific named procedures, so a name match is the
     intended callee."""
-    out: Dict[str, f03.Base] = {}
+    out: dict[str, f03.Base] = {}
     for sub in walk(ast, (f03.Subroutine_Subprogram, f03.Function_Subprogram)):
         stmt = next(iter(children_of_type(sub, stmt_type)), None)
         if stmt is None:
@@ -619,8 +620,13 @@ def _target_defs(ast: f03.Program, want: Set[str], stmt_type) -> Dict[str, f03.B
     return out
 
 
-def _resolve_target_callee(procname: f03.Name, alias_map, want: Set[str], target_defs: Dict[str, f03.Base],
-                           stmt_type) -> Optional[f03.Base]:
+def _resolve_target_callee(
+    procname: f03.Name,
+    alias_map: types.SPEC_TABLE,
+    want: set[str],
+    target_defs: dict[str, f03.Base],
+    stmt_type: Union[type, tuple[type, ...]],
+) -> f03.Base | None:
     """Resolve a call/reference name to a TARGET subprogram definition: first via the
     caller's local alias scope (handles USE-renamed ``deconiface`` specifics), then
     by direct target-name match (handles a forwarded call that landed cross-module)."""
@@ -706,7 +712,12 @@ def inline_named_subprograms(ast: f03.Program, targets: Iterable[str]) -> int:
     return inlined
 
 
-def specialize_at_source(ast: f03.Program, targets: Iterable[str]) -> Tuple[int, int]:
+class SpecializedCounts(NamedTuple):
+    subprograms: int
+    functions: int
+
+
+def specialize_at_source(ast: f03.Program, targets: Iterable[str]) -> SpecializedCounts:
     """Specialize every call to a ``targets`` procedure to its call site by
     inlining its body (SUBROUTINE calls and FUNCTION references both), so the
     call-site-constant arguments fold the body.  Returns ``(n_subprograms,
@@ -717,12 +728,15 @@ def specialize_at_source(ast: f03.Program, targets: Iterable[str]) -> Tuple[int,
     # -- e.g. an absent-optional shape the splice could not express -- and will
     # carry its runtime-selected construct into the bridge, where it fails to lower.
     want = {t.lower() for t in targets}
-    survivors = sorted({
-        c.children[0].string.lower()
-        for c in walk(ast, f03.Call_Stmt)
-        if isinstance(c.children[0], f03.Name) and c.children[0].string.lower() in want
-    })
+    survivors = sorted(
+        {
+            c.children[0].string.lower()
+            for c in walk(ast, f03.Call_Stmt)
+            if isinstance(c.children[0], f03.Name) and c.children[0].string.lower() in want
+        }
+    )
     if survivors:
-        logger.warning("specialize_at_source: %d TARGET call(s) NOT inlined (will block lowering): %s", len(survivors),
-                       survivors)
-    return n_sub, n_fun
+        logger.warning(
+            "specialize_at_source: %d TARGET call(s) NOT inlined (will block lowering): %s", len(survivors), survivors
+        )
+    return SpecializedCounts(n_sub, n_fun)

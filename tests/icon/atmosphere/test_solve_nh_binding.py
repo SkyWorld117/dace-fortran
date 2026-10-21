@@ -12,21 +12,16 @@ the ``_MPI_STUB`` ``module mpi`` and giving ``mo_mpi`` a ``use mpi`` so one
 
 Marked ``long``: builds the 3166-LoC dycore to an SDFG (minutes).
 """
-import shutil
+
 from pathlib import Path
 
 import pytest
 
-from _util import build_sdfg, have_flang
-from icon._halo_modes import _MPI_STUB
-
 from dace_fortran.bindings import build_fortran_library
+from tests._util import build_sdfg
+from tests.icon._halo_modes import _MPI_STUB
 
-pytestmark = [
-    pytest.mark.long,
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+pytestmark = pytest.mark.long
 
 _HERE = Path(__file__).resolve().parent
 _TU = _HERE / "solve_nonhydro_inlined_single_tu.f90"
@@ -53,8 +48,11 @@ def test_solve_nh_binding_compiles(tmp_path: Path):
     stub.write_text(_MPI_STUB)
 
     # prelude_sources compile left-to-right before the binding -- stub (module mpi) must precede the TU that uses it.
-    lib = build_fortran_library(sdfg,
-                                out_dir=str(tmp_path / "lib"),
-                                prelude_sources=[stub, use_mpi_tu],
-                                bind_c_shim=True)
+    lib = build_fortran_library(
+        sdfg, out_dir=str(tmp_path / "lib"), prelude_sources=[stub, use_mpi_tu], bind_c_shim=True
+    )
     assert Path(lib.so_path).exists(), "binding .so was not produced"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -8,7 +8,10 @@ communicator; the Fortran caller typically hands the SDFG a sub-communicator
 the parent communicator from an SDFG symbol (populated by the bindings layer
 via ``MPI_Comm_f2c``).  ``exit_code()`` is inherited unchanged.
 """
-import dace.dtypes as dtypes
+
+from collections.abc import Sequence
+from typing import Any
+
 from dace.data.distributed import ProcessGrid
 from dace.properties import Property, make_properties
 
@@ -21,7 +24,7 @@ class FortranProcessGrid(ProcessGrid):
     (``is_subgrid=True``) ignore :attr:`parent_comm_symbol` -- their parent
     comm comes from ``parent_grid``, same as the stock class."""
 
-    parent_comm_symbol = Property(
+    parent_comm_symbol: Property[str | None] = Property(
         dtype=str,
         allow_none=True,
         default=None,
@@ -31,14 +34,19 @@ class FortranProcessGrid(ProcessGrid):
         "(MPI_COMM_WORLD).",
     )
 
-    def __init__(self, name, shape, parent_comm_symbol=None, exact_grid=None, root=0):
-        super().__init__(name=name,
-                         is_subgrid=False,
-                         shape=shape,
-                         parent_grid=None,
-                         color=None,
-                         exact_grid=exact_grid,
-                         root=root)
+    def __init__(
+        self,
+        name: str,
+        shape: Sequence[Any],
+        parent_comm_symbol: str | None = None,
+        exact_grid: int | None = None,
+        root: int = 0,
+    ) -> None:
+        # dace annotates ``parent_grid``/``color`` as required and ``RankType`` omits ``int``; ``None`` means the world grid.
+        grid_args: dict[str, Any] = dict(
+            name=name, is_subgrid=False, shape=shape, parent_grid=None, color=None, exact_grid=exact_grid, root=root
+        )
+        super().__init__(**grid_args)
         self.parent_comm_symbol = parent_comm_symbol
 
     def init_code(self) -> str:

@@ -6,21 +6,14 @@ trimmed to the surface the inliner tests use (``SourceCodeBuilder`` +
 ``parse_and_improve``) and re-pointed at the dace-fortran package
 (``dace_fortran.fparser_inliner`` / ``dace_fortran.inliner``).
 """
+
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from os import path
 from tempfile import TemporaryDirectory
-from typing import Dict, Optional, Tuple
-
-import pytest
 
 from dace_fortran.fparser_inliner import parse_and_improve  # noqa: F401  (re-exported for tests)
-
-
-def _have_gfortran() -> bool:
-    return shutil.which("gfortran") is not None
 
 
 @dataclass
@@ -32,13 +25,14 @@ class SourceCodeBuilder:
     ``check_with_gfortran`` compile gate, and ``get`` to retrieve the
     ``{name: content}`` mapping.
     """
-    sources: Dict[str, str] = field(default_factory=dict)
 
-    def add_file(self, content: str, name: Optional[str] = None):
+    sources: dict[str, str] = field(default_factory=dict)
+
+    def add_file(self, content: str, name: str | None = None):
         """Add source file contents in the order you'd pass them to ``gfortran``."""
         if not name:
             name = SourceCodeBuilder._identify_name(content)
-        name, ext = name.rsplit('.', 1) if '.' in name else (name, 'f90')
+        name, ext = name.rsplit(".", 1) if "." in name else (name, "f90")
         key, counter = f"{name}.{ext}", 0
         while key in self.sources:
             key, counter = f"{name}_{counter}.{ext}", counter + 1
@@ -46,39 +40,39 @@ class SourceCodeBuilder:
         return self
 
     def check_with_gfortran(self):
-        """Assert that it all compiles with ``gfortran`` (skips if gfortran absent)."""
-        if not _have_gfortran():
-            pytest.skip("gfortran not on PATH")
+        """Assert that it all compiles with ``gfortran`` (fails if gfortran is absent)."""
         with TemporaryDirectory() as td:
             for fname, content in self.sources.items():
-                with open(path.join(td, fname), 'w') as f:
+                with open(path.join(td, fname), "w") as f:
                     f.write(content)
-            cmd = ['gfortran', '-Wall', '-shared', '-fPIC', '-ffree-line-length-none', *self.sources.keys()]
+            cmd = ["gfortran", "-Wall", "-shared", "-fPIC", "-ffree-line-length-none", *self.sources.keys()]
             try:
-                subprocess.run(cmd, cwd=td, capture_output=True).check_returncode()
+                subprocess.run(cmd, check=False, cwd=td, capture_output=True).check_returncode()
                 return self
             except subprocess.CalledProcessError as e:
                 print("Fortran compilation failed!")
                 print(e.stderr.decode())
-                raise e
+                raise
 
-    def get(self) -> Tuple[Dict[str, str], Optional[str]]:
+    def get(self) -> tuple[dict[str, str], str | None]:
         """Get a dictionary mapping file names to their content + the ``main`` source."""
-        main = self.sources.get('main.f90')
+        main = self.sources.get("main.f90")
         return self.sources, main
 
     @staticmethod
     def _identify_name(content: str) -> str:
-        PPAT = re.compile(r"^.*\bprogram\b\s*\b(?P<prog>[a-zA-Z0-9_]*)\b.*$", re.I | re.M | re.S)
+        PPAT = re.compile(r"^.*\bprogram\b\s*\b(?P<prog>[a-zA-Z0-9_]*)\b.*$", re.IGNORECASE | re.MULTILINE | re.DOTALL)
         if PPAT.match(content):
-            return PPAT.search(content).group('prog') or 'main'
-        MPAT = re.compile(r"^.*\bmodule\b\s*\b(?P<mod>[a-zA-Z0-9_]+)\b.*$", re.I | re.M | re.S)
+            return PPAT.search(content).group("prog") or "main"
+        MPAT = re.compile(r"^.*\bmodule\b\s*\b(?P<mod>[a-zA-Z0-9_]+)\b.*$", re.IGNORECASE | re.MULTILINE | re.DOTALL)
         if MPAT.match(content):
-            return MPAT.search(content).group('mod')
-        FPAT = re.compile(r"^.*\bfunction\b\s*\b(?P<fn>[a-zA-Z0-9_]+)\b.*$", re.I | re.M | re.S)
+            return MPAT.search(content).group("mod")
+        FPAT = re.compile(r"^.*\bfunction\b\s*\b(?P<fn>[a-zA-Z0-9_]+)\b.*$", re.IGNORECASE | re.MULTILINE | re.DOTALL)
         if FPAT.match(content):
-            return FPAT.search(content).group('fn')
-        SPAT = re.compile(r"^.*\bsubroutine\b\s*\b(?P<subr>[a-zA-Z0-9_]+)\b.*$", re.I | re.M | re.S)
+            return FPAT.search(content).group("fn")
+        SPAT = re.compile(
+            r"^.*\bsubroutine\b\s*\b(?P<subr>[a-zA-Z0-9_]+)\b.*$", re.IGNORECASE | re.MULTILINE | re.DOTALL
+        )
         if SPAT.match(content):
-            return SPAT.search(content).group('subr')
+            return SPAT.search(content).group("subr")
         raise ValueError(f"Could not find any identifiable object in the content:\n{content}")

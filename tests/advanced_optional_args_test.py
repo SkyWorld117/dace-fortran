@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/advanced_optional_args_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_optional_adv(tmp_path):
@@ -56,7 +53,7 @@ contains
   end subroutine get_indices_c
 end subroutine main
     """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -66,3 +63,9 @@ end subroutine main
 
     # Safe path only: call fun(res2) reads OPTIONAL a without a PRESENT check (UB); res2 left unchecked.
     assert res[0] == 5
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

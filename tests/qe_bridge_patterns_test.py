@@ -5,12 +5,11 @@ kernel, each isolating one pattern as a fast regression guard independent of the
 2. PRESENT() on an inlined OPTIONAL dummy (``bridge/ast/expressions.cpp`` lowerIsPresent)
 3. derived-type INTEGER member used as array size (``bridge/extract_vars.cpp`` shape-symbol snapshot)
 """
+
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_local_allocatable_section_bound(tmp_path):
@@ -209,3 +208,7 @@ END MODULE
     sdfg(eig=eig, mill=mill, na=np.int32(na), n=np.int32(n), offset=np.int32(offset), ld=np.int32(ld), res=res)
     expected = np.array([eig[mill[0, offset + i] - 1, na - 1] for i in range(n)], dtype=np.complex128)
     np.testing.assert_allclose(res, expected)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

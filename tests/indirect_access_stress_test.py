@@ -13,11 +13,8 @@ indirect axes.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 # ---------------------------------------------------------------------------
 # 1-level gather: B(i) = A(idx(i))
@@ -384,15 +381,23 @@ def test_indirect_icon4_minimal_repro(tmp_path: Path):
 
     sdfg = build_sdfg(_ICON4_REPRO_SRC, tmp_path, name="icon4_repro").build()
     out_sdfg = np.zeros((nproma, nlev), dtype=np.float64, order="F")
-    sdfg(vn=vn,
-         iqidx=iqidx,
-         iqblk=iqblk,
-         mask=mask,
-         out=out_sdfg,
-         nproma=nproma,
-         nlev=nlev,
-         nblks=nblks,
-         jb=jb,
-         jk=0,
-         je=0)
+    sdfg(
+        vn=vn,
+        iqidx=iqidx,
+        iqblk=iqblk,
+        mask=mask,
+        out=out_sdfg,
+        nproma=nproma,
+        nlev=nlev,
+        nblks=nblks,
+        jb=jb,
+        jk=0,
+        je=0,
+    )
     np.testing.assert_array_equal(out_sdfg, out_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

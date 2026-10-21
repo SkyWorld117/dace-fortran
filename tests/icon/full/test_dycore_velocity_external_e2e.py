@@ -7,7 +7,7 @@ Velocity-scale, struct-shaped generalisation of the small-scale architecture pro
 Architecture: (1) inner SDFG built from ``velocity_full.f90`` with
 ``bind_c_shim=True`` exposing ``velocity_tendencies_c`` (one ``c_ptr`` per marshal
 leaf); (2) outer ``dycore_wrapper`` SDFG registers ``velocity_tendencies`` as
-``keep_external`` with ``Arg(kind='aos', c_abi='per_member_soa')`` per derived-type
+``keep_external`` with ``Arg(kind=AOS, c_abi=PER_MEMBER_SOA)`` per derived-type
 arg, forwarding the marshal-expanded SoA pointers directly; (3) caller drives the
 outer via standard bindings, a flat-C-ABI shim retargeting ``run_velocity_flat_c`` to
 ``dycore_wrapper_dace``; (4) reference is the gfortran-compiled untransformed source.
@@ -15,18 +15,14 @@ outer via standard bindings, a flat-C-ABI shim retargeting ``run_velocity_flat_c
 xfail: ``hlfir-marshal-external-structs`` v2.1 doesn't cover box/pointer/allocatable
 members (what ``t_nh_prog``/``t_patch`` carry), so ``emit_call`` raises "'aos' arg #0
 has no marshalling group".  Flips green when v2 box/allocatable expansion lands."""
+
 import ctypes
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
-import numpy as np
-import pytest
-
 import dace
-from _util import build_sdfg, have_flang
-from icon.full._harness import _INIT_ARRAY_ORDER, _OUTPUT_NAMES, _allocate
+import numpy as np
 
 from dace_fortran.bindings import (
     FlattenPlan,
@@ -34,6 +30,11 @@ from dace_fortran.bindings import (
     OriginalInterface,
     build_fortran_library,
 )
+from dace_fortran.bindings.fortran_interface import build_auto_interface
+from dace_fortran.bindings.frozen_signature import ModuleOrigin
+from dace_fortran.external import Arg, ArgKind, CAbi, Intent, clear_external_registry, keep_external
+from tests._util import build_sdfg
+from tests.icon.full._harness import _INIT_ARRAY_ORDER, _OUTPUT_NAMES, _allocate
 
 # ``-O0 -fno-fast-math -ffp-contract=off`` matched across every build layer so the
 # SDFG path's arithmetic order matches gfortran exactly.  Without this DaCe's default
@@ -41,13 +42,7 @@ from dace_fortran.bindings import (
 # e2e is a regression gate, not a tolerance-shopping target.
 _O0_FFLAGS = ("-O0", "-fno-fast-math", "-ffp-contract=off", "-ffree-line-length-none")
 _O0_CXX_FLAGS = ("-O0", "-fno-fast-math", "-ffp-contract=off", "-fPIC", "-Wno-unused-parameter", "-Wno-unused-label")
-from dace_fortran.bindings.fortran_interface import build_auto_interface
-from dace_fortran.external import Arg, clear_external_registry, keep_external
 
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
 
 _HERE = Path(__file__).resolve().parent
 _VELOCITY_PATH = _HERE / "velocity_full.f90"
@@ -220,12 +215,9 @@ def _scalar(name, ftype, intent, stype=None):
 
 
 def _arr3(name, intent):
-    return OriginalArg(name=name,
-                       fortran_type="real(8)",
-                       rank=3,
-                       shape=(":", ":", ":"),
-                       intent=intent,
-                       struct_type=None)
+    return OriginalArg(
+        name=name, fortran_type="real(8)", rank=3, shape=(":", ":", ":"), intent=intent, struct_type=None
+    )
 
 
 # Same ``OriginalInterface`` shape as ``test_velocity_full_bindings_e2e``'s inner
@@ -252,20 +244,20 @@ def _velocity_iface(entry: str) -> OriginalInterface:
         ),
         struct_types={},
         used_modules={
-            "mo_model_domain": ("t_patch", ),
-            "mo_intp_data_strc": ("t_int_state", ),
+            "mo_model_domain": ("t_patch",),
+            "mo_intp_data_strc": ("t_int_state",),
             "mo_nonhydro_types": ("t_nh_prog", "t_nh_metrics", "t_nh_diag"),
         },
         module_symbol_sources={
-            "nproma": ("mo_parallel_config", "nproma"),
-            "timers_level": ("mo_run_config", "timers_level"),
-            "nrdmax": ("mo_vertical_grid", "nrdmax"),
-            "nflatlev": ("mo_init_vgrid", "nflatlev"),
-            "i_am_accel_node": ("mo_mpi", "i_am_accel_node"),
-            "lextra_diffu": ("mo_nonhydrostatic_config", "lextra_diffu"),
-            "lvert_nest": ("mo_run_config", "lvert_nest"),
-            "timer_intp": ("mo_timer", "timer_intp"),
-            "timer_solve_nh_veltend": ("mo_timer", "timer_solve_nh_veltend"),
+            "nproma": ModuleOrigin("mo_parallel_config", "nproma"),
+            "timers_level": ModuleOrigin("mo_run_config", "timers_level"),
+            "nrdmax": ModuleOrigin("mo_vertical_grid", "nrdmax"),
+            "nflatlev": ModuleOrigin("mo_init_vgrid", "nflatlev"),
+            "i_am_accel_node": ModuleOrigin("mo_mpi", "i_am_accel_node"),
+            "lextra_diffu": ModuleOrigin("mo_nonhydrostatic_config", "lextra_diffu"),
+            "lvert_nest": ModuleOrigin("mo_run_config", "lvert_nest"),
+            "timer_intp": ModuleOrigin("mo_timer", "timer_intp"),
+            "timer_solve_nh_veltend": ModuleOrigin("mo_timer", "timer_solve_nh_veltend"),
         },
     )
 
@@ -282,16 +274,14 @@ def _make_sdfg_shim_for_outer(caller_src: str) -> str:
     shim = shim.replace("run_velocity_flat_c", "run_velocity_flat_sdfg")
     shim = shim.replace(
         "USE mo_velocity_advection,  ONLY: velocity_tendencies",
-        "USE dycore_wrapper_dace_bindings, ONLY: dycore_wrapper_dace, "
-        "dycore_wrapper_dace_finalize",
+        "USE dycore_wrapper_dace_bindings, ONLY: dycore_wrapper_dace, dycore_wrapper_dace_finalize",
     )
     shim = shim.replace("CALL velocity_tendencies(p_prog, p_patch", "CALL dycore_wrapper_dace(p_prog, p_patch")
-    shim = re.sub(
+    return re.sub(
         r"(?i)\bEND\s+SUBROUTINE\s+run_velocity_flat_sdfg",
         "  CALL dycore_wrapper_dace_finalize()\nEND SUBROUTINE run_velocity_flat_sdfg",
         shim,
     )
-    return shim
 
 
 def _gfortran(out_so: Path, *sources, mod_dir: Path, link_so: Path | None = None):
@@ -318,13 +308,14 @@ def _run(lib, fn, dims, bufs, z_arrays):
     SIGABRT instead of it terminating pytest."""
     import multiprocessing as mp
 
-    nproma, nlev, nlevp1, nblks_c, nblks_e, nblks_v = dims
+    _nproma, _nlev, _nlevp1, _nblks_c, _nblks_e, _nblks_v = dims
     buf_views = {k: (np.asarray(v).tobytes(), v.shape, v.dtype.str) for k, v in bufs.items()}
     z_views = [(z.tobytes(), z.shape, z.dtype.str) for z in z_arrays]
     ctx = mp.get_context("fork")
     q = ctx.Queue()
     # redirect child stdout/stderr to a file so bind_c_shim debug prints survive SIGABRT
     import tempfile
+
     log_path = tempfile.mktemp(prefix=f"{fn}_", suffix=".log")
     p = ctx.Process(target=_run_child, args=(str(lib._name), fn, dims, buf_views, z_views, q, log_path))
     p.start()
@@ -335,13 +326,12 @@ def _run(lib, fn, dims, bufs, z_arrays):
                 log_tail = "\n".join(f.read().splitlines()[-30:])
         except OSError:
             log_tail = "<no log captured>"
-        raise RuntimeError(f"{fn} aborted (exitcode={p.exitcode}).  Last child output:\n"
-                           f"{log_tail}")
+        raise RuntimeError(f"{fn} aborted (exitcode={p.exitcode}).  Last child output:\n{log_tail}")
     out_bufs, out_z = q.get(timeout=5)
     for k, (raw, shape, dtype) in out_bufs.items():
-        bufs[k][:] = np.frombuffer(raw, dtype=dtype).reshape(shape, order='F')
+        bufs[k][:] = np.frombuffer(raw, dtype=dtype).reshape(shape, order="F")
     for i, (raw, shape, dtype) in enumerate(out_z):
-        z_arrays[i][:] = np.frombuffer(raw, dtype=dtype).reshape(shape, order='F')
+        z_arrays[i][:] = np.frombuffer(raw, dtype=dtype).reshape(shape, order="F")
     # return the child's captured stderr so the caller can assert the sync markers fired
     try:
         with open(log_path) as f:
@@ -355,27 +345,52 @@ def _run_child(lib_path, fn, dims, buf_views, z_views, q, log_path):
     ``fn``, ship post-call buffers back over ``q``.  Redirects stdout/stderr to
     ``log_path`` so bind_c_shim debug output survives the SIGABRT path."""
     import os
+
     log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     os.dup2(log_fd, 1)
     os.dup2(log_fd, 2)
     os.close(log_fd)
     lib = ctypes.CDLL(lib_path)
     bufs = {
-        k: np.frombuffer(raw, dtype=dtype).copy().reshape(shape, order='F')
+        k: np.frombuffer(raw, dtype=dtype).copy().reshape(shape, order="F")
         for k, (raw, shape, dtype) in buf_views.items()
     }
-    z_arrays = [np.frombuffer(raw, dtype=dtype).copy().reshape(shape, order='F') for raw, shape, dtype in z_views]
+    z_arrays = [np.frombuffer(raw, dtype=dtype).copy().reshape(shape, order="F") for raw, shape, dtype in z_views]
     f = getattr(lib, fn)
     f.restype = None
-    f.argtypes = ([ctypes.c_int] * 6 + [ctypes.c_int, ctypes.c_int] + [ctypes.c_int8, ctypes.c_int8] +
-                  [ctypes.c_double, ctypes.c_double] + [ctypes.c_void_p, ctypes.c_void_p] +
-                  [ctypes.c_int8, ctypes.c_int8, ctypes.c_int] + [ctypes.c_void_p] * (len(_INIT_ARRAY_ORDER) + 3))
+    f.argtypes = (
+        [ctypes.c_int] * 6
+        + [ctypes.c_int, ctypes.c_int]
+        + [ctypes.c_int8, ctypes.c_int8]
+        + [ctypes.c_double, ctypes.c_double]
+        + [ctypes.c_void_p, ctypes.c_void_p]
+        + [ctypes.c_int8, ctypes.c_int8, ctypes.c_int]
+        + [ctypes.c_void_p] * (len(_INIT_ARRAY_ORDER) + 3)
+    )
     nproma, nlev, nlevp1, nblks_c, nblks_e, nblks_v = dims
-    nrdmax_in = np.full(10, nlev, dtype=np.int32, order='F')
-    nflatlev_in = np.ones(10, dtype=np.int32, order='F')
-    f(nproma, nlev, nlevp1, nblks_c, nblks_e, nblks_v, 1, 1, 0, 0, 60.0, 0.0, nrdmax_in.ctypes.data,
-      nflatlev_in.ctypes.data, 0, 0, 0, *[bufs[k].ctypes.data for k in _INIT_ARRAY_ORDER],
-      *[z.ctypes.data for z in z_arrays])
+    nrdmax_in = np.full(10, nlev, dtype=np.int32, order="F")
+    nflatlev_in = np.ones(10, dtype=np.int32, order="F")
+    f(
+        nproma,
+        nlev,
+        nlevp1,
+        nblks_c,
+        nblks_e,
+        nblks_v,
+        1,
+        1,
+        0,
+        0,
+        60.0,
+        0.0,
+        nrdmax_in.ctypes.data,
+        nflatlev_in.ctypes.data,
+        0,
+        0,
+        0,
+        *[bufs[k].ctypes.data for k in _INIT_ARRAY_ORDER],
+        *[z.ctypes.data for z in z_arrays],
+    )
     out_bufs = {k: (v.tobytes(), v.shape, v.dtype.str) for k, v in bufs.items()}
     out_z = [(z.tobytes(), z.shape, z.dtype.str) for z in z_arrays]
     q.put((out_bufs, out_z))
@@ -395,17 +410,13 @@ def _build_sync_helpers(tmp_path: Path) -> Path:
     cpp_obj = build_dir / "sync_patch_cpp.o"
     so_path = build_dir / "libsync_helpers.so"
     subprocess.check_call(
-        ["gfortran", "-fPIC", "-O0", "-g", f"-J{build_dir}", "-c",
-         str(fortran_src), "-o",
-         str(fortran_obj)],
-        cwd=build_dir)
+        ["gfortran", "-fPIC", "-O0", "-g", f"-J{build_dir}", "-c", str(fortran_src), "-o", str(fortran_obj)],
+        cwd=build_dir,
+    )
     subprocess.check_call(["g++", "-fPIC", "-O0", "-g", "-c", str(cpp_src), "-o", str(cpp_obj)], cwd=build_dir)
     subprocess.check_call(
-        ["gfortran", "-shared", "-fPIC", "-O0", "-g",
-         str(fortran_obj),
-         str(cpp_obj), "-o",
-         str(so_path)],
-        cwd=build_dir)
+        ["gfortran", "-shared", "-fPIC", "-O0", "-g", str(fortran_obj), str(cpp_obj), "-o", str(so_path)], cwd=build_dir
+    )
     return so_path
 
 
@@ -428,8 +439,9 @@ def test_dycore_outer_calls_velocity_sdfg_via_c_abi(tmp_path: Path):
     inner_sdfg_dir.mkdir(parents=True, exist_ok=True)
     clear_external_registry()
     velocity_src = _VELOCITY_PATH.read_text()
-    inner_sdfg = build_sdfg(velocity_src, inner_sdfg_dir, name="velocity_tendencies",
-                            entry="velocity_tendencies").build()
+    inner_sdfg = build_sdfg(
+        velocity_src, inner_sdfg_dir, name="velocity_tendencies", entry="velocity_tendencies"
+    ).build()
     inner_sdfg.name = "velocity_tendencies"
     inner_sdfg.build_folder = str(inner_dir / "dacecache")
     # Bridge-derived ``OriginalInterface`` carries struct_types member layouts the
@@ -460,22 +472,22 @@ def test_dycore_outer_calls_velocity_sdfg_via_c_abi(tmp_path: Path):
         "velocity_tendencies",
         c_name="velocity_tendencies_c",
         args=(
-            Arg(kind="aos", intent="inout", c_abi="per_member_soa"),  # p_prog
-            Arg(kind="aos", intent="in", c_abi="per_member_soa"),  # p_patch
-            Arg(kind="aos", intent="in", c_abi="per_member_soa"),  # p_int
-            Arg(kind="aos", intent="inout", c_abi="per_member_soa"),  # p_metrics
-            Arg(kind="aos", intent="inout", c_abi="per_member_soa"),  # p_diag
-            Arg(kind="array", dtype="float64", intent="inout"),  # z_w_concorr_me
-            Arg(kind="array", dtype="float64", intent="inout"),  # z_kin_hor_e
-            Arg(kind="array", dtype="float64", intent="inout"),  # z_vt_ie
-            Arg(kind="scalar", dtype="int32", intent="in"),  # ntnd
-            Arg(kind="scalar", dtype="int32", intent="in"),  # istep
-            Arg(kind="scalar", dtype="bool", intent="in"),  # lvn_only
-            Arg(kind="scalar", dtype="float64", intent="in"),  # dtime
-            Arg(kind="scalar", dtype="float64", intent="in"),  # dt_linintp_ubc
-            Arg(kind="scalar", dtype="bool", intent="in"),  # ldeepatmo
+            Arg(kind=ArgKind.AOS, intent=Intent.INOUT, c_abi=CAbi.PER_MEMBER_SOA),  # p_prog
+            Arg(kind=ArgKind.AOS, intent=Intent.IN, c_abi=CAbi.PER_MEMBER_SOA),  # p_patch
+            Arg(kind=ArgKind.AOS, intent=Intent.IN, c_abi=CAbi.PER_MEMBER_SOA),  # p_int
+            Arg(kind=ArgKind.AOS, intent=Intent.INOUT, c_abi=CAbi.PER_MEMBER_SOA),  # p_metrics
+            Arg(kind=ArgKind.AOS, intent=Intent.INOUT, c_abi=CAbi.PER_MEMBER_SOA),  # p_diag
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),  # z_w_concorr_me
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),  # z_kin_hor_e
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),  # z_vt_ie
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # ntnd
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # istep
+            Arg(kind=ArgKind.SCALAR, dtype="bool", intent=Intent.IN),  # lvn_only
+            Arg(kind=ArgKind.SCALAR, dtype="float64", intent=Intent.IN),  # dtime
+            Arg(kind=ArgKind.SCALAR, dtype="float64", intent=Intent.IN),  # dt_linintp_ubc
+            Arg(kind=ArgKind.SCALAR, dtype="bool", intent=Intent.IN),  # ldeepatmo
         ),
-        libraries=(str(inner_lib.so_path), ),
+        libraries=(str(inner_lib.so_path),),
         # bind_c_shim ABI: one int extent per dim ahead of each dynamic-shape leaf pointer
         dynamic_extents_abi=True,
         # each library has its own BSS under gfortran linking; forward every module
@@ -487,21 +499,21 @@ def test_dycore_outer_calls_velocity_sdfg_via_c_abi(tmp_path: Path):
     # (tag, d0, d1, d2, field_p); dynamic_extents_abi prepends the extents for
     # c_f_pointer reconstruction; libraries resolves both _c symbols.
     _sync_args = (
-        Arg(kind="scalar", dtype="int32", intent="in"),  # tag
-        Arg(kind="array", dtype="float64", intent="inout"),  # field
+        Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # tag
+        Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),  # field
     )
     keep_external(
         "sync_patch_array",
         c_name="sync_patch_array_c",
         args=_sync_args,
-        libraries=(str(sync_lib_so), ),
+        libraries=(str(sync_lib_so),),
         dynamic_extents_abi=True,
     )
     keep_external(
         "sync_patch_cpp_via",
         c_name="sync_patch_cpp_via_c",
         args=_sync_args,
-        libraries=(str(sync_lib_so), ),
+        libraries=(str(sync_lib_so),),
         dynamic_extents_abi=True,
     )
     try:
@@ -555,11 +567,11 @@ def test_dycore_outer_calls_velocity_sdfg_via_c_abi(tmp_path: Path):
     init.restype = None
     init.argtypes = [ctypes.c_int] * 7 + [ctypes.c_void_p] * len(_INIT_ARRAY_ORDER)
     init(42, *dims, *[bufs_ref[k].ctypes.data for k in _INIT_ARRAY_ORDER])
-    bufs_sdfg = {k: v.copy(order='F') for k, v in bufs_ref.items()}
+    bufs_sdfg = {k: v.copy(order="F") for k, v in bufs_ref.items()}
 
     zshape = ((nproma, nlev, nblks_e), (nproma, nlev, nblks_e), (nproma, nlevp1, nblks_e))
-    z_ref = [np.zeros(s, dtype=np.float64, order='F') for s in zshape]
-    z_sdfg = [np.zeros(s, dtype=np.float64, order='F') for s in zshape]
+    z_ref = [np.zeros(s, dtype=np.float64, order="F") for s in zshape]
+    z_sdfg = [np.zeros(s, dtype=np.float64, order="F") for s in zshape]
 
     # ---- 7. Run both paths and compare on every output ----
     _run(ref_lib, "run_velocity_flat_c", dims, bufs_ref, z_ref)
@@ -569,21 +581,21 @@ def test_dycore_outer_calls_velocity_sdfg_via_c_abi(tmp_path: Path):
     # (Fortran-no-bind-c sync_patch_array, C++ sync_patch_cpp via a Fortran wrapper);
     # both print a unique stderr marker so a missed routing surfaces here.  The
     # reference path doesn't go through dycore_wrapper, so only the SDFG run prints.
-    assert "[sync_patch_array Fortran] tag=1" in sdfg_stderr, \
+    assert "[sync_patch_array Fortran] tag=1" in sdfg_stderr, (
         f"Fortran sync external did not fire.  SDFG stderr:\n{sdfg_stderr}"
-    assert "[sync_patch_cpp C++] tag=2" in sdfg_stderr, \
-        f"C++ sync external did not fire.  SDFG stderr:\n{sdfg_stderr}"
+    )
+    assert "[sync_patch_cpp C++] tag=2" in sdfg_stderr, f"C++ sync external did not fire.  SDFG stderr:\n{sdfg_stderr}"
 
     # -O0 pinned across all three build layers -> every output is BIT-EXACT today
     # (worst rel = 0 ULP).  The 1-ULP assert_allclose below is a safety buffer (a real
     # codegen regression trips it immediately); assert_array_equal pins byte-exactness
     # on this exact source -- relax it first if a future flang reorders a reduction.
     one_ulp_rtol = 2**-52  # ~2.22e-16
-    extras = dict(zip(('z_w_concorr_me', 'z_kin_hor_e', 'z_vt_ie'), zip(z_sdfg, z_ref)))
+    extras = dict(zip(("z_w_concorr_me", "z_kin_hor_e", "z_vt_ie"), zip(z_sdfg, z_ref, strict=False), strict=False))
     per_output_max_rel = {}
     for nm in _OUTPUT_NAMES:
         sd, rf = extras[nm] if nm in extras else (bufs_sdfg[nm], bufs_ref[nm])
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             denom = np.maximum(np.abs(rf), np.finfo(np.float64).tiny)
             rel = np.abs(sd - rf) / denom
             rel = np.where(np.isfinite(rel), rel, 0.0)
@@ -591,23 +603,36 @@ def test_dycore_outer_calls_velocity_sdfg_via_c_abi(tmp_path: Path):
     worst_nm = max(per_output_max_rel, key=per_output_max_rel.get)
     worst_rel = per_output_max_rel[worst_nm]
     # Print so ``pytest -s`` users can read the envelope live.
-    print(f"\n[velocity e2e] worst output {worst_nm!r}: "
-          f"rel = {worst_rel:.3e} ({worst_rel / (2 ** -52):.1f} ULP)")
+    print(f"\n[velocity e2e] worst output {worst_nm!r}: rel = {worst_rel:.3e} ({worst_rel / (2**-52):.1f} ULP)")
     for nm in _OUTPUT_NAMES:
         sd, rf = extras[nm] if nm in extras else (bufs_sdfg[nm], bufs_ref[nm])
-        np.testing.assert_allclose(sd,
-                                   rf,
-                                   rtol=one_ulp_rtol,
-                                   atol=0.0,
-                                   equal_nan=True,
-                                   err_msg=(f"output {nm!r} diverged beyond 1 ULP "
-                                            f"(rtol={one_ulp_rtol:.3e}).  Per-output "
-                                            f"rel-max: {per_output_max_rel}"))
-        np.testing.assert_array_equal(sd,
-                                      rf,
-                                      err_msg=(f"output {nm!r} not bit-exact against the "
-                                               f"gfortran reference.  Per-output rel-max: "
-                                               f"{per_output_max_rel}.  If this fires on a "
-                                               f"new flang or new -O level, relax the "
-                                               f"``assert_array_equal`` to leave the 1-ULP "
-                                               f"``assert_allclose`` above as the gate."))
+        np.testing.assert_allclose(
+            sd,
+            rf,
+            rtol=one_ulp_rtol,
+            atol=0.0,
+            equal_nan=True,
+            err_msg=(
+                f"output {nm!r} diverged beyond 1 ULP "
+                f"(rtol={one_ulp_rtol:.3e}).  Per-output "
+                f"rel-max: {per_output_max_rel}"
+            ),
+        )
+        np.testing.assert_array_equal(
+            sd,
+            rf,
+            err_msg=(
+                f"output {nm!r} not bit-exact against the "
+                f"gfortran reference.  Per-output rel-max: "
+                f"{per_output_max_rel}.  If this fires on a "
+                f"new flang or new -O level, relax the "
+                f"``assert_array_equal`` to leave the 1-ULP "
+                f"``assert_allclose`` above as the gate."
+            ),
+        )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

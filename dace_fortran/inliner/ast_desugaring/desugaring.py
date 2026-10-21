@@ -6,37 +6,40 @@ constructs into simpler, equivalent ones an SDFG can be built from --
 substitution, `DATA`->assignments, statement functions->internal functions,
 `GOTO`->structured control flow.
 """
+
+from __future__ import annotations
+
 import sys
-from typing import Tuple, Dict, List, Set, Union
-from io import StringIO
 import warnings
+from io import StringIO
+from typing import Union
 
 import fparser.two.Fortran2003 as f03
 import fparser.two.Fortran2008 as f08
 from fparser.api import get_reader
-from fparser.two.utils import Base, BlockBase, UnaryOpBase, BinaryOpBase, walk
 from fparser.common.readfortran import FortranReaderBase
 from fparser.common.sourceinfo import FortranFormat
+from fparser.two.utils import Base, BinaryOpBase, BlockBase, UnaryOpBase, walk
 
-from . import analysis, pruning, types, utils
 from .. import ast_utils
+from . import analysis, pruning, types, utils
 
-INTERFACE_NAMESPACE = '__interface__'
+INTERFACE_NAMESPACE = "__interface__"
 
 
 def deconstruct_enums(ast: f03.Program) -> f03.Program:
     """Replaces `ENUM` definitions with `INTEGER, PARAMETER` declarations, assigning
     consecutive values (from 0, unless explicit) to each enumerator."""
     for en in walk(ast, f03.Enum_Def):
-        en_dict: Dict[str, f03.Expr] = {}
+        en_dict: dict[str, f03.Expr] = {}
         # Tracks the running value for automatic counting.
-        next_val = '0'
+        next_val = "0"
         next_offset = 0
         for el in walk(en, f03.Enumerator_List):
             for c in el.children:
                 if isinstance(c, f03.Name):
                     c_name = c.string
-                elif isinstance(c, f03.Enumerator):
+                else:  # f03.Enumerator
                     # TODO: Add ref.
                     name, _, val = c.children
                     c_name = name.string
@@ -53,7 +56,7 @@ def deconstruct_interface_calls(ast: f03.Program) -> f03.Program:
     """Resolves calls to generic interfaces into direct calls to the matching
     concrete subprogram, by comparing argument type signatures; adds `USE`
     statements as needed and prunes now-unused interfaces."""
-    SUFFIX, COUNTER = 'deconiface', 0
+    SUFFIX, COUNTER = "deconiface", 0
 
     # Temporarily rename interface imports to avoid shadowing the implementation.
     alias_map = analysis.alias_specs(ast)
@@ -99,7 +102,8 @@ def deconstruct_interface_calls(ast: f03.Program) -> f03.Program:
             print(
                 f"Could not resolve the function `{fref}` in scope `{scope_spec}`; "
                 f"parts of AST is missing, but moving on",
-                file=sys.stderr)
+                file=sys.stderr,
+            )
             continue
         assert fref_spec in alias_map, f"cannot find: {fref_spec}"
         if fref_spec not in iface_map:
@@ -117,8 +121,8 @@ def deconstruct_interface_calls(ast: f03.Program) -> f03.Program:
         specification_part = ast_utils.atmost_one(ast_utils.children_of_type(subprog, f03.Specification_Part))
 
         ifc_spec = analysis.ident_spec(alias_map[fref_spec])
-        args_sig: Tuple[types.TYPE_SPEC, ...] = analysis._compute_argument_signature(args, scope_spec, alias_map)
-        all_cand_sigs: List[Tuple[types.SPEC, Tuple[types.TYPE_SPEC, ...]]] = []
+        args_sig: tuple[types.TYPE_SPEC, ...] = analysis.compute_argument_signature(args, scope_spec, alias_map)
+        all_cand_sigs: list[tuple[types.SPEC, tuple[types.TYPE_SPEC, ...]]] = []
 
         conc_spec = None
         for cand in iface_map[ifc_spec]:
@@ -137,12 +141,12 @@ def deconstruct_interface_calls(ast: f03.Program) -> f03.Program:
             # TODO: Add ref.
             _, _, cand_args, _ = cand_stmt.children
             if cand_args:
-                cand_args_sig = analysis._compute_candidate_argument_signature(cand_args.children, cand_spec, alias_map)
+                cand_args_sig = analysis.compute_candidate_argument_signature(cand_args.children, cand_spec, alias_map)
             else:
                 cand_args_sig = tuple()
             all_cand_sigs.append((cand_spec, cand_args_sig))
 
-            if analysis._does_type_signature_match(args_sig, cand_args_sig):
+            if analysis.does_type_signature_match(args_sig, cand_args_sig):
                 conc_spec = cand_spec
                 break
         if conc_spec not in alias_map:
@@ -165,8 +169,9 @@ def deconstruct_interface_calls(ast: f03.Program) -> f03.Program:
             # Importing from a different module -- alias to avoid a name collision.
             pname_alias, COUNTER = f"{pname}_{SUFFIX}_{COUNTER}", COUNTER + 1
             if not specification_part:
-                utils.append_children(subprog,
-                                      f03.Specification_Part(get_reader(f"use {mod}, only: {pname_alias} => {pname}")))
+                utils.append_children(
+                    subprog, f03.Specification_Part(get_reader(f"use {mod}, only: {pname_alias} => {pname}"))
+                )
             else:
                 utils.prepend_children(specification_part, f03.Use_Stmt(f"use {mod}, only: {pname_alias} => {pname}"))
 
@@ -175,8 +180,9 @@ def deconstruct_interface_calls(ast: f03.Program) -> f03.Program:
 
     for ui in unused_ifaces:
         assert ui in alias_map
-        assert isinstance(alias_map[ui], f03.Interface_Stmt) or isinstance(alias_map[ui].parent.parent,
-                                                                           f03.Interface_Block)
+        assert isinstance(alias_map[ui], f03.Interface_Stmt) or isinstance(
+            alias_map[ui].parent.parent, f03.Interface_Block
+        )
         utils.remove_self(alias_map[ui].parent)
 
     # Revert any temporary `<name>_deconiface_tmp` rename whose generic could NOT be resolved
@@ -186,22 +192,21 @@ def deconstruct_interface_calls(ast: f03.Program) -> f03.Program:
     for nm in list(walk(ast, f03.Name)):
         if not nm.string.endswith(tmp_suffix):
             continue
-        orig = nm.string[:-len(tmp_suffix)]
+        orig = nm.string[: -len(tmp_suffix)]
         if isinstance(nm.parent, f03.Rename):
             # The ``<name>_deconiface_tmp => <name>`` USE import: restore plain ``<name>``.
             utils.replace_node(nm.parent, f03.Name(orig))
         else:
             utils.replace_node(nm, f03.Name(orig))
 
-    ast = pruning.consolidate_uses(ast)
-    return ast
+    return pruning.consolidate_uses(ast)
 
 
 def deconstruct_procedure_calls(ast: f03.Program) -> f03.Program:
     """Resolves type-bound procedure calls (`my_obj%method(args)`) into direct
     subprogram calls, passing the object as the new first argument; adds `USE`
     statements as needed and drops the now-unused `Type_Bound_Procedure_Part`."""
-    SUFFIX, COUNTER = 'deconproc', 0
+    SUFFIX, COUNTER = "deconproc", 0
 
     alias_map = analysis.alias_specs(ast)
     proc_map = analysis.procedure_specs(ast)
@@ -211,7 +216,7 @@ def deconstruct_procedure_calls(ast: f03.Program) -> f03.Program:
 
     for pd in walk(ast, f03.Procedure_Designator):
         # Ref: https://github.com/stfc/fparser/blob/master/src/fparser/two/Fortran2003.py#L12530
-        dref, op, bname = pd.children
+        dref, _op, bname = pd.children
 
         callsite = pd.parent
         assert isinstance(callsite, (f03.Function_Reference, f03.Call_Stmt))
@@ -221,7 +226,7 @@ def deconstruct_procedure_calls(ast: f03.Program) -> f03.Program:
         while cmod and not isinstance(cmod, (f03.Module, f03.Main_Program)):
             cmod = cmod.parent
         if cmod:
-            stmt, _, _, _ = utils._get_module_or_program_parts(cmod)
+            stmt, _, _, _ = utils.get_module_or_program_parts(cmod)
             cmod = ast_utils.singular(ast_utils.children_of_type(stmt, f03.Name)).string.lower()
         else:
             subp = list(ast_utils.children_of_type(ast, f03.Subroutine_Subprogram))
@@ -241,10 +246,10 @@ def deconstruct_procedure_calls(ast: f03.Program) -> f03.Program:
         fnref = pd.parent
         assert isinstance(fnref, (f03.Function_Reference, f03.Call_Stmt))
         _, args = fnref.children
-        args_sig: Tuple[types.TYPE_SPEC, ...] = analysis._compute_argument_signature(args, scope_spec, alias_map)
-        all_cand_sigs: List[Tuple[types.SPEC, Tuple[types.TYPE_SPEC, ...]]] = []
+        args_sig: tuple[types.TYPE_SPEC, ...] = analysis.compute_argument_signature(args, scope_spec, alias_map)
+        all_cand_sigs: list[tuple[types.SPEC, tuple[types.TYPE_SPEC, ...]]] = []
 
-        bspec = dref_type.spec + (bname.string, )
+        bspec = (*dref_type.spec, bname.string)
         # A binding inherited via EXTENDS is keyed under the child type in alias_map, but
         # proc_map/genc_map key by the type that declares it -- remap to the base binding's
         # spec so lookup resolves (an override keeps its own key, already in proc_map/genc_map).
@@ -252,13 +257,13 @@ def deconstruct_procedure_calls(ast: f03.Program) -> f03.Program:
             inherited = alias_map[bspec]
             if isinstance(inherited, (f03.Specific_Binding, f03.Generic_Binding)):
                 bspec = analysis.ident_spec(inherited)
-        if bspec in genc_map and genc_map[bspec]:
+        if genc_map.get(bspec):
             for cand in genc_map[bspec]:
                 # A generic's candidate is registered on the DECLARING type (an abstract base,
                 # where it may be DEFERRED/absent from proc_map) -- resolve on the CONCRETE
                 # receiver instead (e.g. after a monomorphize ladder,
                 # `this%trans__t_trivial_transfer%into`), remapping (base,spec)->(receiver,spec).
-                rcand = dref_type.spec + (cand[-1], )
+                rcand = (*dref_type.spec, cand[-1])
                 if rcand not in proc_map and rcand in alias_map:
                     inherited_spec = alias_map[rcand]
                     if isinstance(inherited_spec, (f03.Specific_Binding, f03.Generic_Binding)):
@@ -267,57 +272,58 @@ def deconstruct_procedure_calls(ast: f03.Program) -> f03.Program:
                     cand = rcand
                 # External TBP candidate with no Fortran source (e.g. ICON's MPI halo
                 # `%exchange_data` -> `exchange_data_4de1_dp`) -- skip under tolerance; leave for pruning.
-                if analysis.TOLERATE_EXTERNAL_USES and proc_map.get(cand) not in alias_map:
+                if analysis.OPTIONS.tolerate_external_uses and proc_map.get(cand) not in alias_map:
                     continue
                 cand_stmt = alias_map[proc_map[cand]]
                 cand_spec = analysis.ident_spec(cand_stmt)
                 # TODO: Add ref.
                 _, _, cand_args, _ = cand_stmt.children
                 if cand_args:
-                    cand_args_sig = analysis._compute_candidate_argument_signature(cand_args.children[1:], cand_spec,
-                                                                                   alias_map)
+                    cand_args_sig = analysis.compute_candidate_argument_signature(
+                        cand_args.children[1:], cand_spec, alias_map
+                    )
                 else:
                     cand_args_sig = tuple()
                 all_cand_sigs.append((cand_spec, cand_args_sig))
 
-                if analysis._does_type_signature_match(args_sig, cand_args_sig):
+                if analysis.does_type_signature_match(args_sig, cand_args_sig):
                     bspec = cand
                     break
         if bspec not in proc_map:
             # No concrete procedure with source -- under tolerance leave for pruning
             # (a stubbed/unreachable wrapper, e.g. the halo-exchange path).
-            if analysis.TOLERATE_EXTERNAL_USES:
+            if analysis.OPTIONS.tolerate_external_uses:
                 continue
             cand_dump = "".join(f"\n...> {c}" for c in all_cand_sigs)
             raise AssertionError(f"[in mod: {cmod}/{callsite}] {bspec} not found for {args_sig}{cand_dump}")
         pname = proc_map[bspec]
         # Mirrors the generic-candidate guard above: a specific binding may name a sourceless
         # external (e.g. the MPI halo primitive) -- drop it rather than emit a use of a missing symbol.
-        if analysis.TOLERATE_EXTERNAL_USES and pname not in alias_map:
+        if analysis.OPTIONS.tolerate_external_uses and pname not in alias_map:
             continue
 
         # Assumes a subprogram defined directly inside a module.
         assert len(pname) == 2
-        mod, pname = pname
+        mod, proc_name = pname
 
         if mod == cmod:
             # Already visible at the module level -- no alias needed.
-            pname_alias = pname
+            pname_alias = proc_name
         else:
             # Importing from a different module -- alias to avoid a name collision.
-            pname_alias, COUNTER = f"{pname}_{SUFFIX}_{COUNTER}", COUNTER + 1
+            pname_alias, COUNTER = f"{proc_name}_{SUFFIX}_{COUNTER}", COUNTER + 1
             if not specification_part:
-                utils.append_children(subprog,
-                                      f03.Specification_Part(get_reader(f"use {mod}, only: {pname_alias} => {pname}")))
+                utils.append_children(
+                    subprog, f03.Specification_Part(get_reader(f"use {mod}, only: {pname_alias} => {proc_name}"))
+                )
             else:
-                utils.prepend_children(specification_part, f03.Use_Stmt(f"use {mod}, only: {pname_alias} => {pname}"))
+                utils.prepend_children(
+                    specification_part, f03.Use_Stmt(f"use {mod}, only: {pname_alias} => {proc_name}")
+                )
 
         # Replace bname with pname_alias and pass dref as the first argument.
         _, args = callsite.children
-        if args is None:
-            args = f03.Actual_Arg_Spec_List(f"{dref}")
-        else:
-            args = f03.Actual_Arg_Spec_List(f"{dref}, {args}")
+        args = f03.Actual_Arg_Spec_List(f"{dref}") if args is None else f03.Actual_Arg_Spec_List(f"{dref}, {args}")
         utils.set_children(callsite, (f03.Name(pname_alias), args))
 
     for tbp in walk(ast, f03.Type_Bound_Procedure_Part):
@@ -332,12 +338,12 @@ def deconstruct_associations(ast: f03.Program) -> f03.Program:
         # TODO: Add ref.
         stmt, rest, _ = assoc.children[0], assoc.children[1:-1], assoc.children[-1]
         # TODO: Add ref.
-        kw, assoc_list = stmt.children[0], stmt.children[1:]
+        _kw, assoc_list = stmt.children[0], stmt.children[1:]
         if not assoc_list:
             continue
 
         # Keep track of what to replace in the local scope.
-        local_map: Dict[str, Base] = {}
+        local_map: dict[str, Base] = {}
         for al in assoc_list:
             for a in al.children:
                 # TODO: Add ref.
@@ -373,9 +379,10 @@ def deconstruct_associations(ast: f03.Program) -> f03.Program:
                             triplet_positions = [
                                 i for i, a in enumerate(access.children) if isinstance(a, f03.Subscript_Triplet)
                             ]
-                            assert len(triplet_positions) == len(subsc.children), \
-                                f"ASSOCIATE selector sections {len(triplet_positions)} dimension(s) " \
+                            assert len(triplet_positions) == len(subsc.children), (
+                                f"ASSOCIATE selector sections {len(triplet_positions)} dimension(s) "
                                 f"but the use indexes {len(subsc.children)}"
+                            )
 
                             for use_idx, c in enumerate(subsc.children):
                                 i = triplet_positions[use_idx]
@@ -398,7 +405,8 @@ def deconstruct_associations(ast: f03.Program) -> f03.Program:
                                     if c.children[0] is not None:
                                         if low_expr:
                                             new_low_expr_str = f03.Expr(
-                                                f"{low_expr_str} + ({c.children[0].tostr()})").tostr()
+                                                f"{low_expr_str} + ({c.children[0].tostr()})"
+                                            ).tostr()
                                         else:
                                             new_low_expr_str = f03.Expr(f"{c.children[0].tostr()}").tostr()
                                     else:
@@ -410,11 +418,12 @@ def deconstruct_associations(ast: f03.Program) -> f03.Program:
                                     if c.children[1] is not None:
                                         if high_expr:
                                             # TODO: Confirm how upper bound is enforced inside Fortran ASSOCIATE construct.
-                                            raise NotImplementedError()
-                                        elif low_expr:
+                                            raise NotImplementedError
+                                        if low_expr:
                                             # original access has (low::). Combine to be (:low+high_subsc:)
                                             new_high_expr_str = f03.Expr(
-                                                f"{low_expr_str} + ({c.children[1].tostr()})").tostr()
+                                                f"{low_expr_str} + ({c.children[1].tostr()})"
+                                            ).tostr()
                                         else:
                                             # original access was (::)
                                             new_high_expr_str = f03.Expr(f"{c.children[1].tostr()}").tostr()
@@ -425,11 +434,13 @@ def deconstruct_associations(ast: f03.Program) -> f03.Program:
                                     stride_expr = access_child_triplet.children[2]
                                     if c.children[2] is not None:
                                         raise NotImplementedError(
-                                            "Combining strides of f03.Subscript_Triplet not yet supported.")
+                                            "Combining strides of f03.Subscript_Triplet not yet supported."
+                                        )
                                     new_stride_expr_str = f"{stride_expr if stride_expr else ''}"
 
                                     new_triplet = f03.Subscript_Triplet(
-                                        f"{new_low_expr_str}:{new_high_expr_str}:{new_stride_expr_str}")
+                                        f"{new_low_expr_str}:{new_high_expr_str}:{new_stride_expr_str}"
+                                    )
                                     utils.replace_node(access.children[i], new_triplet)
 
                             utils.replace_node(pr, repl)
@@ -461,7 +472,7 @@ def convert_data_statements_into_assignments(ast: f03.Program) -> f03.Program:
         box = spart.parent
         xpart = ast_utils.atmost_one(ast_utils.children_of_type(box, f03.Execution_Part))
         for dst in reversed(walk(spart, f03.Data_Stmt)):
-            repls: List[f03.Assignment_Stmt] = []
+            repls: list[f03.Assignment_Stmt] = []
             for ds in dst.children:
                 assert isinstance(ds, f03.Data_Stmt_Set)
                 varz, valz = ds.children
@@ -469,30 +480,36 @@ def convert_data_statements_into_assignments(ast: f03.Program) -> f03.Program:
                 assert isinstance(valz, f03.Data_Stmt_Value_List)
                 if len(varz.children) != len(valz.children):
                     assert len(varz.children) == 1
-                    singular_varz, = varz.children
+                    (singular_varz,) = varz.children
                     new_varz = [f"{singular_varz}({i + 1})" for i in range(len(valz.children))]
-                    utils.replace_node(varz, f03.Data_Stmt_Object_List(', '.join(new_varz)))
+                    utils.replace_node(varz, f03.Data_Stmt_Object_List(", ".join(new_varz)))
                 varz, valz = ds.children
                 varz, valz = varz.children, valz.children
                 assert len(varz) == len(valz)
-                for k, v in zip(varz, valz):
+                for k, v in zip(varz, valz, strict=False):
                     scope_spec = analysis.find_scope_spec(k)
-                    kroot, ktyp, rest = analysis._dataref_root(k, scope_spec, alias_map)
+                    kroot, ktyp, rest = analysis.dataref_root(k, scope_spec, alias_map)
                     if isinstance(v, f03.Data_Stmt_Value):
                         repeat, elem = v.children
-                        repeat = 1 if not repeat else int(analysis._const_eval_basic_type(repeat, alias_map))
+                        if repeat:
+                            repeat_val = analysis.const_eval_basic_type(repeat, alias_map)
+                            assert repeat_val is not None, f"non-constant repeat count `{repeat}` in DATA statement"
+                            repeat = int(repeat_val)
+                        else:
+                            repeat = 1
                         assert repeat
                     else:
                         elem = v
                     # TODO: Support other types of data expressions.
-                    assert isinstance(elem, types.LITERAL_CLASSES), \
+                    assert isinstance(elem, types.LITERAL_CLASSES), (
                         f"only supports literal values in data data statements: {elem}"
+                    )
                     if ktyp.shape:
                         if rest:
                             assert len(rest) == 1 and isinstance(rest[0], f03.Section_Subscript_List)
                             subsc = rest[0].tofortran()
                         else:
-                            subsc = ','.join([':' for _ in ktyp.shape])
+                            subsc = ",".join([":" for _ in ktyp.shape])
                         repls.append(f03.Assignment_Stmt(f"{kroot.string}({subsc}) = {elem.tofortran()}"))
                     else:
                         assert isinstance(k, f03.Name)
@@ -511,9 +528,8 @@ def deconstruct_statement_functions(ast: f03.Program) -> f03.Program:
     internal/module functions. Outer-scope variables used in the body are
     "carried over" as extra arguments, threaded through at all call sites."""
     alias_map = analysis.alias_specs(ast)
-    all_stmt_fns: Set[types.SPEC] = {
-        analysis.find_scope_spec(sf) + (sf.children[0].string, )
-        for sf in walk(ast, f03.Stmt_Function_Stmt)
+    all_stmt_fns: set[types.SPEC] = {
+        (*analysis.find_scope_spec(sf), sf.children[0].string) for sf in walk(ast, f03.Stmt_Function_Stmt)
     }
 
     for sf in walk(ast, f03.Stmt_Function_Stmt):
@@ -522,8 +538,8 @@ def deconstruct_statement_functions(ast: f03.Program) -> f03.Program:
         if args:
             args = args.children
 
-        def _get_typ(var: f03.Name):
-            _spec = scope_spec + (var.string, )
+        def _get_typ(var: f03.Name) -> Base:
+            _spec = (*scope_spec, var.string)
             _decl = alias_map[_spec]
             assert isinstance(_decl, f03.Entity_Decl)
             _tdecl = _decl.parent.parent
@@ -534,18 +550,19 @@ def deconstruct_statement_functions(ast: f03.Program) -> f03.Program:
         arg_typs = tuple(_get_typ(a) for a in args)
         dummy_args = [a.string for a in args]
 
-        arg_decls = [f"{t}, intent(in) :: {a}" for t, a in zip(arg_typs, args)]
+        arg_decls = [f"{t}, intent(in) :: {a}" for t, a in zip(arg_typs, args, strict=False)]
         carryovers = []
         for nm in walk(expr, f03.Name):
             if nm.string in dummy_args:
                 continue
-            spec = scope_spec + (nm.string, )
+            spec = (*scope_spec, nm.string)
             if spec not in alias_map:
                 continue
             decl = alias_map[spec]
             if not isinstance(decl, f03.Entity_Decl):
                 continue
             entity_type = analysis.find_type_of_entity(decl, alias_map)
+            assert entity_type is not None, f"cannot determine the type of `{decl}`"
             # A PARAMETER (kind param like JPRL, or a physical const) is host-associated into
             # the new function, never a runtime dummy -- a kind specifier MUST be a constant,
             # so carrying it as an INTEGER dummy would produce an invalid REAL(KIND=<dummy>).
@@ -553,18 +570,17 @@ def deconstruct_statement_functions(ast: f03.Program) -> f03.Program:
                 continue
             tdecl = decl.parent.parent
             typ, _, _ = tdecl.children
-            shape = entity_type.shape
-            shape = f"({','.join(shape)})" if shape else ''
+            shape_str = f"({','.join(entity_type.shape)})" if entity_type.shape else ""
             if spec not in all_stmt_fns and nm.string not in carryovers:
                 carryovers.append(nm.string)
-                arg_decls.append(f"{typ}, intent(in) :: {nm}{shape}")
+                arg_decls.append(f"{typ}, intent(in) :: {nm}{shape_str}")
 
-        dummy_args = ','.join(dummy_args + carryovers)
-        arg_decls = '\n'.join(arg_decls)
+        dummy_args_str = ",".join(dummy_args + carryovers)
+        arg_decls_str = "\n".join(arg_decls)
         nufn = f"""
-{ret_typ} function {fn}({dummy_args})
+{ret_typ} function {fn}({dummy_args_str})
   implicit none
-  {arg_decls}
+  {arg_decls_str}
   {fn} = {expr}
 end function {fn}
 """
@@ -576,19 +592,20 @@ end function {fn}
         for fcall in walk(box, (f03.Call_Stmt, f03.Function_Reference, f03.Part_Ref, f03.Structure_Constructor)):
             tfn, targs = fcall.children
             tfnloc = analysis.search_real_local_alias_spec(tfn, alias_map)
-            if tfnloc != scope_spec + (fn.string, ):
+            if tfnloc != (*scope_spec, fn.string):
                 continue
             nufcall = f03.Function_Reference(fcall.tofortran())
             tfn, targs = nufcall.children
             targs = targs.children if targs else []
             targs = [t.string for t in targs]
             targs.extend(carryovers)
-            targs = ','.join(targs)
+            targs = ",".join(targs)
             nufcall = f03.Function_Reference(f"{tfn}({targs})")
             utils.replace_node(fcall, nufcall)
 
         intsp = ast_utils.atmost_one(
-            ast_utils.children_of_type(box, (f03.Internal_Subprogram_Part, f03.Module_Subprogram_Part)))
+            ast_utils.children_of_type(box, (f03.Internal_Subprogram_Part, f03.Module_Subprogram_Part))
+        )
         if intsp:
             utils.append_children(intsp, f03.Function_Subprogram(get_reader(nufn)))
         else:
@@ -599,7 +616,7 @@ end function {fn}
             endbox = box.children[-1]
             utils.replace_node(endbox, (intsp, endbox))
 
-        ret_decl = alias_map[scope_spec + (fn.string, )]
+        ret_decl = alias_map[(*scope_spec, fn.string)]
         ret_declist = ret_decl.parent
         utils.remove_children(ret_declist, ret_decl)
         if not ret_declist.children:
@@ -626,7 +643,7 @@ def deconstruct_goto_statements(ast: f03.Program) -> f03.Program:
 
             if isinstance(node, (f03.If_Then_Stmt, f03.Nonlabel_Do_Stmt, f03.Label_Do_Stmt)):
                 node_pos = ast_utils.singular(iter([i for i, x in enumerate(node.parent.children) if x is node]))
-                assert (node_pos == 0)
+                assert node_pos == 0
                 utils.replace_node(node.parent, (cont, node.parent))
             else:
                 utils.replace_node(node, (cont, node))
@@ -639,7 +656,7 @@ def deconstruct_goto_statements(ast: f03.Program) -> f03.Program:
 
         # Resolve each GOTO's target, then classify forward vs backward.
         for goto in walk(scope_ast, f03.Goto_Stmt):
-            label, = goto.children
+            (label,) = goto.children
             label = label.string
 
             # Walk up to the enclosing subprogram (subroutines can nest) then search its scope for the target.
@@ -651,15 +668,15 @@ def deconstruct_goto_statements(ast: f03.Program) -> f03.Program:
 
             target = None
             for cont_node in walk(ancestor_subroutine, f03.Continue_Stmt):
-                if (str(cont_node.item.label) == label):
-                    assert (
-                        target is None
-                    ), f"Multiple instances of label {label} found in subroutine/function {ancestor_subroutine.content[0].items[1]}. Expected each label to be unique."
+                if str(cont_node.item.label) == label:
+                    assert target is None, (
+                        f"Multiple instances of label {label} found in subroutine/function {ancestor_subroutine.content[0].items[1]}. Expected each label to be unique."
+                    )
                     target = cont_node
             assert target, f"Target of GOTO {goto.item} not found in scope of its parent Subroutine/Function."
 
             # Check that `GOTO` is in subtree from parent of `CONTINUE`.
-            goto_in_parent_ast = (utils.lineage(target.parent, goto) is not None)
+            goto_in_parent_ast = utils.lineage(target.parent, goto) is not None
             if not goto_in_parent_ast:
                 raise NotImplementedError("Only GOTOs in the subtree from parent of target are supported.")
 
@@ -671,10 +688,10 @@ def deconstruct_goto_statements(ast: f03.Program) -> f03.Program:
 
             # Forward vs backward: whichever of goto/target is hit first in a DFS walk.
             for node in walk(ancestor_subroutine, Base):
-                if (node is target):
+                if node is target:
                     backward_gotos.append((ancestor_subroutine, goto, target))
                     break
-                elif (node is goto):
+                if node is goto:
                     forward_gotos.append((ancestor_subroutine, goto, target))
                     break
 
@@ -682,17 +699,20 @@ def deconstruct_goto_statements(ast: f03.Program) -> f03.Program:
         # nodes) -- DFS append order already matches descending GOTO line number.
         backward_gotos.reverse()
 
-        for (ancestor_subroutine, goto, target) in backward_gotos:
+        for ancestor_subroutine, goto, target in backward_gotos:
             ancestor_subroutine = deconstruct_backward_goto_statements(ancestor_subroutine, goto, target)
 
-        for (ancestor_subroutine, goto, target) in forward_gotos:
+        for ancestor_subroutine, goto, target in forward_gotos:
             ancestor_subroutine = deconstruct_forward_goto_statements(ancestor_subroutine, goto, target)
 
     return ast
 
 
-def deconstruct_forward_goto_statements(ancestor_subroutine: Union[f03.Function_Subprogram, f03.Subroutine_Subprogram],
-                                        goto: f03.Goto_Stmt, target: f03.Continue_Stmt):
+def deconstruct_forward_goto_statements(
+    ancestor_subroutine: Union[f03.Function_Subprogram, f03.Subroutine_Subprogram],
+    goto: f03.Goto_Stmt,
+    target: f03.Continue_Stmt,
+) -> Union[f03.Function_Subprogram, f03.Subroutine_Subprogram]:
     """
     Replaces forward-facing `GOTO` statements (i.e. forward jumps) with structured control flow by
     introducing boolean flag variables.
@@ -737,18 +757,26 @@ def deconstruct_forward_goto_statements(ancestor_subroutine: Union[f03.Function_
     child_w_goto = goto
     par = child_w_goto.parent
 
-    for _n in range(len(utils.lineage(target.parent, goto)) - 1):
+    goto_lineage = utils.lineage(target.parent, goto)
+    assert goto_lineage is not None, f"`{goto}` is not inside `{target.parent}`"
+    for _n in range(len(goto_lineage) - 1):
         # determine position of `GOTO`/ancestor of `GOTO`, and `CONTINUE` (if applicable)
         child_pos = ast_utils.singular(iter([i for i, x in enumerate(par.children) if x is child_w_goto]))
-        target_pos = ast_utils.singular(iter([i for i, x in enumerate(par.children)
-                                              if x is target])) if par is target.parent else None
+        target_pos = (
+            ast_utils.singular(iter([i for i, x in enumerate(par.children) if x is target]))
+            if par is target.parent
+            else None
+        )
 
-        if isinstance(par,
-                      (f03.Block_Label_Do_Construct, f03.Block_Nonlabel_Do_Construct)) and (par is not target.parent):
+        if isinstance(par, (f03.Block_Label_Do_Construct, f03.Block_Nonlabel_Do_Construct)) and (
+            par is not target.parent
+        ):
             # if EXIT has been previously added, break loop
-            if (len(par.children) > (child_pos + 1)) and isinstance(
-                    par.children[child_pos + 1], f03.If_Stmt) and (f"IF ({goto_var}) EXIT"
-                                                                   in par.children[child_pos + 1].tostr()):
+            if (
+                (len(par.children) > (child_pos + 1))
+                and isinstance(par.children[child_pos + 1], f03.If_Stmt)
+                and (f"IF ({goto_var}) EXIT" in par.children[child_pos + 1].tostr())
+            ):
                 break
 
             # otherwise, insert conditional EXIT after child with goto
@@ -758,7 +786,7 @@ def deconstruct_forward_goto_statements(ancestor_subroutine: Union[f03.Function_
             # For operations between (1) `GOTO` and end of parent block, (2) an ancestor of `GOTO` and `CONTINUE`, or (3) `GOTO` and `CONTINUE`,
             # Wrap these operations in a new `IF` condition that executes if flag is not set (`.not. goto_{label}`).
             cond_str = f".not. {goto_var}"
-            add_condition_to_node_execution(cond_str, par.children[child_pos + 1:target_pos])
+            add_condition_to_node_execution(cond_str, par.children[child_pos + 1 : target_pos])
 
         child_w_goto = par
         par = child_w_goto.parent
@@ -766,8 +794,11 @@ def deconstruct_forward_goto_statements(ancestor_subroutine: Union[f03.Function_
     return ancestor_subroutine
 
 
-def deconstruct_backward_goto_statements(ancestor_subroutine: Union[f03.Function_Subprogram, f03.Subroutine_Subprogram],
-                                         goto: f03.Goto_Stmt, target: f03.Continue_Stmt):
+def deconstruct_backward_goto_statements(
+    ancestor_subroutine: Union[f03.Function_Subprogram, f03.Subroutine_Subprogram],
+    goto: f03.Goto_Stmt,
+    target: f03.Continue_Stmt,
+) -> Union[f03.Function_Subprogram, f03.Subroutine_Subprogram]:
     """
     Replaces backward-facing `GOTO` statements (i.e. forward jumps) with `DO WHILE` loop and structured
     control flow with an introduced boolean flag variables.
@@ -808,17 +839,17 @@ def deconstruct_backward_goto_statements(ancestor_subroutine: Union[f03.Function
         anc = goto
         while anc.parent and (anc.parent is not target.parent):
             anc = anc.parent
-        assert (anc.parent is target.parent)
+        assert anc.parent is target.parent
 
         target_pos = ast_utils.singular(iter([i for i, x in enumerate(target.parent.children) if x is target]))
         anc_pos = ast_utils.singular(iter([i for i, x in enumerate(anc.parent.children) if x is anc]))
-        children_to_wrap = target.parent.children[target_pos + 1:anc_pos + 1]
+        children_to_wrap = target.parent.children[target_pos + 1 : anc_pos + 1]
 
         # Wrap blocks between `CONTINUE` and `GOTO` in loop
         do_while_constr_buffer = StringIO(f"DO WHILE ({goto_var})\n {goto_var} = .false.\n CALL x\nEND DO")
-        do_while_constr_reader = FortranReaderBase(do_while_constr_buffer,
-                                                   mode=FortranFormat(True, False),
-                                                   ignore_comments=True)
+        do_while_constr_reader = FortranReaderBase(
+            do_while_constr_buffer, mode=FortranFormat(True, False), ignore_comments=True
+        )
         do_while_constr = f03.Block_Nonlabel_Do_Construct(do_while_constr_reader)
         utils.remove_children(target.parent, children_to_wrap)
         utils.replace_node(ast_utils.singular(nm for nm in walk(do_while_constr, f03.Call_Stmt)), children_to_wrap)
@@ -836,7 +867,9 @@ def deconstruct_backward_goto_statements(ancestor_subroutine: Union[f03.Function
     child_w_goto = goto
     par = child_w_goto.parent
 
-    for _n in range(len(utils.lineage(target.parent, goto)) - 2):
+    goto_lineage = utils.lineage(target.parent, goto)
+    assert goto_lineage is not None, f"`{goto}` is not inside `{target.parent}`"
+    for _n in range(len(goto_lineage) - 2):
         # determine position of `GOTO`/ancestor of `GOTO`
         child_pos = ast_utils.singular(iter([i for i, x in enumerate(par.children) if x is child_w_goto]))
 
@@ -844,11 +877,13 @@ def deconstruct_backward_goto_statements(ancestor_subroutine: Union[f03.Function
             # If parent is the `DO WHILE` wrapper we created, no action needed and deconstruction is complete.
             break
 
-        elif isinstance(par, (f03.Block_Label_Do_Construct, f03.Block_Nonlabel_Do_Construct)):
+        if isinstance(par, (f03.Block_Label_Do_Construct, f03.Block_Nonlabel_Do_Construct)):
             # if EXIT has been previously added, break loop
-            if (len(par.children) > (child_pos + 1)) and isinstance(
-                    par.children[child_pos + 1], f03.If_Stmt) and (f"IF ({goto_var}) EXIT"
-                                                                   in par.children[child_pos + 1].tostr()):
+            if (
+                (len(par.children) > (child_pos + 1))
+                and isinstance(par.children[child_pos + 1], f03.If_Stmt)
+                and (f"IF ({goto_var}) EXIT" in par.children[child_pos + 1].tostr())
+            ):
                 break
 
             # otherwise, insert conditional EXIT after child with goto
@@ -858,7 +893,7 @@ def deconstruct_backward_goto_statements(ancestor_subroutine: Union[f03.Function
             # For operations between (1) `GOTO` and end of parent block, (2) an ancestor of `GOTO` and `CONTINUE`, or (3) `GOTO` and `CONTINUE`,
             # Wrap these operations in a new `IF` condition that executes if flag is not set (`.not. goto_{label}`).
             cond_str = f".not. {goto_var}"
-            add_condition_to_node_execution(cond_str, par.children[child_pos + 1:])
+            add_condition_to_node_execution(cond_str, par.children[child_pos + 1 :])
 
         child_w_goto = par
         par = child_w_goto.parent
@@ -866,7 +901,9 @@ def deconstruct_backward_goto_statements(ancestor_subroutine: Union[f03.Function
     return ancestor_subroutine
 
 
-def add_condition_to_node_execution(cond: Union[str, UnaryOpBase, BinaryOpBase], nodes: Union[Base, List[Base]]):
+def add_condition_to_node_execution(
+    cond: Union[str, UnaryOpBase, BinaryOpBase], nodes: Union[Base, list[Base]]
+) -> None:
     """
     Adds a condition to the execution of given nodes. Nodes are executed only if condition is evaluated
     as `.true.`.
@@ -884,7 +921,7 @@ def add_condition_to_node_execution(cond: Union[str, UnaryOpBase, BinaryOpBase],
         if isinstance(node, (f03.Continue_Stmt, f03.EndStmtBase)):
             # Continue statements are no-op, but they may have label attached, so we leave them be.
             continue
-        elif isinstance(node, (f03.If_Stmt, f03.Else_If_Stmt)):
+        if isinstance(node, (f03.If_Stmt, f03.Else_If_Stmt)):
             # We merge the condition with existing if.
             own_cond = node.children[0]
             if cond in own_cond.tostr():
@@ -895,18 +932,18 @@ def add_condition_to_node_execution(cond: Union[str, UnaryOpBase, BinaryOpBase],
             new_else = f03.Else_If_Stmt(f"else if ({cond}) then")
             utils.replace_node(node, new_else)
         elif isinstance(
-                node,
-            (f03.If_Construct, f03.Block_Label_Do_Construct, f03.Block_Nonlabel_Do_Construct, f03.Case_Construct)):
+            node, (f03.If_Construct, f03.Block_Label_Do_Construct, f03.Block_Nonlabel_Do_Construct, f03.Case_Construct)
+        ):
             # Wrap block in `If_Construct`
             if_constr_buffer = StringIO(f"IF ({cond}) THEN\n CALL x\nEND IF")
-            if_constr_reader = FortranReaderBase(if_constr_buffer,
-                                                 mode=FortranFormat(True, False),
-                                                 ignore_comments=True)
+            if_constr_reader = FortranReaderBase(
+                if_constr_buffer, mode=FortranFormat(True, False), ignore_comments=True
+            )
             if_constr = f03.If_Construct(if_constr_reader)
             utils.replace_node(node, if_constr)
             utils.replace_node(ast_utils.singular(nm for nm in walk(if_constr, f03.Call_Stmt)), node)
         else:
-            assert not isinstance(node, BlockBase), f"Encountered an unexpected BlockBase instance."
+            assert not isinstance(node, BlockBase), "Encountered an unexpected BlockBase instance."
             new_if = f03.If_Stmt(f"if ({cond}) call x")
             utils.replace_node(node, new_if)
             utils.replace_node(ast_utils.singular(nm for nm in walk(new_if, f03.Call_Stmt)), node)
@@ -958,9 +995,9 @@ def deconstruct_external_statements(ast: f03.Program) -> f03.Program:
     :return: The modified Fortran AST.
     """
     # Build a dictionary of subprogram name to subprogram node
-    subprograms_wo_modules: Dict[str, Union[f03.Function_Subprogram, f03.Subroutine_Subprogram]] = {}
+    subprograms_wo_modules: dict[str, Union[f03.Function_Subprogram, f03.Subroutine_Subprogram]] = {}
     # Build a dictionary of subprogram name to module
-    new_modules_name_map: Dict[str, str] = {}
+    new_modules_name_map: dict[str, str] = {}
     # Keep track of functions/subroutines with unsupported features. Raise error only if `EXTERNAL` references them.
     not_supported: list[str] = []
 
@@ -983,7 +1020,7 @@ def deconstruct_external_statements(ast: f03.Program) -> f03.Program:
 
         # NOT supported: multiple subprograms with same name.
         # TODO: Support same names according to scope.
-        if (subprog_name in subprograms_wo_modules):
+        if subprog_name in subprograms_wo_modules:
             not_supported.append(subprog_name)
             # warnings.warn(f"When deconstructing `EXTERNAL` statements, found duplicate names of subprogram {subprog_name} (can ignore if not referenced).")
 
@@ -994,9 +1031,9 @@ def deconstruct_external_statements(ast: f03.Program) -> f03.Program:
         # Get external subprogram names ( EXTERNAL :: [ ext_subprogram_names:list ] )
         if isinstance(node, f03.External_Stmt):
             ext_subprogram_names = node.children[1].children
-        elif isinstance(node, f03.Type_Declaration_Stmt):
+        else:  # f03.Type_Declaration_Stmt
             attr_spec_list = ast_utils.atmost_one(ast_utils.children_of_type(node, f08.Attr_Spec_List))
-            if attr_spec_list and ('EXTERNAL' in attr_spec_list.tostr()):
+            if attr_spec_list and ("EXTERNAL" in attr_spec_list.tostr()):
                 entity_decl_list = ast_utils.singular(ast_utils.children_of_type(node, f03.Entity_Decl_List))
                 ext_subprogram_names = entity_decl_list.children
             else:
@@ -1015,8 +1052,10 @@ def deconstruct_external_statements(ast: f03.Program) -> f03.Program:
                 )
 
             # If subprogram not in parsed code, a warning is raised for now. These may be calls to library nodes, to be added later.
-            if (name_str not in subprograms_wo_modules):
-                warnings.warn(f"Unresolved `EXTERNAL` reference: {name_str} (subprogram not found in parsed code)")
+            if name_str not in subprograms_wo_modules:
+                warnings.warn(
+                    f"Unresolved `EXTERNAL` reference: {name_str} (subprogram not found in parsed code)", stacklevel=2
+                )
                 continue
 
             # Wrap in module (default name: {name_str}_module)
@@ -1027,17 +1066,18 @@ def deconstruct_external_statements(ast: f03.Program) -> f03.Program:
                 {subprograms_wo_modules[name_str].tostr()}
                 END MODULE {name_str}_module
             """)
-            module_new_reader = FortranReaderBase(module_new_buffer,
-                                                  mode=FortranFormat(True, False),
-                                                  ignore_comments=True)
+            module_new_reader = FortranReaderBase(
+                module_new_buffer, mode=FortranFormat(True, False), ignore_comments=True
+            )
             module_new = f03.Module(module_new_reader)
 
             # add module to AST at root
             utils.append_children(ast, module_new)
             new_modules_name_map[name_str] = f"{name_str}_module"
 
-            utils.replace_node(subprograms_wo_modules[name_str],
-                               None)  # remove original subprogram from AST if newly wrapped in module.
+            utils.replace_node(
+                subprograms_wo_modules[name_str], None
+            )  # remove original subprogram from AST if newly wrapped in module.
             subprograms_wo_modules.pop(name_str)
 
     # (3) For each function/subroutine - convert `EXTERNAL` statements to `USE`, if present.
@@ -1052,9 +1092,9 @@ def deconstruct_external_statements(ast: f03.Program) -> f03.Program:
             # This part is repetitive, but object management is cleaner by separating passes (2) and (3)
             if isinstance(ext_node, f03.External_Stmt):
                 ext_subprogram_names = ext_node.children[1].children
-            elif isinstance(ext_node, f03.Type_Declaration_Stmt):
+            else:  # f03.Type_Declaration_Stmt
                 attr_spec_list = ast_utils.atmost_one(ast_utils.children_of_type(ext_node, f08.Attr_Spec_List))
-                if attr_spec_list and ('EXTERNAL' in attr_spec_list.tostr()):
+                if attr_spec_list and ("EXTERNAL" in attr_spec_list.tostr()):
                     entity_decl_list = ast_utils.singular(ast_utils.children_of_type(ext_node, f03.Entity_Decl_List))
                     ext_subprogram_names = entity_decl_list.children
                 else:
@@ -1065,7 +1105,7 @@ def deconstruct_external_statements(ast: f03.Program) -> f03.Program:
                 if name_str in new_modules_name_map:
                     utils.prepend_children(spec_part, f03.Use_Stmt(f"USE {new_modules_name_map[name_str]}"))
 
-            if all([(name_node.tostr() in new_modules_name_map) for name_node in ext_subprogram_names]):
+            if all((name_node.tostr() in new_modules_name_map) for name_node in ext_subprogram_names):
                 nodes_to_remove.append(ext_node)
             else:
                 nodes_to_remove += [n for n in ext_subprogram_names if (n.tostr() in new_modules_name_map)]

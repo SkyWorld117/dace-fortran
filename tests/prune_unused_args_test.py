@@ -12,7 +12,7 @@ symbols through `sdfg.symbols`, and removing an array can make a name resurface 
 """
 import pytest
 
-from _util import build_sdfg, have_flang
+from tests._util import build_sdfg, have_flang
 from dace_fortran.prune import prune_unused_arguments, unused_arguments
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")

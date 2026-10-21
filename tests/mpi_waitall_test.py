@@ -4,13 +4,10 @@ Recognises ``MPI_Waitall(count, array_of_requests, statuses, ierr)``, threaded a
 matching Isend/Irecv producers through the shared per-request opaque transient -- the array
 analogue of ``mpi_wait`` -> ``Wait``. Lowering test only; no ranks required.
 """
+
 from pathlib import Path
 
-import pytest
-
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 #: nonblocking exchange, two requests in an array, completed by one MPI_Waitall -- the ICON
 #: halo mpi_waitall(p_irequest, p_request, ...) shape in miniature
@@ -41,5 +38,12 @@ def test_mpi_waitall_lowers_to_waitall_libnode(tmp_path: Path):
 
     sdfg = build_sdfg(_WAITALL, tmp_path / "sdfg", name="waitall", entry="waitall_mod::waitall_ring").build()
     mpi = sorted({type(n).__name__ for n, _ in sdfg.all_nodes_recursive() if isinstance(n, MPINode)})
-    assert mpi == ["CommF2c", "Irecv", "Isend", "Waitall"], \
+    assert mpi == ["CommF2c", "Irecv", "Isend", "Waitall"], (
         f"expected CommF2c/Irecv/Isend/Waitall MPI libnodes, got {mpi}"
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

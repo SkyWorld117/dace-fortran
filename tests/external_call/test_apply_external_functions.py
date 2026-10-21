@@ -5,16 +5,26 @@ a call whose argument order comes entirely from the Fortran source.
 Two layers: **contract** (no toolchain) -- registry population + policy validation.
 **e2e** (flang+gfortran) -- a bare ``ExternalFunction`` with no ``Arg`` list must produce
 the same ``ExternalCall`` as an explicit two-``Arg`` ``keep_external``."""
-import shutil
+
 import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from dace_fortran.external import (Arg, ExternalCall, apply_external_functions, clear_external_registry, keep_external,
-                                   lookup_external, registered_names)
+from dace_fortran.external import (
+    Arg,
+    ArgKind,
+    ExternalCall,
+    Intent,
+    apply_external_functions,
+    clear_external_registry,
+    keep_external,
+    lookup_external,
+    registered_names,
+)
 from dace_fortran.external_functions import ExternalFunction
+from tests._util import build_sdfg
 
 # ---------------------------------------------------------------------------
 # contract -- registry population (no toolchain needed)
@@ -26,12 +36,13 @@ def test_apply_registers_emitted_external():
     ``c_name`` is its symbol and whose library is linked."""
     clear_external_registry()
     try:
-        apply_external_functions([ExternalFunction("sync_patch_array", c_function="sync_c", library="/tmp/libhalo.so")],
-                                 [])
+        apply_external_functions(
+            [ExternalFunction("sync_patch_array", c_function="sync_c", library="/tmp/libhalo.so")], []
+        )
         sig = lookup_external("sync_patch_array")
         assert sig is not None
         assert sig.c_name == "sync_c"
-        assert sig.libraries == ("/tmp/libhalo.so", )
+        assert sig.libraries == ("/tmp/libhalo.so",)
         assert sig.stub is False
         assert sig.args == (), "a bare ExternalFunction authors no args"
     finally:
@@ -68,8 +79,9 @@ def test_apply_both_lists_together():
     """Both collections register in one call; ``registered_names`` lists all."""
     clear_external_registry()
     try:
-        apply_external_functions([ExternalFunction("sync_patch_array"),
-                                  ExternalFunction("exchange_data")], ["finish", "dbg_print"])
+        apply_external_functions(
+            [ExternalFunction("sync_patch_array"), ExternalFunction("exchange_data")], ["finish", "dbg_print"]
+        )
         assert set(registered_names()) == {"sync_patch_array", "exchange_data", "finish", "dbg_print"}
         assert lookup_external("sync_patch_array").stub is False
         assert lookup_external("finish").stub is True
@@ -102,13 +114,6 @@ def test_apply_validates_duplicate_emit_name():
 # ---------------------------------------------------------------------------
 # e2e -- the derive-from-HLFIR linchpin: a bare ExternalFunction lowers + runs
 # ---------------------------------------------------------------------------
-
-from _util import build_sdfg, have_flang  # tests/conftest.py puts tests/ on sys.path
-
-_e2e = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
 
 # Increments every element by 1.  ``bind(c, name="bar")`` -> stable C symbol.
 _BAR_F90 = """
@@ -151,8 +156,7 @@ def _build_libbar(tmp_path: Path) -> Path:
     return libbar
 
 
-@pytest.mark.parametrize("_m", [pytest.param(None, marks=_e2e)])
-def test_bare_external_function_lowers_and_runs(tmp_path: Path, _m):
+def test_bare_external_function_lowers_and_runs(tmp_path: Path):
     """The linchpin: ``ExternalFunction("bar", library=...)`` with NO ``Arg`` list still
     lowers ``call bar(a, n)`` to a working ``ExternalCall`` -- ``emit_call`` derives the plan
     from the HLFIR call site (``a`` inout pointer, ``n`` referenced inline), matching the
@@ -191,8 +195,7 @@ def _external_call_node(tmp_path, libbar, register):
     return calls[0]
 
 
-@pytest.mark.parametrize("_m", [pytest.param(None, marks=_e2e)])
-def test_derived_node_matches_authored(tmp_path: Path, _m):
+def test_derived_node_matches_authored(tmp_path: Path):
     """Derive-from-HLFIR is byte-identical to hand-authored: a bare ``ExternalFunction``
     and the explicit ``keep_external(args=[...])`` produce the SAME ``c_decl``/``body`` --
     minimal registration is a drop-in for the verbose one."""
@@ -206,9 +209,12 @@ def test_derived_node_matches_authored(tmp_path: Path, _m):
         clear_external_registry()
         keep_external(
             "bar",
-            args=[Arg(kind="array", dtype="float64", intent="inout"),
-                  Arg(kind="scalar", dtype="int32", intent="in")],
-            libraries=[str(lib)])
+            args=[
+                Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+            ],
+            libraries=[str(lib)],
+        )
 
     try:
         derived = _external_call_node(tmp_path, libbar, bare)
@@ -218,3 +224,7 @@ def test_derived_node_matches_authored(tmp_path: Path, _m):
         assert d_body == explicit.body
     finally:
         clear_external_registry()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -1,11 +1,8 @@
 """Ported from f2dace/dev:tests/fortran/call_extract_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_call_extract(tmp_path):
@@ -27,12 +24,17 @@ def test_fortran_frontend_call_extract(tmp_path):
                     END SUBROUTINE intrinsic_call_extract_test_function
                     """
 
-    sdfg = build_sdfg(test_string,
-                      tmp_path,
-                      name='intrinsic_call_extract',
-                      entry='intrinsic_call_extract_test_function').build()
+    sdfg = build_sdfg(
+        test_string, tmp_path, name="intrinsic_call_extract", entry="intrinsic_call_extract_test_function"
+    ).build()
 
     inp = np.full([2], 42, order="F", dtype=np.float32)
     res = np.full([2], 42, order="F", dtype=np.float32)
     sdfg(d=inp, res=res)
     assert np.allclose(res, [np.sqrt(np.exp(inp[0])), np.sqrt(np.exp(inp[0])) - 1])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

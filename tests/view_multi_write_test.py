@@ -3,12 +3,9 @@ cloudsc's tendency-init loop body: three view dummies each get a write in the sa
 inlined-callee block. E2e against an f2py-compiled reference."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-from _helpers import f2py
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._helpers import f2py
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_view_multi_write(tmp_path):
@@ -38,15 +35,15 @@ ENDDO
 END SUBROUTINE driver
 END MODULE kernel_mod
 """
-    ref = f2py(src, tmp_path / 'ref', 'view_multi_write_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", "view_multi_write_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='view_multi_write', entry='driver').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="view_multi_write", entry="driver").build()
 
     klon, klev, nb = 4, 5, 3
 
     def fresh():
-        return np.full([klon, klev, nb], 42.0, order='F', dtype=np.float64)
+        return np.full([klon, klev, nb], 42.0, order="F", dtype=np.float64)
 
     t_ref, q_ref, a_ref = fresh(), fresh(), fresh()
     ref.kernel_mod.driver(t_ref, q_ref, a_ref, klon, klev, nb)
@@ -56,3 +53,9 @@ END MODULE kernel_mod
     np.testing.assert_allclose(t, t_ref, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(q, q_ref, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(a, a_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

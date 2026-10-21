@@ -6,11 +6,8 @@ Both lower through a per-iteration loop reassigning a single indirection symbol 
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # ---------------------------------------------------------------------------
 # GATHER  --  ``out = d(cols)`` shape patterns
@@ -32,7 +29,7 @@ subroutine main(d, cols, out)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(0)
     d = rng.random(8).astype(np.float64)
     cols = np.array([2, 5, 1, 7], dtype=np.int32)  # 1-based Fortran indices
@@ -55,7 +52,7 @@ subroutine main(d, cols, out)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(1)
     d = rng.random(10).astype(np.float64)
     cols = np.array([1, 4, 7, 9, 2], dtype=np.int32)
@@ -78,7 +75,7 @@ subroutine main(n, d, cols, out)
   out = tmp
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     n = 4
     d = np.arange(8, dtype=np.float64)
     cols = np.array([1, 3, 5, 7], dtype=np.int32)
@@ -106,7 +103,7 @@ subroutine main(d, cols, out)
   call fun(d(cols), out)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     rng = np.random.default_rng(2)
     d = rng.random(10).astype(np.float64)
     cols = np.array([3, 6, 1, 9], dtype=np.int32)
@@ -130,7 +127,7 @@ subroutine main(d, cols, source)
   d(cols) = source
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(3)
     d = rng.random(8).astype(np.float64)
     d_orig = d.copy()
@@ -152,12 +149,12 @@ subroutine main(d, cols, source)
   d(cols) = source
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
-    d = np.array([10., 20., 30., 40., 50., 60.], dtype=np.float64)
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
+    d = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float64)
     cols = np.array([2, 5], dtype=np.int32)
     source = np.array([-1.0, -2.0], dtype=np.float64)
     sdfg(d=d, cols=cols, source=source)
-    expected = np.array([10., -1., 30., 40., -2., 60.], dtype=np.float64)
+    expected = np.array([10.0, -1.0, 30.0, 40.0, -2.0, 60.0], dtype=np.float64)
     np.testing.assert_allclose(d, expected, rtol=1e-12)
 
 
@@ -177,12 +174,12 @@ subroutine main(n, d, cols, source)
   d(cols) = source
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     n = 4
-    d = np.array([10., 20., 30., 40., 50., 60., 70., 80.], dtype=np.float64)
+    d = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0], dtype=np.float64)
     d_orig = d.copy()
     cols = np.array([1, 3, 5, 7], dtype=np.int32)
-    source = np.array([100., 200., 300., 400.], dtype=np.float64)
+    source = np.array([100.0, 200.0, 300.0, 400.0], dtype=np.float64)
     sdfg(n=n, d=d, cols=cols, source=source)
     expected = d_orig.copy()
     expected[cols - 1] = source
@@ -201,7 +198,7 @@ subroutine main(n, a, c, cols1, cols2)
   a(cols2) = c(cols1)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     n = 4
     rng = np.random.default_rng(7)
     a = rng.random(8).astype(np.float64)
@@ -226,7 +223,7 @@ subroutine main(a, c, read_idx, write_idx)
   a(write_idx) = c(read_idx)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(4)
     a = rng.random(8).astype(np.float64)
     a_orig = a.copy()
@@ -249,8 +246,8 @@ subroutine main(a, read_idx, write_idx)
   a(write_idx) = a(read_idx)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
-    a = np.array([10., 20., 30., 40., 50., 60., 70., 80.], dtype=np.float64)
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
+    a = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0], dtype=np.float64)
     a_orig = a.copy()
     # Overlapping: positions 3,4 are BOTH read and written.
     read_idx = np.array([1, 2, 3, 4], dtype=np.int32)
@@ -259,13 +256,15 @@ end subroutine main
     # Correct (Fortran-semantics) result: a_orig[0..3] copied into a[2..5].
     expected = a_orig.copy()
     expected[write_idx - 1] = a_orig[read_idx - 1]
-    np.testing.assert_allclose(a,
-                               expected,
-                               rtol=1e-12,
-                               err_msg="gather/scatter on the same array must materialise the "
-                               "RHS to a temp first; check that hlfir-expand-vector-subscript-scatter "
-                               "emits a separate gather loop into a transient before the "
-                               "scatter loop.")
+    np.testing.assert_allclose(
+        a,
+        expected,
+        rtol=1e-12,
+        err_msg="gather/scatter on the same array must materialise the "
+        "RHS to a temp first; check that hlfir-expand-vector-subscript-scatter "
+        "emits a separate gather loop into a transient before the "
+        "scatter loop.",
+    )
 
 
 def test_gather_scatter_aliasing_same_array_symbolic(tmp_path: Path):
@@ -279,9 +278,9 @@ subroutine main(n, a, read_idx, write_idx)
   a(write_idx) = a(read_idx)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     n = 4
-    a = np.array([10., 20., 30., 40., 50., 60., 70., 80.], dtype=np.float64)
+    a = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0], dtype=np.float64)
     a_orig = a.copy()
     read_idx = np.array([1, 2, 3, 4], dtype=np.int32)
     write_idx = np.array([3, 4, 5, 6], dtype=np.int32)
@@ -289,3 +288,9 @@ end subroutine main
     expected = a_orig.copy()
     expected[write_idx - 1] = a_orig[read_idx - 1]
     np.testing.assert_allclose(a, expected, rtol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

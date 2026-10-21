@@ -10,10 +10,8 @@ runs them and routine local sweeps skip the cost with ``-m "not long"``.
 
 import pytest
 
-from _util import build_sdfg, have_flang
-from dace_fortran.codegen_check import CRITICAL_WARNINGS, analyze
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
+from tests.codegen_check import CRITICAL_WARNINGS, analyze
 
 # An ALLOCATE whose extent comes from a runtime scalar, plus a loop nest over it -- the shape that produced the
 # uninitialised-extent miscompile.  Kept tiny so the analysis, not the build, dominates the runtime.
@@ -65,8 +63,9 @@ def test_generated_cpp_has_no_critical_warnings(kernel, tmp_path):
     """No generated TU may emit a UB-class warning; see ``CRITICAL_WARNINGS`` for the list and why."""
     sdfg = built_sdfg(SOURCES[kernel], tmp_path, name=kernel)
     found = analyze(sdfg, "warnings")
-    assert not found, ("generated C++ emits critical warnings (" + ", ".join(CRITICAL_WARNINGS) + "):\n" +
-                       "\n".join(found))
+    assert not found, (
+        "generated C++ emits critical warnings (" + ", ".join(CRITICAL_WARNINGS) + "):\n" + "\n".join(found)
+    )
 
 
 @pytest.mark.parametrize("kernel", sorted(SOURCES))
@@ -92,3 +91,7 @@ def test_generated_cpp_passes_deep_analysis(tool, kernel, tmp_path):
     sdfg = built_sdfg(SOURCES[kernel], tmp_path, name=kernel)
     found = analyze(sdfg, tool)
     assert not found, f"{tool} reported on generated C++:\n" + "\n".join(found)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

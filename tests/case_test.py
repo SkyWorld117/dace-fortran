@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/case_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_case_const(tmp_path):
@@ -33,10 +30,10 @@ subroutine main(d)
   call foo(d(1, 2))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     a = np.array([[i + j for i in range(5)] for j in range(5)], order="F", dtype=np.int32)
     sdfg(d=a)
-    assert (a[0, 1] == 5)
+    assert a[0, 1] == 5
 
 
 def test_fortran_frontend_case_const_range(tmp_path):
@@ -67,8 +64,14 @@ subroutine main(d)
   call foo(d(1, 5))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     a = np.array([[i + j for i in range(5)] for j in range(5)], order="F", dtype=np.int32)
     sdfg(d=a)
-    assert (a[0, 2] == 6)
-    assert (a[0, 4] == 4)
+    assert a[0, 2] == 6
+    assert a[0, 4] == 4
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

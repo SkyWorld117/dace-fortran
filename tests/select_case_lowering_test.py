@@ -12,11 +12,8 @@ so the inliner actually clones the lowered CFG (the original segfault path).
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_select_case_point_in_inlined_callee(tmp_path: Path):
@@ -43,7 +40,7 @@ subroutine main(d)
   call foo(d(2))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     a = np.array([1, 7, 0, 0, 0], dtype=np.int32, order="F")
     sdfg(d=a)
     # d(1) was 1 -> matched, becomes 5; d(2) was 7 -> no match, unchanged.
@@ -78,7 +75,7 @@ subroutine main(d)
   call foo(d(6))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     a = np.array([1, 2, 3, 4, 5, 0], dtype=np.int32, order="F")
     sdfg(d=a)
     # Only 2..4 match the case (2:4) range -> become 6; 1, 5, 0 stay put.
@@ -88,3 +85,9 @@ end subroutine main
     assert a[3] == 6
     assert a[4] == 5
     assert a[5] == 0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

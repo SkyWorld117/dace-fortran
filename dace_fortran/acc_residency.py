@@ -35,14 +35,17 @@ An argument with no ACC evidence is reported in ``unclassified``; it is never
 defaulted into ``host``, because "no directive mentions it" and "the directives
 say it is on the host" call for different actions on the binding side.
 """
+
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import re
 import sys
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import NamedTuple
 
 from fparser.common.readfortran import FortranStringReader
 from fparser.two import Fortran2003 as f03
@@ -51,31 +54,33 @@ from fparser.two.utils import FortranSyntaxError, walk
 
 #: Clauses proving the data has a device copy at call time.  ``DELETE`` /
 #: ``DETACH`` qualify: only device-resident data can be removed from the device.
-DEVICE_CLAUSES = frozenset({
-    "present",
-    "copy",
-    "copyin",
-    "copyout",
-    "create",
-    "deviceptr",
-    "device_resident",
-    "attach",
-    "detach",
-    "delete",
-    "device",
-    "use_device",
-    "link",
-    "present_or_copy",
-    "present_or_copyin",
-    "present_or_copyout",
-    "present_or_create",
-    "pcopy",
-    "pcopyin",
-    "pcopyout",
-    "pcreate",
-    "pcopy_in",
-    "pcopy_out",
-})
+DEVICE_CLAUSES = frozenset(
+    {
+        "present",
+        "copy",
+        "copyin",
+        "copyout",
+        "create",
+        "deviceptr",
+        "device_resident",
+        "attach",
+        "detach",
+        "delete",
+        "device",
+        "use_device",
+        "link",
+        "present_or_copy",
+        "present_or_copyin",
+        "present_or_copyout",
+        "present_or_create",
+        "pcopy",
+        "pcopyin",
+        "pcopyout",
+        "pcreate",
+        "pcopy_in",
+        "pcopy_out",
+    }
+)
 
 #: Clauses that leave the data usable from the host.  ``NO_CREATE`` is the only
 #: ACC clause admitting host memory as the fallback; ``UPDATE HOST/SELF`` marks
@@ -135,14 +140,15 @@ def _cpp_expr_true(expr: str, defines: frozenset) -> bool:
 def _mask_cpp(source: str, defines: frozenset) -> str:
     """Comment out cpp directive lines and every line of a not-taken arm,
     preserving the line count so fparser spans keep pointing at the original."""
-    out: List[str] = []
-    stack: List[List[bool]] = []  # [taken_now, taken_ever] per open #if
+    out: list[str] = []
+    stack: list[list[bool]] = []  # [taken_now, taken_ever] per open #if
     for line in source.splitlines():
         stripped = line.lstrip()
         if stripped.startswith("#"):
             directive = stripped[1:].lstrip()
-            word = re.match(r"\w*", directive).group(0)
-            rest = directive[len(word):].strip()
+            word_match = re.match(r"\w*", directive)  # matches the empty string at worst
+            word = word_match.group(0) if word_match else ""
+            rest = directive[len(word) :].strip()
             if word == "ifdef":
                 taken = rest.split()[0] in defines if rest.split() else False
                 stack.append([taken, taken])
@@ -166,14 +172,9 @@ def _mask_cpp(source: str, defines: frozenset) -> str:
     return "\n".join(out)
 
 
-_PARSER = None
-
-
-def _parser():
-    global _PARSER
-    if _PARSER is None:
-        _PARSER = ParserFactory().create(std="f2008")
-    return _PARSER
+@functools.cache
+def _parser() -> Callable[..., f03.Program]:
+    return ParserFactory().create(std="f2008")
 
 
 def _parse(source: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> f03.Program:
@@ -189,7 +190,7 @@ _SCOPE_CLASSES = (f03.Subroutine_Subprogram, f03.Function_Subprogram)
 _SCOPE_STMT_CLASSES = (f03.Subroutine_Stmt, f03.Function_Stmt)
 
 
-def _routine_node(ast: f03.Program, routine: str):
+def _routine_node(ast: f03.Program, routine: str) -> f03.Base:
     """The subprogram node defining ``routine`` (first match, like the old scan)."""
     want = routine.lower()
     for scope in walk(ast, _SCOPE_CLASSES):
@@ -199,10 +200,15 @@ def _routine_node(ast: f03.Program, routine: str):
     raise ValueError(f"routine {routine!r} not found in source")
 
 
-def _node_span(node) -> Tuple[int, int]:
+class LineSpan(NamedTuple):
+    first: int
+    last: int
+
+
+def _node_span(node: f03.Base) -> LineSpan:
     """1-based (first, last) source line of ``node``'s subtree."""
     spans = [n.item.span for n in walk(node) if getattr(n, "item", None) is not None]
-    return min(s[0] for s in spans), max(s[1] for s in spans)
+    return LineSpan(min(s[0] for s in spans), max(s[1] for s in spans))
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +219,9 @@ def _node_span(node) -> Tuple[int, int]:
 class _Logical:
     """A directive joined across ``&`` continuations, with offset->line map."""
 
-    __slots__ = ("text", "_spans", "line")
+    __slots__ = ("_spans", "line", "text")
 
-    def __init__(self, pieces):
+    def __init__(self, pieces: Sequence[tuple[int, str]]) -> None:
         parts, spans, off = [], [], 0
         for lineno, piece in pieces:
             parts.append(piece)
@@ -232,20 +238,27 @@ class _Logical:
         return self.line
 
 
-def _sentinel_body(line: str) -> Tuple[str, bool]:
+class SentinelBody(NamedTuple):
+    text: str
+    continued: bool
+
+
+def _sentinel_body(line: str) -> SentinelBody:
     """The directive text of one physical ``!$acc`` line, plus its continues-flag."""
     match = _ACC_SENTINEL_RE.match(line)
-    body = _strip_comment(line[match.end():]).rstrip()
+    if match is None:
+        raise ValueError(f"not a !$acc sentinel line: {line!r}")
+    body = _strip_comment(line[match.end() :]).rstrip()
     continued = body.endswith("&")
     if continued:
         body = body[:-1]
     body = body.strip()
     if body.startswith("&"):
         body = body[1:].strip()
-    return body, continued
+    return SentinelBody(body, continued)
 
 
-def acc_directives(source: str) -> List[_Logical]:
+def acc_directives(source: str) -> list[_Logical]:
     """Yield every ``!$ACC`` directive of ``source`` as a :class:`_Logical`."""
     lines = source.splitlines()
     out, i = [], 0
@@ -275,7 +288,18 @@ def _head(text: str) -> str:
     return words[0].lower()
 
 
-def _clause_entities(text: str, start: int, end: int):
+class ClauseEntity(NamedTuple):
+    base: str
+    ref: str
+    offset: int
+
+
+class Clause(NamedTuple):
+    name: str
+    entities: list[ClauseEntity]
+
+
+def _clause_entities(text: str, start: int, end: int) -> list[ClauseEntity]:
     """``(base_name, full_ref, offset)`` per comma-separated clause item.
 
     An item is a variable reference: plain name, component path (``a%b%c``),
@@ -284,7 +308,8 @@ def _clause_entities(text: str, start: int, end: int):
     removed.  Items that do not start with an identifier (e.g. a ``*``) are
     skipped.
     """
-    out, depth, token_start = [], 0, start
+    out: list[ClauseEntity] = []
+    depth, token_start = 0, start
     for i in range(start, end + 1):
         ch = text[i] if i < end else ","
         if ch == "(":
@@ -296,12 +321,12 @@ def _clause_entities(text: str, start: int, end: int):
             match = _IDENT_RE.match(item)
             if match is not None:
                 ref = re.sub(r"\s+", "", item)
-                out.append((match.group(1).lower(), ref, token_start + match.start(1)))
+                out.append(ClauseEntity(match.group(1).lower(), ref, token_start + match.start(1)))
             token_start = i + 1
     return out
 
 
-def _clauses(logical: _Logical):
+def _clauses(logical: _Logical) -> Iterator[Clause]:
     """Yield ``(clause_name, [(base, ref, offset), ...])`` for one directive."""
     text, i = logical.text, 0
     while True:
@@ -315,7 +340,7 @@ def _clauses(logical: _Logical):
             elif text[j] == ")":
                 depth -= 1
             j += 1
-        yield match.group(1).lower(), _clause_entities(text, match.end(), j - 1)
+        yield Clause(match.group(1).lower(), _clause_entities(text, match.end(), j - 1))
         i = j
 
 
@@ -324,19 +349,14 @@ def _clauses(logical: _Logical):
 # ---------------------------------------------------------------------------
 
 
-def routine_span(source: str, routine: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> Tuple[int, int]:
-    """1-based ``(first_line, last_line)`` of ``routine``'s definition."""
-    return _node_span(_routine_node(_parse(source, defines), routine))
-
-
-def dummy_args(source: str, routine: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> List[str]:
+def dummy_args(source: str, routine: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> list[str]:
     """Dummy argument names of ``routine``, in declaration order, lowercased."""
     node = _routine_node(_parse(source, defines), routine)
     stmt = next(iter(walk(node, _SCOPE_STMT_CLASSES)))
     args = next(iter(walk(stmt, f03.Dummy_Arg_List)), None)
     if args is None:
         return []
-    out: List[str] = []
+    out: list[str] = []
     for name in walk(args, f03.Name):
         low = name.string.lower()
         if low not in out:
@@ -344,7 +364,7 @@ def dummy_args(source: str, routine: str, defines: Iterable[str] = DEFAULT_CPP_D
     return out
 
 
-def _collect_evidence_impl(source: str, routine: str, defines: Iterable[str]) -> Dict[str, list]:
+def _collect_evidence_impl(source: str, routine: str, defines: Iterable[str]) -> dict[str, list]:
     ast = _parse(source, defines)
     node = _routine_node(ast, routine)
     first, last = _node_span(node)
@@ -356,7 +376,7 @@ def _collect_evidence_impl(source: str, routine: str, defines: Iterable[str]) ->
     # Directive scan runs over the cpp-masked text so only live-arm directives
     # count, matching the parsed structure the spans came from.
     masked = _mask_cpp(source, frozenset(defines))
-    evidence: Dict[str, list] = {}
+    evidence: dict[str, list] = {}
     depth, order = 0, 0
     for logical in acc_directives(masked):
         if not first <= logical.line <= last:
@@ -377,7 +397,7 @@ def _collect_evidence_impl(source: str, routine: str, defines: Iterable[str]) ->
     return evidence
 
 
-def collect_evidence(source: str, routine: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> Dict[str, list]:
+def collect_evidence(source: str, routine: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> dict[str, list]:
     """Map ``arg -> [(depth, order, clause, line, ref)]`` from the routine's
     directives.
 
@@ -413,16 +433,15 @@ def classify(source: str, routine: str, source_name: str, defines: Iterable[str]
     return {"routine": routine, "source": source_name, "args": classified, "unclassified": unclassified}
 
 
-def extract_acc_residency(source_path, routine: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> dict:
+def extract_acc_residency(source_path: str | Path, routine: str, defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> dict:
     """Classify ``routine`` in the Fortran file ``source_path``."""
     path = Path(source_path)
     return classify(path.read_text(), routine, path.name, defines)
 
 
-def write_acc_residency_sidecar(source_path,
-                                routine: str,
-                                out_dir,
-                                defines: Iterable[str] = DEFAULT_CPP_DEFINES) -> Path:
+def write_acc_residency_sidecar(
+    source_path: str | Path, routine: str, out_dir: str | Path, defines: Iterable[str] = DEFAULT_CPP_DEFINES
+) -> Path:
     """Write ``<routine>.acc_residency.json`` into ``out_dir``; return its path."""
     payload = extract_acc_residency(source_path, routine, defines)
     out = Path(out_dir) / f"{routine}.acc_residency.json"
@@ -431,27 +450,30 @@ def write_acc_residency_sidecar(source_path,
     return out
 
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m dace_fortran.acc_residency",
-                                     description="Extract per-argument OpenACC data residency for a Fortran routine.")
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m dace_fortran.acc_residency",
+        description="Extract per-argument OpenACC data residency for a Fortran routine.",
+    )
     parser.add_argument("source", type=Path, nargs="*",
                         help="Fortran source(s), ACC directives intact.  One file in extract "
                         "mode; every file to walk in --check-deviceptr mode.")
     parser.add_argument("--routine", help="Target routine name (extract mode, required).")
-    parser.add_argument("--define",
-                        action="append",
-                        default=[],
-                        help="Extra cpp macro assumed defined when selecting #if arms "
-                        "(added to the default set: %s)." % ", ".join(sorted(DEFAULT_CPP_DEFINES)))
+    parser.add_argument(
+        "--define",
+        action="append",
+        default=[],
+        help="Extra cpp macro assumed defined when selecting #if arms (added to the default set: {}).".format(
+            ", ".join(sorted(DEFAULT_CPP_DEFINES))
+        ),
+    )
     parser.add_argument("--out", type=Path, help="Write the sidecar JSON here (default: stdout).")
     parser.add_argument("--out-dir", type=Path, help="Write <routine>.acc_residency.json into this directory.")
     parser.add_argument("--table", action="store_true", help="Also print a human-readable table on stderr.")
     parser.add_argument("--check-deviceptr", action="append", default=[], metavar="NAME",
                         help="Check mode: require `present(NAME)` on every array a deviceptr loop "
-                        "writes.  Repeatable; naming the arrays is exact and cheap, because "
-                        "deciding in general which identifier in a loop body is a module array "
-                        "needs scope information this pass does not have.  Every positional file "
-                        "is walked.  Exit 1 if any site is unguarded.")
+                        "writes.  Repeatable; every positional file is walked.  Exit 1 if any "
+                        "site is unguarded.")
     ns = parser.parse_args(argv)
 
     defines = DEFAULT_CPP_DEFINES | set(ns.define)
@@ -603,7 +625,6 @@ def check_deviceptr_files(paths, targets, defines: Iterable[str] = DEFAULT_CPP_D
                        f"`{target}` with no `present({target})` -- the write will not reach "
                        f"the device")
     return len(paths), out
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

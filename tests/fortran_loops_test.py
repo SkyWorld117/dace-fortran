@@ -1,11 +1,8 @@
 """Ported from f2dace/dev:tests/fortran/fortran_loops_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_loop_region_basic_loop(tmp_path):
@@ -32,7 +29,7 @@ def test_fortran_frontend_loop_region_basic_loop(tmp_path):
         ENDDO
     end SUBROUTINE loop_test_function
     """
-    sdfg = build_sdfg(test_string, tmp_path, name='loop_test', entry='loop_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="loop_test", entry="loop_test_function").build()
 
     a_test = np.full([10, 10], 2, order="F", dtype=np.float64)
     b_test = np.full([10, 10], 3, order="F", dtype=np.float64)
@@ -41,3 +38,9 @@ def test_fortran_frontend_loop_region_basic_loop(tmp_path):
 
     validate = np.full([10, 10], 5, order="F", dtype=np.float64)
     assert np.allclose(c_test, validate)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

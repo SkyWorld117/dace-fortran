@@ -2,40 +2,15 @@
 
 Locates gfortran / flang-new / nvfortran (PATH + standard NVHPC prefix) and exposes ``FORTRAN_COMPILERS`` for ``@pytest.mark.parametrize``; the iso_c wrappers + solve_nh patch must parse cleanly under all three ICON-shipped compilers.
 """
+
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Optional
 
 import pytest
 
 from dace_fortran.llvm_toolchain import flang_names
-
-# standard NVIDIA HPC SDK install prefixes; version segment (e.g. 25.7) varies by release.
-_NVHPC_PREFIXES = (
-    "/opt/nvidia/hpc_sdk/Linux_x86_64",
-    "/opt/nvhpc/Linux_x86_64",
-    "/usr/local/nvhpc/Linux_x86_64",
-)
-
-
-def _find_nvfortran() -> Optional[Path]:
-    """Locate nvfortran on PATH or under the standard NVHPC prefixes; picks the newest version dir when several are installed."""
-    p = shutil.which("nvfortran")
-    if p is not None:
-        return Path(p)
-    for prefix in _NVHPC_PREFIXES:
-        prefix_path = Path(prefix)
-        if not prefix_path.is_dir():
-            continue
-        versions = sorted((d for d in prefix_path.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
-        for version_dir in versions:
-            candidate = version_dir / "compilers" / "bin" / "nvfortran"
-            if candidate.is_file():
-                return candidate
-    return None
-
 
 # LLVM-flang binary names probed in order, for every supported LLVM major; distributions differ on which spelling is canonical.
 _FLANG_NAMES = tuple(flang_names())
@@ -50,7 +25,7 @@ def _looks_like_llvm_flang(path: str) -> bool:
     return "flang version" in out
 
 
-def _find_flang() -> Optional[Path]:
+def _find_flang() -> Path | None:
     """Locate an LLVM-flang binary: ``$FC`` if set and self-identifying as flang, else the first ``_FLANG_NAMES`` hit on PATH."""
     fc = os.environ.get("FC")
     if fc:
@@ -64,7 +39,7 @@ def _find_flang() -> Optional[Path]:
     return None
 
 
-def _find_gfortran() -> Optional[Path]:
+def _find_gfortran() -> Path | None:
     p = shutil.which("gfortran")
     return Path(p) if p else None
 
@@ -83,30 +58,27 @@ def discover_fortran_compilers() -> dict:
     return out
 
 
-def _make_params() -> List:
+def _make_params() -> list:
     """Build the ``pytest.param(...)`` list for the discovered set."""
     found = discover_fortran_compilers()
     if not found:
-        return [
-            pytest.param(("gfortran", "gfortran"),
-                         id="gfortran",
-                         marks=[pytest.mark.skip(reason="no Fortran compiler found on the host")])
-        ]
+        # No compiler on the host: keep the gfortran param so its test fails loudly.
+        return [pytest.param(("gfortran", "gfortran"), id="gfortran")]
     return [pytest.param((name, str(path)), id=name) for name, path in found.items()]
 
 
-#: (name, executable_path) tuples for @pytest.mark.parametrize("fc", FORTRAN_COMPILERS); no-compiler-available is handled via per-param skip marks.
+#: (name, executable_path) tuples for @pytest.mark.parametrize("fc", FORTRAN_COMPILERS); with no compiler found the gfortran param stays and its test fails.
 FORTRAN_COMPILERS = _make_params()
 
 
-def fortran_compiler_flags(fc_name: str) -> List[str]:
+def fortran_compiler_flags(fc_name: str) -> list[str]:
     """Per-compiler base flags for wrapper-syntax checks: gfortran needs -ffree-line-length-none (default 132-col limit) for long generated lines; flang-new/nvfortran need nothing (no limit, and flang rejects the gfortran flag)."""
     if fc_name == "gfortran":
         return ["-ffree-line-length-none"]
     return []
 
 
-def syntax_check_argv(fc_name: str, scratch_dir: Path) -> List[str]:
+def syntax_check_argv(fc_name: str, scratch_dir: Path) -> list[str]:
     """Per-compiler argv tail for a parse+semantic-check pass: gfortran/flang-new use -fsyntax-only; nvfortran has no equivalent, falls back to bare -c (no -o -- it refuses -c -o single.o with multiple sources; caller's cwd=scratch_dir keeps per-source .o files xdist-safe)."""
     del scratch_dir  # reserved for future single-output compilers
     if fc_name == "nvfortran":
@@ -128,7 +100,7 @@ _FLANG_RT_DIRS = (
 )
 
 
-def find_flang_runtime_dir() -> Optional[str]:
+def find_flang_runtime_dir() -> str | None:
     """First directory with libflang_rt.runtime.a (flang-21's -lflang_rt.runtime archive), or None.  Tests linking with flang-new-21 use this to skip cleanly or inject LIBRARY_PATH."""
     for d in _FLANG_RT_DIRS:
         if (Path(d) / "libflang_rt.runtime.a").is_file():
@@ -152,8 +124,10 @@ def env_with_flang_runtime(fc_name: str) -> dict:
 
 
 #: pytest.skip reason for tests needing a full flang link but no runtime found.
-FLANG_RT_HINT = ("flang-new-21 needs ``libflang_rt.runtime.a`` for a full link; "
-                 "build it locally with the recipe at the top of the README's "
-                 "Fortran-compiler matrix section, or symlink ROCm's "
-                 "/opt/rocm-7.2.0/...x86_64-unknown-linux-gnu/libflang_rt.runtime.a "
-                 "into a $LIBRARY_PATH directory.")
+FLANG_RT_HINT = (
+    "flang-new-21 needs ``libflang_rt.runtime.a`` for a full link; "
+    "build it locally with the recipe at the top of the README's "
+    "Fortran-compiler matrix section, or symlink ROCm's "
+    "/opt/rocm-7.2.0/...x86_64-unknown-linux-gnu/libflang_rt.runtime.a "
+    "into a $LIBRARY_PATH directory."
+)

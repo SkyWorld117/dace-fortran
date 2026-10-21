@@ -22,8 +22,8 @@ Checked e2e against an f2py-compiled gfortran reference: bugged = diverges, fixe
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
-from _helpers import f2py
+from tests._util import build_sdfg, have_flang
+from tests._helpers import f2py
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
@@ -208,3 +208,7 @@ ENDDO
 END SUBROUTINE driver
 """, "symbol_reuse_index")
 
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

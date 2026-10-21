@@ -13,11 +13,8 @@ bounds ``a(10:,20:)`` -- previously unhandled, offsets silently lost -> OOB).
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _e2e(src: str, entry: str, tmp_path: Path, sdfg_kw: dict, ref_args: tuple):
@@ -194,3 +191,9 @@ end module as_shift2_mod
                 ext[k] = np.int64(sz)
     sdfg(n=np.int32(n), m=np.int32(m), a=a.copy(order="F"), out=o, **ext)
     np.testing.assert_allclose(o, a * 3.0 - 2.0, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

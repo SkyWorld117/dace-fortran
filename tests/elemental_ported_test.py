@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/elemental_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_elemental_ecrad(tmp_path):
@@ -36,7 +33,7 @@ SUBROUTINE main(od_sw_liq, scat_od_sw_liq, g_sw_liq)
     CALL delta_eddington_scat_od(od_sw_liq, scat_od_sw_liq, g_sw_liq)
 END SUBROUTINE
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     size = 14
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -100,7 +97,7 @@ SUBROUTINE main(fsd, cdf, val)
     CALL sample_from_pdf(class_object, fsd, cdf, val)
 END SUBROUTINE
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -168,7 +165,7 @@ SUBROUTINE main(iters, fsd, cdf, val)
     CALL sample_from_pdf(class_object, fsd(iter_up - iter_low : iter_up - 1), cdf(1:iter_low), val(iter_up - iter_low: iter_up - 1))
 END SUBROUTINE
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -190,3 +187,9 @@ END SUBROUTINE
     sdfg(iters=iters, fsd=arg1, cdf=arg2, val=arg3)
 
     assert np.allclose(val[1:4], arg3[1:4])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -11,11 +11,8 @@ Each test compares an SDFG run against an f2py/gfortran reference.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _build(src: str, tmp: Path, name: str = "main"):
@@ -179,3 +176,9 @@ end subroutine main
     sdfg(arr=arr, out=out, arr_d0=n, arr_d1=m, arr_d2=p)
     np.testing.assert_array_equal(out, out_ref)
     np.testing.assert_array_equal(out, [n * m * p, n, m, p])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

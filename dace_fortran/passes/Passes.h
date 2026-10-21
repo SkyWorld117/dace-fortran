@@ -27,12 +27,15 @@ std::unique_ptr<mlir::Pass> createFlattenGlobalScalarReadsPass();
 std::unique_ptr<mlir::Pass> createSplitAoRDummiesPass();
 std::unique_ptr<mlir::Pass> createEliminateDoubleBufferTogglePass();
 std::unique_ptr<mlir::Pass> createDefaultIntentPass();
+std::unique_ptr<mlir::Pass> createRestoreCountedLoopsPass();
 std::unique_ptr<mlir::Pass> createVerifyNoUnresolvedCallsPass();
 std::unique_ptr<mlir::Pass> createFoldElementAliasesPass();
 std::unique_ptr<mlir::Pass> createFoldCopyInOutPass();
 std::unique_ptr<mlir::Pass> createDropStubCallsPass();
 std::unique_ptr<mlir::Pass> createExpandVectorSubscriptGatherPass();
 std::unique_ptr<mlir::Pass> createExpandVectorSubscriptScatterPass();
+std::unique_ptr<mlir::Pass> createMaterialiseArrayConstructorsPass();
+std::unique_ptr<mlir::Pass> createSinkScalarStoresPass();
 std::unique_ptr<mlir::Pass> createRejectPolymorphismPass();
 std::unique_ptr<mlir::Pass> createRewritePointerAssignsPass();
 std::unique_ptr<mlir::Pass> createRewriteSequenceAssociationPass();
@@ -50,6 +53,7 @@ std::unique_ptr<mlir::Pass> createMarkBoundsRemapViewsPass();
 std::unique_ptr<mlir::Pass> createFoldAssumedRankQueriesPass();
 std::unique_ptr<mlir::Pass> createPruneNeverAllocatedMemberDerefPass();
 std::unique_ptr<mlir::Pass> createFoldConstantScalarsPass();
+std::unique_ptr<mlir::Pass> createSpecializeGlobalsPass();
 
 // --- Registry ---
 

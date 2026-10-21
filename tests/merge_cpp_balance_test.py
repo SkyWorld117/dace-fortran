@@ -8,16 +8,12 @@ by the real build).
 
 This is the shape ICON's ~150-module USE-closure hits; reproduced minimally here.
 """
+
 import re
 from pathlib import Path
 
-import pytest
-
-from _util import have_flang
 from dace_fortran import build_sdfg_from_files
 from dace_fortran.preprocess import merge_used_modules
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 # mo_dbl shares a file with a preceding module wrapped in a whole-module #ifdef:
 # mo_dbl's extracted block picks up the orphan #endif, the wrapped block an orphan #if.
@@ -79,12 +75,17 @@ def test_cpp_wrapped_module_merges_and_builds(tmp_path: Path):
     helpers = tmp_path / "helpers.f90"
     helpers.write_text(_HELPERS)
 
-    sdfg = build_sdfg_from_files([caller, helpers],
-                                 entry="apply_dbl_mod::apply_dbl",
-                                 name="apply_dbl",
-                                 out_dir=tmp_path / "build")
+    sdfg = build_sdfg_from_files(
+        [caller, helpers], entry="apply_dbl_mod::apply_dbl", name="apply_dbl", out_dir=tmp_path / "build"
+    )
     k = 5
     out = np.zeros(4, dtype=np.float64)
     sdfg(k=np.int32(k), out=out)
     ref = np.array([2 * k + i for i in range(1, 5)], dtype=np.float64)
     np.testing.assert_allclose(out, ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

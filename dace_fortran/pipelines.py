@@ -4,49 +4,58 @@
 
 ``optimize`` is the end-to-end parallelization pipeline:
 
-    len1-to-scalar -> specialize -> short-loop-unroll -> unique-loop-iterators -> scalar-fission
-      -> simplify -> state-fusion-extended -> loop2map -> state-fusion-extended -> mapfusion
-      -> map-collapse -> mapfusion -> make-transients-persistent
+    specialize -> len1-to-scalar -> short-loop-unroll -> unique-loop-iterators -> scalar-fission
+      -> simplify -> state-fusion-extended -> privatize-loop-local-arrays -> loop2map
+      -> state-fusion-extended -> mapfusion -> map-collapse -> mapfusion -> make-transients-persistent
+      -> bind-omp-thread-count
 
 ``scalar_fission`` runs unconditionally, BEFORE simplify (it splits scalar-carried loop bodies so
 the loop can map downstream): LoopToMap needs it in general, not just CloudSC. ``specialize``
-bakes the known compile-time constants (CloudSC: nclv, ncldqi, ...) so the shape and branch
-folding downstream have literals to work on. ``len1_to_scalar`` runs FIRST, with ``preserve_abi``,
-so the rest of the pipeline sees a plain scalar instead of a one-element buffer while the SDFG
-signature keeps its array form. The builder already runs it on frontend output; repeating it here
+runs FIRST and bakes the known compile-time constants (CloudSC: nclv, ncldqi, ...), so the
+short-loop unroll sees literal trip counts and the shape and branch folding downstream have
+literals to work on. ``len1_to_scalar`` runs with ``preserve_abi``, so the rest of the pipeline
+sees a plain scalar instead of a one-element buffer while the SDFG signature keeps its array form. The builder already runs it on frontend output; repeating it here
 covers an SDFG that reached ``optimize`` some other way, and the pass is idempotent.
+``privatize-loop-local-arrays`` (:mod:`dace_fortran.loop_privatization`) gives each loop its own copy of a work
+array the loops share but never pass values through, so ``loop2map`` can privatise it.
 ``mapfusion`` is ``FullMapFusion`` (vertical +
 horizontal fusion run together to a fixed point), applied a second time after ``map-collapse``
-since a freshly-collapsed nest can expose fusions the first pass missed.
+since a freshly-collapsed nest can expose fusions the first pass missed. ``bind-omp-thread-count``
+defines the team-size symbol of thread-strided persistent maps at SDFG entry, when the SDFG uses it.
 """
+
 import copy
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, Optional, Union, cast
 
-from dace.transformation.dataflow.map_collapse import MapCollapse
 import numpy as np
-
 from dace import SDFG
 from dace.sdfg import nodes
 from dace.sdfg.utils import specialize_scalars, specialize_symbols
+from dace.transformation.dataflow.map_collapse import MapCollapse
 from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.interstate.state_fusion_with_happens_before import StateFusionExtended
 from dace.transformation.pass_pipeline import Pipeline
 from dace.transformation.passes.full_map_fusion import FullMapFusion
-from dace.transformation.passes.length_one_array_scalar_conversion import (ConvertLengthOneArraysToScalars,
-                                                                           _STAGING_STATE_PREFIXES)
+from dace.transformation.passes.length_one_array_scalar_conversion import (
+    STAGING_STATE_PREFIXES,
+    ConvertLengthOneArraysToScalars,
+)
 from dace.transformation.passes.parallelization_prep import ShortLoopUnroll
 from dace.transformation.passes.scalar_fission import ScalarFission
 from dace.transformation.passes.unique_loop_iterators import UniqueLoopIterators
 
+from dace_fortran.loop_privatization import privatize_loop_local_arrays
+from dace_fortran.omp_threads import BindOmpThreadCount
+
 Const = Union[float, int, str]
 
 
-def accepted_call_args(sdfg: SDFG) -> Set[str]:
+def accepted_call_args(sdfg: SDFG) -> set[str]:
     """Names ``sdfg`` can be called with: its arglist plus its free symbols."""
     return set(sdfg.arglist()) | {str(s) for s in sdfg.free_symbols}
 
 
-def abi_proxy_transients(sdfg: SDFG) -> Set[str]:
+def abi_proxy_transients(sdfg: SDFG) -> set[str]:
     """Transients that exist only as the copy-in/copy-out shadow of a NON-transient.
 
     ``ConvertLengthOneArraysToScalars(preserve_abi=True)`` keeps the signature array and stages it
@@ -55,9 +64,9 @@ def abi_proxy_transients(sdfg: SDFG) -> Set[str]:
     Derived from the staging edges themselves rather than the ``scal_`` name the pass happens to mint,
     and keyed on that pass's OWN state-label constant so a rename there cannot silently unhook this.
     """
-    proxies: Set[str] = set()
+    proxies: set[str] = set()
     for state in sdfg.all_states():
-        if not state.label.startswith(_STAGING_STATE_PREFIXES):
+        if not state.label.startswith(STAGING_STATE_PREFIXES):
             continue
         for edge in state.edges():
             if not (isinstance(edge.src, nodes.AccessNode) and isinstance(edge.dst, nodes.AccessNode)):
@@ -68,7 +77,7 @@ def abi_proxy_transients(sdfg: SDFG) -> Set[str]:
     return proxies
 
 
-def fission_scalars(sdfg: SDFG) -> Dict[str, Set[str]]:
+def fission_scalars(sdfg: SDFG) -> dict[str, set[str]]:
     """Run ``ScalarFission`` on ``sdfg``, leaving ABI-proxy transients whole.
 
     Fissioning a proxy splits its value over several shadows while the copy-out still reads exactly
@@ -83,13 +92,13 @@ def fission_scalars(sdfg: SDFG) -> Dict[str, Set[str]]:
     for name in proxies:
         sdfg.arrays[name].transient = False
     try:
-        return (Pipeline([ScalarFission()]).apply_pass(sdfg, {}) or {}).get('ScalarFission') or {}
+        return (Pipeline([ScalarFission()]).apply_pass(sdfg, {}) or {}).get("ScalarFission") or {}
     finally:
         for name in proxies:
             sdfg.arrays[name].transient = True
 
 
-def verify_numerics(reference: SDFG, optimized: SDFG, inputs: Dict[str, Any]) -> None:
+def verify_numerics(reference: SDFG, optimized: SDFG, inputs: dict[str, Any]) -> None:
     """Run both SDFGs on the same inputs and require BIT-IDENTICAL results.
 
     The pipeline reorders statements and forms maps but never reassociates arithmetic, so anything
@@ -108,11 +117,11 @@ def verify_numerics(reference: SDFG, optimized: SDFG, inputs: Dict[str, Any]) ->
     # The two SDFGs share a name, and the build folder is keyed on it -- compiling both would put
     # them in one directory and the second would clobber the first.
     reference = copy.deepcopy(reference)
-    reference.name = f"{reference.name}_preopt"
+    cast(Any, reference).name = f"{reference.name}_preopt"  # dace declares SDFG.name as a Property
 
-    def fresh() -> Dict[str, Any]:
+    def fresh() -> dict[str, Any]:
         return {
-            k: (v.copy(order='F' if v.flags.f_contiguous else 'C') if isinstance(v, np.ndarray) else v)
+            k: (v.copy(order="F" if v.flags.f_contiguous else "C") if isinstance(v, np.ndarray) else v)
             for k, v in inputs.items()
         }
 
@@ -140,20 +149,60 @@ def verify_numerics(reference: SDFG, optimized: SDFG, inputs: Dict[str, Any]) ->
         raise AssertionError("optimize() changed the numerics (must be bit-exact):\n  " + "\n  ".join(mismatched))
 
 
-def optimize(sdfg: SDFG,
-             *,
-             symbols: Optional[Dict[str, Const]] = None,
-             scalars: Optional[Dict[str, Const]] = None,
-             unroll_limit: int = 8,
-             validate: bool = True,
-             verify_inputs: Optional[Dict[str, Any]] = None,
-             gpu: bool = False,
-             gpu_block_size=None,
-             force_inline: bool = False,
-             split_siblings: bool = False,
-             permissive_ltm: bool = False,
-             device_libnodes: bool = False,
-             allow_abi_scalar_fission: bool = False) -> SDFG:
+def read_data(sdfg: SDFG) -> set[str]:
+    """The data containers of ``sdfg`` something reads: an access node anywhere (nested SDFGs reach the outer
+    containers through access nodes), an interstate edge, or a loop or branch condition."""
+    from dace.sdfg.state import AbstractControlFlowRegion
+
+    read = {n.data for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.AccessNode)}
+    read |= {m.data for e in sdfg.all_interstate_edges() for m in e.data.get_read_memlets(sdfg.arrays)}
+    for block in sdfg.all_control_flow_blocks():
+        if isinstance(block, AbstractControlFlowRegion):
+            read |= {m.data for m in block.get_meta_read_memlets()}
+    return read
+
+
+def specialize(sdfg: SDFG, *, symbols: dict[str, Const] | None = None, scalars: dict[str, Const] | None = None) -> None:
+    """Bake free symbols and scalar data containers to constants (each batched into one recursive walk), and drop the
+    scalar inputs nothing reads any more.
+
+    ``specialize_scalars`` folds every read of a scalar into the code that reads it but keeps the container: a
+    non-transient one would stay in the signature, an input the specialised SDFG ignores.
+    """
+    if symbols:
+        specialize_symbols(sdfg, symbols)
+    if not scalars:
+        return
+    # ConvertLengthOneArraysToScalars (run by the builder, and below) stages a length-1 signature array into a
+    # fresh ``scal_<name>`` transient and rewrites the body reads to it.  Baking the ARRAY name alone then folds
+    # only the copy-in's source: the staged scalar loses its writer, dead-code cleanup removes the container, and
+    # the tasklet code still references ``scal_<name>`` -- an undeclared identifier at codegen.  Bake through the
+    # staging rename as well when the staged name already exists.
+    staged = {f'scal_{name}': val for name, val in scalars.items() if f'scal_{name}' in sdfg.arrays}
+    specialize_scalars(sdfg, {**scalars, **staged})
+    read = read_data(sdfg)
+    for name in scalars:
+        desc = sdfg.arrays.get(name)
+        if desc is not None and not desc.transient and name not in read:
+            sdfg.remove_data(name, validate=False)
+
+
+def optimize(
+    sdfg: SDFG,
+    *,
+    symbols: dict[str, Const] | None = None,
+    scalars: dict[str, Const] | None = None,
+    unroll_limit: int = 8,
+    validate: bool = True,
+    verify_inputs: dict[str, Any] | None = None,
+    gpu: bool = False,
+    gpu_block_size=None,
+    force_inline: bool = False,
+    split_siblings: bool = False,
+    permissive_ltm: bool = False,
+    device_libnodes: bool = False,
+    allow_abi_scalar_fission: bool = False,
+) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
 
     :param sdfg: the SDFG to optimize (mutated in place).
@@ -162,32 +211,21 @@ def optimize(sdfg: SDFG,
     :param unroll_limit: fully unroll constant-trip loops at or below this many iterations.
     :param validate: validate the SDFG after each structural stage. STRUCTURAL only -- it says
                      nothing about whether the transformations preserved values.
-    :param gpu: run the GPU offload pass at the END of the pipeline (see
-                :mod:`dace_fortran.offload`).  Off by default because it changes the schedule and
-                the storage of every array -- this function's contract is otherwise CPU-only.
+    :param gpu: run the GPU offload pass at the END of the pipeline (see :mod:`dace_fortran.offload`).
+                Off by default because it changes the schedule and the storage of every array.
     :param gpu_block_size: the CUDA block size to pin, if ``gpu``.
     :param force_inline: force the nested-SDFG inlining that ``InlineSDFG.can_be_applied`` declines.
                 NOT generally sound -- enabled per kernel, paid for by that kernel's differential.
-    :param split_siblings: clone the enclosing Map per child when a Map's body holds SIBLING Maps, so
-                each stencil arm's chain can collapse on its own.  Recovers a measured 372x (2.0
-                ms/launch vs 5.40 us) on the source's natural one-loop-per-arm form.  A no-op unless
-                that form is present, so it cannot move a kernel written in the union form. NOT
-                generally sound -- enabled per kernel, paid for by that kernel's differential.
+    :param split_siblings: clone the enclosing Map per child when a Map's body holds SIBLING Maps.
+                NOT generally sound -- enabled per kernel, paid for by that kernel's differential.
     :param permissive_ltm: allow the PERMISSIVE ``LoopToMap`` escalation when the conservative
                 per-iteration affine-write check refuses every loop.  NOT generally sound and the
-                failure is SILENT: on the fused acoustic-substep window it restructured ~24 nests and
-                diverged wildly from stock, while conservative-only is byte-identical
-                (W9-localise).  Enabled per kernel, paid for by that kernel's bit-exact differential.
-                Off, a kernel the conservative check refuses fails loudly rather than being silently
-                restructured (see :mod:`dace_fortran.offload`).
+                failure is SILENT; enabled per kernel, paid for by that kernel's differential.
+    :param device_libnodes: schedule a top-level compute library node whose inputs are all
+                device-resident on the GPU.  Opt-in per frontend.
     :param allow_abi_scalar_fission: let ``fission_loop_local_scalars`` split a size-1 ABI-STAGED
-                transient (one whose only out-of-loop accesses are the ``stage_copyin``/
-                ``stage_copyout`` copies), so a nest that writes it can map.  Default OFF: the
-                staging read is a live-OUT, so the split makes the scalar's ABI return value the
-                copy-in value instead of the last iteration's -- deterministic but not
-                Fortran-faithful.  Enabled per kernel, paid for by that kernel's differential (or by
-                the scalar being provably a caller-ignored scratch).  See
-                :func:`dace_fortran.loop_scalar_fission.fission_loop_local_scalars`.
+                transient.  Default OFF: the staged read is a live-OUT, so the split changes the ABI
+                return value; enabled per kernel, paid for by that kernel's differential.
     :param verify_inputs: call arguments to check numerics with once the pipeline is done. The
                           pre-optimization SDFG is snapshotted and both are run on these inputs,
                           requiring bit-identical results (:func:`verify_numerics`). Costs a
@@ -197,23 +235,9 @@ def optimize(sdfg: SDFG,
     """
     reference = copy.deepcopy(sdfg) if verify_inputs is not None else None
 
-    ConvertLengthOneArraysToScalars(preserve_abi=True).apply_pass(sdfg, {})
+    specialize(sdfg, symbols=symbols, scalars=scalars)
 
-    if symbols:
-        specialize_symbols(sdfg, symbols)
-    if scalars:
-        # ConvertLengthOneArraysToScalars (above) stages every non-transient length-1
-        # array into a fresh ``scal_<name>`` transient and rewrites all body reads to
-        # that staged name.  Baking the ARRAY name alone therefore folds only the
-        # copy-in's source: the staged scalar loses its writer, later dead-code cleanup
-        # removes the container, and the tasklet code still references ``scal_<name>``
-        # -- an undeclared identifier at codegen (CPU and CUDA alike).  Bake through
-        # the staging rename as well so the constant reaches the body.
-        staged = {
-            f"scal_{name}": val
-            for name, val in scalars.items() if f"scal_{name}" in sdfg.arrays
-        }
-        specialize_scalars(sdfg, {**scalars, **staged})
+    ConvertLengthOneArraysToScalars(preserve_abi=True).apply_pass(sdfg, {})
 
     ShortLoopUnroll(unroll_limit).apply_pass(sdfg, {})
     # default assign_loop_iterator_post_value=True keeps Fortran counted-DO exit-value semantics;
@@ -224,27 +248,15 @@ def optimize(sdfg: SDFG,
     sdfg.simplify(validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)
 
-    # BEFORE loop2map: LoopToMap refuses any nest that writes a size-1 container, because its
-    # write-injectivity test can never match the subset "0" a scalar produces (verified on ysu_prod:
-    # 2833 of 2947 refusals).  Give each nest its own copy of the scalars it writes and reads --
-    # which the check then ignores entirely, since a container touched only inside one loop is not
-    # in `other_access_nodes`.  Only scalars whose value is provably dead on entry are split; see
-    # the module docstring for the liveness condition and why it is checked rather than assumed.
+    privatize_loop_local_arrays(sdfg)
+    # The scalar analogue, also before LoopToMap: LoopToMap refuses any nest that writes a size-1
+    # container, because its write-injectivity test can never match the subset "0" a scalar
+    # produces.  Give each nest its own copy of the scalars it writes and reads; only scalars
+    # whose value is provably dead on entry are split (see loop_scalar_fission's docstring).
     from dace_fortran.loop_scalar_fission import fission_loop_local_scalars
     _fissioned = fission_loop_local_scalars(sdfg, allow_abi_staged=allow_abi_scalar_fission)
     if _fissioned:
         print(f"[dace_fortran.optimize] loop-local scalar fission: {len(_fissioned)} container(s)")
-
-    # The ARRAY analogue of the fission above, BEFORE LoopToMap for the same reason: a work array
-    # several nests share without passing a value through it (`w(0:2)`, one per direction) makes each
-    # nest look shared to LoopToMap and keeps every one of them sequential.  Give each outermost loop
-    # its own copy where the pass can prove no value crosses.  Arrays and scalars are independent, so
-    # the order between the two passes is not semantic; it is measured (A/B), not assumed.
-    from dace_fortran.loop_privatization import privatize_loop_local_arrays
-    _privatized = privatize_loop_local_arrays(sdfg)
-    if _privatized:
-        print(f"[dace_fortran.optimize] loop-local array privatisation: {len(_privatized)} container(s)")
-
     sdfg.apply_transformations_repeated(LoopToMap, validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)
     # FullMapFusion: MapFusionVertical + MapFusionHorizontal run together to a fixed point, not just
@@ -255,14 +267,17 @@ def optimize(sdfg: SDFG,
     FullMapFusion(validate=validate).apply_pass(sdfg, {})
 
     from dace.transformation.passes.persistent_transients import MakeTransientsPersistent
+
     MakeTransientsPersistent().apply_pass(sdfg, {})
+    BindOmpThreadCount().apply_pass(sdfg, {})
 
     if gpu:
         # AFTER the CPU pipeline, not inside it: the offload pass reads the map structure the
         # collapse produced (that is what decides the launch geometry) and then pins the schedule
         # and the storage.  Running it earlier would hand it maps that are about to be fused.
         from dace_fortran.offload import offload_device_resident
-        sdfg, n_gpu, n_dev = offload_device_resident(sdfg, block_size=gpu_block_size,
+        sdfg, n_gpu, n_dev = offload_device_resident(sdfg,
+                                                     block_size=gpu_block_size,
                                                      force_inline=force_inline,
                                                      split_siblings=split_siblings,
                                                      permissive_ltm=permissive_ltm,
@@ -271,7 +286,7 @@ def optimize(sdfg: SDFG,
 
     if validate:
         sdfg.validate()
-    if verify_inputs is not None:
+    if verify_inputs is not None and reference is not None:
         verify_numerics(reference, sdfg, verify_inputs)
     return sdfg
 
@@ -279,4 +294,5 @@ def optimize(sdfg: SDFG,
 def num_maps(sdfg: SDFG) -> int:
     """Map entries anywhere in ``sdfg``, nested SDFGs included -- the parallelization yardstick."""
     from dace.sdfg import nodes
+
     return sum(1 for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.MapEntry))

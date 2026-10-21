@@ -4,11 +4,8 @@
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_size_lbound_ubound_explicit_shape(tmp_path: Path):
@@ -26,7 +23,7 @@ subroutine probe(a, n, m, sz, sz1, sz2, lb, ub)
   ub = ubound(a, 1)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     rng = np.random.default_rng(0)
     n, m = 4, 5
     a = np.asfortranarray(rng.random((n, m)))
@@ -55,7 +52,7 @@ subroutine probe(a, lb, ub, sz)
   sz = size(a)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     a = np.asfortranarray(np.arange(5, dtype=np.float64))
     lb = np.zeros(1, dtype=np.int32)
     ub = np.zeros(1, dtype=np.int32)
@@ -64,3 +61,9 @@ end subroutine
     assert int(lb[0]) == -2
     assert int(ub[0]) == 2
     assert int(sz[0]) == 5
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

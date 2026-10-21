@@ -26,53 +26,114 @@ classifiers = [
 keywords = ["fortran", "flang", "hlfir", "mlir", "dace", "frontend", "dataflow"]
 
 dependencies = [
-    # Pinned to the FaCe branch: it carries the DaCe-core pieces the
-    # frontend needs (``dace.sdfg.construction_utils``, the
-    # Memset/Copy/Count library nodes, the post-cleaning passes).
-    # Switch to ``@main`` once those land upstream.
-    "dace @ git+https://github.com/spcl/dace.git@FaCe",
+    # A commit of the FaCe branch, which carries the DaCe-core pieces the frontend needs; a sha keeps CI reproducible.
+    "dace @ git+https://github.com/spcl/dace.git@9755b9e6f79556280859d6e2aed0cb4d0a305f92",
     # fparser AST single-TU inliner (dace_fortran.fparser_inliner).  >0.2
     # carries the Fortran2003-before-Fortran2008 import ordering needed
     # under Python 3.14 (cf. d-face commit 74110d690).
     "fparser > 0.2",
     "networkx",
     "numpy",
-    # Formatters + git-hook runner are core deps so a plain ``pip install -e .``
-    # makes ``pre-commit run`` (clang-format / yapf / fprettify) work out of the
-    # box.  yapf and clang-format are version-pinned so a local run agrees with the
-    # CI ``format`` job (see .pre-commit-config.yaml, .style.yapf, .clang-format,
-    # .fprettify.rc).
-    "pre-commit",
-    "yapf==0.43.0",
-    "fprettify",
-    "clang-format~=21.1",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 testing = [
     "pytest",
     "pytest-cov",
+    "pytest-timeout",
     "pytest-xdist",
     "coverage",
-    "numpy",
-    # numpy's f2py uses meson as its build backend on Python >= 3.12; the
-    # numerical-reference builds skip without it (``meson not available``).
+    # The bridge is a nanobind extension, built by CMake on first use.
+    "nanobind",
+    # numpy's f2py uses meson as its build backend on Python >= 3.12; the numerical-reference builds need it
+    # (a missing meson fails them). meson also configures the icon-model build.
     "meson",
     "ninja",
 ]
+# mpi4py builds against the system MPI: ``MPICC=mpicc uv sync --group mpi``.
+mpi = ["mpi4py"]
+# Pinned so a local ``pre-commit run`` agrees with the CI ``format`` job (see .pre-commit-config.yaml).
 linting = [
-    # Formatters / pre-commit moved to core ``dependencies`` (always available).
-    "flake8",
+    "pre-commit",
+    "ruff==0.14.3",
+    "mypy==1.18.2",
+    "pyright==1.1.407",
+    "fprettify",
+    "clang-format~=21.1",
 ]
 dev = [
-    "dace-fortran[testing,linting]",
+    { include-group = "testing" },
+    { include-group = "linting" },
 ]
+
+[tool.uv]
+default-groups = ["dev"]
+# Editable installs as a plain path entry: mypy and pyright cannot follow setuptools' import-hook finders, so an
+# editable dace (``uv pip install -e <dace checkout>``) resolves for them only in compat mode.
+config-settings = { editable_mode = "compat" }
 
 [project.urls]
 Homepage = "https://github.com/spcl/dace-fortran"
 Repository = "https://github.com/spcl/dace-fortran"
 Documentation = "https://spcldace.readthedocs.io"
 Issues = "https://github.com/spcl/dace-fortran/issues"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["tests/icon/full/icon-model", "tests/cloudsc/variants/dwarf-p-cloudsc"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # The set agreed for dace (Tal): annotations, docstrings, unused arguments, dict(...) calls, magic values.
+    "F821", "F841", "ANN", "D", "EM101", "EM102", "ARG", "C408", "PLR2004",
+    # Conflict with ruff format.
+    "COM812", "E501",
+    # Tests assert; scripts print and run subprocesses; error messages are written inline.
+    "S", "T201", "TRY003", "TRY300",
+    # Lazy imports (fparser, MLIR bridge), private access between our own modules, Fortran-style names.
+    "PLC0415", "SLF001", "N8",
+    # Size and style heuristics.
+    "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "FBT", "TD", "FIX", "ERA001", "PT006", "PT018",
+    # Imports stay where annotations read them at runtime; os.path stays; tests and scripts catch broadly.
+    "TC", "PTH", "PERF203", "PERF401", "BLE001", "S108", "S110", "S112", "PT011", "PT019",
+    # Scripts and stubs are not packages.
+    "INP001", "EXE001", "PYI021", "N999",
+    # Closures here run inside the iteration that defines them; DaCe config variables are mixed case.
+    "B023", "SIM112",
+    # Loop variables are rebound on purpose; class-level tables are constants; tests raise blind exceptions.
+    "PLW2901", "RUF012", "A001", "B017", "PLC0206",
+    # ``Union[...]`` aliases are runtime objects (walk/isinstance targets); package-relative imports stay.
+    "UP007", "TID252",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Spack recipes star-import the package DSL by spack's own convention.
+"spack/**/package.py" = ["F403", "F405"]
+# The MPI / stack environment has to be in place before mpi4py and dace are imported.
+"tests/conftest.py" = ["E402"]
+# Imports the ICON test helpers, which expect tests/ on sys.path.
+"scripts/build_icon_solve_nh_libs.py" = ["E402"]
+
+[tool.mypy]
+files = ["dace_fortran"]
+follow_imports = "silent"
+
+# dace ships no ``py.typed`` marker; analyze its sources instead of treating every dace name as ``Any``.
+[[tool.mypy.overrides]]
+module = ["dace", "dace.*"]
+follow_untyped_imports = true
+
+# fparser ships neither annotations nor a ``py.typed`` marker (``typings/`` stubs it for pyright, whose
+# ``type[Base]`` module ``__getattr__`` mypy does not accept in annotations); networkx stubs are not a dependency.
+[[tool.mypy.overrides]]
+module = ["fparser", "fparser.*", "networkx", "networkx.*"]
+ignore_missing_imports = true
+
+[tool.pyright]
+include = ["dace_fortran"]
+stubPath = "typings"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -101,13 +162,14 @@ dace_fortran = [
 
 [tool.pytest.ini_options]
 markers = [
-    "long: Slow test (e.g. builds ICON from source). CI runs it (CI filters only '-m \"not mpi\"'); routine local full-sweeps exclude it with '-m \"not long\"'.",
+    "long: Slow test (tens of minutes: ICON built from source, ICON-O / atmosphere single-TU extractions, the full QE h_psi build); the CI heavy lanes run it.",
     "sequential: Test must be run sequentially (select with '-m \"sequential\"')",
-    "mpi: Multi-rank MPI test; excluded from the normal sweep, run under mpirun (select with '-m \"mpi\"')",
-    "integration: ICON orig-vs-binding bit-exact integration test (per-call duplicate-data, VERY SHORT run); runs only on the CI 'integration' runner and is excluded from fast/heavy (select with '-m \"integration\"')",
-    "e2e: Production kernel through the full parallelization pipeline (CloudSC, QE vexx, ICON atmosphere velocity_tendencies x2 __LOOP_EXCHANGE variants), built twice on seeded random inputs so pre- vs post-optimize is checked BIT-EXACTLY as well as against the untouched gfortran/f2py reference. Slow (two SDFG builds + -O3 -march=native compiles per kernel); runs only on the CI 'e2e' / 'e2e-cloudsc' runners (select with '-m \"e2e\"')",
+    "mpi: Multi-rank MPI test, run under mpirun (select with '-m \"mpi\"')",
+    "integration: ICON orig-vs-binding bit-exact integration test (per-call duplicate-data, short run)",
+    "e2e: Production kernel through the full parallelization pipeline, built with and without it on seeded inputs: pre- vs post-optimize bit-exact, and against the gfortran/f2py reference",
     "xdist_group: pytest-xdist load-group marker (ICON-build tests share one worker via --dist loadgroup)",
-    "fftw: Needs libfftw3 to link the FFT library node's expansion (CI installs libfftw3-dev; select with '-m \"fftw\"')",
+    "fftw: Needs libfftw3 to link the FFT library node's expansion",
+    "gpu: Needs an AMD GPU, ROCm amdflang and DaCe's HIP backend; runs in the agent-mi300 container (select with '-m gpu')",
 ]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]

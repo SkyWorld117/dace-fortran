@@ -22,7 +22,7 @@ either way when the value happens to be baked correctly, and silently wrong when
 """
 import pytest
 
-from _util import build_sdfg, have_flang
+from tests._util import build_sdfg, have_flang
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 

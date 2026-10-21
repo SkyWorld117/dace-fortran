@@ -8,7 +8,7 @@ external builtins instead of asserting.  ``CalcElemVolumeDerivative`` is then
 built to an SDFG via both engines and checked against a gfortran reference on
 Park-Miller-seeded inputs.
 """
-import shutil
+
 import subprocess
 import sys
 from pathlib import Path
@@ -16,18 +16,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.fparser_inliner import inline_to_ast
-from dace_fortran.preprocess import merge_used_modules
+from dace_fortran.preprocess import MergeEngine, merge_used_modules
+from tests._util import build_sdfg
 
 _HERE = Path(__file__).parent
 _KERNELS = _HERE / "lulesh_comp_kernels.f90"
 _DRIVER = _HERE / "lulesh.f90"
 _ENTRY = "calcelemvolumederivative"
-
-
-def _have(tool: str) -> bool:
-    return shutil.which(tool) is not None
 
 
 def _park_miller(seed: int, n: int) -> np.ndarray:
@@ -102,8 +98,15 @@ def _f2py_reference(tu_text: str, out_dir: Path, mod: str):
     (out_dir / f"{mod}.f90").write_text(tu_text)
     subprocess.check_call(
         [
-            sys.executable, "-m", "numpy.f2py", "-c", f"{mod}.f90", "-m", mod, "--quiet",
-            "--f90flags=-O0 -fno-fast-math -ffp-contract=off -ffree-line-length-none"
+            sys.executable,
+            "-m",
+            "numpy.f2py",
+            "-c",
+            f"{mod}.f90",
+            "-m",
+            mod,
+            "--quiet",
+            "--f90flags=-O0 -fno-fast-math -ffp-contract=off -ffree-line-length-none",
         ],
         cwd=out_dir,
     )
@@ -112,14 +115,12 @@ def _f2py_reference(tu_text: str, out_dir: Path, mod: str):
     return __import__(mod)
 
 
-@pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
-@pytest.mark.parametrize("engine", ["regex", "fparser"])
-def test_calcelemvolumederivative_e2e(tmp_path: Path, engine: str):
+@pytest.mark.parametrize("engine", list(MergeEngine), ids=lambda e: e.value)
+def test_calcelemvolumederivative_e2e(tmp_path: Path, engine: MergeEngine):
     """SDFG of the inlined kernel matches the gfortran reference element-wise."""
-    if not (_have("gfortran") and _have("meson")):
-        pytest.skip("gfortran + meson needed for the f2py reference")
 
     import re
+
     merged = _prune_kernel()
     module_name = re.search(r"(?im)^\s*MODULE\s+(\w+)", merged).group(1).lower()
 
@@ -135,7 +136,7 @@ def test_calcelemvolumederivative_e2e(tmp_path: Path, engine: str):
     dvdz_r = np.zeros(8, order="F")
     ref.calcelemvolumederivative(dvdx_r, dvdy_r, dvdz_r, x, y, z)
 
-    sdfg = build_sdfg(merged, tmp_path / f"sdfg_{engine}", name="cevd", entry=_ENTRY, merge_engine=engine).build()
+    sdfg = build_sdfg(merged, tmp_path / f"sdfg_{engine.value}", name="cevd", entry=_ENTRY, merge_engine=engine).build()
     dvdx = np.zeros(8, order="F")
     dvdy = np.zeros(8, order="F")
     dvdz = np.zeros(8, order="F")
@@ -144,3 +145,7 @@ def test_calcelemvolumederivative_e2e(tmp_path: Path, engine: str):
     np.testing.assert_allclose(dvdx, dvdx_r, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(dvdy, dvdy_r, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(dvdz, dvdz_r, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

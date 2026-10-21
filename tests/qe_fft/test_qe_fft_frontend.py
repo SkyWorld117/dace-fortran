@@ -2,17 +2,13 @@
 
 3-D-grid extraction from QE's fft_type_descriptor is out of scope -- only recognition + lowering is pinned here.
 """
+
 from pathlib import Path
 
-import pytest
-
 import dace_fortran
-from _util import have_flang
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "qe_fft_probe.f90"
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _build_and_assert(entry: str, expected_node: str, tmp_path):
@@ -21,8 +17,7 @@ def _build_and_assert(entry: str, expected_node: str, tmp_path):
     sdfg = dace_fortran.build_sdfg(src, out_dir=str(tmp_path / name), entry=entry, name=name)
     sdfg.validate()
     classes = {type(n).__name__ for s in sdfg.states() for n in s.nodes()}
-    assert expected_node in classes, \
-        f"{entry}: expected a {expected_node!r} lib node, got {sorted(classes)!r}"
+    assert expected_node in classes, f"{entry}: expected a {expected_node!r} lib node, got {sorted(classes)!r}"
 
 
 def test_qe_fwfft_recognised(tmp_path):
@@ -33,3 +28,9 @@ def test_qe_fwfft_recognised(tmp_path):
 def test_qe_invfft_recognised(tmp_path):
     """``invfft_y`` call site lowers to an :class:`IFFT` lib node."""
     _build_and_assert("qe_fft_probe::run_invfft", "IFFT", tmp_path)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

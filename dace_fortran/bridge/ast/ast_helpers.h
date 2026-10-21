@@ -32,10 +32,7 @@ namespace hlfir_bridge {
   }
   throw std::runtime_error(std::string(fn) + ": unhandled HLFIR op '" + opName + "' at " +
                            (loc.empty() ? "<unknown loc>" : loc) +
-                           ".  Add a handler in the corresponding "
-                           "bridge/ast/*.cpp file (search for the helper "
-                           "name) or update the op coverage in "
-                           "tasks/audit_question_mark_emissions.md.");
+                           ".  Add a handler in the bridge/ast/*.cpp file that defines " + fn + ".");
 }
 
 // ============================================================================
@@ -62,6 +59,10 @@ inline thread_local llvm::DenseSet<mlir::Operation*> kPendingSwitchResults;
 /// hlfir.declare); names are __al_<N>.
 inline thread_local int kAllocaCounter = 0;
 inline thread_local llvm::DenseMap<mlir::Operation*, std::string> kAllocaMap;
+
+/// The module's fir.allocmem sites by uniq_name, built once per extractAST after the extraction-state renames: an
+/// ALLOCATE statement looks its buffer class up here instead of walking the module (quadratic on an inlined entry).
+inline thread_local AllocSitesIndex kAllocSitesIndex;
 
 /// Maps a libcall-producing hlfir op (matmul/transpose/dot_product) inlined inside an elemental body to the synthetic
 /// transient buildElementalAssign materialises ahead of the loop; buildExpr consults this for hlfir.apply.
@@ -144,6 +145,37 @@ std::string buildExprWithSubscripts(mlir::Value val, int d);
 /// for OPTIONAL present(x)); honours context flags for bare-name vs subscripted operand rendering. See
 /// control_flow.cpp.
 std::string buildBoolExpr(mlir::Value val, int d);
+
+/// The truth value of the LOGICAL SSA value ``logical`` as a Python boolean expression.  LOGICAL storage holds the
+/// caller's bytes and any non-zero value is .TRUE. (a foreign producer may store -1 or 0x7FFFFFFF), so a stored value
+/// reads as ``(x != 0)``; a LOGICAL converted from an ``i1`` is that boolean itself.  ``render`` renders a stored
+/// value (bare name or subscripted, per the caller's context).
+std::string logicalTruth(mlir::Value logical, int d, std::string (*render)(mlir::Value, int));
+
+/// The array a ``fir.box_dims`` queries: its box operand seen through ``fir.convert`` / ``fir.load`` and through any
+/// ``fir.rebox`` that keeps the extents (no slice, no reshape).  ``boundsRebox`` is the outermost such rebox; it sets
+/// the lower bounds the query sees (``reboxLowerBound``), the extents come from ``array``.
+/// ``hlfir-lift-aos-pointer-records`` rebases a gather-buffer slice to a pointer member's lower bounds this way.
+struct BoxDimsSource {
+  mlir::Value array;
+  fir::ReboxOp boundsRebox;
+};
+
+/// See ``BoxDimsSource``.  See expressions.cpp.
+BoxDimsSource traceBoxDimsSource(mlir::Value box);
+
+/// The lower bound of dim ``dim`` of a box a bounds-setting ``fir.rebox`` produces: its ``fir.shift`` origin, else 1.
+/// See expressions.cpp.
+std::string reboxLowerBound(fir::ReboxOp rebox, unsigned dim, int d);
+
+/// The lower bound ``decl`` declares for dim ``dim`` (its ``fir.shape_shift`` / ``fir.shift`` origin); null when the
+/// dim starts at 1 by default. See expressions.cpp.
+mlir::Value declaredLowerBound(hlfir::DeclareOp decl, unsigned dim);
+
+/// The Fortran index of the 1-based position ``pos`` (an elemental or loop iterator) in a dim whose lower bound is
+/// ``lb`` (null: 1): ``pos + lb - 1``, folded for a constant ``lb``; ``?`` when ``lb`` cannot be rendered. See
+/// expressions.cpp.
+std::string fortranIndexAt(const std::string& pos, mlir::Value lb, int depth);
 
 /// Render the dim-th index expression of an hlfir.designate, applying section/assumed-shape lower-bound rebases. See
 /// expressions.cpp.

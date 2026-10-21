@@ -12,11 +12,8 @@ walker divergence reintroducing the mismatch.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_count_parent_designate_scalar_dim(tmp_path: Path):
@@ -30,13 +27,13 @@ SUBROUTINE count_parent_dg(m, pos1, res)
   res(1) = COUNT(m(:, pos1) .eq. 5)
 END SUBROUTINE count_parent_dg
 """
-    sdfg = build_sdfg(src, tmp_path, name='count_parent_dg').build()
+    sdfg = build_sdfg(src, tmp_path, name="count_parent_dg").build()
 
-    m = np.zeros((7, 4), order='F', dtype=np.int32)
+    m = np.zeros((7, 4), order="F", dtype=np.int32)
     m[2, 1] = 5
     m[5, 1] = 5
     m[3, 2] = 5
-    res = np.zeros(2, order='F', dtype=np.int32)
+    res = np.zeros(2, order="F", dtype=np.int32)
 
     sdfg(m=m, pos1=2, res=res)
     assert res[0] == 2
@@ -59,12 +56,11 @@ SUBROUTINE any_parent_dg(m, pos1, res)
   res(1) = ANY(m(:, pos1) .gt. 0)
 END SUBROUTINE any_parent_dg
 """
-    sdfg = build_sdfg(src, tmp_path, name='any_parent_dg').build()
+    sdfg = build_sdfg(src, tmp_path, name="any_parent_dg").build()
 
-    m = np.zeros((5, 3), order='F', dtype=np.int32)
+    m = np.zeros((5, 3), order="F", dtype=np.int32)
     m[2, 1] = 7
-    # res is Fortran LOGICAL -- pass np.bool_ so the C ABI dtype matches the SDFG's bool* declaration
-    res = np.zeros(2, order='F', dtype=np.bool_)
+    res = np.zeros(2, order="F", dtype=np.uint32)
 
     sdfg(m=m, pos1=2, res=res)
     assert res[0] != 0
@@ -84,11 +80,10 @@ SUBROUTINE all_parent_dg(m, pos1, res)
   res(1) = ALL(m(:, pos1) .gt. 0)
 END SUBROUTINE all_parent_dg
 """
-    sdfg = build_sdfg(src, tmp_path, name='all_parent_dg').build()
+    sdfg = build_sdfg(src, tmp_path, name="all_parent_dg").build()
 
-    m = np.ones((4, 3), order='F', dtype=np.int32)
-    # res is Fortran LOGICAL -- pass np.bool_
-    res = np.zeros(2, order='F', dtype=np.bool_)
+    m = np.ones((4, 3), order="F", dtype=np.int32)
+    res = np.zeros(2, order="F", dtype=np.uint32)
 
     sdfg(m=m, pos1=2, res=res)
     assert res[0] != 0
@@ -96,3 +91,9 @@ END SUBROUTINE all_parent_dg
     m[1, 1] = 0
     sdfg(m=m, pos1=2, res=res)
     assert res[0] == 0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -9,9 +9,10 @@ axes), the depth guard hit via an abstract base that itself ``EXTENDS`` another
 type, and the :class:`UnsupportedProgram` ``reason`` contract.  Rejections are
 asserted with ``pytest.raises`` (not xfail) so detection is itself under test.
 """
+
 import pytest
 
-from dace_fortran.inliner.ast_desugaring.monomorphize import analyze_source, UnsupportedProgram
+from dace_fortran.inliner.ast_desugaring.monomorphize import UnsupportedProgram, analyze_source
 
 # Two independent abstract bases -- mirrors ICON's orthogonal dispatch axes
 # (backend + transfer), each its own closed subtype set => two plans.
@@ -110,3 +111,7 @@ def test_unsupported_program_carries_reason():
     # callers can detect + surface *why* a program was rejected.
     assert excinfo.value.reason == str(excinfo.value)
     assert "CLASS(*)" in excinfo.value.reason
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

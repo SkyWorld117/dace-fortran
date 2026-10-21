@@ -5,11 +5,7 @@ Flang lowers ``call MPI_Send(...)`` to an opaque fir.call; the bridge recognises
 
 from pathlib import Path
 
-import pytest
-
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # external MPI decls + parameter constants so the program needs no mpi.mod / MPI install to lower (bridge sees the same opaque fir.call either way).
 _SENDRECV = """
@@ -55,6 +51,7 @@ def _expanded_mpi_call_codes(sdfg):
     The communicator is baked into the expansion's C code, not a node property, so verifying it without mpirun means inspecting the tasklet source.
     """
     import dace
+
     sdfg.expand_library_nodes()
     codes = []
     for nd, _ in sdfg.all_nodes_recursive():
@@ -145,30 +142,34 @@ def test_isend_irecv_wait_lower_to_mpi_libnodes(tmp_path: Path):
 def test_runtime_communicator_lowers_to_comm_connector(tmp_path: Path):
     """A non-default (runtime dummy) communicator flows as opaque dataflow: a CommF2c node (MPI_Comm_f2c) converts the Fortran integer handle into an opaque(MPI_Comm) feeding Send's _comm connector.  The Fortran handle stays in sdfg.arrays (CommF2c reads it) -- supersedes the legacy process-grid path, which dropped the handle and wired a _grid cartesian sub-comm connector instead."""
     import dace
-    from dace.libraries.mpi.nodes.send import Send
     from dace.libraries.mpi.nodes.comm_f2c import CommF2c
+    from dace.libraries.mpi.nodes.send import Send
 
     sdfg = _build(_USER_COMM, tmp_path, "sr_usercomm", "sr_usercomm")
 
     sends = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, Send)]
     assert len(sends) == 1, f"expected 1 Send node, got {len(sends)}"
     # communicator threads in via an opaque(MPI_Comm) _comm connector, not the legacy _grid process-grid connector.
-    assert '_comm' in sends[0].in_connectors
-    assert '_grid' not in sends[0].in_connectors
-    assert isinstance(sends[0].in_connectors['_comm'], dace.dtypes.opaque)
-    assert sends[0].in_connectors['_comm'].ctype == 'MPI_Comm'
+    assert "_comm" in sends[0].in_connectors
+    assert "_grid" not in sends[0].in_connectors
+    assert isinstance(sends[0].in_connectors["_comm"], dace.dtypes.opaque)
+    assert sends[0].in_connectors["_comm"].ctype == "MPI_Comm"
 
     # exactly one CommF2c node, reading the Fortran integer comm handle on _fcomm and producing the opaque(MPI_Comm) Send consumes.
     f2cs = [n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, CommF2c)]
     assert len(f2cs) == 1, f"expected 1 CommF2c node, got {len(f2cs)}"
     fcomm_srcs = [
-        e.data.data for st in sdfg.states() for n in st.nodes() if isinstance(n, CommF2c) for e in st.in_edges(n)
-        if e.dst_conn == '_fcomm'
+        e.data.data
+        for st in sdfg.states()
+        for n in st.nodes()
+        if isinstance(n, CommF2c)
+        for e in st.in_edges(n)
+        if e.dst_conn == "_fcomm"
     ]
-    assert fcomm_srcs == ['comm'], f"CommF2c must read the Fortran comm handle, got {fcomm_srcs}"
+    assert fcomm_srcs == ["comm"], f"CommF2c must read the Fortran comm handle, got {fcomm_srcs}"
 
-    assert 'comm' in sdfg.arrays, "the Fortran integer comm handle is read by CommF2c, so it is kept"
-    assert 'dace_user_pgrid' not in sdfg.arrays, "the process-grid path is superseded by CommF2c/_comm"
+    assert "comm" in sdfg.arrays, "the Fortran integer comm handle is read by CommF2c, so it is kept"
+    assert "dace_user_pgrid" not in sdfg.arrays, "the process-grid path is superseded by CommF2c/_comm"
 
     sdfg.validate()
 
@@ -176,4 +177,10 @@ def test_runtime_communicator_lowers_to_comm_connector(tmp_path: Path):
     codes = _expanded_mpi_call_codes(sdfg)
     assert len(codes) == 1, f"expected 1 Send tasklet, got {len(codes)}"
     assert "_comm" in codes[0], f"user-comm Send must use ``_comm``: {codes[0]!r}"
-    assert "MPI_COMM_WORLD" not in codes[0], (f"user-comm Send must NOT fall back to MPI_COMM_WORLD: {codes[0]!r}")
+    assert "MPI_COMM_WORLD" not in codes[0], f"user-comm Send must NOT fall back to MPI_COMM_WORLD: {codes[0]!r}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

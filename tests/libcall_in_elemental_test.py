@@ -6,11 +6,8 @@ Flang lowers this to an hlfir.matmul/transpose/dot_product producing an hlfir.ex
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_one_minus_transpose(tmp_path: Path):
@@ -22,7 +19,7 @@ subroutine main(a, res)
   res = 1.0 - transpose(a)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     a = np.empty((5, 4), order="F", dtype=np.float64)
     a[:] = np.arange(20).reshape(5, 4)
     res = np.zeros((4, 5), order="F", dtype=np.float64)
@@ -40,7 +37,7 @@ subroutine main(a, b, res)
   res = 2.0 - matmul(a, b)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     a = np.empty((5, 3), order="F", dtype=np.float64)
     a[:] = np.arange(15).reshape(5, 3)
     b = np.empty((3, 7), order="F", dtype=np.float64)
@@ -48,3 +45,9 @@ end subroutine main
     res = np.zeros((5, 7), order="F", dtype=np.float64)
     sdfg(a=a, b=b, res=res)
     np.testing.assert_array_equal(res, 2.0 - a @ b)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

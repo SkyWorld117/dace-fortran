@@ -7,19 +7,18 @@ emitted to HLFIR and lowered to an SDFG.
 
 Skipped without the icon-model submodule or an LLVM flang/OpenMPI.
 """
+
+import os
 from pathlib import Path
 
 import pytest
 
 import dace_fortran
-from _util import have_flang
-from dace_fortran.flang_codebase import find_openmpi_include
 
 _HERE = Path(__file__).resolve().parent
 _STUB_SOURCE = _HERE / "velocity_full.f90"
 
 #: ICON checkout pinned by the ``icon-model`` submodule; override via ``ICON_SRC``.
-import os
 
 _ICON_SRC = Path(os.environ.get("ICON_SRC", str(_HERE / "icon-model")))
 
@@ -35,18 +34,10 @@ _CACHE_DIR = Path(os.environ.get("DACE_FORTRAN_CACHE", str(Path.home() / ".cache
 _VELOCITY_TARGET = "src/atm_dyn_iconam/mo_velocity_advection.o"
 _VELOCITY_ENTRY = "mo_velocity_advection::velocity_tendencies"
 
-_HAVE_FLANG = have_flang()
-_HAVE_OPENMPI = find_openmpi_include() is not None
-
 
 def _real_velocity_source() -> Path:
     """Pristine ICON velocity source -- prefers the ``.bak`` so a patched live file doesn't perturb the test."""
     return _VELOCITY_REAL_BAK if _VELOCITY_REAL_BAK.is_file() else _VELOCITY_REAL
-
-
-def _have_icon() -> bool:
-    """Submodule checked out (build dir optional -- falls back to :data:`_ICON_DEFINES_FALLBACK`)."""
-    return _real_velocity_source().is_file()
 
 
 def _icon_search_dirs() -> list:
@@ -111,10 +102,7 @@ def _icon_compile_args() -> dict:
 
 # Reads ICON's real source via the icon-model submodule (heavy CI lane only) -> long.
 # The self-contained velocity_full.f90 e2e tests stay in the fast lane.
-pytestmark = [
-    pytest.mark.long,
-    pytest.mark.skipif(not (_HAVE_FLANG and _HAVE_OPENMPI), reason="needs an LLVM flang on PATH + OpenMPI"),
-]
+pytestmark = pytest.mark.long
 
 # ---------------------------------------------------------------------------
 # Headline test: build from BOTH the stub and ICON's real source in one
@@ -159,13 +147,6 @@ _PATHS = [
     pytest.param("stub", marks=[], id="velocity_full_stub"),
     pytest.param(
         "real_icon",
-        marks=[
-            pytest.mark.skipif(not _have_icon(),
-                               reason="icon-model submodule not checked out + built; "
-                               "run `git submodule update --init --recursive "
-                               "tests/icon/full/icon-model` and configure a "
-                               "stock CPU build before re-running"),
-        ],
         id="icon_real_source",
     ),
 ]
@@ -185,8 +166,7 @@ def test_build_velocity_sdfg(tmp_path: Path, source: str):
     assert sdfg is not None
     assert sdfg.name
     name_lc = sdfg.name.lower()
-    assert "velocity" in name_lc, \
-        f"SDFG name doesn't carry the expected entry: {sdfg.name!r}"
+    assert "velocity" in name_lc, f"SDFG name doesn't carry the expected entry: {sdfg.name!r}"
     # Structural validation: dangling memlets, orphan connectors, missing access nodes, schedule mismatches.
     sdfg.validate()
     # Load-bearing: an orphaned view_alias passes validate() but raises KeyError in
@@ -200,7 +180,6 @@ def test_build_velocity_sdfg(tmp_path: Path, source: str):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _have_icon(), reason="icon-model submodule not checked out")
 def test_emit_hlfir_for_icon_velocity(tmp_path: Path):
     """``emit_hlfir_from_codebase`` produces an ``.hlfir`` flang actually wrote (sanity check before SDFG lowering)."""
     args = _icon_compile_args()
@@ -216,3 +195,7 @@ def test_emit_hlfir_for_icon_velocity(tmp_path: Path):
     assert out.is_file()
     # Full closure lowering hits hundreds of MB; a small file means flang silently truncated.
     assert out.stat().st_size > 100 * 1024 * 1024
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

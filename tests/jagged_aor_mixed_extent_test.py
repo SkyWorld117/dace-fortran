@@ -24,12 +24,8 @@ rather than the LARGEST, which surfaces a different code path
 through ``replaceStructArgJagged``'s ``maxExtent`` -> column-index
 clamping).
 """
-import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_jagged_scalar_struct_max_extent_packing(tmp_path):
@@ -59,9 +55,8 @@ end module
     # Both are valid as long as the access works.
     arrs = sdfg.arrays
     has_jagged = "g" in arrs and len(arrs["g"].shape) == 2
-    has_per_member = ("g_a" in arrs and "g_b" in arrs and "g_c" in arrs)
-    assert has_jagged or has_per_member, \
-        f"expected jagged or per-member flatten: {sorted(arrs.keys())}"
+    has_per_member = "g_a" in arrs and "g_b" in arrs and "g_c" in arrs
+    assert has_jagged or has_per_member, f"expected jagged or per-member flatten: {sorted(arrs.keys())}"
 
 
 def test_aor_member_extent_distinct_from_jagged(tmp_path):
@@ -117,8 +112,8 @@ end module
         # Per-member flat path -- both companions sized to their
         # native extents.
         assert "g_small" in arrs and "g_large" in arrs
-        assert tuple(int(s) for s in arrs["g_small"].shape) == (2, )
-        assert tuple(int(s) for s in arrs["g_large"].shape) == (8, )
+        assert tuple(int(s) for s in arrs["g_small"].shape) == (2,)
+        assert tuple(int(s) for s in arrs["g_large"].shape) == (8,)
 
 
 def test_jagged_then_aor_separate_dummies(tmp_path):
@@ -149,5 +144,10 @@ end module
     assert "arr_x" in arrs
     # Jagged ``g`` -> either packed 2-D ``g`` or per-member
     # ``g_a``/``g_b`` (both valid).
-    assert ("g" in arrs and len(arrs["g"].shape) == 2) or \
-        ("g_a" in arrs and "g_b" in arrs)
+    assert ("g" in arrs and len(arrs["g"].shape) == 2) or ("g_a" in arrs and "g_b" in arrs)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

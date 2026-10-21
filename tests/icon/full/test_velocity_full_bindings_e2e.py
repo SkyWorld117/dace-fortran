@@ -21,15 +21,11 @@ executed; outputs compared against the gfortran reference.
 import ctypes
 import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
-
-from _util import build_sdfg, have_flang
-from icon.full._harness import _INIT_ARRAY_ORDER, _OUTPUT_NAMES, _allocate
 
 from dace_fortran.bindings import (
     FlattenPlan,
@@ -38,16 +34,15 @@ from dace_fortran.bindings import (
     build_fortran_library,
     emit_bindings,
 )
+from dace_fortran.bindings.frozen_signature import ModuleOrigin
+from tests._util import build_sdfg
+from tests.icon.full._harness import _INIT_ARRAY_ORDER, _OUTPUT_NAMES, _allocate
 
 #: Single source for the Fortran compiler that builds BOTH the reference .so and the .so that
 #: links the SDFG.  ICON and the binding it dispatches into must be the same compiler, so the
 #: timing harness sets this once and nothing below may hard-code a compiler name.
 _FC = os.environ.get("VELO_FC", "gfortran")
 
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which(_FC) is None, reason=f"{_FC} not on PATH"),
-]
 
 _HERE = Path(__file__).resolve().parent
 _DRIVER_PATH = _HERE / "velocity_full.f90"
@@ -70,12 +65,9 @@ def _scalar(name, ftype, intent, stype=None):
 
 
 def _arr3(name, intent):
-    return OriginalArg(name=name,
-                       fortran_type="real(8)",
-                       rank=3,
-                       shape=(":", ":", ":"),
-                       intent=intent,
-                       struct_type=None)
+    return OriginalArg(
+        name=name, fortran_type="real(8)", rank=3, shape=(":", ":", ":"), intent=intent, struct_type=None
+    )
 
 
 _IFACE = OriginalInterface(
@@ -98,22 +90,22 @@ _IFACE = OriginalInterface(
     ),
     struct_types={},
     used_modules={
-        "mo_model_domain": ("t_patch", ),
-        "mo_intp_data_strc": ("t_int_state", ),
+        "mo_model_domain": ("t_patch",),
+        "mo_intp_data_strc": ("t_int_state",),
         "mo_nonhydro_types": ("t_nh_prog", "t_nh_metrics", "t_nh_diag"),
     },
     # free symbols the kernel reads from Fortran module data (no dummy to
     # query); emitter use-imports each under a __mod alias and assigns it.
     module_symbol_sources={
-        "nproma": ("mo_parallel_config", "nproma"),
-        "timers_level": ("mo_run_config", "timers_level"),
-        "nrdmax": ("mo_vertical_grid", "nrdmax"),
-        "nflatlev": ("mo_init_vgrid", "nflatlev"),
-        "i_am_accel_node": ("mo_mpi", "i_am_accel_node"),
-        "lextra_diffu": ("mo_nonhydrostatic_config", "lextra_diffu"),
-        "lvert_nest": ("mo_run_config", "lvert_nest"),
-        "timer_intp": ("mo_timer", "timer_intp"),
-        "timer_solve_nh_veltend": ("mo_timer", "timer_solve_nh_veltend"),
+        "nproma": ModuleOrigin("mo_parallel_config", "nproma"),
+        "timers_level": ModuleOrigin("mo_run_config", "timers_level"),
+        "nrdmax": ModuleOrigin("mo_vertical_grid", "nrdmax"),
+        "nflatlev": ModuleOrigin("mo_init_vgrid", "nflatlev"),
+        "i_am_accel_node": ModuleOrigin("mo_mpi", "i_am_accel_node"),
+        "lextra_diffu": ModuleOrigin("mo_nonhydrostatic_config", "lextra_diffu"),
+        "lvert_nest": ModuleOrigin("mo_run_config", "lvert_nest"),
+        "timer_intp": ModuleOrigin("mo_timer", "timer_intp"),
+        "timer_solve_nh_veltend": ModuleOrigin("mo_timer", "timer_solve_nh_veltend"),
     },
 )
 
@@ -129,20 +121,28 @@ def _make_sdfg_driver(caller_src: str) -> str:
     shim = shim.replace("run_velocity_flat_c", "run_velocity_flat_sdfg")
     shim = shim.replace(
         "USE mo_velocity_advection,  ONLY: velocity_tendencies",
-        "USE velocity_tendencies_dace_bindings, ONLY: velocity_tendencies_dace, "
-        "velocity_tendencies_dace_finalize",
+        "USE velocity_tendencies_dace_bindings, ONLY: velocity_tendencies_dace, velocity_tendencies_dace_finalize",
     )
     # retarget the kernel call (reference call spans continuation lines; swap just the callee name)
     shim = shim.replace("CALL velocity_tendencies(p_prog, p_patch", "CALL velocity_tendencies_dace(p_prog, p_patch")
     # finalize the ref-counted SDFG handle before returning
-    shim = re.sub(r"(?i)\bEND\s+SUBROUTINE\s+run_velocity_flat_sdfg", "  CALL velocity_tendencies_dace_finalize()\n"
-                  "END SUBROUTINE run_velocity_flat_sdfg", shim)
-    return shim
+    return re.sub(
+        r"(?i)\bEND\s+SUBROUTINE\s+run_velocity_flat_sdfg",
+        "  CALL velocity_tendencies_dace_finalize()\nEND SUBROUTINE run_velocity_flat_sdfg",
+        shim,
+    )
 
 
 def _gfortran(out_so: Path, *sources, mod_dir: Path, link_so: Path | None = None):
     cmd = [
-        _FC, "-shared", "-fPIC", "-O0", "-fno-fast-math", "-ffp-contract=off", "-ffree-line-length-none", f"-J{mod_dir}"
+        _FC,
+        "-shared",
+        "-fPIC",
+        "-O0",
+        "-fno-fast-math",
+        "-ffp-contract=off",
+        "-ffree-line-length-none",
+        f"-J{mod_dir}",
     ]
     cmd += [str(s) for s in sources]
     cmd += ["-o", str(out_so)]
@@ -154,19 +154,39 @@ def _gfortran(out_so: Path, *sources, mod_dir: Path, link_so: Path | None = None
 def _run(lib, fn, dims, bufs, z_arrays):
     f = getattr(lib, fn)
     f.restype = None
-    f.argtypes = ([ctypes.c_int] * 6  # dims
-                  + [ctypes.c_int, ctypes.c_int]  # ntnd, istep
-                  + [ctypes.c_int8, ctypes.c_int8]  # lvn_only, ldeepatmo
-                  + [ctypes.c_double, ctypes.c_double]  # dtime, dt_linintp_ubc
-                  + [ctypes.c_void_p, ctypes.c_void_p]  # nrdmax_in, nflatlev_in
-                  + [ctypes.c_int8, ctypes.c_int8, ctypes.c_int]  # lvert_nest, lextra_diffu, timers_level
-                  + [ctypes.c_void_p] * (len(_INIT_ARRAY_ORDER) + 3))
+    f.argtypes = (
+        [ctypes.c_int] * 6  # dims
+        + [ctypes.c_int, ctypes.c_int]  # ntnd, istep
+        + [ctypes.c_int8, ctypes.c_int8]  # lvn_only, ldeepatmo
+        + [ctypes.c_double, ctypes.c_double]  # dtime, dt_linintp_ubc
+        + [ctypes.c_void_p, ctypes.c_void_p]  # nrdmax_in, nflatlev_in
+        + [ctypes.c_int8, ctypes.c_int8, ctypes.c_int]  # lvert_nest, lextra_diffu, timers_level
+        + [ctypes.c_void_p] * (len(_INIT_ARRAY_ORDER) + 3)
+    )
     nproma, nlev, nlevp1, nblks_c, nblks_e, nblks_v = dims
-    nrdmax_in = np.full(10, nlev, dtype=np.int32, order='F')
-    nflatlev_in = np.ones(10, dtype=np.int32, order='F')
-    f(nproma, nlev, nlevp1, nblks_c, nblks_e, nblks_v, 1, _ISTEP, _LVN, 0, 60.0, 0.0, nrdmax_in.ctypes.data,
-      nflatlev_in.ctypes.data, 0, 0, 0, *[bufs[k].ctypes.data for k in _INIT_ARRAY_ORDER],
-      *[z.ctypes.data for z in z_arrays])
+    nrdmax_in = np.full(10, nlev, dtype=np.int32, order="F")
+    nflatlev_in = np.ones(10, dtype=np.int32, order="F")
+    f(
+        nproma,
+        nlev,
+        nlevp1,
+        nblks_c,
+        nblks_e,
+        nblks_v,
+        1,
+        _ISTEP,
+        _LVN,
+        0,
+        60.0,
+        0.0,
+        nrdmax_in.ctypes.data,
+        nflatlev_in.ctypes.data,
+        0,
+        0,
+        0,
+        *[bufs[k].ctypes.data for k in _INIT_ARRAY_ORDER],
+        *[z.ctypes.data for z in z_arrays],
+    )
 
 
 @pytest.mark.parametrize("build_path", ["inline", "build_fortran_library"])
@@ -194,13 +214,15 @@ def test_velocity_full_f90_bindings_e2e(tmp_path: Path, build_path: str):
     shim_path.write_text(_make_sdfg_driver(_CALLER_PATH.read_text()))
 
     if build_path == "build_fortran_library":
-        lib = build_fortran_library(sdfg,
-                                    _IFACE,
-                                    plan,
-                                    str(sdfg_build),
-                                    name="velocity_sdfg",
-                                    prelude_sources=[_DRIVER_PATH, _CALLER_PATH],
-                                    extra_sources=[shim_path])
+        lib = build_fortran_library(
+            sdfg,
+            _IFACE,
+            plan,
+            str(sdfg_build),
+            name="velocity_sdfg",
+            prelude_sources=[_DRIVER_PATH, _CALLER_PATH],
+            extra_sources=[shim_path],
+        )
         sdfg_lib = lib.load()
     else:
         compiled = sdfg.compile()
@@ -228,12 +250,12 @@ def test_velocity_full_f90_bindings_e2e(tmp_path: Path, build_path: str):
     init.restype = None
     init.argtypes = [ctypes.c_int] * 7 + [ctypes.c_void_p] * len(_INIT_ARRAY_ORDER)
     init(42, nproma, nlev, nlevp1, nblks_c, nblks_e, nblks_v, *[bufs_ref[k].ctypes.data for k in _INIT_ARRAY_ORDER])
-    bufs_sdfg = {k: v.copy(order='F') for k, v in bufs_ref.items()}
-    pristine = {k: v.copy(order='F') for k, v in bufs_ref.items()} if _REPS else {}
+    bufs_sdfg = {k: v.copy(order="F") for k, v in bufs_ref.items()}
+    pristine = {k: v.copy(order="F") for k, v in bufs_ref.items()} if _REPS else {}
 
     zshape = ((nproma, nlev, nblks_e), (nproma, nlev, nblks_e), (nproma, nlevp1, nblks_e))
-    z_ref = [np.zeros(s, dtype=np.float64, order='F') for s in zshape]
-    z_sdfg = [np.zeros(s, dtype=np.float64, order='F') for s in zshape]
+    z_ref = [np.zeros(s, dtype=np.float64, order="F") for s in zshape]
+    z_sdfg = [np.zeros(s, dtype=np.float64, order="F") for s in zshape]
 
     # pristine snapshots to prove the kernel mutated outputs (guards against a vacuous "both untouched" pass)
     pre = {nm: bufs_ref[nm].copy() for nm in _OUTPUT_NAMES if nm in bufs_ref}
@@ -241,7 +263,7 @@ def test_velocity_full_f90_bindings_e2e(tmp_path: Path, build_path: str):
     _run(ref_lib, "run_velocity_flat_c", dims, bufs_ref, z_ref)
     _run(sdfg_lib, "run_velocity_flat_sdfg", dims, bufs_sdfg, z_sdfg)
 
-    extras = dict(zip(('z_w_concorr_me', 'z_kin_hor_e', 'z_vt_ie'), zip(z_sdfg, z_ref)))
+    extras = dict(zip(("z_w_concorr_me", "z_kin_hor_e", "z_vt_ie"), zip(z_sdfg, z_ref, strict=False), strict=False))
     mismatches = []
     mutated = False
     for nm in _OUTPUT_NAMES:
@@ -250,8 +272,7 @@ def test_velocity_full_f90_bindings_e2e(tmp_path: Path, build_path: str):
             mutated = True
         if not np.allclose(sd, rf, rtol=1e-10, atol=1e-10, equal_nan=True):
             d = np.abs(sd - rf)
-            mismatches.append(f"{nm}: max_abs_diff={d.max():.3e} "
-                              f"(n_diff={np.count_nonzero(d > 1e-10)})")
+            mismatches.append(f"{nm}: max_abs_diff={d.max():.3e} (n_diff={np.count_nonzero(d > 1e-10)})")
     # reference must have done real work, and SDFG side must agree to 1e-10 on all 12 outputs
     assert mutated, "reference left every output untouched -- kernel did not run"
     assert not mismatches, "\n".join(mismatches)
@@ -261,6 +282,10 @@ def test_velocity_full_f90_bindings_e2e(tmp_path: Path, build_path: str):
     # the differential above is byte-identical to the un-instrumented run.
     for _ in range(_REPS):
         for lib_, sym in ((ref_lib, "run_velocity_flat_c"), (sdfg_lib, "run_velocity_flat_sdfg")):
-            replay = {k: v.copy(order='F') for k, v in pristine.items()}
-            z_replay = [np.zeros(s, dtype=np.float64, order='F') for s in zshape]
+            replay = {k: v.copy(order="F") for k, v in pristine.items()}
+            z_replay = [np.zeros(s, dtype=np.float64, order="F") for s in zshape]
             _run(lib_, sym, dims, replay, z_replay)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

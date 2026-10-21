@@ -2,19 +2,17 @@
 
 Two rules that must hold globally (the binding/codegen depend on them):
 
-* ``LOGICAL`` of ANY kind -> ``bool`` (1 byte).  The kind width is a
-  caller-ABI detail the logical-bridge converts at the Fortran boundary;
-  the SDFG itself only ever sees ``bool``.
+* ``LOGICAL(KIND=k)`` -> the unsigned integer of its width (``uint8`` ..
+  ``uint64``): the SDFG works on the caller's LOGICAL storage.
 * ``INTEGER(1/2/4/8)`` -> ``int8/16/32/64`` (width preserved, never
   widened or conflated with ``bool``).
 """
+
 from pathlib import Path
 
-import pytest
+import dace
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def _dtypes(src: str, tmp_path: Path, entry: str) -> dict:
@@ -22,7 +20,7 @@ def _dtypes(src: str, tmp_path: Path, entry: str) -> dict:
     return {n: str(d.dtype) for n, d in sdfg.arrays.items()}
 
 
-def test_logical_every_kind_is_bool(tmp_path):
+def test_logical_kind_is_its_unsigned_width(tmp_path):
     # Every LOGICAL kind arg gets a write so the post-build prune
     # (``prune_unused_arrays``) keeps each in ``sdfg.arrays`` -- the
     # dtype-mapping invariant the test is here to enforce is about
@@ -49,8 +47,8 @@ subroutine klog(n, ld, l1, l4, l8, lcb)
 end subroutine klog
 """
     d = _dtypes(src, tmp_path, "klog")
-    for nm in ("ld", "l1", "l4", "l8", "lcb"):
-        assert d[nm] == "bool", f"{nm} -> {d[nm]}, expected bool"
+    expected = {"ld": dace.uint32, "l1": dace.uint8, "l4": dace.uint32, "l8": dace.uint64, "lcb": dace.uint8}
+    assert {nm: d[nm] for nm in expected} == {nm: str(dt) for nm, dt in expected.items()}
 
 
 def test_integer_kinds_preserve_width(tmp_path):
@@ -80,3 +78,9 @@ end subroutine kint
     assert d["a2"] == "int16_t"
     assert d["a4"] == "int"
     assert d["a8"] == "int64_t"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

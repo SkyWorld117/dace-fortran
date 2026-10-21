@@ -12,12 +12,10 @@ bound rides emit_loop's bound-hoist machinery.
 
 Pinned: (1) build + validate, (2) numerics vs a numpy reference.
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 subroutine probe_sum(deeq, nh, becpr, nhm, nt, ia, m, fac, w1)
@@ -62,3 +60,9 @@ def test_sum_dynamic_extent_numerical(tmp_path):
     w1 = np.zeros(nhm, dtype=np.float64)
     sdfg(deeq=deeq, nh=nh, becpr=becpr, nhm=nhm, nt=nt, ia=ia, m=m, fac=fac, w1=w1)
     np.testing.assert_allclose(w1, w1_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

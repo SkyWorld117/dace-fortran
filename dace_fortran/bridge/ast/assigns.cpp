@@ -1,5 +1,6 @@
 // Translation-unit headers.  ``ast_helpers.h`` carries the cross-TU
 // API + thread-local state shared with the other ``ast/*.cpp`` files.
+#include <algorithm>
 #include <functional>
 #include <iomanip>
 #include <map>
@@ -13,6 +14,8 @@
 #include "bridge/ast/ast_internal.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -35,8 +38,89 @@ namespace hlfir_bridge {
 // #include "bridge/ast/assigns.cpp" and shares that translation
 // unit's namespace, includes, and file-static state.  It MUST NOT be
 // added to the build's compile list  --  CMakeLists.txt deliberately omits
-// it.  The split is purely for readability: the AST builder used to
-// be a single 2800-line file.
+// it.  The split is purely for readability.
+
+/// The declare of the variable ``v`` names, or null: through the designates that select a member or an element of it,
+/// and through the declares an inlined callee puts on its dummies -- a dummy declared on the caller's variable is that
+/// variable.
+static hlfir::DeclareOp rootDeclare(mlir::Value v) {
+  hlfir::DeclareOp root;
+  for (int hop = 0; hop < 16 && v; ++hop) {
+    mlir::Operation* def = v.getDefiningOp();
+    if (auto dg = mlir::dyn_cast_or_null<hlfir::DesignateOp>(def)) {
+      v = dg.getMemref();
+    } else if (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(def)) {
+      v = cv.getValue();
+    } else if (auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(def)) {
+      root = decl;
+      v = decl.getMemref();
+    } else {
+      break;
+    }
+  }
+  return root;
+}
+
+/// Whether two declares name the same variable: the same op, or two declares of one module variable (an inlined
+/// callee declares the global again).
+static bool sameVariable(hlfir::DeclareOp a, hlfir::DeclareOp b) {
+  if (a == b) return true;
+  auto globalOf = [](hlfir::DeclareOp d) -> mlir::StringRef {
+    auto addr = mlir::dyn_cast_or_null<fir::AddrOfOp>(d.getMemref().getDefiningOp());
+    return addr ? addr.getSymbol().getRootReference().getValue() : mlir::StringRef();
+  };
+  mlir::StringRef ga = globalOf(a);
+  return !ga.empty() && ga == globalOf(b);
+}
+
+/// Whether the variable ``v`` selects (through designates) is assigned anywhere in its function, whole or through a
+/// member or an element: the LHS of some ``hlfir.assign`` names it.  Such a variable may change after SDFG entry, so
+/// an element or member of it read as an index must not become an entry-time position symbol.
+static bool assignedInItsFunction(mlir::Value v) {
+  hlfir::DeclareOp decl = rootDeclare(v);
+  if (!decl) return false;
+  auto func = decl->getParentOfType<mlir::func::FuncOp>();
+  if (!func) return false;
+  bool assigned = false;
+  func.walk([&](hlfir::AssignOp aop) {
+    hlfir::DeclareOp target = rootDeclare(aop.getLhs());
+    if (target && sameVariable(target, decl)) {
+      assigned = true;
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return assigned;
+}
+
+/// Whether a value computed from ``ld`` is used, in ``ld``'s block, after a later store to the memory it loads: a
+/// name for the load would read the stored value there, not the loaded one.
+static bool loadOutlivedByStore(fir::LoadOp ld) {
+  mlir::Block* block = ld->getBlock();
+  mlir::Value mem = ld.getMemref();
+  mlir::Operation* store = nullptr;
+  for (mlir::Operation* user : mem.getUsers()) {
+    auto st = mlir::dyn_cast<fir::StoreOp>(user);
+    if (!st || st.getMemref() != mem) continue;
+    mlir::Operation* top = block->findAncestorOpInBlock(*user);
+    if (top && ld->isBeforeInBlock(top) && (!store || top->isBeforeInBlock(store))) store = top;
+  }
+  if (!store) return false;
+  llvm::SmallVector<mlir::Value> work{ld.getResult()};
+  llvm::DenseSet<mlir::Operation*> seen;
+  while (!work.empty()) {
+    mlir::Value v = work.pop_back_val();
+    for (mlir::Operation* user : v.getUsers()) {
+      mlir::Operation* top = block->findAncestorOpInBlock(*user);
+      if (top == store && user == store) continue;  // the store itself writes a value computed from the load
+      if (!top || !top->isBeforeInBlock(store)) return true;
+      if (seen.insert(top).second)
+        for (mlir::Value r : top->getResults()) work.push_back(r);
+    }
+  }
+  return false;
+}
+
 std::string buildIndexExpr(mlir::Value v, int d) {
   if (d > limits::kBuildIndexExprDepth || !v) return "?";
 
@@ -63,13 +147,7 @@ std::string buildIndexExpr(mlir::Value v, int d) {
   // treats these as transparent; mirror it here.)
   {
     auto cn = def->getName().getStringRef();
-    // ``arith.index_cast`` belongs with the width casts: it is equally transparent in an index
-    // context, and it is the one `IndexCastOp` the pass itself introduces when a subscript's type does
-    // not match the arithmetic it is folded into.  MEASURED: without this an index of the form
-    // ``index_cast(i) * 15`` renders as ``(? * 15)`` -- the cast is not peeled, so its operand never
-    // resolves, and the memlet carries a `?` that no amount of fixing the OPERATOR removes.
-    if ((cn == "arith.extsi" || cn == "arith.extui" || cn == "arith.trunci" || cn == "arith.index_cast")
-        && def->getNumOperands() == 1)
+    if ((cn == "arith.extsi" || cn == "arith.extui" || cn == "arith.trunci") && def->getNumOperands() == 1)
       return buildIndexExpr(def->getOperand(0), d + 1);
   }
 
@@ -139,12 +217,19 @@ std::string buildIndexExpr(mlir::Value v, int d) {
         // ``g_idx`` scalar transient leaks into the memlet
         // subset and DaCe's parser raises
         // ``unresolved free symbol(s) in SDFG: ['g_idx']``.
+        // A record the kernel assigns (``b = d`` ahead of
+        // ``do j = b % beg, b % end``) is the exception: its
+        // members are read where they are used, like any scalar
+        // the kernel writes -- an entry-time symbol would hold
+        // the value from before the assignment.
         if (dg.getComponentAttr() && dg.getIndices().empty()) {
           auto flatName = traceToDecl(dg.getResult());
           if (flatName.empty()) return "?";
+          if (assignedInItsFunction(dg.getMemref())) return flatName;
           return internPosSymbol(flatName, 1);
         }
-        auto arrName = resolveIndex(dg.getMemref());
+        // ``s % lb(1)`` carries the component and the index in one designate: name the member, not the record.
+        auto arrName = dg.getComponentAttr() ? traceToDecl(dg.getResult()) : resolveIndex(dg.getMemref());
         if (arrName.empty()) arrName = traceToDecl(dg.getMemref());
         if (arrName.empty()) return "?";
         // Constant-indexed array element used as an index / bound
@@ -181,7 +266,7 @@ std::string buildIndexExpr(mlir::Value v, int d) {
         // (a) loads ``ind_indices[0]`` BEFORE the body's
         // initialiser runs.
         //
-        // Gate: if the source declare is the LHS of any
+        // Gate: if the source variable is the LHS of any
         // ``hlfir.assign`` in the enclosing function (walked
         // through chained ``hlfir.designate`` ops on the
         // LHS), treat it as mutable and fall through to (b).
@@ -197,28 +282,7 @@ std::string buildIndexExpr(mlir::Value v, int d) {
           consts.push_back(*c);
         }
         if (allConstScalar && consts.size() == 1) {
-          bool isMutable = false;
-          if (auto srcDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(dg.getMemref().getDefiningOp())) {
-            if (auto func = srcDecl->getParentOfType<mlir::func::FuncOp>()) {
-              func.walk([&](hlfir::AssignOp aop) {
-                auto lhs = aop.getLhs();
-                for (int hop = 0; hop < 8 && lhs; ++hop) {
-                  if (lhs == srcDecl.getResult(0) || lhs == srcDecl.getResult(1)) {
-                    isMutable = true;
-                    return;
-                  }
-                  auto* ld = lhs.getDefiningOp();
-                  if (!ld) break;
-                  if (auto innerDg = mlir::dyn_cast<hlfir::DesignateOp>(ld)) {
-                    lhs = innerDg.getMemref();
-                    continue;
-                  }
-                  break;
-                }
-              });
-            }
-          }
-          if (!isMutable) return internPosSymbol(arrName, consts[0]);
+          if (!assignedInItsFunction(dg.getMemref())) return internPosSymbol(arrName, consts[0]);
           // Mutable source  --  fall through.  The matching
           // Python-side fix lives in
           // ``builder/access.py::build_memlet_index``: the
@@ -283,6 +347,12 @@ std::string buildIndexExpr(mlir::Value v, int d) {
     }
     auto n = traceToDecl(mem);
     if (!n.empty()) return n;
+    // A bare ``fir.alloca`` scratch counter (the position an implied-do array constructor stores at) reads as its
+    // synthetic name, as in ``buildExpr`` -- unless the loaded value is still used after a later store to the counter:
+    // the name would then read the advanced value.  ``hlfir-sink-scalar-stores`` moves such stores below those uses
+    // wherever nothing else accesses the counter in between.
+    if (auto* md = mem.getDefiningOp())
+      if (mlir::isa<fir::AllocaOp>(md)) return loadOutlivedByStore(ld) ? "?" : allocaSynthName(mem);
     // Last resort: maybe the load memref is the elemental's block arg
     // indirectly (unlikely, but guard).
     return "?";
@@ -319,20 +389,10 @@ std::string buildIndexExpr(mlir::Value v, int d) {
     if (resIdx == 2) return "1";  // stride  --  bridge requires contiguous
     auto dimC = traceConstInt(def->getOperand(1));
     // Walk operand 0 back to a declare so we can name the array.
-    mlir::Value arrayVal = def->getOperand(0);
-    for (int hop = 0; hop < limits::kTraceToDeclMax && arrayVal; ++hop) {
-      auto* adef = arrayVal.getDefiningOp();
-      if (!adef) break;
-      if (auto cv = mlir::dyn_cast<fir::ConvertOp>(adef)) {
-        arrayVal = cv.getValue();
-        continue;
-      }
-      if (auto ld = mlir::dyn_cast<fir::LoadOp>(adef)) {
-        arrayVal = ld.getMemref();
-        continue;
-      }
-      break;
-    }
+    BoxDimsSource const src = traceBoxDimsSource(def->getOperand(0));
+    mlir::Value const arrayVal = src.array;
+    fir::ReboxOp const boundsRebox = src.boundsRebox;
+    if (resIdx == 0 && boundsRebox && dimC) return reboxLowerBound(boundsRebox, static_cast<unsigned>(*dimC), d);
     auto arrName = traceToDecl(arrayVal);
     // ``fir.box_dims`` reads the box (#1) result of an
     // ``hlfir.declare``; ``traceToDecl`` keys on the addr result
@@ -428,6 +488,9 @@ std::string buildIndexExpr(mlir::Value v, int d) {
               if (!shapeVal) {
                 if (auto outer = asAssumedShapeAlias(decl)) shapeVal = outer.getShape();
               }
+            } else if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(adef)) {
+              // A section's own shape: the LiftAos gather-buffer slice (see the ``buildExpr`` box_dims handler).
+              shapeVal = dg.getShape();
             }
           }
           if (shapeVal) {
@@ -468,21 +531,19 @@ std::string buildIndexExpr(mlir::Value v, int d) {
       {"arith.addi", " + "},
       {"arith.subi", " - "},
       {"arith.muli", " * "},
-      {"arith.divsi", " // "},
-      {"arith.divui", " // "},
-      // ``MOD(i, k)`` in an index expression (``arr(mod(i,2)+1)``)
-      // lowers to ``arith.remsi`` / ``arith.remui``.  Render as Python
-      // ``%`` -- sympy maps it to ``Mod``, which the memlet-subset
-      // engine accepts.  Fortran ``MOD`` truncates toward zero and
-      // Python ``%`` floors; they agree for non-negative operands,
-      // which every valid array index is (index >= lbound >= 1, and
-      // ``mod(i,k)+1`` only produces a valid subscript when ``i`` is
-      // non-negative).
-      {"arith.remsi", " % "},
-      {"arith.remui", " % "},
   };
   if (auto it = int_bin.find(nm); it != int_bin.end() && def->getNumOperands() == 2) {
     return "(" + buildIndexExpr(def->getOperand(0), d + 1) + it->second + buildIndexExpr(def->getOperand(1), d + 1) +
+           ")";
+  }
+  if ((nm == "arith.divsi" || nm == "arith.divui") && def->getNumOperands() == 2) {
+    const std::string a = buildIndexExpr(def->getOperand(0), d + 1), b = buildIndexExpr(def->getOperand(1), d + 1);
+    return nm == "arith.divsi" ? truncatedDivision(a, b) : floorDivision(a, b);
+  }
+  // ``MOD(i, k)`` in an index expression (``arr(mod(i,2)+1)``) lowers to ``arith.remsi`` / ``arith.remui``.
+  // ``FtnMod`` is the SDFG's truncated remainder (sign of the dividend), the semantics of Fortran ``MOD``.
+  if ((nm == "arith.remsi" || nm == "arith.remui") && def->getNumOperands() == 2) {
+    return "FtnMod(" + buildIndexExpr(def->getOperand(0), d + 1) + ", " + buildIndexExpr(def->getOperand(1), d + 1) +
            ")";
   }
 
@@ -599,9 +660,9 @@ ASTNode buildAssignNode(hlfir::AssignOp assign) {
       // component-aware walk fires) and DON'T treat it as an
       // array write -- emit_assign downstream uses the registered
       // VarInfo's descriptor classification to pick scalar vs
-      // array write.  Previously ``expandDesignateChain`` +
-      // ``traceToDecl(dg.getMemref())`` returned the struct base
-      // ``g``, leaking it as the target name.
+      // array write.  ``expandDesignateChain`` +
+      // ``traceToDecl(dg.getMemref())`` would return the struct base
+      // ``g`` and leak it as the target name.
       if (dg.getComponentAttr() && dg.getIndices().empty()) {
         node.target = traceToDecl(dg.getResult());
       } else {
@@ -782,6 +843,12 @@ mlir::Type peelWrappers(mlir::Type t) {
     t = next;
   }
   return t;
+}
+
+// Element type of an array-typed value (``ref`` / ``box`` / ``heap`` / ``pointer`` around a ``fir.array``).
+static mlir::Type arrayElementType(mlir::Type ty) {
+  auto seq = mlir::dyn_cast<fir::SequenceType>(peelWrappers(ty));
+  return seq ? seq.getEleTy() : ty;
 }
 
 /// True iff the MLIR type peels to a ``fir.array<...>`` OR is an
@@ -1100,7 +1167,7 @@ std::vector<ASTNode> buildSectionScalarAssign(hlfir::AssignOp assign, hlfir::Des
       current = wrap;
     }
   }
-  return {current};
+  return evaluateBeforeAssigning(std::move(current), arrayElementType(dst.getResult().getType()));
 }
 
 /// ``<section> = <other_section>`` where both sides are
@@ -1429,7 +1496,7 @@ std::vector<ASTNode> buildSectionToSectionAssign(hlfir::AssignOp assign, mlir::V
       current = wrap;
     }
   }
-  return {current};
+  return evaluateBeforeAssigning(std::move(current), arrayElementType(dst.getType()));
 }
 
 /// ``hlfir.assign %scalar to %arr_decl`` where the destination is the bare
@@ -1439,6 +1506,10 @@ std::vector<ASTNode> buildSectionToSectionAssign(hlfir::AssignOp assign, mlir::V
 /// element.  Mirrors ``buildSectionScalarAssign``'s shape but iterates
 /// from 1 to the declare's extent for each dim instead of ``lo:hi``.
 ///
+/// A declare without extents of its own -- an assumed-shape dummy (no shape, or a ``fir.shift`` of lower bounds only),
+/// an allocatable -- takes them from the variable an inlined copy of it is bound to, else from the ``<name>_d<i>``
+/// extent symbols that ``SIZE`` reads too (``fir.box_dims`` in ``buildIndexExpr``).
+///
 /// Returns an empty vector when the destination's shape can't be
 /// resolved  --  caller falls back to the default assign handler.
 std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
@@ -1447,24 +1518,26 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
   if (!dDef) return {};
   auto decl = mlir::dyn_cast<hlfir::DeclareOp>(dDef);
   if (!decl) return {};
-  auto shape = decl.getShape();
-  if (!shape) return {};
-  auto* shDef = shape.getDefiningOp();
-  if (!shDef) return {};
 
   // Collect per-dim extent operands.  ``fir.shape`` lists them flat;
   // ``fir.shape_shift`` interleaves (lb, ext) pairs  --  pick out the
   // extents (odd indices).
-  std::vector<mlir::Value> extents;
-  if (auto sh = mlir::dyn_cast<fir::ShapeOp>(shDef)) {
-    for (auto e : sh.getExtents()) extents.push_back(e);
-  } else if (auto ss = mlir::dyn_cast<fir::ShapeShiftOp>(shDef)) {
-    auto ops = ss->getOperands();
-    for (unsigned i = 1; i < ops.size(); i += 2) extents.push_back(ops[i]);
-  } else {
-    return {};
-  }
-  unsigned const rank = extents.size();
+  auto extentsOf = [](hlfir::DeclareOp d) {
+    std::vector<mlir::Value> out;
+    auto* shDef = d.getShape() ? d.getShape().getDefiningOp() : nullptr;
+    if (auto sh = mlir::dyn_cast_or_null<fir::ShapeOp>(shDef)) {
+      for (auto e : sh.getExtents()) out.push_back(e);
+    } else if (auto ss = mlir::dyn_cast_or_null<fir::ShapeShiftOp>(shDef)) {
+      auto ops = ss->getOperands();
+      for (unsigned i = 1; i < ops.size(); i += 2) out.push_back(ops[i]);
+    }
+    return out;
+  };
+  std::vector<mlir::Value> extents = extentsOf(decl);
+  for (hlfir::DeclareOp outer = decl; extents.empty() && (outer = asAssumedShapeAlias(outer));)
+    extents = extentsOf(outer);
+  auto seq = mlir::dyn_cast<fir::SequenceType>(peelWrappers(decl.getResult(0).getType()));
+  unsigned const rank = extents.empty() ? (seq ? seq.getDimension() : 0) : extents.size();
   if (rank == 0) return {};
 
   auto extentString = [](mlir::Value ext) -> std::string {
@@ -1481,8 +1554,10 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
 
   std::vector<std::string> bounds;
   bounds.reserve(rank);
+  std::string const boxName = extents.empty() ? traceToDecl(dst) : std::string{};
   for (unsigned i = 0; i < rank; ++i) {
-    auto s = extentString(extents[i]);
+    auto s = extents.empty() ? (boxName.empty() ? std::string{} : boxName + "_d" + std::to_string(i))
+                             : extentString(extents[i]);
     if (s.empty()) return {};
     bounds.push_back(std::move(s));
   }
@@ -1497,48 +1572,18 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
   inner.target_is_array = true;
   inner.expr = buildExpr(assign.getOperand(0), 0);
 
+  // The loops run over 1-based positions; the write takes each dim's declared lower bound (``qv(0:n, -2:k)``).
+  bool const bounded = mlir::cast<mlir::OpResult>(dst).getResultNumber() == 0;
   AccessInfo wa;
   wa.array_name = inner.target;
   wa.is_write = true;
   for (unsigned i = 0; i < rank; ++i) {
     wa.index_vars.push_back(iter_names[i]);
-    wa.index_exprs.push_back(iter_names[i]);
+    wa.index_exprs.push_back(bounded ? fortranIndexAt(iter_names[i], declaredLowerBound(decl, i), 0) : iter_names[i]);
   }
   inner.accesses.push_back(std::move(wa));
-
-  // Also collect read accesses on the scalar RHS.  ``inner.expr`` is the
-  // rendered RHS string (e.g. ``c0t3d``), and Python ``emit_tasklet``
-  // rewrites every array-name occurrence to ``_in_<name>_<N>`` and creates
-  // one in-connector + memlet PER ``AccessInfo`` in ``inner.accesses``.
-  // Without read AccessInfos here the connector references in the rewritten
-  // code become dangling  --  DaCe's free-symbol analysis then treats the
-  // unbound ``_in_<name>_<N>`` token as an undefined symbol and SDFG
-  // construction fails with ``unresolved free symbol(s)``.  The RHS is a
-  // SCALAR expression (e.g. ``chem_pw = c0t3d(i,j)*dz*trash*zuo(i,j)``) whose
-  // array reads are element designates at fixed indices, so this mirrors the
-  // ``collectScalarRhsReads`` walker in ``buildSectionScalarAssign``.
-  std::function<void(mlir::Value, int)> collectScalarRhsReads = [&](mlir::Value v, int depth) {
-    if (depth > 40) return;
-    auto* op = v.getDefiningOp();
-    if (!op) return;
-    if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(op)) {
-      AccessInfo ra;
-      ra.array_name = traceToDecl(dg.getMemref());
-      ra.is_read = true;
-      unsigned di = 0;
-      for (auto idx : dg.getIndices()) {
-        auto n = resolveIndex(idx);
-        ra.index_vars.push_back(n.empty() ? "?" : n);
-        ra.index_exprs.push_back(buildDesignateIndexExpr(dg, di, idx, 0));
-        ++di;
-        collectScalarRhsReads(idx, depth + 1);
-      }
-      inner.accesses.push_back(std::move(ra));
-      return;
-    }
-    for (auto operand : op->getOperands()) collectScalarRhsReads(operand, depth + 1);
-  };
-  collectScalarRhsReads(assign.getOperand(0), 0);
+  // The value may read array elements (``v = s(1) * 2``): each needs its read access, or its connector dangles.
+  collectReadAccesses(assign.getOperand(0), inner.accesses, 0);
 
   ASTNode current = inner;
   for (int i = (int)rank - 1; i >= 0; --i) {
@@ -1550,7 +1595,7 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
     wrap.children.push_back(current);
     current = wrap;
   }
-  return {current};
+  return evaluateBeforeAssigning(std::move(current), arrayElementType(decl.getResult(0).getType()));
 }
 
 ASTNode buildMemsetNode(hlfir::AssignOp assign) {
@@ -1982,6 +2027,111 @@ std::vector<ASTNode> buildSectionReduceAssign(hlfir::AssignOp assign, hlfir::Des
   }
 
   return {init, current};
+}
+
+// An index expression without its spaces and enclosing parentheses, so ``(ei0)`` and ``ei0`` compare equal.
+static std::string canonicalIndex(std::string s) {
+  s.erase(std::remove(s.begin(), s.end(), ' '), s.end());
+  while (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+    int depth = 0;
+    bool wraps = true;
+    for (size_t i = 0; i + 1 < s.size(); ++i) {
+      depth += s[i] == '(' ? 1 : (s[i] == ')' ? -1 : 0);
+      if (depth == 0) {
+        wraps = false;
+        break;
+      }
+    }
+    if (!wraps) break;
+    s = s.substr(1, s.size() - 2);
+  }
+  return s;
+}
+
+std::vector<ASTNode> evaluateBeforeAssigning(ASTNode nest, mlir::Type elementType) {
+  // The nest: loop nodes with one child each, down to the assign.
+  std::vector<ASTNode*> loops;
+  ASTNode* node = &nest;
+  while (node->kind == "loop" && node->children.size() == 1 && node->else_children.empty()) {
+    loops.push_back(node);
+    node = &node->children.front();
+  }
+  if (node->kind != "assign" || !node->target_is_array || loops.empty()) return {std::move(nest)};
+  ASTNode& inner = *node;
+  auto write = std::find_if(inner.accesses.begin(), inner.accesses.end(),
+                            [&](const AccessInfo& a) { return a.is_write && a.array_name == inner.target; });
+  if (write == inner.accesses.end()) return {std::move(nest)};
+  bool overlaps = false;
+  for (const auto& read : inner.accesses) {
+    if (!read.is_read || read.array_name != write->array_name) continue;
+    if (read.index_exprs.size() != write->index_exprs.size()) {
+      overlaps = true;
+      break;
+    }
+    for (size_t d = 0; d < read.index_exprs.size() && !overlaps; ++d)
+      overlaps = canonicalIndex(read.index_exprs[d]) != canonicalIndex(write->index_exprs[d]);
+    if (overlaps) break;
+  }
+  if (!overlaps) return {std::move(nest)};
+
+  // Every element of the right-hand side lands in a transient over the same iteration space first, then the transient
+  // is assigned to the target.
+  std::string const dtype = dtypeName(elementType);
+  std::string const tmp = "_rhs_" + std::to_string(kSynthTransientCounter++);
+  if (dtype.empty())
+    throw UnsupportedConstruct("assignment to \"" + inner.target +
+                               "\" reads its own target elsewhere than at the element written, and its element type "
+                               "has no transient dtype to evaluate the right-hand side into first");
+  std::vector<std::string> iters;
+  std::vector<std::string> extents;
+  std::vector<std::string> positions;
+  for (ASTNode* loop : loops) {
+    if (!loop->loop_step_expr.empty() || loop->loop_step != 1 ||
+        (loop->loop_lower < 0 && loop->loop_lower_expr.empty()))
+      throw UnsupportedConstruct("assignment to \"" + inner.target +
+                                 "\" reads its own target elsewhere than at the element written, over a loop the "
+                                 "right-hand side cannot be evaluated into a transient for first");
+    std::string const lower = loop->loop_lower_expr.empty() ? std::to_string(loop->loop_lower) : loop->loop_lower_expr;
+    iters.push_back(loop->loop_iter);
+    if (canonicalIndex(lower) == "1") {
+      extents.push_back(loop->loop_bound);
+      positions.push_back(loop->loop_iter);
+    } else {
+      extents.push_back("((" + loop->loop_bound + ") - (" + lower + ") + 1)");
+      positions.push_back("((" + loop->loop_iter + ") - (" + lower + ") + 1)");
+    }
+  }
+  auto tmpAccess = [&](bool isWrite) {
+    AccessInfo a;
+    a.array_name = tmp;
+    a.is_write = isWrite;
+    a.is_read = !isWrite;
+    a.index_vars = iters;
+    a.index_exprs = positions;
+    return a;
+  };
+
+  ASTNode decl;
+  decl.kind = "declare_transient";
+  decl.target = tmp;
+  decl.expr = dtype;
+  decl.target_is_array = true;
+  AccessInfo shape;
+  shape.array_name = tmp;
+  shape.index_exprs = extents;
+  decl.accesses.push_back(std::move(shape));
+
+  ASTNode store = nest;  // copy before the target assign below rewrites ``inner``
+  AccessInfo const targetWrite = *write;
+  inner.expr = tmp;
+  inner.accesses = {targetWrite, tmpAccess(false)};
+
+  ASTNode* storeInner = &store;
+  while (storeInner->kind == "loop") storeInner = &storeInner->children.front();
+  storeInner->target = tmp;
+  for (auto& a : storeInner->accesses)
+    if (a.is_write && a.array_name == targetWrite.array_name) a = tmpAccess(true);
+  return {std::move(decl), std::move(store), std::move(nest)};
 }
 
 /// ``target = MAXLOC(src(lo:hi), dim)`` / ``MINLOC`` where ``src`` is a

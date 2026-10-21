@@ -31,14 +31,12 @@ Every subroutine fills its own target deterministically so the test is
 self-contained -- only the ``intent(out)`` result (and any scalar
 ``intent(in)`` index) crosses the boundary.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _build(src: str, tmp: Path, entry: str = "main"):
@@ -677,7 +675,7 @@ subroutine main(out)
   out = reshape(a, [20])
 end subroutine main
 """
-    mod = f2py_compile(src, tmp_path / "ref", "h_call", only=("main", ))
+    mod = f2py_compile(src, tmp_path / "ref", "h_call", only=("main",))
     ref = np.asarray(mod.main(), dtype=np.float64)
 
     out = np.zeros(20, order="F", dtype=np.float64)
@@ -717,7 +715,7 @@ subroutine main(out)
   call total(p, 12, out)
 end subroutine main
 """
-    mod = f2py_compile(src, tmp_path / "ref", "h_ro_call", only=("main", ))
+    mod = f2py_compile(src, tmp_path / "ref", "h_ro_call", only=("main",))
     ref = float(np.asarray(mod.main(), dtype=np.float64))
 
     out = np.zeros(1, order="F", dtype=np.float64)
@@ -758,7 +756,7 @@ subroutine main(out)
   out = reshape(a, [20])
 end subroutine main
 """
-    mod = f2py_compile(src, tmp_path / "ref", "h_sec_call", only=("main", ))
+    mod = f2py_compile(src, tmp_path / "ref", "h_sec_call", only=("main",))
     ref = np.asarray(mod.main(), dtype=np.float64)
 
     out = np.zeros(20, order="F", dtype=np.float64)
@@ -766,3 +764,9 @@ end subroutine main
     np.testing.assert_array_equal(out, ref)
     # Only column 3 (flat slots 8..11) gets +1000.
     assert list(out[8:12]) == [1031, 1032, 1033, 1034]
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

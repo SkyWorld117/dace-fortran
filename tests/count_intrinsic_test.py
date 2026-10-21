@@ -10,11 +10,8 @@ own expansion is covered in ``count_library_node_test.py``.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # ---------------------------------------------------------------------------
 # Mode A  --  plain mask
@@ -31,12 +28,12 @@ subroutine main(mask, n, res)
   res = COUNT(mask)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(0)
     n = 16
-    mask = (rng.random(n) > 0.5)
+    mask = rng.random(n) > 0.5
     res = np.zeros(1, dtype=np.int32)
-    sdfg(mask=mask, n=n, res=res)
+    sdfg(mask=mask.astype(np.uint32), n=n, res=res)
     assert int(res[0]) == int(mask.sum())
 
 
@@ -50,12 +47,12 @@ subroutine main(mask, n, m, res)
   res = COUNT(mask)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(1)
     n, m = 6, 8
     mask = np.asfortranarray(rng.random((n, m)) > 0.5)
     res = np.zeros(1, dtype=np.int32)
-    sdfg(mask=mask, n=n, m=m, res=res)
+    sdfg(mask=mask.astype(np.uint32), n=n, m=m, res=res)
     assert int(res[0]) == int(mask.sum())
 
 
@@ -75,12 +72,12 @@ subroutine main(mask, n, m, res)
   res = COUNT(mask, dim=2)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(2)
     n, m = 5, 7
     mask = np.asfortranarray(rng.random((n, m)) > 0.5)
     res = np.zeros(n, dtype=np.int32)
-    sdfg(mask=mask, n=n, m=m, res=res)
+    sdfg(mask=mask.astype(np.uint32), n=n, m=m, res=res)
     np.testing.assert_array_equal(res, mask.sum(axis=1))
 
 
@@ -94,12 +91,12 @@ subroutine main(mask, n, m, res)
   res = COUNT(mask, dim=1)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(3)
     n, m = 4, 6
     mask = np.asfortranarray(rng.random((n, m)) > 0.5)
     res = np.zeros(m, dtype=np.int32)
-    sdfg(mask=mask, n=n, m=m, res=res)
+    sdfg(mask=mask.astype(np.uint32), n=n, m=m, res=res)
     np.testing.assert_array_equal(res, mask.sum(axis=0))
 
 
@@ -119,7 +116,7 @@ subroutine main(a, b, n, res)
   res = COUNT(a .eq. b)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(4)
     n = 12
     a = np.ascontiguousarray(rng.integers(0, 5, size=n, dtype=np.int32))
@@ -140,10 +137,16 @@ subroutine main(a, n, lo, hi, res)
   res = COUNT((a .gt. lo) .and. (a .lt. hi))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     rng = np.random.default_rng(5)
     n, lo_val, hi_val = 20, 3, 8
     a = np.ascontiguousarray(rng.integers(0, 12, size=n, dtype=np.int32))
     res = np.zeros(1, dtype=np.int32)
     sdfg(a=a, n=n, lo=lo_val, hi=hi_val, res=res)
     assert int(res[0]) == int(((a > lo_val) & (a < hi_val)).sum())
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

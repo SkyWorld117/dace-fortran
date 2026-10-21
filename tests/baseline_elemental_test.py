@@ -5,11 +5,8 @@ uses an explicit per-element DO loop instead of the ELEMENTAL form.
 """
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def test_elemental(tmp_path):
@@ -72,3 +69,9 @@ end subroutine apply_delta
     np.testing.assert_allclose(od_sdfg, od_ref, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(s_sdfg, s_ref, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(g_sdfg, g_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

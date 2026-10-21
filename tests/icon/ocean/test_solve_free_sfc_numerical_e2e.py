@@ -12,22 +12,15 @@ so both sides read identical state). ``inject_use_mpi`` lets the inlined
 
 ``@pytest.mark.long``: builds the full driver to an SDFG (minutes).
 """
-import shutil
+
 from pathlib import Path
 
 import pytest
 
-from _util import have_flang
-from icon._halo_modes import _MPI_NOOP_IMPL, _MPI_STUB
-from icon.ocean._ocean_harness import have_icon_ocean
-from icon.ocean._ocean_e2e import run_kernel_e2e
+from tests.icon._halo_modes import _MPI_NOOP_IMPL, _MPI_STUB
+from tests.icon.ocean._ocean_e2e import run_kernel_e2e
 
-pytestmark = [
-    pytest.mark.long,
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-    pytest.mark.skipif(not have_icon_ocean(), reason="icon-model ocean source not checked out"),
-]
+pytestmark = pytest.mark.long
 
 _HERE = Path(__file__).resolve().parent
 _TU = _HERE / "solve_free_sfc_single_tu.f90"
@@ -136,3 +129,7 @@ def test_solve_free_sfc_numerical_e2e(tmp_path: Path):
     assert res["passed"], f"solve_free_sfc e2e did not run:\n{res['output'][-6000:]}"
     assert res["n_changed"] > 0, "solve_free_sfc produced no output changes (kernel ran as a no-op?)"
     assert res["max_diff"] == 0.0, f"solve_free_sfc not bit-exact: max|dut-ref| = {res['max_diff']}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

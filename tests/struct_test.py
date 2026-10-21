@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/struct_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_struct(tmp_path):
@@ -38,15 +35,15 @@ subroutine fun(res, idx)
   res(idx%start:idx%end) = 42
 end subroutine fun
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     size = 6
     res = np.full([size], 42, order="F", dtype=np.int32)
     res[:] = 0
     # Scalar I/O convention: intent(in) scalar dummies surface as plain Scalars on the SDFG signature.
     sdfg(res=res, startidx=2, endidx=5)
-    assert (res[1] == 42 and res[4] == 42)
-    assert (res[0] == 0 and res[5] == 0)
+    assert res[1] == 42 and res[4] == 42
+    assert res[0] == 0 and res[5] == 0
 
 
 def test_fortran_struct_lhs(tmp_path):
@@ -85,9 +82,15 @@ subroutine fun(idx)
   idx%var%res(idx%var%start:idx%var%end) = 42
 end subroutine fun
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     size = 6
     res = np.full([size], 42, order="F", dtype=np.int32)
     res[:] = 0
     sdfg(res=res, start=2, end=5)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

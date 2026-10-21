@@ -2,18 +2,12 @@
 the SDFG carries the right :class:`CShift` lib node with memlets covering the full shift
 dimension.  Tests stop at SDFG-build time -- the lib node's pure expansion stub
 (``NotImplementedError``) never runs."""
-from pathlib import Path
-import sys
 
-import pytest
+from pathlib import Path
 
 import dace_fortran
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent))
-from _util import have_flang  # noqa: E402
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _build(probe_name: str, entry: str, tmp_path):
@@ -93,6 +87,7 @@ def test_cshift_memlets_cover_full_arrays(tmp_path):
     assert len(nodes) == 1
     state, node = nodes[0]
     import sympy
+
     memlets = _connector_memlets(sdfg, state, node)
     assert "_x" in memlets and "_out" in memlets
     # subset volume == full descriptor volume; sympy.simplify needed since direct ``==``
@@ -101,3 +96,9 @@ def test_cshift_memlets_cover_full_arrays(tmp_path):
     o_desc = sdfg.arrays[memlets["_out"].data]
     assert sympy.simplify(memlets["_x"].subset.num_elements() - x_desc.total_size) == 0
     assert sympy.simplify(memlets["_out"].subset.num_elements() - o_desc.total_size) == 0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

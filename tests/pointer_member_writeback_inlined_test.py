@@ -11,14 +11,12 @@ dropped -- the member never changed (and calling with the member name raised ``K
 (``hlfir.designate %memberBox (i, j)``), which honours the component's strides and erases the
 phantom ``v``. A per-element pattern (``i + 100*j``) catches a dropped/transposed index.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module mo_wb
@@ -189,3 +187,9 @@ def test_writeback_through_assumed_shape_forward_inlined(tmp_path: Path):
     expected = i + 100.0 * j
     for b in range(nb):
         np.testing.assert_array_equal(e[:, :, b], expected)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

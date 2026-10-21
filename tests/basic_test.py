@@ -1,12 +1,10 @@
 """Smoke tests for the HLFIR -> SDFG frontend: inline Fortran source, build an SDFG,
 validate against a numpy reference (E2E-numerical rule) plus structural assertions
 against silent SDFG-shape regressions."""
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_elementwise_loop(tmp_path):
@@ -42,8 +40,8 @@ end subroutine elementwise_add
 def test_read_after_write_shares_access_node(tmp_path):
     """RAW within a loop body: exactly one AccessNode for ``tmp`` in the innermost
     state (single-access-node rule); numerical check catches a dropped RAW edge."""
-    from dace.sdfg.state import LoopRegion
     from dace.sdfg import nodes as nd
+    from dace.sdfg.state import LoopRegion
 
     src = """
 subroutine chained(a, out, n)
@@ -72,8 +70,7 @@ end subroutine chained
 
     body = next(s for s in iter_states(sdfg) if any(isinstance(n, nd.Tasklet) for n in s.nodes()))
     tmp_nodes = [n for n in body.nodes() if isinstance(n, nd.AccessNode) and n.data == "tmp"]
-    assert len(tmp_nodes) == 1, (f"expected a single shared access node for tmp in the body state; "
-                                 f"got {len(tmp_nodes)}")
+    assert len(tmp_nodes) == 1, f"expected a single shared access node for tmp in the body state; got {len(tmp_nodes)}"
 
     rng = np.random.default_rng(1)
     n = 8
@@ -82,3 +79,9 @@ end subroutine chained
     expected = a * 2.0 + 1.0
     sdfg(a=a, out=out, n=n)
     np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

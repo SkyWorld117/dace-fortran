@@ -14,13 +14,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from _util import f2py_compile, have_flang
-from cloudsc.full._registries import (
-    CLOUDSC_F90FLAGS, )
-from cloudsc.full._harness import run_cloudsc
+from tests._util import f2py_compile
+from tests.cloudsc.full._harness import run_cloudsc
+from tests.cloudsc.full._registries import (
+    CLOUDSC_F90FLAGS,
+)
 
 _HERE = Path(__file__).resolve().parent
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 @pytest.fixture(scope="module")
@@ -33,7 +33,7 @@ def _f2py_bottom_upper(tmp_path_factory):
         "cloudsc_bottom_upper_ref",
         # -ffree-line-length-none is gfortran-only (long-line source); flang has no line limit, needs no equivalent.
         extra_f90flags=CLOUDSC_F90FLAGS,
-        only=("cloudscouter", ),
+        only=("cloudscouter",),
     )
 
 
@@ -50,3 +50,7 @@ def test_cloudsc_bottom_upper_numerical(tmp_path, _f2py_bottom_upper, _strict_fp
         atol=1e-14,
         err_msg="PCOVPTOT mismatch in bottom-upper (sedimentation/physics) reproducer",
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

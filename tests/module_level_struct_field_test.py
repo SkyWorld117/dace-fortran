@@ -10,12 +10,8 @@ Fix (extract_vars.cpp's fir.RecordType drop branch): when a declare traces to a 
 fir.address_of and has component-attribute hlfir.designate uses, synthesise one per-field
 VarInfo per unique component referenced, as a TRANSIENT (module globals are internal state).
 """
-import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_module_level_struct_field_summed(tmp_path):
@@ -70,7 +66,7 @@ end module
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()
     assert "vcut_a" in sdfg.arrays
-    pass  # transient or kwarg, both work
+    # transient or kwarg, both work
 
 
 def test_module_level_struct_multiple_array_fields(tmp_path):
@@ -151,7 +147,7 @@ end module
     # After inline-all, g%a/g%c reach the bridge through inlined read_field's s dummy declare
     # aliasing g; per-field VarInfo synthesis must pick them up via the alias chain.
     assert "g_a" in sdfg.arrays, f"expected g_a in arrays: {sorted(sdfg.arrays.keys())}"
-    assert ("g_c" in sdfg.arrays or "g_c" in sdfg.scalars or "g_c" in sdfg.symbols)
+    assert "g_c" in sdfg.arrays or "g_c" in sdfg.scalars or "g_c" in sdfg.symbols
 
 
 def test_module_level_struct_field_unaccessed_not_registered(tmp_path):
@@ -173,8 +169,7 @@ end module
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()
     assert "g_used" in sdfg.arrays
-    assert "g_unused" not in sdfg.arrays, \
-        "unaccessed fields should not be registered"
+    assert "g_unused" not in sdfg.arrays, "unaccessed fields should not be registered"
 
 
 def test_module_level_struct_field_no_uninitialized_transient_warning(tmp_path):
@@ -185,6 +180,7 @@ def test_module_level_struct_field_no_uninitialized_transient_warning(tmp_path):
     flag, which only fires at the array's allocation site). Pins: no warning, and genuine
     zero-stores in that entry state."""
     import warnings
+
     src = """
 module m
   type :: t
@@ -204,6 +200,7 @@ end module
         warnings.simplefilter("error", UserWarning)
         sdfg = build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()
     from dace import nodes as dace_nodes
+
     # An explicit entry state must hold the zero stores.
     init_states = [s for s in sdfg.states() if s.label == "init_unwritten_globals"]
     init_state = init_states[0] if init_states else None
@@ -215,24 +212,226 @@ end module
                 zero_inited.add(node.data)
         for node in init_state.nodes():
             if isinstance(node, dace_nodes.Tasklet):
-                assert node.code.as_string.strip(
-                ) == "_out = 0", f"init tasklet must store zero, got {node.code.as_string!r}"
+                assert node.code.as_string.strip() == "_out = 0", (
+                    f"init tasklet must store zero, got {node.code.as_string!r}"
+                )
     # A read-only companion is safe either way: zero-initialised as a transient, or supplied by the
     # caller as a signature argument. What is never acceptable is a transient read with no producer,
     # which is the check below.
-    assert "g_c" in zero_inited or not sdfg.arrays["g_c"].transient, \
+    assert "g_c" in zero_inited or not sdfg.arrays["g_c"].transient, (
         f"read-only g_c is a transient with no zero store: {sorted(zero_inited)}"
+    )
     # Contract: every transient read but never written outside the init state must be covered
     # by an init-state zero store -- exactly what keeps the validator quiet.
     written_outside = {
         node.data
-        for state in sdfg.states() if state is not init_state for node in state.nodes()
+        for state in sdfg.states()
+        if state is not init_state
+        for node in state.nodes()
         if isinstance(node, dace_nodes.AccessNode) and state.in_degree(node) > 0
     }
     for state in sdfg.states():
         if state is init_state:
             continue
         for node in state.nodes():
-            if (isinstance(node, dace_nodes.AccessNode) and node.data not in written_outside
-                    and sdfg.arrays[node.data].transient and state.out_degree(node) > 0):
-                assert node.data in zero_inited, f"{node.data} read-only transient must be zero-initialised in entry state"
+            if (
+                isinstance(node, dace_nodes.AccessNode)
+                and node.data not in written_outside
+                and sdfg.arrays[node.data].transient
+                and state.out_degree(node) > 0
+            ):
+                assert node.data in zero_inited, (
+                    f"{node.data} read-only transient must be zero-initialised in entry state"
+                )
+
+
+def test_local_named_like_module_record_member(tmp_path):
+    """A local ``becp_r`` next to the module record member ``becp % r``, whose container is also named
+    ``becp_r`` (QE ``add_vuspsi_gamma_acc``): the copy ``becp_r = becp % r`` must stay a copy between two
+    containers. It used to merge them into one, and the copy into a self-cycle the SDFG rejects."""
+    import numpy as np
+
+    src = """
+module becmod
+  type :: bec_type
+    real(kind=8) :: r(4)
+  end type
+  type(bec_type) :: becp
+end module becmod
+
+module kern
+contains
+  subroutine add_ps(out)
+    use becmod, only: becp
+    real(kind=8), intent(out) :: out(4)
+    real(kind=8) :: becp_r(4)
+    becp % r = 2.0d0
+    becp_r = becp % r
+    out = becp_r + 1.0d0
+  end subroutine add_ps
+end module kern
+"""
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="add_ps", entry="kern::add_ps").build()
+    sdfg.validate()
+    assert {"becp_r", "add_ps_becp_r"} <= set(sdfg.arrays), sorted(sdfg.arrays)
+    out = np.zeros(4)
+    member = np.zeros(4)
+    sdfg(out=out, becp_r=member)
+    np.testing.assert_array_equal(member, np.full(4, 2.0))
+    np.testing.assert_array_equal(out, np.full(4, 3.0))
+
+
+def test_module_level_array_of_records_scalar_members(tmp_path):
+    """``co(i) % a`` with ``co`` a static module array of records (an EOS-coefficient table): each scalar member
+    reads as an element of a per-member array ``co_a`` / ``co_b`` with ``co``'s shape and lower bound."""
+    import numpy as np
+
+    src = """
+module coefs
+  type :: coef
+    real(8) :: a, b
+  end type
+  type(coef) :: co(0:3)
+end module coefs
+
+module m
+contains
+  subroutine k(n, x, y)
+    use coefs, only: co
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(n)
+    real(8), intent(out) :: y(n)
+    integer :: i
+    do i = 1, n
+      y(i) = co(mod(i, 4)) % a * x(i) + co(0) % b
+    end do
+  end subroutine
+end module m
+"""
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="k", entry="m::k").build()
+    assert tuple(int(s) for s in sdfg.arrays["co_a"].shape) == (4,)
+    a = np.array([1.0, 2.0, 3.0, 4.0])
+    b = np.array([0.5, 0.0, 0.0, 0.0])
+    x = np.arange(1, 7, dtype=np.float64)
+    y = np.zeros(6)
+    sdfg(n=np.int32(6), x=x, y=y, co_a=a, co_b=b)
+    np.testing.assert_allclose(y, a[np.arange(1, 7) % 4] * x + 0.5)
+
+
+def test_module_level_nested_record_scalar_members_as_loop_bounds(tmp_path):
+    """``DO i = idx % cont % beg, idx % cont % end`` with ``idx`` a module record of records: each scalar leaf lifts
+    to its own symbol ``idx_cont_beg`` / ``idx_cont_end``."""
+    import numpy as np
+
+    src = """
+module eqns
+  type :: bounds_info
+    integer :: beg, end
+  end type
+  type :: eqn_indices
+    type(bounds_info) :: cont, species
+  end type
+  type(eqn_indices) :: idx
+end module eqns
+
+module m
+contains
+  subroutine k(x, out)
+    use eqns, only: idx
+    real(8), intent(in) :: x(8)
+    real(8), intent(out) :: out
+    integer :: i
+    out = 0
+    do i = idx % cont % beg, idx % cont % end
+      out = out + x(i)
+    end do
+  end subroutine
+end module m
+"""
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="k", entry="m::k").build()
+    x = np.arange(1, 9, dtype=np.float64)
+    out = np.zeros(1)
+    sdfg(x=x, out=out, idx_cont_beg=np.int32(2), idx_cont_end=np.int32(5))
+    assert out[0] == 2 + 3 + 4 + 5
+
+
+def test_member_array_element_as_extent(tmp_path):
+    """``ALLOCATE(w(smap % lb(1) : smap % ub(1)))`` with ``smap`` a module record (QE ``fft_type_init``'s sticks
+    map): the extent reads elements of the members ``smap_lb`` / ``smap_ub``, not of the record ``smap``."""
+    import numpy as np
+
+    src = """
+module smapmod
+  type :: sticks
+    integer :: lb(3) = 0
+    integer :: ub(3) = 0
+  end type
+  type(sticks) :: smap
+end module smapmod
+
+module m
+contains
+  subroutine k(out)
+    use smapmod, only: smap
+    real(8), intent(out) :: out
+    real(8), allocatable :: w(:)
+    allocate(w(smap % lb(1) : smap % ub(1)))
+    w = 2
+    out = sum(w)
+    deallocate(w)
+  end subroutine
+end module m
+"""
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="k", entry="m::k").build()
+    assert "smap" not in {str(s) for s in sdfg.free_symbols}
+    out = np.zeros(1)
+    sdfg(out=out, smap_lb=np.array([2, 0, 0], dtype=np.int32), smap_ub=np.array([5, 0, 0], dtype=np.int32))
+    assert out[0] == 8.0
+
+
+def test_member_array_elements_as_loop_bounds_through_a_dummy(tmp_path):
+    """``DO i = smap % lb(1), smap % ub(1)`` in a callee whose ``smap`` dummy is a module record (QE
+    ``get_sticks``): the bounds read elements of the members, not of the record."""
+    import numpy as np
+
+    src = """
+module smapmod
+  type :: sticks
+    integer :: lb(3) = 0
+    integer :: ub(3) = 0
+  end type
+  type(sticks) :: smap_exx
+end module smapmod
+
+module m
+  use smapmod, only: sticks
+contains
+  subroutine fill(smap, out)
+    type(sticks), intent(inout) :: smap
+    real(8), intent(inout) :: out
+    integer :: i, j
+    out = 0
+    do j = smap % lb(2), smap % ub(2)
+      do i = smap % lb(1), smap % ub(1)
+        out = out + 1
+      end do
+    end do
+  end subroutine
+  subroutine k(out)
+    use smapmod, only: smap_exx
+    real(8), intent(out) :: out
+    call fill(smap_exx, out)
+  end subroutine
+end module m
+"""
+    sdfg = build_sdfg(src, tmp_path / "sdfg", name="k", entry="m::k").build()
+    assert "smap_exx" not in {str(s) for s in sdfg.free_symbols}
+    out = np.zeros(1)
+    sdfg(out=out, smap_exx_lb=np.array([2, 1, 0], dtype=np.int32), smap_exx_ub=np.array([5, 3, 0], dtype=np.int32))
+    assert out[0] == 12.0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

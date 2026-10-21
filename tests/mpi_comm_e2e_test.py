@@ -11,26 +11,20 @@ World ranks pair by parity {0<->2, 1<->3}, so expected result is ``world_rank XO
 """
 
 import ctypes
-import shutil
-import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from _util import build_on_root, build_sdfg, have_flang
 from dace_fortran.bindings import (
     FlattenPlan,
     OriginalArg,
     OriginalInterface,
     build_fortran_library,
 )
+from tests._util import build_on_root, build_sdfg
 
-pytestmark = [
-    pytest.mark.mpi,
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("mpif90") is None, reason="mpif90 not on PATH"),
-]
+pytestmark = pytest.mark.mpi
 
 _KERNEL = """
 module sr_usercomm_mod
@@ -78,8 +72,8 @@ end subroutine run_sr
 _IFACE = OriginalInterface(
     entry="sr_usercomm",
     args=(
-        OriginalArg(name="buf", fortran_type="real(c_double)", rank=1, shape=("n", ), intent="inout"),
-        OriginalArg(name="rbuf", fortran_type="real(c_double)", rank=1, shape=("n", ), intent="out"),
+        OriginalArg(name="buf", fortran_type="real(c_double)", rank=1, shape=("n",), intent="inout"),
+        OriginalArg(name="rbuf", fortran_type="real(c_double)", rank=1, shape=("n",), intent="out"),
         OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         OriginalArg(name="dst", fortran_type="integer(c_int)", rank=0, intent="in"),
         OriginalArg(name="src", fortran_type="integer(c_int)", rank=0, intent="in"),
@@ -97,8 +91,7 @@ def test_user_comm_split_send_recv(tmp_path: Path):
     world = MPI.COMM_WORLD
     wrank = world.Get_rank()
     wsize = world.Get_size()
-    if wsize < 4:
-        pytest.skip("user-comm split e2e needs 4 ranks (mpirun --oversubscribe -n 4 ...)")
+    assert wsize >= 4, "user-comm split e2e needs 4 ranks (mpirun --oversubscribe -n 4 ...)"
 
     # Even ranks {0,2} -> one comm, odd {1,3} -> another (size 2 each).
     split = world.Split(color=wrank % 2, key=wrank)
@@ -118,12 +111,9 @@ def test_user_comm_split_send_recv(tmp_path: Path):
         sdfg.compile()
         driver_path = tmp_path / "driver.f90"
         driver_path.write_text(_DRIVER)
-        lib = build_fortran_library(sdfg,
-                                    _IFACE,
-                                    plan,
-                                    str(tmp_path / "lib"),
-                                    name="sr_usercomm",
-                                    extra_sources=[driver_path])
+        lib = build_fortran_library(
+            sdfg, _IFACE, plan, str(tmp_path / "lib"), name="sr_usercomm", extra_sources=[driver_path]
+        )
         return str(lib.so_path)
 
     so_path = build_on_root(world, _build_lib)

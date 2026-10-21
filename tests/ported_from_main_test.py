@@ -4,11 +4,6 @@ Only the short ones so far; allocate-based/PROGRAM-wrapper cases wait on matchin
 """
 
 import numpy as np
-import pytest
-
-from _util import have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 # ---------------------------------------------------------------------------
 # tests/fortran/fortran_loops_test.py  --  simplest nested-loop case.
@@ -44,3 +39,9 @@ end module loop_test_function_mod
 
     validate = np.full((10, 10), 5.0, dtype=np.float64)
     assert np.allclose(c_test, validate)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))
