@@ -76,3 +76,10 @@ def test_a_line_expanded_more_than_once_is_clamped_where_the_subscript_is():
     patched, clamped = clamp_out_of_bounds_constant_subscripts(source, errors)
     assert clamped == 1
     assert "out(1) = c(0, 1)" in patched and "out(2) = c(0, 2)" in patched
+
+
+def test_cpp_directives_and_fypp_markers_before_a_dead_subscript(tmp_path: Path):
+    source = _SOURCE.replace("    if (num_dims > 2)", "#if 0\n    coords(1) = 0\n#endif\n    if (num_dims > 2)")
+    out = dace_fortran.emit_hlfir_from_codebase(entry_source=source, out_path=tmp_path / "mixed.hlfir",
+                                               flang_program=flang_binary())
+    assert "neighbours" in out.read_text()

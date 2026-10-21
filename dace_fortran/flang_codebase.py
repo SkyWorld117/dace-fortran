@@ -665,6 +665,17 @@ def emit_hlfir_from_codebase(
             break
         tu_source, clamped = clamp_out_of_bounds_constant_subscripts(tu_source, check.stderr + check.stdout, str(tu_path))
         if not clamped:
+            # Mixed fypp line markers and surviving CPP conditionals can make the
+            # diagnostic's original location ambiguous. Expand CPP before dropping
+            # its markers so __LINE__/__FILE__ retain their meaning, then retry
+            # against physical TU locations. Never edit the original source files.
+            if (_OUT_OF_BOUNDS_RE.search(check.stderr + check.stdout)
+                    and any(_LINE_MARKER_RE.match(line) for line in tu_source.splitlines())):
+                expanded = subprocess.run([*base, "-E", "-P", str(tu_path)], cwd=str(out_path.parent),
+                                          capture_output=True, text=True, check=True)
+                tu_source = expanded.stdout
+                tu_path.write_text(tu_source)
+                continue
             break
         tu_path.write_text(tu_source)
     # Run flang with ``cwd = out_path.parent`` so its default module
