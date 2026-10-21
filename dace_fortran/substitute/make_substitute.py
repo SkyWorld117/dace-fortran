@@ -487,24 +487,24 @@ def finish_scratch_images(sdfg: dace.SDFG, images: dict[str, dict]) -> None:
 
 def relayout_field_last(sdfg: dace.SDFG, names: list[str], small: int = 16) -> dict[str, tuple]:
     """Lay the transient arrays ``names`` out with their small dimensions (a record's index, a component) slowest:
-    a thread then steps through a field dimension contiguously instead of jumping over every component. Applied
-    to the descriptor and to every nested descriptor connected to it. Returns the new strides per array."""
+    a thread then steps through a field dimension contiguously instead of jumping over every component. A symbolic
+    extent (a grid extent that differs between the ranks of a run) is a field dimension. Applied to the descriptor
+    and to every nested descriptor connected to it, whose SDFG gets the symbols of the new strides. Returns the new
+    strides per array."""
     done = {}
     for name in names:
-        desc = sdfg.arrays[name]
-        try:
-            extents = [int(x) for x in desc.shape]
-        except (TypeError, ValueError):
-            continue  # a symbolic shape: left alone
-        order = [d for d, x in enumerate(extents) if x > small] + [d for d, x in enumerate(extents) if x <= small]
-        if order == list(range(len(extents))):
+        shape = sdfg.arrays[name].shape
+        smalls = [not dace.symbolic.issymbolic(x) and int(x) <= small for x in shape]
+        order = [d for d, s in enumerate(smalls) if not s] + [d for d, s in enumerate(smalls) if s]
+        if order == list(range(len(shape))):
             continue
-        strides = [0] * len(extents)
+        strides = [0] * len(shape)
         stride = 1
         for d in order:
             strides[d] = stride
-            stride *= extents[d]
+            stride *= shape[d]
         new = tuple(strides)
+        used = {str(x) for x in dace.symbolic.free_symbols_and_functions(stride)}
 
         def apply(container: dace.SDFG, array: str) -> None:
             container.arrays[array].strides = new
@@ -515,12 +515,16 @@ def relayout_field_last(sdfg: dace.SDFG, names: list[str], small: int = 16) -> d
                         for e in list(st.in_edges(n)) + list(st.out_edges(n)):
                             conn = e.dst_conn if e.dst is n else e.src_conn
                             if e.data.data == array and conn and conn in n.sdfg.arrays \
-                                    and len(n.sdfg.arrays[conn].shape) == len(extents):
+                                    and len(n.sdfg.arrays[conn].shape) == len(shape):
+                                for sym in used - set(n.sdfg.symbols) - set(n.sdfg.arrays):  # mapped to themselves
+                                    n.sdfg.add_symbol(sym, container.symbols.get(sym, dace.int64))
+                                    n.symbol_mapping.setdefault(sym, dace.symbolic.pystr_to_symbolic(sym))
                                 apply(n.sdfg, conn)
 
         apply(sdfg, name)
         done[name] = new
     return done
+
 
 def body_tasklets(region) -> int:
     """Tasklets in a control-flow region, nested SDFGs included."""
