@@ -719,6 +719,21 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
                                                                  dace.dtypes.StorageType.GPU_Shared):
                         desc.storage = dace.dtypes.StorageType.GPU_Global
 
+    # 2d. Device copies of host scalars the kernels read.
+    #
+    # A kernel reads a host scalar (an argument, or a value a host tasklet computes) as a kernel
+    # argument from a tasklet, but a nested SDFG inside the kernel takes it through a memlet, and
+    # CUDA codegen refuses the host-to-device copy that would mean.  Give each such scalar a
+    # device copy made in the state where the map reads it, after any host write.  AFTER 2/2b/2c:
+    # those steps decide each container's final storage, and AFTER the host-mirror reroute, whose
+    # mirrors are length-1 ARRAYS (`__host_mirror_N`) and so cannot be picked up here (this pass
+    # only looks at `dace.data.Scalar`).  It is a no-op on a graph whose maps read no host scalar.
+    from dace_fortran.device_scalars import device_copies_of_kernel_read_scalars
+    _dev_scalars = device_copies_of_kernel_read_scalars(sdfg)
+    if _dev_scalars:
+        print(f"[dace_fortran.offload] device copy of {len(_dev_scalars)} kernel-read scalar(s): "
+              f"{_dev_scalars}")
+
     # 3. Scheduling validation: at least one GPU map, all GPU maps have device arrays.
     n_gpu = sum(1 for st in sdfg.all_states() for nd in st.nodes()
                 if isinstance(nd, nodes.MapEntry) and nd.schedule == dace.dtypes.ScheduleType.GPU_Device)

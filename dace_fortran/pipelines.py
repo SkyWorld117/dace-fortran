@@ -235,6 +235,16 @@ def optimize(sdfg: SDFG,
     if _fissioned:
         print(f"[dace_fortran.optimize] loop-local scalar fission: {len(_fissioned)} container(s)")
 
+    # The ARRAY analogue of the fission above, BEFORE LoopToMap for the same reason: a work array
+    # several nests share without passing a value through it (`w(0:2)`, one per direction) makes each
+    # nest look shared to LoopToMap and keeps every one of them sequential.  Give each outermost loop
+    # its own copy where the pass can prove no value crosses.  Arrays and scalars are independent, so
+    # the order between the two passes is not semantic; it is measured (A/B), not assumed.
+    from dace_fortran.loop_privatization import privatize_loop_local_arrays
+    _privatized = privatize_loop_local_arrays(sdfg)
+    if _privatized:
+        print(f"[dace_fortran.optimize] loop-local array privatisation: {len(_privatized)} container(s)")
+
     sdfg.apply_transformations_repeated(LoopToMap, validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)
     # FullMapFusion: MapFusionVertical + MapFusionHorizontal run together to a fixed point, not just
