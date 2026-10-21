@@ -3,6 +3,7 @@ stand-in that writes module variables on every call, and a substitute entry that
 binding declines."""
 
 import subprocess
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -209,6 +210,16 @@ _BAKED = [
 def test_baked_values_that_hold_let_the_binding_take_the_call(tmp_path: Path):
     plain, substituted = _with_baked(tmp_path, _BAKED)
     assert substituted != plain  # the binding ran (and did nothing)
+
+
+def test_trace_reports_an_accepted_substitute_once_per_process(tmp_path: Path):
+    _with_baked(tmp_path, _BAKED)
+    env = {**os.environ, "DACE_SUBSTITUTE_TRACE": "1"}
+    run = subprocess.run([str(tmp_path / "run_wrapped")], env=env, capture_output=True, text=True, check=True)
+    assert run.stderr.count("DACE_SUBSTITUTE_ENGAGED step") == 1  # two accepted calls
+    env.pop("DACE_SUBSTITUTE_TRACE")
+    silent = subprocess.run([str(tmp_path / "run_wrapped")], env=env, capture_output=True, text=True, check=True)
+    assert "DACE_SUBSTITUTE_ENGAGED" not in silent.stderr
 
 
 def test_a_baked_value_that_differs_sends_the_call_to_the_original(tmp_path: Path):

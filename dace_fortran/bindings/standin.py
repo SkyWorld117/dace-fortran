@@ -329,7 +329,9 @@ def emit_substitute_entry(
     args = [a.name for a in iface.args]
     original = standin_name("original", iface.entry)
     uses = [f"use {binding_module}, only: {wrapper}"]
-    local = ["logical :: declined", "character(len=120) :: dace_why", "logical, save :: dace_reported = .false."]
+    local = ["logical :: declined", "character(len=120) :: dace_why", "logical, save :: dace_reported = .false.",
+             "logical, save :: dace_trace_reported = .false.", "character(len=1) :: dace_trace",
+             "integer :: dace_trace_status"]
     if refuse_handover:
         local.append("logical, save :: dace_took = .false.")
     body: list[str] = []
@@ -368,6 +370,13 @@ def emit_substitute_entry(
         body += ["if (declined) then", *(f"    {ln}" for ln in refuse), "else", "    dace_took = .true.", "end if"]
     body += [
         *report,
+        "if (.not. declined .and. .not. dace_trace_reported) then",
+        "    call get_environment_variable('DACE_SUBSTITUTE_TRACE', dace_trace, status=dace_trace_status)",
+        "    if (dace_trace_status == 0 .and. dace_trace == '1') then",
+        f"        write(0, '(a)') 'DACE_SUBSTITUTE_ENGAGED {iface.entry}'",
+        "    end if",
+        "    dace_trace_reported = .true.",
+        "end if",
         *_with_arguments(f"if (declined) call {original}", args),
     ]
     lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, local,
