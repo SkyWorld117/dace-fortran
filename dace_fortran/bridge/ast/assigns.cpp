@@ -147,7 +147,11 @@ std::string buildIndexExpr(mlir::Value v, int d) {
   // treats these as transparent; mirror it here.)
   {
     auto cn = def->getName().getStringRef();
-    if ((cn == "arith.extsi" || cn == "arith.extui" || cn == "arith.trunci") && def->getNumOperands() == 1)
+    // ``arith.index_cast`` is the same kind of no-op: the record-major companion (``arr_cm(i * numFields + k)``)
+    // widens a 32-bit Fortran index to ``index`` before the arithmetic, and without this pass-through every
+    // VARIABLE index into a module-level array of records stranded as ``?`` (a constant index never hits it).
+    if ((cn == "arith.extsi" || cn == "arith.extui" || cn == "arith.trunci" || cn == "arith.index_cast") &&
+        def->getNumOperands() == 1)
       return buildIndexExpr(def->getOperand(0), d + 1);
   }
 
@@ -541,9 +545,13 @@ std::string buildIndexExpr(mlir::Value v, int d) {
     return nm == "arith.divsi" ? truncatedDivision(a, b) : floorDivision(a, b);
   }
   // ``MOD(i, k)`` in an index expression (``arr(mod(i,2)+1)``) lowers to ``arith.remsi`` / ``arith.remui``.
-  // ``FtnMod`` is the SDFG's truncated remainder (sign of the dividend), the semantics of Fortran ``MOD``.
+  // Render as Python ``%``: sympy maps it to ``Mod``, which the memlet-subset engine accepts, while a FUNCTION
+  // CALL (``FtnMod(i, k)``) is opaque to it and the subset strands as ``?`` (``co(mod(i, 4)) % a`` on a
+  // module-level record table).  Fortran ``MOD`` truncates toward zero and Python ``%`` floors; they agree for
+  // non-negative operands, which every valid array index is.  Tasklet and condition expressions keep ``FtnMod``
+  // (``buildExpr`` in expressions.cpp), where the C++ printer maps it to the truncated runtime helper.
   if ((nm == "arith.remsi" || nm == "arith.remui") && def->getNumOperands() == 2) {
-    return "FtnMod(" + buildIndexExpr(def->getOperand(0), d + 1) + ", " + buildIndexExpr(def->getOperand(1), d + 1) +
+    return "(" + buildIndexExpr(def->getOperand(0), d + 1) + " % " + buildIndexExpr(def->getOperand(1), d + 1) +
            ")";
   }
 
