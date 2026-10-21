@@ -1056,6 +1056,16 @@ def build_wrapper_tail(
             return f"c_loc({actual})"
         if a.kind is FrozenArgKind.SYMBOL:
             return _symbol_actual(a.sdfg_name, actual)
+        if (a.kind is FrozenArgKind.SCALAR and a.rank == 0 and str(a.dtype) == "bool"):
+            # The outer surface keeps the caller's LOGICAL kind while the C ABI takes the SDFG's ``bool``
+            # (``logical(c_bool)``, by value); passing a 4-byte ``logical`` there is a hard gfortran type
+            # error when caller and wrapper compile as one TU.  ``merge`` converts without branching.
+            outer = next(
+                (o for o in iface.args
+                 if o.name.lower() == (a.fortran_name or a.sdfg_name).lower()), None)
+            ft = (outer.fortran_type or "").lower().replace(" ", "") if outer is not None else ""
+            if ft and ft != "logical(c_bool)":
+                return f"merge(.true._c_bool, .false._c_bool, {actual})"
         return actual
 
     call_args = ",  &\n".join(f"      {_call_actual(a)}" for a in _dace_call_order(frozen, dace_arglist))
