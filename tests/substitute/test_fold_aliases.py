@@ -1,11 +1,18 @@
 """``fold_aliases``: the image of a one-element module array of records folds onto the module array it is, in the
 nested SDFGs too; the frozen signature loses the image.   Run: PYTHONPATH=../../dace:../../dace-fortran pytest"""
 import numpy as np
+import pytest
+
 import dace
 from dace_fortran.bindings.frozen_signature import FrozenArg, FrozenArgKind, FrozenSignature, attach_to_sdfg, \
     get_frozen_signature
 
 from dace_fortran.substitute.fold_aliases import fold_aliases, fold_member_aliases
+
+pytestmark = pytest.mark.skip(
+    reason="``fold_aliases`` calls ``dace.sdfg.dealias``, which this fork has not ported (deferred with the "
+           "OTF/Tile stencil-fusion batch; see merge-analysis-20261021).  The module is here for the substitute "
+           "workflow's next phase, not on the WRF path.")
 
 N = 8
 
