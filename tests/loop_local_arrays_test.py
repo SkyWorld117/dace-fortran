@@ -1,4 +1,4 @@
-"""Arrays private to one loop are placed on the stack (``StorageType.Register(dynamic=True)``)."""
+"""Arrays private to one loop are placed on the stack (``StorageType.Register``, a VLA for a symbolic size)."""
 
 import numpy as np
 import pytest
@@ -26,12 +26,13 @@ end subroutine
 
 def test_a_loop_private_array_is_a_dynamic_register(tmp_path):
     """``row`` is allocated, used and freed inside the ``DO`` body: it becomes a stack VLA of runtime size ``n``,
-    while the signature arrays keep their storage."""
+    while the signature arrays keep their storage.  This fork has no ``is_dynamic_register``: its CPU target
+    declares every ``Register`` array as ``T name[size]``, i.e. a VLA whenever the size is symbolic."""
     sdfg = build_sdfg(_SRC, tmp_path, name="row_scan", entry="row_scan").build()
     loop_private = [
         name
         for name, desc in sdfg.arrays.items()
-        if isinstance(desc, data.Array) and desc.transient and dtypes.is_dynamic_register(desc.storage)
+        if isinstance(desc, data.Array) and desc.transient and desc.storage == dtypes.StorageType.Register
     ]
     assert loop_private, f"no loop-private array was placed on the stack: {sdfg.arrays}"
     assert not any(dtypes.StorageType.Register == sdfg.arrays[name].storage for name in ("a", "total"))

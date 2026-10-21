@@ -152,9 +152,6 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
   // synthetic scalar its statement lowering assigns.
   auto pushBreakSnapshot = [&]() {
     auto condVal = pendingCondOp.getCondition();
-    // Materialises SUM/MINVAL/MAXVAL/PRODUCT in the loop condition into a Reduce lib-node scalar before the
-    // break-check; without it a runtime-extent DO WHILE (MAXVAL(a) > 0) falls to inline-unroll which bails to "?".
-    materialiseCondReductions(condVal, out);
     auto b = buildBoolExpr(condVal, 0);
     if (b.empty() || b == "?") return;
     // An array-element break condition (e.g. rsdnm(i) < tolrsd(i)) can't ride an interstate-edge assignment -- DaCe
@@ -180,6 +177,17 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
   };
   mlir::Operation* snapshotAfter = pendingCondOp ? lastDependencyInBlock(block, pendingCondOp.getCondition()) : nullptr;
   bool snapshotPending = static_cast<bool>(pendingCondOp);
+  // Materialises SUM/MINVAL/MAXVAL/PRODUCT in the loop condition into a Reduce lib-node scalar before the
+  // break-check; without it a runtime-extent DO WHILE (MAXVAL(a) > 0) falls to inline-unroll which bails to "?".
+  // This runs BEFORE the block's ops are walked, unlike the snapshot below: an scf.if the condition depends on is
+  // lowered to statements at its own position, and the expression it yields must already see the materialised scalar
+  // (``if (dby(k) < dthresh * MAXVAL(dby)) exit`` inside the loop's lifted scf.if would otherwise strand the operand as
+  // ``?``).  This is the placement this fork had before the merge, so it cannot change an existing lowering.  The
+  // reduction therefore reads its source before the body runs; that is the condition's value only when the body does
+  // not write the source (the exit-condition shapes seen so far: a read-only array reduced by the EXIT test).  A
+  // body-mutated source would need the Reduce emitted with the snapshot instead, which requires the statements that
+  // read it to resolve the transient through dataflow rather than emission order.
+  if (pendingCondOp) materialiseCondReductions(pendingCondOp.getCondition(), out);
   if (snapshotPending && !snapshotAfter) {
     pushBreakSnapshot();
     snapshotPending = false;

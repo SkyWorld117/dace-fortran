@@ -26,7 +26,7 @@ end subroutine
 
     rng = np.random.default_rng(42)
     mask = np.asfortranarray(rng.random(8) > 0.5)
-    result = np.zeros(1, dtype=np.uint32)
+    result = np.zeros(1, dtype=np.bool_)
     sdfg(mask=mask, result=result, n=8)
     expected = bool(mask.any())
     assert bool(result[0]) == expected, f"ANY({mask.tolist()}) -> {bool(result[0])}, want {expected}"
@@ -46,14 +46,14 @@ end subroutine
     sdfg = build_sdfg(src, tmp_path, name="kernel_all", pipeline="hlfir-propagate-shapes").build()
 
     # All-true case
-    mask_all = np.asfortranarray(np.ones(5, dtype=np.uint32))
-    res_all = np.zeros(1, dtype=np.uint32)
+    mask_all = np.asfortranarray(np.ones(5, dtype=np.bool_))
+    res_all = np.zeros(1, dtype=np.bool_)
     sdfg(mask=mask_all, result=res_all, n=5)
     assert bool(res_all[0]) is True
 
     # One-false case
-    mask_mixed = np.asfortranarray(np.array([True, True, False, True, True], dtype=np.uint32))
-    res_mixed = np.zeros(1, dtype=np.uint32)
+    mask_mixed = np.asfortranarray(np.array([True, True, False, True, True], dtype=np.bool_))
+    res_mixed = np.zeros(1, dtype=np.bool_)
     sdfg(mask=mask_mixed, result=res_mixed, n=5)
     assert bool(res_mixed[0]) is False
 

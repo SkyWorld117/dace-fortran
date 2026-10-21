@@ -268,15 +268,6 @@ END MODULE m
 """
 
 
-@pytest.mark.xfail(
-    strict=False,
-    raises=NotImplementedError,
-    reason="MERGE REGRESSION (integration branch only): the merged bridge's control-flow lowering "
-           "(theirs' evaluateBeforeAssigning + fortranIndexAt, with the symbolic-lower-bound fallback) still "
-           "leaves the MAXVAL operand of a do-loop EXIT condition as a `?` placeholder.  This test passes on "
-           "main and on wrf/colleague-tier1; it must be fixed before the merge reaches main.  The WRF live path "
-           "is checked separately by the producer dry run + one-kernel source diff.",
-)
 def test_maxval_in_do_loop_exit_condition(tmp_path):
     """MAXVAL nested in a do-loop EXIT condition (goto -> scf.if-mediated
     scf.while break) materialises into a Reduce lib-node; the break continuation
