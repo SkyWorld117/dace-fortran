@@ -2368,7 +2368,7 @@ std::vector<VarInfo> extractVariables(mlir::ModuleOp module, std::vector<ValueSy
     }
 
     // Element type string.
-    if (std::string dt = dtypeName(ty, /*logical_as_bool=*/false); !dt.empty())
+    if (std::string dt = dtypeName(ty, /*logical_as_bool=*/v.rank == 0); !dt.empty())
       v.dtype = dt;
     else if (mlir::isa<mlir::ComplexType>(ty)) {
       std::string s;

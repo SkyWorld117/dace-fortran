@@ -70,7 +70,8 @@ def _offload_arch() -> str:
 def test_openmp_offload_binding_runs_the_offloaded_sdfg(tmp_path: Path):
     """``y = a*x + y`` on the GPU through an OpenMP-offload binding matches numpy, and ``x`` is left untouched."""
     amdflang = shutil.which("amdflang")
-    assert amdflang is not None, "the gpu lane needs ROCm's amdflang"
+    if amdflang is None:
+        pytest.skip("needs ROCm's amdflang (run the gpu lane in the agent-mi300 container)")
 
     sdfg = build_sdfg(_KERNEL, tmp_path / "sdfg", name="axpy", entry="kern::axpy").build()
     sdfg.name = "axpy"  # the driver uses axpy_dace_bindings; the test builder suffixes the name per test

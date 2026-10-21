@@ -235,9 +235,12 @@ end subroutine main
 
 
 def test_sympy_function_name_as_local_survives_simplify(tmp_path: Path):
-    """A local called ``denom`` (SymPy's ``denom()``) that an IF tests: the condition is an interstate-edge expression,
-    which DaCe's parser read as SymPy's function ("cannot sympify object of type function") while only the listed
-    names were renamed.  A local is renamed whenever the parser misreads it; the caller never sees its name."""
+    """A local called ``denom`` that an IF tests: the condition is an interstate-edge expression.
+
+    DaCe's parser reads ``denom`` as a plain SYMBOL in this fork (its eval namespace does not expose
+    ``sympy.denom``), so nothing is misread and the local keeps its name -- what matters is that the
+    condition computes the same values as Fortran, checked below.  A name the parser DOES misread is
+    renamed instead (``test_names_the_symbolic_parser_misreads``)."""
     src = """
 subroutine main(n, a, b)
   implicit none
@@ -262,14 +265,20 @@ end subroutine main
     b = np.zeros(4)
     sdfg(n=4, a=a, b=b)
     np.testing.assert_allclose(b, [0.0, 1.0, 0.5, 0.0])
-    assert "denom" not in sdfg.arrays and "denom" not in sdfg.symbols
+    # Not renamed here (no collision), so the local is still a transient -- and still not a
+    # free symbol leaking out of the SDFG.
+    assert "denom" not in sdfg.symbols
 
 
 def test_names_the_symbolic_parser_misreads():
-    """SymPy's functions, classes and constants and Python's builtins are misread; plain identifiers are not."""
+    """A name the parser resolves to something other than a symbol of that name is a hazard (the builder
+    renames it); a plain identifier is not.  WHICH names are hazards is a property of the parser's eval
+    namespace, not a fixed list: this fork exposes only ``nan`` and ``iter`` among the ones this test used
+    to name, and parses ``denom`` / ``sign`` / ``exp`` / ``field`` / ``test`` as plain symbols."""
     from dace_fortran.builder import misread_by_symbolic_parser
 
-    for name in ("denom", "sign", "exp", "field", "nan", "test", "iter"):
+    for name in ("nan", "iter"):
         assert misread_by_symbolic_parser(name), name
-    for name in ("q_cons_vf", "i", "n", "x1", "program_denom", "_loop_it_3"):
+    for name in ("q_cons_vf", "i", "n", "x1", "program_denom", "_loop_it_3", "denom", "sign", "exp", "field",
+                 "test"):
         assert not misread_by_symbolic_parser(name), name

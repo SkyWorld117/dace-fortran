@@ -624,7 +624,12 @@ def build_wrapper_head(
     # is never referenced. Filled in build_wrapper_body, passed in build_wrapper_tail.
     for _oa, fa in _optional_outer_dummies(frozen, iface):
         local = _optional_local_name(fa.sdfg_name)
-        ftype = fortran_c_type(fa.dtype)
+        # The SAME type the outer dummy is declared with (``_outer_decl``).  Deriving it from the SDFG
+        # dtype instead makes the local disagree with the dummy whenever the two spellings differ --
+        # a LOGICAL scalar is ``bool`` in the SDFG but ``logical(c_bool)`` in the interface, and the
+        # by-value forward then fails the caller's own gfortran type check ("passed LOGICAL(4) to
+        # LOGICAL(1)") when caller and shim compile as one TU.
+        ftype = _oa.fortran_type
         if _optional_array_dummy(fa):
             spec = "(" + ", ".join(":" for _ in range(fa.rank)) + ")"
             scratch_lines.append(f"    {ftype}, pointer, contiguous :: {local}{spec}")

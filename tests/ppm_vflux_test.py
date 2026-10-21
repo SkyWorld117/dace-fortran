@@ -72,7 +72,9 @@ subroutine run_ppm_binding(np, nz, tracer, w, dtime, vlt, ct, cih, {margs}, flux
   use upwind_vflux_ppm_dace_bindings, only: upwind_vflux_ppm_dace, upwind_vflux_ppm_dace_finalize
   implicit none
 {common}
-  call upwind_vflux_ppm_dace(tracer, w, dtime, vlt, ct, cih, ppmcoeffs, flux, si, ei, nlev, .false.)
+  ! The generated binding's LOGICAL scalars are ``bool`` in the SDFG, which the interface spells
+  ! ``logical(c_bool)``; a default-kind ``.false.`` is a LOGICAL(4) and Fortran rejects the call.
+  call upwind_vflux_ppm_dace(tracer, w, dtime, vlt, ct, cih, ppmcoeffs, flux, si, ei, nlev, .false._c_bool)
   call upwind_vflux_ppm_dace_finalize()
 end subroutine run_ppm_binding
 
