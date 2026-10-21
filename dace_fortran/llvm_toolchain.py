@@ -25,6 +25,23 @@ _UNVERSIONED = ("flang-new", "flang")
 _FLANG_VERSION_RE = re.compile(r"flang(?:-new)? version (\d+)")
 
 
+def build_parallelism() -> int:
+    """Bridge build jobs within the CPU affinity, Slurm allocation and CMake's requested limit.
+
+    Limit an unconfigured build to 32 jobs. Explicit limits must be positive integers;
+    an invalid allocation must fail before CMake starts rather than launch an unbounded build.
+    """
+    available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    limits = [32, available]
+    for name in ("CMAKE_BUILD_PARALLEL_LEVEL", "SLURM_CPUS_PER_TASK"):
+        value = os.environ.get(name)
+        if value is not None:
+            if not value.isdecimal() or int(value) < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            limits.append(int(value))
+    return min(limits)
+
+
 def requested_version() -> str:
     """The LLVM major pinned by ``$LLVM_VERSION``, or ``''`` to auto-detect."""
     return os.environ.get("LLVM_VERSION", "").strip()

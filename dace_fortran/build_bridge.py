@@ -21,6 +21,7 @@ from types import ModuleType
 
 from dace_fortran.llvm_toolchain import (
     SUPPORTED_LLVM_VERSIONS,
+    build_parallelism,
     candidate_versions,
     find_flang,
     llvm_prefix,
@@ -294,7 +295,7 @@ def build(clean: bool = False, verbose: bool = True) -> None:
 
     _BUILD_DIR.mkdir(exist_ok=True)
 
-    nproc = os.cpu_count() or 4
+    nproc = build_parallelism()
 
     # --- cmake configure ---
     cmake_args = [
