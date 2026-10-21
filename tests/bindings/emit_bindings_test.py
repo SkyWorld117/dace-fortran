@@ -5,6 +5,8 @@ Asserts on Fortran shapes present/absent (zero-copy); no compile-and-run here.
 
 from pathlib import Path
 
+import pytest
+
 from dace_fortran.bindings import (
     FlattenEntry,
     FlattenPlan,
@@ -15,6 +17,7 @@ from dace_fortran.bindings import (
     OriginalInterface,
     emit_bindings,
 )
+from dace_fortran.bindings.frozen_signature import FrozenArgKind
 
 # --------------------------------------------------------------------------
 # Fixtures
@@ -27,52 +30,66 @@ def _two_real_array_parts():
         entry="kernel",
         mangled="_QPkernel",
         args=(
-            FrozenArg(fortran_name="a",
-                      sdfg_name="fld_a",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout",
-                      from_struct_member="fld%a",
-                      layout="same"),
-            FrozenArg(fortran_name="b",
-                      sdfg_name="fld_b",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout",
-                      from_struct_member="fld%b",
-                      layout="same"),
+            FrozenArg(
+                fortran_name="a",
+                sdfg_name="fld_a",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+                from_struct_member="fld%a",
+            ),
+            FrozenArg(
+                fortran_name="b",
+                sdfg_name="fld_b",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+                from_struct_member="fld%b",
+            ),
         ),
         free_symbols=("m", "n"),
     )
     iface = OriginalInterface(
         entry="kernel",
-        args=(OriginalArg(name="fld", fortran_type="type(t_fields)", rank=0, intent="inout", struct_type="t_fields"),
-              OriginalArg(name="n", fortran_type="integer(c_int)", rank=0,
-                          intent="in"), OriginalArg(name="m", fortran_type="integer(c_int)", rank=0, intent="in")),
-        used_modules={"mo_fields": ("t_fields", )},
+        args=(
+            OriginalArg(name="fld", fortran_type="type(t_fields)", rank=0, intent="inout", struct_type="t_fields"),
+            OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
+            OriginalArg(name="m", fortran_type="integer(c_int)", rank=0, intent="in"),
+        ),
+        used_modules={"mo_fields": ("t_fields",)},
     )
-    plan = FlattenPlan(entries=(
-        FlattenEntry(outer_expr="fld%a",
-                     outer_type="real(c_double)",
-                     writeback_intent="inout",
-                     recipe=FlattenRecipe(flat_names=("fld_a", ),
-                                          read_exprs=("fld%a($i1, $i2)", ),
-                                          rank=2,
-                                          shape_exprs=("size(fld%a, dim=1)", "size(fld%a, dim=2)"),
-                                          aliasable=True)),
-        FlattenEntry(outer_expr="fld%b",
-                     outer_type="real(c_double)",
-                     writeback_intent="inout",
-                     recipe=FlattenRecipe(flat_names=("fld_b", ),
-                                          read_exprs=("fld%b($i1, $i2)", ),
-                                          rank=2,
-                                          shape_exprs=("size(fld%b, dim=1)", "size(fld%b, dim=2)"),
-                                          aliasable=True)),
-    ))
+    plan = FlattenPlan(
+        entries=(
+            FlattenEntry(
+                outer_expr="fld%a",
+                outer_type="real(c_double)",
+                writeback_intent="inout",
+                recipe=FlattenRecipe(
+                    flat_names=("fld_a",),
+                    read_exprs=("fld%a($i1, $i2)",),
+                    rank=2,
+                    shape_exprs=("size(fld%a, dim=1)", "size(fld%a, dim=2)"),
+                    aliasable=True,
+                ),
+            ),
+            FlattenEntry(
+                outer_expr="fld%b",
+                outer_type="real(c_double)",
+                writeback_intent="inout",
+                recipe=FlattenRecipe(
+                    flat_names=("fld_b",),
+                    read_exprs=("fld%b($i1, $i2)",),
+                    rank=2,
+                    shape_exprs=("size(fld%b, dim=1)", "size(fld%b, dim=2)"),
+                    aliasable=True,
+                ),
+            ),
+        )
+    )
     return frozen, iface, plan
 
 
@@ -90,56 +107,74 @@ def _complex_split_struct(tmp_path: Path) -> str:
         entry="kernel",
         mangled="_QPkernel",
         args=(
-            FrozenArg(fortran_name="z_re",
-                      sdfg_name="st_z_re",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout"),
-            FrozenArg(fortran_name="z_im",
-                      sdfg_name="st_z_im",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout"),
-            FrozenArg(fortran_name="u",
-                      sdfg_name="st_u",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout"),
+            FrozenArg(
+                fortran_name="z_re",
+                sdfg_name="st_z_re",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+            ),
+            FrozenArg(
+                fortran_name="z_im",
+                sdfg_name="st_z_im",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+            ),
+            FrozenArg(
+                fortran_name="u",
+                sdfg_name="st_u",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+            ),
         ),
         free_symbols=("m", "n"),
     )
     iface = OriginalInterface(
         entry="kernel",
-        args=(OriginalArg(name="st", fortran_type="type(t_state)", rank=0, intent="inout", struct_type="t_state"),
-              OriginalArg(name="n", fortran_type="integer(c_int)", rank=0,
-                          intent="in"), OriginalArg(name="m", fortran_type="integer(c_int)", rank=0, intent="in")),
-        used_modules={"mo_state": ("t_state", )},
+        args=(
+            OriginalArg(name="st", fortran_type="type(t_state)", rank=0, intent="inout", struct_type="t_state"),
+            OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
+            OriginalArg(name="m", fortran_type="integer(c_int)", rank=0, intent="in"),
+        ),
+        used_modules={"mo_state": ("t_state",)},
     )
-    plan = FlattenPlan(entries=(
-        FlattenEntry(outer_expr="st%z",
-                     outer_type="complex(c_double)",
-                     writeback_intent="inout",
-                     recipe=FlattenRecipe(flat_names=("st_z_re", "st_z_im"),
-                                          read_exprs=("real(st%z($i1,$i2), kind=c_double)", "aimag(st%z($i1,$i2))"),
-                                          write_expr="cmplx(st_z_re($i1,$i2), st_z_im($i1,$i2), kind=c_double)",
-                                          rank=2,
-                                          shape_exprs=("size(st%z, dim=1)", "size(st%z, dim=2)"),
-                                          aliasable=False)),
-        FlattenEntry(outer_expr="st%u",
-                     outer_type="real(c_double)",
-                     writeback_intent="inout",
-                     recipe=FlattenRecipe(flat_names=("st_u", ),
-                                          read_exprs=("st%u($i1, $i2)", ),
-                                          rank=2,
-                                          shape_exprs=("size(st%u, dim=1)", "size(st%u, dim=2)"),
-                                          aliasable=True)),
-    ))
+    plan = FlattenPlan(
+        entries=(
+            FlattenEntry(
+                outer_expr="st%z",
+                outer_type="complex(c_double)",
+                writeback_intent="inout",
+                recipe=FlattenRecipe(
+                    flat_names=("st_z_re", "st_z_im"),
+                    read_exprs=("real(st%z($i1,$i2), kind=c_double)", "aimag(st%z($i1,$i2))"),
+                    write_expr="cmplx(st_z_re($i1,$i2), st_z_im($i1,$i2), kind=c_double)",
+                    rank=2,
+                    shape_exprs=("size(st%z, dim=1)", "size(st%z, dim=2)"),
+                    aliasable=False,
+                ),
+            ),
+            FlattenEntry(
+                outer_expr="st%u",
+                outer_type="real(c_double)",
+                writeback_intent="inout",
+                recipe=FlattenRecipe(
+                    flat_names=("st_u",),
+                    read_exprs=("st%u($i1, $i2)",),
+                    rank=2,
+                    shape_exprs=("size(st%u, dim=1)", "size(st%u, dim=2)"),
+                    aliasable=True,
+                ),
+            ),
+        )
+    )
     out = tmp_path / "kernel_bindings.f90"
     emit_bindings(frozen, iface, plan, str(out))
     return out.read_text()
@@ -151,48 +186,64 @@ def _nested_struct(tmp_path: Path) -> str:
         entry="kernel",
         mangled="_QPkernel",
         args=(
-            FrozenArg(fortran_name="a_v",
-                      sdfg_name="st_a_v",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout"),
-            FrozenArg(fortran_name="b_v",
-                      sdfg_name="st_b_v",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout"),
+            FrozenArg(
+                fortran_name="a_v",
+                sdfg_name="st_a_v",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+            ),
+            FrozenArg(
+                fortran_name="b_v",
+                sdfg_name="st_b_v",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+            ),
         ),
         free_symbols=("m", "n"),
     )
     iface = OriginalInterface(
         entry="kernel",
-        args=(OriginalArg(name="st", fortran_type="type(t_outer)", rank=0, intent="inout", struct_type="t_outer"),
-              OriginalArg(name="n", fortran_type="integer(c_int)", rank=0,
-                          intent="in"), OriginalArg(name="m", fortran_type="integer(c_int)", rank=0, intent="in")),
-        used_modules={"mo_types": ("t_outer", )},
+        args=(
+            OriginalArg(name="st", fortran_type="type(t_outer)", rank=0, intent="inout", struct_type="t_outer"),
+            OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
+            OriginalArg(name="m", fortran_type="integer(c_int)", rank=0, intent="in"),
+        ),
+        used_modules={"mo_types": ("t_outer",)},
     )
-    plan = FlattenPlan(entries=(
-        FlattenEntry(outer_expr="st%a%v",
-                     outer_type="real(c_double)",
-                     writeback_intent="inout",
-                     recipe=FlattenRecipe(flat_names=("st_a_v", ),
-                                          read_exprs=("st%a%v($i1, $i2)", ),
-                                          rank=2,
-                                          shape_exprs=("size(st%a%v, dim=1)", "size(st%a%v, dim=2)"),
-                                          aliasable=True)),
-        FlattenEntry(outer_expr="st%b%v",
-                     outer_type="real(c_double)",
-                     writeback_intent="inout",
-                     recipe=FlattenRecipe(flat_names=("st_b_v", ),
-                                          read_exprs=("st%b%v($i1, $i2)", ),
-                                          rank=2,
-                                          shape_exprs=("size(st%b%v, dim=1)", "size(st%b%v, dim=2)"),
-                                          aliasable=True)),
-    ))
+    plan = FlattenPlan(
+        entries=(
+            FlattenEntry(
+                outer_expr="st%a%v",
+                outer_type="real(c_double)",
+                writeback_intent="inout",
+                recipe=FlattenRecipe(
+                    flat_names=("st_a_v",),
+                    read_exprs=("st%a%v($i1, $i2)",),
+                    rank=2,
+                    shape_exprs=("size(st%a%v, dim=1)", "size(st%a%v, dim=2)"),
+                    aliasable=True,
+                ),
+            ),
+            FlattenEntry(
+                outer_expr="st%b%v",
+                outer_type="real(c_double)",
+                writeback_intent="inout",
+                recipe=FlattenRecipe(
+                    flat_names=("st_b_v",),
+                    read_exprs=("st%b%v($i1, $i2)",),
+                    rank=2,
+                    shape_exprs=("size(st%b%v, dim=1)", "size(st%b%v, dim=2)"),
+                    aliasable=True,
+                ),
+            ),
+        )
+    )
     out = tmp_path / "kernel_bindings.f90"
     emit_bindings(frozen, iface, plan, str(out))
     return out.read_text()
@@ -201,6 +252,41 @@ def _nested_struct(tmp_path: Path) -> str:
 # --------------------------------------------------------------------------
 # Two-real-array struct  --  zero-copy guarantee
 # --------------------------------------------------------------------------
+
+
+def test_fold_long_lines_keeps_lines_within_the_standard_limit():
+    """A long ``use ..., only:`` list is continued after commas outside string literals; the statement is unchanged."""
+    from dace_fortran.bindings.block_builders import FORTRAN_LINE_LIMIT, fold_long_lines
+
+    renames = ", ".join(f"v{i}__mod => v{i}" for i in range(80))
+    src = f"  use m_globals, only: {renames}\n  print *, 'a, b, c'\n"
+    folded = fold_long_lines(src)
+    assert all(len(line) <= FORTRAN_LINE_LIMIT for line in folded.split("\n"))
+    assert folded.split("\n")[0].endswith(", &")
+    assert " ".join(folded.replace("&\n", " ").split()) == " ".join(src.split())
+    # A comma inside a string literal is no place to break, so a short line with one is left alone.
+    assert "  print *, 'a, b, c'" in folded.split("\n")
+
+
+def test_fold_long_lines_without_a_comma_in_reach():
+    """A statement whose first comma lies past the limit (a guard over a member of a member of an array of records)
+    is continued after an opening parenthesis or at a blank instead; the statement is unchanged."""
+    from dace_fortran.bindings.block_builders import FORTRAN_LINE_LIMIT, fold_long_lines
+
+    x = "records_with_long_names(rec_index_i0)%fields(member_index_i1)%data"
+    stmt = (
+        f"if (size({x}) > 0) call add_range(ranges, nranges, 2, storage_size({x}) / 8, "
+        f"int([loc({x}(lbound({x}, 1), lbound({x}, 2))), loc({x}(min(lbound({x}, 1) + 1, ubound({x}, 1))))], "
+        "c_intptr_t), [size(x, 1, kind=c_intptr_t)])"
+    )
+    src = f"        {stmt}\n  print *, 'no break (here)'\n"
+    folded = fold_long_lines(src)
+    lines = folded.split("\n")
+    assert all(len(line) <= FORTRAN_LINE_LIMIT for line in lines)
+    assert all(line.endswith(" &") for line in lines[: lines.index("  print *, 'no break (here)'") - 1])
+    assert " ".join(folded.replace("&\n", " ").split()).replace("( ", "(").replace("[ ", "[") == " ".join(
+        src.split()
+    )
 
 
 def test_two_real_array_struct_all_aliased(tmp_path: Path):
@@ -284,154 +370,72 @@ def test_nested_struct_no_copy_overhead(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------
-# LOGICAL -> logical(c_bool) bridge
+# LOGICAL: the SDFG works on the caller's storage
 # --------------------------------------------------------------------------
 
 
-def _logical_array_kernel(tmp_path: Path) -> str:
-    """Kernel with a top-level LOGICAL array dummy. Post LOGICAL-to-bool migration
-    the SDFG sees np.bool_ (1 byte) while the Fortran type stays LOGICAL (4 bytes);
-    wrapper bridges via a logical(c_bool) scratch buffer + intrinsic-cast copy."""
+def _logical_kernel(tmp_path: Path, fortran_outer_type: str, dtype: str) -> str:
+    """Bindings for ``kernel(flag, n)`` with an intent(inout) LOGICAL array ``flag`` of the given Fortran type."""
     frozen = FrozenSignature(
         entry="kernel",
         mangled="_QPkernel",
-        args=(FrozenArg(fortran_name="mask",
-                        sdfg_name="mask",
-                        kind="array",
-                        dtype="bool",
-                        rank=1,
-                        shape=("n", ),
-                        intent="inout",
-                        from_struct_member="",
-                        layout="same"),
-              FrozenArg(fortran_name="n",
-                        sdfg_name="n",
-                        kind="symbol",
-                        dtype="int32",
-                        rank=0,
-                        shape=(),
-                        intent="in",
-                        from_struct_member="",
-                        layout="same")),
-        free_symbols=("n", ),
+        args=(
+            FrozenArg(
+                fortran_name="flag",
+                sdfg_name="flag",
+                kind=FrozenArgKind.ARRAY,
+                dtype=dtype,
+                rank=1,
+                shape=("n",),
+                intent="inout",
+                from_struct_member="",
+            ),
+            FrozenArg(
+                fortran_name="n",
+                sdfg_name="n",
+                kind=FrozenArgKind.SYMBOL,
+                dtype="int32",
+                rank=0,
+                shape=(),
+                intent="in",
+                from_struct_member="",
+            ),
+        ),
+        free_symbols=("n",),
     )
     iface = OriginalInterface(
         entry="kernel",
-        args=(OriginalArg(name="mask", fortran_type="logical", rank=1, shape=("n", ),
-                          intent="inout"), OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in")),
+        args=(
+            OriginalArg(name="flag", fortran_type=fortran_outer_type, rank=1, shape=("n",), intent="inout"),
+            OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
+        ),
     )
-    plan = FlattenPlan(entries=())
     out = tmp_path / "kernel_bindings.f90"
-    emit_bindings(frozen, iface, plan, str(out))
+    emit_bindings(frozen, iface, FlattenPlan(entries=()), str(out))
     return out.read_text()
 
 
-def test_logical_array_emits_cbool_scratch(tmp_path: Path):
-    """Wrapper declares a logical(c_bool), allocatable, target scratch buffer whenever the outer LOGICAL dummy isn't already c_bool."""
-    src = _logical_array_kernel(tmp_path)
-    assert "logical(c_bool), allocatable, target :: mask_cbool(:)" in src
+@pytest.mark.parametrize(
+    "fortran_type, dtype",
+    [
+        ("logical", "uint32"),
+        ("logical(1)", "uint8"),
+        ("logical(2)", "uint16"),
+        ("logical(4)", "uint32"),
+        ("logical(8)", "uint64"),
+        ("logical(c_bool)", "uint8"),
+    ],
+)
+def test_logical_array_passes_caller_storage(tmp_path: Path, fortran_type: str, dtype: str):
+    """Every LOGICAL kind reaches the SDFG as the caller's own buffer: no scratch, no copy in or out."""
+    src = _logical_kernel(tmp_path, fortran_type, dtype)
+    call_block = src[src.index("call dace_program_kernel") :]
+    assert "c_loc(flag)" in call_block
+    assert "allocate(" not in src
+    assert "flag =" not in src
 
 
-def test_logical_array_emits_intrinsic_cast_on_entry(tmp_path: Path):
-    """Wrapper copies outer dummy into scratch via Fortran intrinsic LOGICAL-kind-conversion (whole-array assign)."""
-    src = _logical_array_kernel(tmp_path)
-    assert "allocate(mask_cbool(size(mask, dim=1)))" in src
-    assert "mask_cbool = mask" in src
+if __name__ == "__main__":
+    import pytest
 
-
-def test_logical_array_passes_scratch_to_sdfg(tmp_path: Path):
-    """SDFG-call args use the scratch name, not the outer dummy -- passing outer would corrupt every element."""
-    src = _logical_array_kernel(tmp_path)
-    # call line must reference mask_cbool, not bare mask
-    call_block = src[src.index("call dace_program_kernel"):]
-    assert "mask_cbool" in call_block.splitlines()[1] or any("mask_cbool" in l for l in call_block.splitlines()[:6])
-
-
-def test_logical_array_emits_intrinsic_cast_on_exit(tmp_path: Path):
-    """intent(inout): wrapper copies scratch back into outer dummy after the SDFG call, then deallocates."""
-    src = _logical_array_kernel(tmp_path)
-    assert "mask = mask_cbool" in src
-    assert "deallocate(mask_cbool)" in src
-
-
-# --------------------------------------------------------------------------
-# Per-kind LOGICAL(N) bridge coverage
-# --------------------------------------------------------------------------
-# SDFG storage is always 1-byte bool (c_bool ABI); Fortran LOGICAL kinds
-# 1/2/4/8 all need the scratch-buffer bridge except logical(c_bool) itself.
-
-
-def _logical_kernel_with_outer_type(tmp_path: Path, fortran_outer_type: str, arr_name: str = "flag") -> str:
-    """Same as _logical_array_kernel but with outer Fortran type configurable per LOGICAL kind."""
-    frozen = FrozenSignature(
-        entry="kernel",
-        mangled="_QPkernel",
-        args=(FrozenArg(fortran_name=arr_name,
-                        sdfg_name=arr_name,
-                        kind="array",
-                        dtype="bool",
-                        rank=1,
-                        shape=("n", ),
-                        intent="inout",
-                        from_struct_member="",
-                        layout="same"),
-              FrozenArg(fortran_name="n",
-                        sdfg_name="n",
-                        kind="symbol",
-                        dtype="int32",
-                        rank=0,
-                        shape=(),
-                        intent="in",
-                        from_struct_member="",
-                        layout="same")),
-        free_symbols=("n", ),
-    )
-    iface = OriginalInterface(
-        entry="kernel",
-        args=(OriginalArg(name=arr_name, fortran_type=fortran_outer_type, rank=1, shape=("n", ),
-                          intent="inout"), OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in")),
-    )
-    plan = FlattenPlan(entries=())
-    out = tmp_path / "kernel_bindings.f90"
-    emit_bindings(frozen, iface, plan, str(out))
-    return out.read_text()
-
-
-def test_logical_kind_1_emits_bridge(tmp_path: Path):
-    """LOGICAL(KIND=1): byte width matches c_bool, but Fortran treats it as a distinct kind -- wrapper still bridges."""
-    src = _logical_kernel_with_outer_type(tmp_path, "logical(1)")
-    assert "logical(c_bool), allocatable, target :: flag_cbool(:)" in src
-    assert "flag_cbool = flag" in src
-    assert "flag = flag_cbool" in src
-    assert "deallocate(flag_cbool)" in src
-
-
-def test_logical_kind_2_emits_bridge(tmp_path: Path):
-    """``LOGICAL(KIND=2)``  --  2-byte storage, must bridge."""
-    src = _logical_kernel_with_outer_type(tmp_path, "logical(2)")
-    assert "logical(c_bool), allocatable, target :: flag_cbool(:)" in src
-    assert "flag_cbool = flag" in src
-    assert "flag = flag_cbool" in src
-
-
-def test_logical_kind_4_emits_bridge(tmp_path: Path):
-    """LOGICAL(KIND=4): default kind, 4 bytes -- most ICON code lands here; the bridge is the hot path."""
-    src = _logical_kernel_with_outer_type(tmp_path, "logical(4)")
-    assert "logical(c_bool), allocatable, target :: flag_cbool(:)" in src
-    assert "flag_cbool = flag" in src
-    assert "flag = flag_cbool" in src
-
-
-def test_logical_kind_8_emits_bridge(tmp_path: Path):
-    """``LOGICAL(KIND=8)``  --  8-byte storage, must bridge."""
-    src = _logical_kernel_with_outer_type(tmp_path, "logical(8)")
-    assert "logical(c_bool), allocatable, target :: flag_cbool(:)" in src
-    assert "flag_cbool = flag" in src
-    assert "flag = flag_cbool" in src
-
-
-def test_logical_cbool_passes_through_no_bridge(tmp_path: Path):
-    """logical(c_bool) already matches SDFG bool layout -- no scratch, no cast, outer dummy passes straight through."""
-    src = _logical_kernel_with_outer_type(tmp_path, "logical(c_bool)")
-    assert "_cbool" not in src.replace("logical(c_bool)", "")
-    assert "flag_cbool" not in src
+    raise SystemExit(pytest.main([__file__]))

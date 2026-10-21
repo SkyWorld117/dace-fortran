@@ -38,12 +38,15 @@ void registerAllBridgePasses() {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createSplitAoRDummiesPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createEliminateDoubleBufferTogglePass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createDefaultIntentPass(); });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createRestoreCountedLoopsPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createVerifyNoUnresolvedCallsPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createFoldElementAliasesPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createFoldCopyInOutPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createDropStubCallsPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createExpandVectorSubscriptGatherPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createExpandVectorSubscriptScatterPass(); });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createMaterialiseArrayConstructorsPass(); });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createSinkScalarStoresPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createRejectPolymorphismPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createRewritePointerAssignsPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createRewriteSequenceAssociationPass(); });
@@ -61,6 +64,7 @@ void registerAllBridgePasses() {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createFoldAssumedRankQueriesPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createPruneNeverAllocatedMemberDerefPass(); });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createFoldConstantScalarsPass(); });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> { return createSpecializeGlobalsPass(); });
   // Flang's polymorphic-op conversion: statically devirtualises
   // ``fir.dispatch`` / ``fir.select_type`` ops whose target is
   // resolvable at compile time.  Run BEFORE

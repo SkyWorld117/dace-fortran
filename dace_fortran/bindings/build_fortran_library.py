@@ -9,20 +9,60 @@ verify it still matches the ``FrozenSignature`` snapshot (raises
 ``<entry>_bindings.f90`` wrapper, then gfortran-link it with the
 kernel ``.so`` and any extra sources into one shared library.
 """
+
+from __future__ import annotations
+
 import ctypes
 import re
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
-from typing import List, Sequence
+from typing import TYPE_CHECKING
 
+from dace_fortran.bindings.acc_transfers import Directive
 from dace_fortran.bindings.bind_c_shim import emit_bind_c_shim
 from dace_fortran.bindings.emit_bindings import emit_bindings
 from dace_fortran.bindings.flatten_plan import FlattenPlan
 from dace_fortran.bindings.fortran_interface import OriginalInterface, build_auto_interface
+from dace_fortran.bindings.frozen_signature import get_frozen_signature
+from dace_fortran.bindings.specialization import Specialization
 
-#: Mandatory flags -- a shared, position-independent, long-line module.
-_SHARED_FLAGS = ("-shared", "-fPIC", "-ffree-line-length-none")
+if TYPE_CHECKING:
+    from dace import SDFG
+
+
+class CompilerFamily(Enum):
+    """The flag dialect of a Fortran compiler."""
+
+    GNU = auto()  # gfortran
+    LLVM = auto()  # flang, ROCm amdflang
+
+
+@dataclass(frozen=True, slots=True)
+class FortranCompiler:
+    """The compiler that builds the binding library, and the flag dialect it speaks."""
+
+    executable: str
+    family: CompilerFamily
+
+
+GFORTRAN = FortranCompiler("gfortran", CompilerFamily.GNU)
+
+
+class BuildMode(Enum):
+    """Optimisation flags of the binding library: bit-reproducible, or fast."""
+
+    DEBUG = auto()
+    RELEASE = auto()
+
+
+#: Mandatory flags besides ``-shared`` -- position-independent, long-line sources (flang has no line limit to lift).
+_SOURCE_FLAGS = {
+    CompilerFamily.GNU: ("-fPIC", "-ffree-line-length-none"),
+    CompilerFamily.LLVM: ("-fPIC",),
+}
 
 #: True when a source line is a module-level variable declaration carrying
 #: ALLOCATABLE (i.e. a deferred-shape array) without a TARGET attribute.
@@ -32,7 +72,9 @@ _ALLOCATABLE_RE = re.compile(r"\bALLOCATABLE\b", re.IGNORECASE)
 _POINTER_RE = re.compile(r"\bPOINTER\b", re.IGNORECASE)
 _NON_VAR_RE = re.compile(
     r"^\s*(?:TYPE|INTERFACE|ABSTRACT\s+INTERFACE|PROCEDURE|MODULE\s+PROCEDURE|"
-    r"SUBROUTINE|FUNCTION|END\b)", re.IGNORECASE)
+    r"SUBROUTINE|FUNCTION|END\b)",
+    re.IGNORECASE,
+)
 
 _TYPE_DEF_START_RE = re.compile(r"^\s*TYPE\b(?:\s+[A-Za-z_]\w*|\s*(?:,|::))", re.IGNORECASE)
 _END_TYPE_RE = re.compile(r"^\s*END\s*TYPE\b", re.IGNORECASE)
@@ -55,9 +97,8 @@ def _ensure_target_on_module_deferred_arrays(text: str) -> str:
     in_module = False
     in_spec = True
     in_type = False
-    out: List[str] = []
+    out: list[str] = []
     for raw in lines:
-        stripped = raw.strip()
         if re.match(r"^\s*MODULE\s+\w+", raw, re.IGNORECASE):
             in_module = True
             in_spec = True
@@ -73,9 +114,16 @@ def _ensure_target_on_module_deferred_arrays(text: str) -> str:
             in_type = True
         elif in_type and _END_TYPE_RE.match(raw):
             in_type = False
-        elif in_spec and not in_type and _DECL_TYPE_RE.match(raw) and _ALLOCATABLE_RE.search(raw) \
-                and not _POINTER_RE.search(raw) and not _TARGET_RE.search(raw) and "::" in raw \
-                and not _NON_VAR_RE.match(raw):
+        elif (
+            in_spec
+            and not in_type
+            and _DECL_TYPE_RE.match(raw)
+            and _ALLOCATABLE_RE.search(raw)
+            and not _POINTER_RE.search(raw)
+            and not _TARGET_RE.search(raw)
+            and "::" in raw
+            and not _NON_VAR_RE.match(raw)
+        ):
             # Insert TARGET right before the first :: on the line.
             raw = re.sub(r"(\S)(\s*)(::)", r"\1, target\2\3", raw, count=1)
         out.append(raw)
@@ -84,15 +132,34 @@ def _ensure_target_on_module_deferred_arrays(text: str) -> str:
 
 #: Optimised + debug info + strict IEEE (no fast-math/fp-contract,
 #: rounding-aware) so SDFG-vs-reference comparisons stay bit-reproducible.
-_DEBUG_FLAGS = ("-O3", "-g", "-fno-fast-math", "-ffp-contract=off", "-frounding-math")
+#: flang has no ``-frounding-math``; it keeps the default rounding mode anyway.
+_DEBUG_FLAGS = {
+    CompilerFamily.GNU: ("-O3", "-g", "-fno-fast-math", "-ffp-contract=off", "-frounding-math"),
+    CompilerFamily.LLVM: ("-O3", "-g", "-fno-fast-math", "-ffp-contract=off"),
+}
 
 #: -O3 -ffast-math -- trades IEEE reproducibility for speed.
 _RELEASE_FLAGS = ("-O3", "-ffast-math")
 
-_MODE_FLAGS = {"debug": _DEBUG_FLAGS, "release": _RELEASE_FLAGS}
+
+def compiled_init_symbols(sdfg_so: Path, sdfg_name: str) -> tuple[str, ...] | None:
+    """Parameter names of the compiled SDFG's ``__dace_init_<name>``, in declaration order.
+
+    Read from the header DaCe generates next to the library (``<build>/include/<name>.h``), which is the only
+    authoritative record: the init routine takes the symbols the generated code uses, not every free symbol of the
+    SDFG.  ``None`` when the header is absent (callers then assume every free symbol).
+    """
+    header = sdfg_so.parent.parent / "include" / f"{sdfg_name}.h"
+    if not header.is_file():
+        return None
+    match = re.search(rf"__dace_init_{re.escape(sdfg_name)}\(([^)]*)\)", header.read_text())
+    if match is None:
+        return None
+    params = [p.strip() for p in match.group(1).split(",") if p.strip()]
+    return tuple(re.split(r"[\s*&]+", p)[-1] for p in params)
 
 
-@dataclass
+@dataclass(slots=True)
 class FortranLibrary:
     """A built Fortran-callable shared library: linked ``.so``, its SDFG
     kernel ``.so``, the emitted bindings wrapper, and (if requested) the
@@ -101,7 +168,7 @@ class FortranLibrary:
     so_path: Path
     sdfg_so: Path
     bindings_f90: Path
-    bind_c_shim_f90: Path = None
+    bind_c_shim_f90: Path | None = None
 
     def load(self) -> ctypes.CDLL:
         """Open the library with :class:`ctypes.CDLL`.
@@ -112,21 +179,29 @@ class FortranLibrary:
 
 
 def build_fortran_library(
-        sdfg,
-        iface: OriginalInterface = None,
-        plan: FlattenPlan = None,
-        out_dir: str = None,
-        *,
-        name: str = None,
-        prelude_sources: Sequence = (),
-        extra_sources: Sequence = (),
-        mode: str = "debug",
-        flags: Sequence = None,
-        extra_flags: Sequence = (),
-        verify: bool = True,
-        bind_c_shim: bool = False,
-        bind_c_shim_debug_prints: bool = False,
-        bind_c_shim_module_symbol_forward=(),
+    sdfg: SDFG,
+    iface: OriginalInterface | None = None,
+    plan: FlattenPlan | None = None,
+    out_dir: str | Path | None = None,
+    *,
+    name: str | None = None,
+    prelude_sources: Sequence[str | Path] = (),
+    extra_sources: Sequence[str | Path] = (),
+    mode: BuildMode = BuildMode.DEBUG,
+    flags: Sequence[str] | None = None,
+    extra_flags: Sequence[str] = (),
+    verify: bool = True,
+    bind_c_shim: bool = False,
+    bind_c_shim_debug_prints: bool = False,
+    bind_c_shim_module_symbol_forward: Sequence[tuple[str, str, str, int]] = (),
+    directive: Directive = Directive.OPENACC,
+    fortran_compiler: FortranCompiler = GFORTRAN,
+    specialization: Specialization | None = None,
+    record_symbols_to: str | Path | None = None,
+    record_per_rank: bool = False,
+    extra_procedures: str = "",
+    prologue: Sequence[str] = (),
+    prologue_uses: Sequence[str] = (),
 ) -> FortranLibrary:
     """Emit + verify + link a Fortran-callable library for ``sdfg``.
 
@@ -141,28 +216,37 @@ def build_fortran_library(
     entry point (flat + inline-flat-struct dummies only; raises
     :class:`UnsupportedShimInterfaceError` otherwise).
 
+    ``directive`` picks the device-staging language of the binding (see :func:`emit_bindings`) and
+    ``fortran_compiler`` the compiler that builds it; an OpenMP-offload build passes its offload flags in
+    ``extra_flags`` (``amdflang`` with ``--offload-arch=gfx942``, say).
+
+    ``specialization`` and ``record_symbols_to`` go to :func:`emit_bindings`: the guard of an SDFG specialised to
+    the values of its symbols and scalar inputs, and the file a general binding records those values to; so do
+    ``prologue`` and ``prologue_uses``, the statements the wrapper runs once it has taken a call.
+
     :raises SignatureDriftError: live SDFG drifted from the snapshot.
     """
     if out_dir is None:
         raise ValueError("build_fortran_library: out_dir is required")
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir_path = Path(out_dir)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
     name = name or sdfg.name
 
     if flags is not None:
         opt_flags = tuple(flags)
-    elif mode in _MODE_FLAGS:
-        opt_flags = _MODE_FLAGS[mode]
+    elif mode is BuildMode.DEBUG:
+        opt_flags = _DEBUG_FLAGS[fortran_compiler.family]
     else:
-        raise ValueError(f"unknown mode {mode!r}; expected 'debug', "
-                         f"'release', or an explicit flags= list")
+        opt_flags = _RELEASE_FLAGS
 
-    frozen = getattr(sdfg, "_frozen_signature", None)
+    frozen = get_frozen_signature(sdfg)
     if frozen is None:
-        raise ValueError("build_fortran_library requires an SDFG built by "
-                         "SDFGBuilder.build() (no _frozen_signature attached). "
-                         "Plain SDFGs are unaffected -- dace-core codegen is "
-                         "vanilla; the drift contract is dace-fortran-only.")
+        raise ValueError(
+            "build_fortran_library requires an SDFG built by "
+            "SDFGBuilder.build() (no _frozen_signature attached). "
+            "Plain SDFGs are unaffected -- dace-core codegen is "
+            "vanilla; the drift contract is dace-fortran-only."
+        )
     # Refuse to emit a wrapper that disagrees with the kernel -- checked
     # before compile so it never produces a stale binding.
     if verify:
@@ -171,16 +255,20 @@ def build_fortran_library(
     # Auto-derive when not given, after the drift gate so a drift error
     # surfaces first; iface is built against final ``name`` for symbol match.
     if plan is None:
-        raw = getattr(sdfg, "_flatten_plan_raw", None)
+        raw = sdfg.__dict__.get("_flatten_plan_raw")  # sidecar set by SDFGBuilder.build()
         if raw is None:
-            raise ValueError("build_fortran_library: no plan given and the SDFG "
-                             "carries no _flatten_plan_raw (build via SDFGBuilder).")
+            raise ValueError(
+                "build_fortran_library: no plan given and the SDFG "
+                "carries no _flatten_plan_raw (build via SDFGBuilder)."
+            )
         plan = FlattenPlan.from_dict(raw)
     if iface is None:
-        raw = getattr(sdfg, "_fortran_interface_raw", None)
+        raw = sdfg.__dict__.get("_fortran_interface_raw")  # sidecar set by SDFGBuilder.build()
         if raw is None:
-            raise ValueError("build_fortran_library: no iface given and the SDFG "
-                             "carries no _fortran_interface_raw (build via SDFGBuilder).")
+            raise ValueError(
+                "build_fortran_library: no iface given and the SDFG "
+                "carries no _fortran_interface_raw (build via SDFGBuilder)."
+            )
         iface = build_auto_interface(raw, name)
 
     compiled = sdfg.compile()
@@ -189,38 +277,67 @@ def build_fortran_library(
     # Authoritative __program_<entry> arg order comes live from
     # CompiledSDFG._sig (codegen output, transform-dependent -- NOT
     # snapshotted in FrozenSignature).  Empty -> falls back to frozen.args.
-    dace_arglist = tuple(getattr(compiled, "_sig", None) or ())
+    dace_arglist = tuple(compiled._sig or ())
+    init_symbols = compiled_init_symbols(sdfg_so, sdfg.name)
 
-    bindings_f90 = out_dir / f"{name}_bindings.f90"
-    emit_bindings(frozen, iface, plan, str(bindings_f90), dace_arglist)
+    bindings_f90 = out_dir_path / f"{name}_bindings.f90"
+    emit_bindings(
+        frozen,
+        iface,
+        plan,
+        str(bindings_f90),
+        dace_arglist,
+        init_symbols=init_symbols,
+        directive=directive,
+        specialization=specialization,
+        record_symbols_to=record_symbols_to,
+        record_per_rank=record_per_rank,
+        extra_procedures=extra_procedures,
+        prologue=prologue,
+        prologue_uses=prologue_uses,
+    )
 
     # Threaded between the binding (which the shim USEs) and extra_sources
     # -- gfortran compiles strictly left-to-right by module dependency.
     shim_f90 = None
     if bind_c_shim:
-        shim_f90 = out_dir / f"{iface.entry}_c.f90"
-        emit_bind_c_shim(iface,
-                         str(shim_f90),
-                         debug_prints=bind_c_shim_debug_prints,
-                         module_symbol_forward=bind_c_shim_module_symbol_forward,
-                         plan=plan)
+        shim_f90 = out_dir_path / f"{iface.entry}_c.f90"
+        emit_bind_c_shim(
+            iface,
+            str(shim_f90),
+            debug_prints=bind_c_shim_debug_prints,
+            module_symbol_forward=bind_c_shim_module_symbol_forward,
+            plan=plan,
+        )
 
-    so_path = out_dir / f"lib{name}.so"
+    so_path = out_dir_path / f"lib{name}.so"
     # Copy and patch prelude sources in the build dir so module arrays used by
     # the binding carry TARGET; the originals are left untouched.
-    patched_preludes: List[Path] = []
+    patched_preludes: list[Path] = []
     for src in prelude_sources:
         src_path = Path(src)
-        patched = out_dir / f"{src_path.stem}_target{src_path.suffix}"
+        patched = out_dir_path / f"{src_path.stem}_target{src_path.suffix}"
         patched.write_text(_ensure_target_on_module_deferred_arrays(src_path.read_text()))
         patched_preludes.append(patched)
 
     # gfortran compiles left-to-right, no reordering: deps before, users after.
     cmd = [
-        "gfortran", *_SHARED_FLAGS, *opt_flags, *extra_flags, "-fopenmp", f"-J{out_dir}",
+        fortran_compiler.executable,
+        "-shared",
+        *_SOURCE_FLAGS[fortran_compiler.family],
+        *opt_flags,
+        *extra_flags,
+        "-fopenmp",
+        f"-J{out_dir_path}",
         *[str(s) for s in patched_preludes],
-        str(bindings_f90), *([str(shim_f90)] if shim_f90 else []), *[str(s) for s in extra_sources], "-o",
-        str(so_path), f"-L{sdfg_so.parent}", f"-Wl,-rpath,{sdfg_so.parent}", f"-l:{sdfg_so.name}"
+        str(bindings_f90),
+        *([str(shim_f90)] if shim_f90 else []),
+        *[str(s) for s in extra_sources],
+        "-o",
+        str(so_path),
+        f"-L{sdfg_so.parent}",
+        f"-Wl,-rpath,{sdfg_so.parent}",
+        f"-l:{sdfg_so.name}",
     ]
-    subprocess.check_call(cmd, cwd=out_dir)
+    subprocess.check_call(cmd, cwd=out_dir_path)
     return FortranLibrary(so_path=so_path, sdfg_so=sdfg_so, bindings_f90=bindings_f90, bind_c_shim_f90=shim_f90)

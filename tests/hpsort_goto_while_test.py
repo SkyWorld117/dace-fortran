@@ -18,12 +18,10 @@ unmaterialised.
 Pinned: (1) build + validate of the verbatim QE ``hpsort`` body, (2) numerical
 sort correctness incl. the index permutation and the duplicate-key tie-break.
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # Verbatim from QE (ast_v1_h_psi.f90:977) -- the ``goto_10`` DO WHILE shape is
 # what drives the structurizer to scf.index_switch.
@@ -123,8 +121,12 @@ def test_hpsort_goto_while_numerical(tmp_path):
     ra_orig = ra.copy()
     sdfg(ra=ra, ind=ind, n=n)
     assert np.all(np.diff(ra) >= 0), f"not sorted ascending: {ra}"
-    np.testing.assert_allclose(ra_orig[ind - 1],
-                               ra,
-                               rtol=0,
-                               atol=0,
-                               err_msg="ind is not the permutation of the sorted array")
+    np.testing.assert_allclose(
+        ra_orig[ind - 1], ra, rtol=0, atol=0, err_msg="ind is not the permutation of the sorted array"
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/intrinsic_blas_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_dot(tmp_path):
@@ -17,7 +14,7 @@ subroutine main(arg1, arg2, res1)
   res1(1) = dot_product(arg1, arg2)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -42,7 +39,7 @@ subroutine main(arg1, arg2, res1)
   res1(1) = dot_product(arg1(1:3), arg2(1:3))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -65,7 +62,7 @@ subroutine main(arg1, arg2, res1)
   res1 = transpose(arg1)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size_x = 5
     size_y = 4
@@ -89,7 +86,7 @@ subroutine main(arg1, arg2, res1)
   res1 = 1.0 - transpose(arg1)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size_x = 5
     size_y = 4
@@ -133,7 +130,7 @@ MODULE test_transpose
 
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path, name='test_function', entry='test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="test_function", entry="test_function").build()
 
     size_x = 5
     size_y = 4
@@ -158,7 +155,7 @@ subroutine main(arg1, arg2, res1)
   res1 = matmul(arg1, arg2)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size_x = 5
     size_y = 3
@@ -188,7 +185,7 @@ subroutine main(arg1, arg2, res1)
   res1 = 2.0 - matmul(arg1, arg2)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size_x = 5
     size_y = 3
@@ -208,3 +205,9 @@ end subroutine main
 
     x = np.matmul(arg1, arg2)
     assert np.all([2.0 - val for val in x] == res1)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

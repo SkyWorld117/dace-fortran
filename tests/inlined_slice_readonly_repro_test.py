@@ -5,11 +5,8 @@ a broken alias reads uninitialised memory (~1e228), a gross mismatch rather than
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 _SRC = """
 module mo_inner
@@ -42,10 +39,13 @@ end subroutine outer
 """
 
 # Module-wrapped variant of _SRC for the outer_mod::outer build entry; _SRC itself stays free for f2py.
-_SRC_BUILD = _SRC.replace(
-    "subroutine outer(n, lev, nb, plude, out)",
-    "module outer_mod\ncontains\nsubroutine outer(n, lev, nb, plude, out)",
-).rstrip() + "\nend module outer_mod\n"
+_SRC_BUILD = (
+    _SRC.replace(
+        "subroutine outer(n, lev, nb, plude, out)",
+        "module outer_mod\ncontains\nsubroutine outer(n, lev, nb, plude, out)",
+    ).rstrip()
+    + "\nend module outer_mod\n"
+)
 
 
 def test_inlined_2d_slice_readonly_of_3d_array(tmp_path: Path):
@@ -59,7 +59,7 @@ def test_inlined_2d_slice_readonly_of_3d_array(tmp_path: Path):
 
     sdfg = build_sdfg(_SRC_BUILD, sdfg_dir, name="outer", entry="outer_mod::outer").build()
     sdfg.validate()
-    ref = f2py_compile(_SRC, ref_dir, "slice_ref", only=("outer", ))
+    ref = f2py_compile(_SRC, ref_dir, "slice_ref", only=("outer",))
 
     rng = np.random.default_rng(0)
     plude = np.asfortranarray(rng.random((n, lev, nb)))
@@ -112,10 +112,13 @@ end subroutine outer_flux
 # Build variant of ``_SRC_FLUX`` (see ``_SRC_BUILD``): module-wrapped
 # ``outer_flux`` for the ``outer_flux_mod::outer_flux`` build entry;
 # ``_SRC_FLUX`` itself stays free for the f2py reference.
-_SRC_FLUX_BUILD = _SRC_FLUX.replace(
-    "subroutine outer_flux(n, lev, nb, plude, pfsqlf)",
-    "module outer_flux_mod\ncontains\nsubroutine outer_flux(n, lev, nb, plude, pfsqlf)",
-).rstrip() + "\nend module outer_flux_mod\n"
+_SRC_FLUX_BUILD = (
+    _SRC_FLUX.replace(
+        "subroutine outer_flux(n, lev, nb, plude, pfsqlf)",
+        "module outer_flux_mod\ncontains\nsubroutine outer_flux(n, lev, nb, plude, pfsqlf)",
+    ).rstrip()
+    + "\nend module outer_flux_mod\n"
+)
 
 
 def test_inlined_flux_accumulation_shifted_index(tmp_path: Path):
@@ -131,7 +134,7 @@ def test_inlined_flux_accumulation_shifted_index(tmp_path: Path):
 
     sdfg = build_sdfg(_SRC_FLUX_BUILD, sdfg_dir, name="outer_flux", entry="outer_flux_mod::outer_flux").build()
     sdfg.validate()
-    ref = f2py_compile(_SRC_FLUX, ref_dir, "flux_ref", only=("outer_flux", ))
+    ref = f2py_compile(_SRC_FLUX, ref_dir, "flux_ref", only=("outer_flux",))
 
     rng = np.random.default_rng(1)
     plude = np.asfortranarray(rng.random((n, lev, nb)))
@@ -144,3 +147,9 @@ def test_inlined_flux_accumulation_shifted_index(tmp_path: Path):
     sdfg(n=np.int32(n), lev=np.int32(lev), nb=np.int32(nb), plude=p_sdfg, pfsqlf=f_sdfg)
 
     np.testing.assert_allclose(f_sdfg, f_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -26,11 +26,8 @@ component automatically.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _build(src: str, tmp: Path, name: str = "main", entry: str | None = None):
@@ -70,7 +67,7 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "ptr_full_member_ref")
     out_ref = np.asarray(mod.main(), dtype=np.float32)
 
-    sdfg = _build(src, tmp_path, entry='main')
+    sdfg = _build(src, tmp_path, entry="main")
     out = np.zeros(1, dtype=np.float32)
     sdfg(out=out)
     np.testing.assert_array_equal(out, out_ref)
@@ -109,7 +106,7 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "ptr_member_slice_ref")
     out_ref = np.asarray(mod.main(), dtype=np.float32)
 
-    sdfg = _build(src, tmp_path, entry='main')
+    sdfg = _build(src, tmp_path, entry="main")
     out = np.zeros(1, dtype=np.float32)
     sdfg(out=out)
     np.testing.assert_array_equal(out, out_ref)
@@ -150,7 +147,7 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "ptr_2d_column_ref")
     out_ref = np.asarray(mod.main(), dtype=np.float32)
 
-    sdfg = _build(src, tmp_path, entry='main')
+    sdfg = _build(src, tmp_path, entry="main")
     out = np.zeros(4, order="F", dtype=np.float32)
     sdfg(out=out)
     np.testing.assert_array_equal(out, out_ref)
@@ -183,7 +180,7 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "ptr_element_rebind_ref")
     out_ref = np.asarray(mod.main(), dtype=np.int32)
 
-    sdfg = _build(src, tmp_path, entry='main')
+    sdfg = _build(src, tmp_path, entry="main")
     out = np.zeros(1, dtype=np.int32)
     sdfg(out=out)
     np.testing.assert_array_equal(out, out_ref)
@@ -227,9 +224,15 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "ptr_write_member_slice_ref")
     out_ref = np.asarray(mod.main(), dtype=np.int32)
 
-    sdfg = _build(src, tmp_path, entry='main')
+    sdfg = _build(src, tmp_path, entry="main")
     out = np.zeros(8, order="F", dtype=np.int32)
     sdfg(out=out)
     np.testing.assert_array_equal(out, out_ref)
     # s%w = [0, 0, 101, 102, 103, 0, 0, 0] after the writes through p.
     np.testing.assert_array_equal(out, [0, 0, 101, 102, 103, 0, 0, 0])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

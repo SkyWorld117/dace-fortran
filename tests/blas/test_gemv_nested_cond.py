@@ -10,12 +10,10 @@ ControlFlowRegion, not the top-level SDFG graph --
 ``KeyError: SDFGState (s_NNNN)`` (the QE h_psi build's third fatal error).
 Pinned: build + validate + numerics.
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 subroutine probe_gemv_cond(A, x, y, alpha, n, flag)
@@ -50,3 +48,9 @@ def test_gemv_in_branch_numerical(tmp_path):
     y_ref = alpha[0] * (A @ x)
     sdfg(a=A, x=x, y=y, alpha=alpha, n=n, flag=1)  # Fortran descriptors register lowercase
     np.testing.assert_allclose(y, y_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/intrinsic_bound_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_bound(tmp_path):
@@ -21,7 +18,7 @@ res(4) = UBOUND(input, 2)
 
 END SUBROUTINE intrinsic_bound_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_bound_test_function").build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -43,7 +40,7 @@ res(4) = UBOUND(input, 2)
 
 END SUBROUTINE intrinsic_bound_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_bound_test_function").build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -84,8 +81,9 @@ res(4) = UBOUND(input, 2)
 
 END SUBROUTINE intrinsic_bound_test_function2
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function',
-                      entry='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_bound_test_function", entry="intrinsic_bound_test_function"
+    ).build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -128,8 +126,9 @@ res(4) = UBOUND(input, 2)
 
 END SUBROUTINE intrinsic_bound_test_function2
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function',
-                      entry='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_bound_test_function", entry="intrinsic_bound_test_function"
+    ).build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -174,8 +173,9 @@ res(4) = UBOUND(input, 2)
 
 END SUBROUTINE intrinsic_bound_test_function3
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function',
-                      entry='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_bound_test_function", entry="intrinsic_bound_test_function"
+    ).build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -218,8 +218,9 @@ MODULE test_bounds
     END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function',
-                      entry='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_bound_test_function", entry="intrinsic_bound_test_function"
+    ).build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -263,8 +264,9 @@ MODULE test_bounds
     END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function',
-                      entry='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_bound_test_function", entry="intrinsic_bound_test_function"
+    ).build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -317,11 +319,18 @@ MODULE test_bounds
     END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_bound_test_function',
-                      entry='intrinsic_bound_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_bound_test_function", entry="intrinsic_bound_test_function"
+    ).build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
     sdfg(res=res)
 
     assert np.allclose(res, [-1, 0, 2, 3])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

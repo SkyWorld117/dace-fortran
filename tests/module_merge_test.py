@@ -3,18 +3,14 @@ separate-files-together and single-merged-file compiles must be numerically
 equivalent, and the HLFIR bridge must build a correct SDFG from the merged TU.  Plus
 structural guards: pass-through, idempotence, intrinsic ``USE`` untouched, dep order."""
 
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.preprocess import merge_used_modules
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # Transitive project: physmod  <-  drivermod (use physmod)  <-  drv (use drivermod)
 _PHYSMOD = """\
@@ -63,15 +59,18 @@ end subroutine drv
 
 def _f2py(out_dir: Path, mod: str, *src_files: Path):
     """f2py-compile ``src_files`` together into module ``mod``."""
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
     out_dir.mkdir(parents=True, exist_ok=True)
     subprocess.check_call(
         [
-            sys.executable, "-m", "numpy.f2py", "-c", *[str(s) for s in src_files], "-m", mod, "--quiet",
-            "--f90flags=-O0 -fno-fast-math -ffp-contract=off"
+            sys.executable,
+            "-m",
+            "numpy.f2py",
+            "-c",
+            *[str(s) for s in src_files],
+            "-m",
+            mod,
+            "--quiet",
+            "--f90flags=-O0 -fno-fast-math -ffp-contract=off",
         ],
         cwd=out_dir,
     )
@@ -102,8 +101,9 @@ def test_merge_then_single_file_matches_all_files_together(tmp_path: Path):
     merged = merge_used_modules(_DRV, search_dirs=[proj])
     assert merged != _DRV, "multi-module entry must actually be merged"
     lo = merged.lower()
-    assert lo.index("module physmod") < lo.index("module drivermod") < lo.index("subroutine drv"), \
+    assert lo.index("module physmod") < lo.index("module drivermod") < lo.index("subroutine drv"), (
         "merged TU must place dependencies before dependents"
+    )
     md = tmp_path / "b"
     md.mkdir(parents=True, exist_ok=True)
     (md / "merged.f90").write_text(merged)
@@ -121,6 +121,7 @@ def test_merge_then_single_file_matches_all_files_together(tmp_path: Path):
     ref_merged.drv(bb, bb.size)
     cc = base.copy(order="F")
     from dace.data import Scalar
+
     al = sdfg.arglist()
     nkw = {"n": 7 if isinstance(al.get("n"), Scalar) else np.array([7], np.int32)}
     sdfg(a=cc, **nkw)
@@ -143,12 +144,20 @@ def test_merge_noop_on_self_contained_and_idempotent(tmp_path: Path):
 
 def test_merge_leaves_intrinsic_use_untouched(tmp_path: Path):
     """An ``intrinsic`` / compiler-provided module is never merged."""
-    src = ("subroutine k(x)\n"
-           "  use iso_c_binding, only: c_double\n"
-           "  use iso_fortran_env, only: real64\n"
-           "  implicit none\n"
-           "  real(c_double), intent(inout) :: x\n"
-           "  x = x + 1.0_real64\n"
-           "end subroutine k\n")
+    src = (
+        "subroutine k(x)\n"
+        "  use iso_c_binding, only: c_double\n"
+        "  use iso_fortran_env, only: real64\n"
+        "  implicit none\n"
+        "  real(c_double), intent(inout) :: x\n"
+        "  x = x + 1.0_real64\n"
+        "end subroutine k\n"
+    )
     d = _proj(tmp_path / "intr", k_f90=src)
     assert merge_used_modules(src, search_dirs=[d]) == src
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

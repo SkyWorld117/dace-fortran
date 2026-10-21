@@ -3,17 +3,16 @@
 
 import re
 import sys
-from typing import Union, Dict, Optional, List, Iterable, Set, Generator
+from collections.abc import Generator, Iterable
+from typing import Union
 
 import fparser.two.Fortran2003 as f03
 import numpy as np
 from fparser.two.Fortran2008 import Type_Declaration_Stmt
 from fparser.two.utils import Base, walk
 
-from . import analysis
-from . import types
-from . import utils
 from .. import ast_utils
+from . import analysis, types, utils
 
 
 def make_practically_constant_global_vars_constants(ast: f03.Program) -> f03.Program:
@@ -31,16 +30,19 @@ def make_practically_constant_global_vars_constants(ast: f03.Program) -> f03.Pro
     # - Must be an Entity_Decl (variable declaration).
     # - Must not already be a constant.
     # - Must be in a module scope (global variable).
-    never_assigned: Set[types.SPEC] = {
+    never_assigned: set[types.SPEC] = {
         k
         for k, v in ident_map.items()
-        if isinstance(v, f03.Entity_Decl) and not analysis.find_type_of_entity(v, alias_map).const
-        and analysis.search_scope_spec(v) and isinstance(alias_map[analysis.search_scope_spec(v)], f03.Module_Stmt)
+        if isinstance(v, f03.Entity_Decl)
+        and (v_type := analysis.find_type_of_entity(v, alias_map)) is not None
+        and not v_type.const
+        and (v_scope := analysis.search_scope_spec(v))
+        and isinstance(alias_map[v_scope], f03.Module_Stmt)
     }
 
     # Any variable that is assigned to is removed from the candidate set.
     for asgn in walk(ast, f03.Assignment_Stmt):
-        lv, _, rv = asgn.children
+        lv, _, _rv = asgn.children
         if not isinstance(lv, f03.Name):
             # Everything else unsupported for now.
             continue
@@ -51,13 +53,11 @@ def make_practically_constant_global_vars_constants(ast: f03.Program) -> f03.Pro
         if not isinstance(var, f03.Entity_Decl):
             continue
         var_spec = analysis.ident_spec(var)
-        if var_spec in never_assigned:
-            # If a candidate variable is assigned to, it's no longer a constant.
-            never_assigned.remove(var_spec)
+        never_assigned.discard(var_spec)
 
     # Any variable passed as an argument to a function/subroutine might be modified, so it is disqualified.
     for fcall in walk(ast, (f03.Function_Reference, f03.Call_Stmt)):
-        fn, args = fcall.children
+        _fn, args = fcall.children
         args = args.children if args else tuple()
         for a in args:
             if not isinstance(a, f03.Name):
@@ -69,16 +69,13 @@ def make_practically_constant_global_vars_constants(ast: f03.Program) -> f03.Pro
                 # MPI handle like ``mpi_comm_world`` passed to ``mpi_abort``).
                 # When tolerating externals it cannot be a local constant
                 # candidate anyway -- skip it.
-                if analysis.TOLERATE_EXTERNAL_USES:
+                if analysis.OPTIONS.tolerate_external_uses:
                     continue
                 assert loc
             var = alias_map[loc]
             assert isinstance(var, f03.Entity_Decl)
             var_spec = analysis.ident_spec(var)
-            if var_spec in never_assigned:
-                # If a candidate variable is passed as an argument, it might be modified,
-                # so it's no longer considered a constant.
-                never_assigned.remove(var_spec)
+            never_assigned.discard(var_spec)
 
     # For all remaining candidates, convert them to PARAMETERs.
     for fixed in never_assigned:
@@ -93,8 +90,8 @@ def make_practically_constant_global_vars_constants(ast: f03.Program) -> f03.Pro
         typ, attr, _ = tdcl.children
         if not attr:
             # If no attributes exist, just add 'parameter'.
-            nuattr = 'parameter'
-        elif 'PARAMETER' in f"{attr}":
+            nuattr = "parameter"
+        elif "PARAMETER" in f"{attr}":
             # If 'parameter' already exists, keep attributes as is.
             nuattr = f"{attr}"
         else:
@@ -107,14 +104,14 @@ def make_practically_constant_global_vars_constants(ast: f03.Program) -> f03.Pro
             # If there are other entities, modify only this entity's declaration and move others.
             utils.replace_node(tdcl, Type_Declaration_Stmt(f"{typ}, {nuattr} :: {edcl}"))
             utils.remove_children(edclist, edcl)
-            attr = f", {attr}" if attr else ''
+            attr = f", {attr}" if attr else ""
             # Append a new Type_Declaration_Stmt for the remaining entities.
             utils.append_children(tdcl.parent, Type_Declaration_Stmt(f"{typ} {attr} :: {edclist}"))
 
     return ast
 
 
-def make_practically_constant_arguments_constants(ast: f03.Program, keepers: List[types.SPEC]) -> f03.Program:
+def make_practically_constant_arguments_constants(ast: f03.Program, keepers: list[types.SPEC]) -> f03.Program:
     """
     Analyzes function/subroutine calls to find arguments that are always passed the same constant value.
     If such an argument is found, its usage within the function body is replaced by the constant value.
@@ -127,11 +124,11 @@ def make_practically_constant_arguments_constants(ast: f03.Program, keepers: Lis
 
     # First, build a table to see what possible values a function argument may see.
     # Stores possible constant values seen for each function argument.
-    fnargs_possible_values: Dict[types.SPEC, Set[Optional[types.NUMPY_TYPES]]] = {}
+    fnargs_possible_values: dict[types.SPEC, set[types.NUMPY_TYPES | None]] = {}
     # Stores arguments for which a constant value could not be determined (e.g., passed a variable).
-    fnargs_undecidables: Set[types.SPEC] = set()
+    fnargs_undecidables: set[types.SPEC] = set()
     # Tracks the presence (True for passed, False for omitted) of optional arguments across all calls.
-    fnargs_optional_presence: Dict[types.SPEC, Set[bool]] = {}
+    fnargs_optional_presence: dict[types.SPEC, set[bool]] = {}
     for fcall in walk(ast, (f03.Function_Reference, f03.Call_Stmt)):
         fn, args = fcall.children
         if isinstance(fn, f03.Intrinsic_Name):
@@ -143,15 +140,15 @@ def make_practically_constant_arguments_constants(ast: f03.Program, keepers: Lis
             # to, so its arguments stay undecidable (skip -- conservative).
             continue
         args = args.children if args else tuple()
-        kwargs = tuple(a.children for a in args if isinstance(a, f03.Actual_Arg_Spec))
-        kwargs = {k.string: v for k, v in kwargs}
+        kwarg_pairs = tuple(a.children for a in args if isinstance(a, f03.Actual_Arg_Spec))
+        kwargs = {k.string: v for k, v in kwarg_pairs}
         fnspec = analysis.search_real_local_alias_spec(fn, alias_map)
         if not fnspec:
             # A call to a procedure with no resolvable source (e.g. an external
             # MPI routine like ``mpi_abort`` reached through a stubbed error
             # path).  When tolerating externals, its argument usage cannot be
             # analysed -- skip it (pruning drops the dead path later).
-            if analysis.TOLERATE_EXTERNAL_USES:
+            if analysis.OPTIONS.tolerate_external_uses:
                 continue
             assert fnspec, fn
         fnstmt = alias_map[fnspec]
@@ -187,11 +184,12 @@ def make_practically_constant_arguments_constants(ast: f03.Program, keepers: Lis
         # that happens, mark every resolvable dummy of this callee UNDECIDABLE
         # (so it is never folded) and skip the call -- conservative, never an
         # unsafe fold.
-        dummy_specs = [analysis.search_real_local_alias_spec(a, alias_map) for a in fnargs]
-        if any(s is None for s in dummy_specs):
-            fnargs_undecidables.update(s for s in dummy_specs if s is not None)
+        maybe_dummy_specs = [analysis.search_real_local_alias_spec(a, alias_map) for a in fnargs]
+        dummy_specs = [s for s in maybe_dummy_specs if s is not None]
+        if len(dummy_specs) != len(maybe_dummy_specs):
+            fnargs_undecidables.update(dummy_specs)
             continue
-        for a, aspec in zip(fnargs, dummy_specs):
+        for a, aspec in zip(fnargs, dummy_specs, strict=False):
             adecl = alias_map[aspec]
             atype = analysis.find_type_of_entity(adecl, alias_map)
             assert atype
@@ -248,7 +246,7 @@ def make_practically_constant_arguments_constants(ast: f03.Program, keepers: Lis
 
             # If the passed value is a literal, record it. Otherwise, mark as undecidable.
             if isinstance(v, types.LITERAL_CLASSES):
-                v = analysis._const_eval_basic_type(v, alias_map)
+                v = analysis.const_eval_basic_type(v, alias_map)
                 assert v is not None
                 if aspec not in fnargs_possible_values:
                     fnargs_possible_values[aspec] = set()
@@ -262,17 +260,19 @@ def make_practically_constant_arguments_constants(ast: f03.Program, keepers: Lis
                 fnargs_undecidables.add(aspec)
 
     # --- Pass 2: Replace PRESENT calls if an optional argument's presence is constant --- #
-    for aspec, vals in fnargs_optional_presence.items():
-        if len(vals) > 1:
+    for aspec, presences in fnargs_optional_presence.items():
+        if len(presences) > 1:
             # If presence varies across calls, cannot optimize.
             continue
-        assert len(vals) == 1
-        presence, = vals
+        assert len(presences) == 1
+        (presence,) = presences
 
         arg = alias_map[aspec]
         atype = analysis.find_type_of_entity(arg, alias_map)
-        assert atype.optional
-        fn = utils.find_named_ancestor(arg).parent
+        assert atype is not None and atype.optional
+        arg_scope = utils.find_named_ancestor(arg)
+        assert arg_scope is not None, f"dummy argument {aspec} has no enclosing named scope"
+        fn = arg_scope.parent
         assert isinstance(fn, (f03.Subroutine_Subprogram, f03.Function_Subprogram))
         fexec = ast_utils.atmost_one(ast_utils.children_of_type(fn, f03.Execution_Part))
         if not fexec:
@@ -282,7 +282,7 @@ def make_practically_constant_arguments_constants(ast: f03.Program, keepers: Lis
         for pcall in walk(fexec, f03.Intrinsic_Function_Reference):
             fn, cargs = pcall.children
             cargs = cargs.children if cargs else tuple()
-            if fn.string != 'PRESENT':
+            if fn.string != "PRESENT":
                 continue
             assert len(cargs) == 1
             optvar = cargs[0]
@@ -292,15 +292,19 @@ def make_practically_constant_arguments_constants(ast: f03.Program, keepers: Lis
 
     # --- Pass 3: Replace argument usages if they are always passed the same constant value --- #
     for aspec, vals in fnargs_possible_values.items():
-        if (aspec in fnargs_undecidables or len(vals) > 1
-                or (aspec in fnargs_optional_presence and False in fnargs_optional_presence[aspec])):
+        if (
+            aspec in fnargs_undecidables
+            or len(vals) > 1
+            or (aspec in fnargs_optional_presence and False in fnargs_optional_presence[aspec])
+        ):
             # If there are multiple possibilities (undecidable, multiple literals, or optional and sometimes absent),
             # cannot optimize to a single constant.
             continue
-        fixed_val, = vals
+        (fixed_val,) = vals
         arg = alias_map[aspec]
-        atype = analysis.find_type_of_entity(arg, alias_map)
-        fn = utils.find_named_ancestor(arg).parent
+        arg_scope = utils.find_named_ancestor(arg)
+        assert arg_scope is not None, f"dummy argument {aspec} has no enclosing named scope"
+        fn = arg_scope.parent
         assert isinstance(fn, (f03.Subroutine_Subprogram, f03.Function_Subprogram))
         fexec = ast_utils.atmost_one(ast_utils.children_of_type(fn, f03.Execution_Part))
         if not fexec:
@@ -336,7 +340,7 @@ def exploit_locally_constant_variables(ast: f03.Program) -> f03.Program:
     for expart in walk(ast, f03.Execution_Part):
         # Tracks variables that are assigned a constant value within this execution part
         # and replaces their uses with that constant value.
-        analysis._track_local_consts(expart, alias_map)
+        analysis.track_local_consts(expart, alias_map)
 
     return ast
 
@@ -360,10 +364,19 @@ def const_eval_nodes(ast: f03.Program) -> f03.Program:
     :param ast: The Fortran AST to optimize.
     :return: The optimized Fortran AST.
     """
-    EXPRESSION_CLASSES = (types.LITERAL_CLASSES, f03.Expr, f03.Equiv_Operand, f03.Add_Operand, f03.Or_Operand,
-                          f03.Mult_Operand, f03.Level_2_Expr, f03.Level_3_Expr, f03.Level_4_Expr, f03.Level_5_Expr,
-                          f03.Intrinsic_Function_Reference
-                          )  # Classes representing expressions that can be constant-evaluated.
+    EXPRESSION_CLASSES = (
+        types.LITERAL_CLASSES,
+        f03.Expr,
+        f03.Equiv_Operand,
+        f03.Add_Operand,
+        f03.Or_Operand,
+        f03.Mult_Operand,
+        f03.Level_2_Expr,
+        f03.Level_3_Expr,
+        f03.Level_4_Expr,
+        f03.Level_5_Expr,
+        f03.Intrinsic_Function_Reference,
+    )  # Classes representing expressions that can be constant-evaluated.
 
     alias_map = analysis.alias_specs(ast)
 
@@ -374,14 +387,14 @@ def const_eval_nodes(ast: f03.Program) -> f03.Program:
         :param n: The AST node to evaluate.
         :return: True if the node was successfully constant-evaluated and replaced, False otherwise.
         """
-        val = analysis._const_eval_basic_type(n, alias_map)
+        val = analysis.const_eval_basic_type(n, alias_map)
         if val is None:
             return False
         assert not np.isnan(val)
         val = types.numpy_type_to_literal(val)
         # If the resulting literal is negative, wrap it in parenthesis to avoid parsing issues.
-        if val.tostr().startswith('-'):
-            val = f03.Parenthesis(f'({val})')
+        if val.tostr().startswith("-"):
+            val = f03.Parenthesis(f"({val})")
         utils.replace_node(n, val)
         return True
 
@@ -390,8 +403,8 @@ def const_eval_nodes(ast: f03.Program) -> f03.Program:
 
     # First, specifically target the right-hand side of assignments.
     for asgn in reversed(walk(ast, f03.Assignment_Stmt)):
-        lv, op, rv = asgn.children
-        assert op == '='
+        _lv, op, rv = asgn.children
+        assert op == "="
         # Attempt to constant-evaluate the right-hand side of assignments.
         _const_eval_node(rv)
 
@@ -423,9 +436,17 @@ def const_eval_nodes(ast: f03.Program) -> f03.Program:
         _, kind, _ = knode.children
         _const_eval_node(kind)
 
-    NON_EXPRESSION_CLASSES = (f03.Explicit_Shape_Spec, f03.Loop_Control, f03.Call_Stmt, f03.Function_Reference,
-                              f03.Initialization, f03.Component_Initialization, f03.Section_Subscript_List,
-                              f03.Write_Stmt, f03.Allocate_Stmt)
+    NON_EXPRESSION_CLASSES = (
+        f03.Explicit_Shape_Spec,
+        f03.Loop_Control,
+        f03.Call_Stmt,
+        f03.Function_Reference,
+        f03.Initialization,
+        f03.Component_Initialization,
+        f03.Section_Subscript_List,
+        f03.Write_Stmt,
+        f03.Allocate_Stmt,
+    )
     # Finally, handle other non-expression nodes that might contain constant-evaluable names (e.g., array bounds).
     for node in reversed(walk(ast, NON_EXPRESSION_CLASSES)):
         for nm in reversed(walk(node, f03.Name)):
@@ -434,43 +455,41 @@ def const_eval_nodes(ast: f03.Program) -> f03.Program:
     return ast
 
 
-def _val_2_np_lit(val, type_spec: types.SPEC) -> types.NUMPY_TYPES:
+def val_2_np_lit(val: Union[str, bool, float, np.generic], type_spec: types.SPEC) -> types.NUMPY_TYPES:
     """
     Converts a string value to a NumPy scalar of a specific Fortran type.
     :param val: The string representation of the value (e.g., "123", "true").
     :param type_spec: The target Fortran type specification (e.g., ('INTEGER4',)).
     :return: A NumPy scalar (e.g., np.int32, np.float64) representing the value.
     """
-    val = str(val).lower()
+    text = str(val).lower()
     # Convert the string value to the appropriate NumPy type based on the Fortran type specification.
-    if type_spec == ('INTEGER1', ):
-        val = np.int8(val)
-    elif type_spec == ('INTEGER2', ):
-        val = np.int16(val)
-    elif type_spec == ('INTEGER4', ):
-        val = np.int32(val)
-    elif type_spec == ('INTEGER8', ):
-        val = np.int64(val)
-    elif type_spec == ('REAL4', ):
-        val = np.float32(val)
-    elif type_spec == ('REAL8', ):
-        val = np.float64(val)
-    elif type_spec == ('LOGICAL', ):
-        assert val in {'true', 'false', '0', '1'}
-        val = np.bool_(val in {'true', '1'})
-    else:
-        raise NotImplementedError(f"{val} cannot be parsed as the target literal type: {type_spec}")
-    return val
+    if type_spec == ("INTEGER1",):
+        return np.int8(text)
+    if type_spec == ("INTEGER2",):
+        return np.int16(text)
+    if type_spec == ("INTEGER4",):
+        return np.int32(text)
+    if type_spec == ("INTEGER8",):
+        return np.int64(text)
+    if type_spec == ("REAL4",):
+        return np.float32(text)
+    if type_spec == ("REAL8",):
+        return np.float64(text)
+    if type_spec == ("LOGICAL",):
+        assert text in {"true", "false", "0", "1"}
+        return np.bool_(text in {"true", "1"})
+    raise NotImplementedError(f"{text} cannot be parsed as the target literal type: {type_spec}")
 
 
-def _val_2_lit(val, type_spec: types.SPEC) -> types.LITERAL_TYPES:
+def _val_2_lit(val: Union[str, bool, float], type_spec: types.SPEC) -> types.LITERAL_TYPES:
     """
     Converts a string value to a Fortran literal node of a specific type.
     :param val: The string representation of the value (e.g., "123", "true").
     :param type_spec: The target Fortran type specification (e.g., ('INTEGER4',)).
     :return: An fparser literal node representing the value.
     """
-    return types.numpy_type_to_literal(_val_2_np_lit(val, type_spec))
+    return types.numpy_type_to_literal(val_2_np_lit(val, type_spec))
 
 
 def _item_comp_matches_actual_comp(item_comp: str, actual_comp: str) -> bool:
@@ -491,15 +510,14 @@ def _item_comp_matches_actual_comp(item_comp: str, actual_comp: str) -> bool:
     if f"{actual_comp}_a" == item_comp:
         # Matched the allocatable array's special variable.
         return True
-    dims: re.Match = re.match(r'^__f2dace_SO?A_([a-zA-Z0-9_]+)_d_[0-9]+_s$', item_comp)
-    if dims and dims.group(1) == actual_comp:
-        # Matched the general array's special variable.
-        return True
-    return False
+    dims = re.match(r"^__f2dace_SO?A_([a-zA-Z0-9_]+)_d_[0-9]+_s$", item_comp)
+    # Matched the general array's special variable.
+    return dims is not None and dims.group(1) == actual_comp
 
 
-def _type_injection_applies_to_instance(item: types.ConstTypeInjection, defn_spec: types.SPEC, comp_spec: types.SPEC,
-                                        alias_map: types.SPEC_TABLE) -> bool:
+def _type_injection_applies_to_instance(
+    item: types.ConstTypeInjection, defn_spec: types.SPEC, comp_spec: types.SPEC, alias_map: types.SPEC_TABLE
+) -> bool:
     """
     Determines if a `ConstTypeInjection` rule applies to a specific variable instance.
 
@@ -526,6 +544,8 @@ def _type_injection_applies_to_instance(item: types.ConstTypeInjection, defn_spe
         return False
 
     inst_typ = analysis.find_type_of_entity(alias_map[defn_spec], alias_map)
+    if inst_typ is None:
+        return False
     # Traverse the components of the instance reference to match the injection's component path.
     # We need to traverse the components until the remaining components have the exact same length as the `item`'s
     # (i.e., exactly 1 for now).
@@ -535,12 +555,16 @@ def _type_injection_applies_to_instance(item: types.ConstTypeInjection, defn_spe
         tdef = alias_map[inst_typ.spec].parent
         if not isinstance(tdef, f03.Derived_Type_Def):
             return False
-        comp: Optional[f03.Component_Decl] = ast_utils.atmost_one(c for c in walk(tdef, f03.Component_Decl)
-                                                                  if utils.find_name_of_node(c) == comp_spec[0])
-        if not comp:
+        comp_decl: f03.Component_Decl | None = ast_utils.atmost_one(
+            c for c in walk(tdef, f03.Component_Decl) if utils.find_name_of_node(c) == comp_spec[0]
+        )
+        if not comp_decl:
             # Either not a valid component (possibly a bug), or could not proceed with the traversal.
             return False
-        inst_typ = analysis.find_type_of_entity(comp, alias_map)
+        comp_type = analysis.find_type_of_entity(comp_decl, alias_map)
+        if comp_type is None:
+            return False
+        inst_typ = comp_type
         comp_spec = comp_spec[1:]
 
     if inst_typ.spec != item.type_spec:
@@ -549,13 +573,13 @@ def _type_injection_applies_to_instance(item: types.ConstTypeInjection, defn_spe
     if comp_spec[:-1] != item.component_spec[:-1]:
         # For what's left, everything until the leaf must exactly match.
         return False
-    comp: str = comp_spec[-1]
-    item_comp = item.component_spec[-1]
-    return _item_comp_matches_actual_comp(item_comp, comp)
+    leaf = comp_spec[len(comp_spec) - 1]
+    return _item_comp_matches_actual_comp(item.component_spec[-1], leaf)
 
 
-def _instance_injection_applies_to_instance(item: types.ConstInstanceInjection, defn_spec: types.SPEC,
-                                            comp_spec: types.SPEC) -> bool:
+def _instance_injection_applies_to_instance(
+    item: types.ConstInstanceInjection, defn_spec: types.SPEC, comp_spec: types.SPEC
+) -> bool:
     """
     Determines if a `ConstInstanceInjection` rule applies to a specific variable instance.
 
@@ -593,9 +617,11 @@ def _instance_injection_applies_to_instance(item: types.ConstInstanceInjection, 
     return _item_comp_matches_actual_comp(item_comp, comp)
 
 
-def _find_items_applicable_to_instance(items: Iterable[types.ConstInjection],
-                                       inst_ref: Union[f03.Name, f03.Part_Ref, f03.Data_Ref, f03.Entity_Decl],
-                                       alias_map: types.SPEC_TABLE) -> Generator[types.ConstInjection, None, None]:
+def _find_items_applicable_to_instance(
+    items: Iterable[types.ConstInjection],
+    inst_ref: Union[f03.Name, f03.Part_Ref, f03.Data_Ref, f03.Entity_Decl],
+    alias_map: types.SPEC_TABLE,
+) -> Generator[types.ConstInjection, None, None]:
     """
     Finds and yields all constant injection rules applicable to a given instance reference.
 
@@ -609,16 +635,18 @@ def _find_items_applicable_to_instance(items: Iterable[types.ConstInjection],
     :return: A generator that yields applicable `ConstInjection` rules.
     """
     # Find out if `inst_ref` can match any item at all.
+    local_spec: types.SPEC | None
+    comp_spec: types.SPEC
     if isinstance(inst_ref, f03.Entity_Decl):
         defn_spec, comp_spec, local_spec = analysis.ident_spec(inst_ref), tuple(), None
     else:
-        root, rest = analysis._lookup_dataref(inst_ref, alias_map) or (None, None)
+        root, rest = analysis.lookup_dataref(inst_ref, alias_map)
         if not root:
             return None
 
         # Find out if `inst_ref`'s root refers to a valid variable.
         local_spec = analysis.search_real_local_alias_spec(root, alias_map)
-        if local_spec not in alias_map or not isinstance(alias_map[local_spec], f03.Entity_Decl):
+        if local_spec is None or local_spec not in alias_map or not isinstance(alias_map[local_spec], f03.Entity_Decl):
             # `local_spec` does not really describe a target instance.
             return None
 
@@ -628,14 +656,16 @@ def _find_items_applicable_to_instance(items: Iterable[types.ConstInjection],
         local_spec = analysis.search_local_alias_spec(root)
 
     for it in items:
-        if it.scope_spec and it.scope_spec != local_spec[:len(it.scope_spec)]:
+        if it.scope_spec and (local_spec is None or it.scope_spec != local_spec[: len(it.scope_spec)]):
             # If `item` is restricted to a scope, then local spec of the instance must start with that.
             continue
-        if (isinstance(it, types.ConstTypeInjection)
-                and _type_injection_applies_to_instance(it, defn_spec, comp_spec, alias_map)):
-            yield it
-        elif (isinstance(it, types.ConstInstanceInjection)
-              and _instance_injection_applies_to_instance(it, defn_spec, comp_spec)):
+        if (
+            isinstance(it, types.ConstTypeInjection)
+            and _type_injection_applies_to_instance(it, defn_spec, comp_spec, alias_map)
+        ) or (
+            isinstance(it, types.ConstInstanceInjection)
+            and _instance_injection_applies_to_instance(it, defn_spec, comp_spec)
+        ):
             yield it
 
 
@@ -648,9 +678,10 @@ def _type_injection_applies_to_component(item: types.ConstTypeInjection, defn_sp
     :param comp: The name of the component declaration.
     :return: True if the injection rule applies to the component, False otherwise.
     """
-    assert len(item.component_spec) == 1, \
-        (f"Unimplemented: type injection must have just one-level of component for now; "
-         f"got {item.component_spec} to match against {comp}")
+    assert len(item.component_spec) == 1, (
+        f"Unimplemented: type injection must have just one-level of component for now; "
+        f"got {item.component_spec} to match against {comp}"
+    )
     item_comp = item.component_spec[-1]
 
     if item.type_spec != defn_spec:
@@ -661,8 +692,8 @@ def _type_injection_applies_to_component(item: types.ConstTypeInjection, defn_sp
 
 
 def _find_items_applicable_to_component(
-        items: Iterable[types.ConstInjection],
-        comp_ref: f03.Component_Decl) -> Generator[types.ConstTypeInjection, None, None]:
+    items: Iterable[types.ConstInjection], comp_ref: f03.Component_Decl
+) -> Generator[types.ConstTypeInjection, None, None]:
     """
     Finds and yields all constant type injection rules applicable to a component declaration.
 
@@ -683,15 +714,14 @@ def _find_items_applicable_to_component(
 
     for it in items:
         # Find out if `item` is even allowed to apply in this scope.
-        if it.scope_spec:
-            if it.scope_spec != defn_spec[:len(it.scope_spec)]:
-                # If `item` is restricted to a scope, then local spec of the instance must start with that.
-                continue
+        if it.scope_spec and it.scope_spec != defn_spec[: len(it.scope_spec)]:
+            # If `item` is restricted to a scope, then local spec of the instance must start with that.
+            continue
         if isinstance(it, types.ConstTypeInjection) and _type_injection_applies_to_component(it, defn_spec, comp):
             yield it
 
 
-def inject_const_evals(ast: f03.Program, inject_consts: Optional[List[types.ConstInjection]] = None) -> f03.Program:
+def inject_const_evals(ast: f03.Program, inject_consts: list[types.ConstInjection] | None = None) -> f03.Program:
     """
     Injects pre-defined constant values into the AST based on a list of injection rules.
 
@@ -716,10 +746,10 @@ def inject_const_evals(ast: f03.Program, inject_consts: Optional[List[types.Cons
     inject_consts = inject_consts or []
     alias_map = analysis.alias_specs(ast)
 
-    TOPLEVEL_SPEC = ('*', )
+    TOPLEVEL_SPEC = ("*",)
 
     # Group injection items by the scope they apply to for efficient processing.
-    items_by_scopes = {}
+    items_by_scopes: dict[types.SPEC, list[types.ConstInjection]] = {}
     for item in inject_consts:
         scope_spec = item.scope_spec or TOPLEVEL_SPEC
         if scope_spec not in items_by_scopes:
@@ -727,85 +757,85 @@ def inject_const_evals(ast: f03.Program, inject_consts: Optional[List[types.Cons
         items_by_scopes[scope_spec].append(item)
 
         # --- Validate injection items to ensure they refer to real entities --- #
-        if item.scope_spec:
-            if item.scope_spec not in alias_map:
-                print(f"{item}/{item.scope_spec} does not refer to a valid object; moving on...", file=sys.stderr)
-                continue
+        if item.scope_spec and item.scope_spec not in alias_map:
+            print(f"{item}/{item.scope_spec} does not refer to a valid object; moving on...", file=sys.stderr)
+            continue
         if isinstance(item, types.ConstTypeInjection):
             # For TypeInjections, the type itself must be a valid derived type.
-            if item.type_spec not in alias_map or not isinstance(alias_map[item.type_spec].parent,
-                                                                 f03.Derived_Type_Def):
+            if item.type_spec not in alias_map or not isinstance(
+                alias_map[item.type_spec].parent, f03.Derived_Type_Def
+            ):
                 print(f"{item}/{item.type_spec} does not refer to a valid type; moving on...", file=sys.stderr)
                 continue
         elif isinstance(item, types.ConstInstanceInjection):
             # For InstanceInjections, the root variable must be a valid entity declaration.
             root_spec = item.root_spec
-            if not item.component_spec and root_spec[-1].endswith('_a'):
-                root_spec = root_spec[:-1] + tuple(root_spec[-1].rsplit('_', maxsplit=2)[:1])
-            elif not item.component_spec and root_spec[-1].endswith('_s'):
-                root_spec = root_spec[:-1] + tuple(root_spec[-1].rsplit('_', maxsplit=3)[:1])
+            if not item.component_spec and root_spec[-1].endswith("_a"):
+                root_spec = root_spec[:-1] + tuple(root_spec[-1].rsplit("_", maxsplit=2)[:1])
+            elif not item.component_spec and root_spec[-1].endswith("_s"):
+                root_spec = root_spec[:-1] + tuple(root_spec[-1].rsplit("_", maxsplit=3)[:1])
             if root_spec not in alias_map or not isinstance(alias_map[root_spec], f03.Entity_Decl):
                 print(f"{item}/{root_spec} does not refer to a valid object; moving on...", file=sys.stderr)
                 continue
 
     # Process injections for each scope.
     for scope_spec, items in items_by_scopes.items():
-        if scope_spec == TOPLEVEL_SPEC:
-            scope = ast
-        else:
-            scope = alias_map[scope_spec].parent
+        scope = ast if scope_spec == TOPLEVEL_SPEC else alias_map[scope_spec].parent
 
-        drefs: List[f03.Data_Ref] = [
-            dr for dr in walk(scope, f03.Data_Ref)
-            if analysis.find_type_dataref(dr, analysis.find_scope_spec(dr), alias_map).spec != ('CHARACTER', )
+        drefs: list[f03.Data_Ref] = [
+            dr
+            for dr in walk(scope, f03.Data_Ref)
+            if analysis.find_type_dataref(dr, analysis.find_scope_spec(dr), alias_map).spec != ("CHARACTER",)
         ]
-        names: List[f03.Name] = walk(scope, f03.Name)
-        allocateds: List[f03.Intrinsic_Function_Reference] = [
-            c for c in walk(scope, f03.Intrinsic_Function_Reference) if c.children[0].string == 'ALLOCATED'
+        names: list[f03.Name] = walk(scope, f03.Name)
+        allocateds: list[f03.Intrinsic_Function_Reference] = [
+            c for c in walk(scope, f03.Intrinsic_Function_Reference) if c.children[0].string == "ALLOCATED"
         ]
-        allocatables: List[Union[f03.Entity_Decl, f03.Component_Decl]] = [
-            c for c in walk(scope, (f03.Entity_Decl, f03.Component_Decl))
-            if analysis.find_type_of_entity(c, alias_map).alloc
+        allocatables: list[Union[f03.Entity_Decl, f03.Component_Decl]] = [
+            c
+            for c in walk(scope, (f03.Entity_Decl, f03.Component_Decl))
+            if (c_type := analysis.find_type_of_entity(c, alias_map)) is not None and c_type.alloc
         ]
 
         # Separate items for allocation status (`_a`), array sizes (`_s`), and regular values.
-        alloc_items = list(
-            filter(
-                lambda it: it.component_spec[-1].endswith('_a')
-                if it.component_spec else it.root_spec[-1].endswith('_a'), items))
-        size_items = list(
-            filter(
-                lambda it: it.component_spec[-1].endswith('_s')
-                if it.component_spec else it.root_spec[-1].endswith('_s'), items))
+        def _leaf(it: types.ConstInjection) -> str:
+            if it.component_spec:
+                return it.component_spec[-1]
+            assert isinstance(it, types.ConstInstanceInjection)
+            return it.root_spec[-1]
+
+        alloc_items = [it for it in items if _leaf(it).endswith("_a")]
+        size_items = [it for it in items if _leaf(it).endswith("_s")]
         items = [it for it in items if it not in alloc_items and it not in size_items]
 
         # --- Handle `ALLOCATED(arr)` intrinsics --- #
         for al in allocateds:
             _, args = al.children
             assert args and len(args.children) == 1
-            arr, = args.children
+            (arr,) = args.children
             # Find an injection rule for the allocation status of this array.
-            item = ast_utils.atmost_one(_find_items_applicable_to_instance(alloc_items, arr, alias_map))
-            if not item:
+            alloc_item = ast_utils.atmost_one(_find_items_applicable_to_instance(alloc_items, arr, alias_map))
+            if not alloc_item:
                 continue
             # Replace the `ALLOCATED(arr)` call with a boolean literal.
-            utils.replace_node(al, _val_2_lit(item.value, ('LOGICAL', )))
+            utils.replace_node(al, _val_2_lit(alloc_item.value, ("LOGICAL",)))
 
         # --- Handle allocatable arrays where dimensions can be fixed --- #
         for al in allocatables:
             name = utils.find_name_of_node(al)
+            assert name is not None, f"allocatable declaration without a name: {al}"
             typ = analysis.find_type_of_entity(al, alias_map)
-            assert typ.alloc
+            assert typ is not None and typ.alloc
             shape = list(typ.shape)
+            siz_or_off: list[types.ConstInjection]
             if isinstance(al, f03.Component_Decl):
-                siz_or_off: List[types.ConstInjection] = list(_find_items_applicable_to_component(size_items, al))
+                siz_or_off = list(_find_items_applicable_to_component(size_items, al))
             else:
-                siz_or_off: List[types.ConstInjection] = list(
-                    _find_items_applicable_to_instance(size_items, al, alias_map))
+                siz_or_off = list(_find_items_applicable_to_instance(size_items, al, alias_map))
             if not siz_or_off:
                 continue
 
-            def _key_(z: types.ConstInjection) -> Optional[str]:
+            def _key_(z: types.ConstInjection) -> str | None:
                 """
                 Helper function to extract a key from a ConstInjection object for comparison.
                 This key represents the component or root specification.
@@ -820,27 +850,27 @@ def inject_const_evals(ast: f03.Program, inject_consts: Optional[List[types.Cons
 
             # Try to find injected size and offset for each dimension.
             for idx in range(len(shape)):
-                if shape[idx] != ':':
+                if shape[idx] != ":":
                     # It's already fixed anyway.
                     continue
-                siz = ast_utils.atmost_one(z for z in siz_or_off if _key_(z) == f"__f2dace_SA_{name}_d_{idx}_s")
-                off = ast_utils.atmost_one(z for z in siz_or_off if _key_(z) == f"__f2dace_SOA_{name}_d_{idx}_s")
-                if not siz or not off:
+                siz_item = ast_utils.atmost_one(z for z in siz_or_off if _key_(z) == f"__f2dace_SA_{name}_d_{idx}_s")
+                off_item = ast_utils.atmost_one(z for z in siz_or_off if _key_(z) == f"__f2dace_SOA_{name}_d_{idx}_s")
+                if not siz_item or not off_item:
                     # We cannot inject and fix the size for this dimension.
                     continue
-                siz, off = int(siz.value), int(off.value)
+                siz, off = int(siz_item.value), int(off_item.value)
                 # Reconstruct the dimension with fixed bounds, e.g., '1:10'.
                 shape[idx] = f"{off}:{siz + off - 1}"
             if typ.shape == tuple(shape):
                 # Nothing changed, therefore, nothing to do.
                 continue
-            if ':' in shape:
+            if ":" in shape:
                 # The shape is not fully determined, so don't replace it
                 continue
 
             # The array is now fully sized, so we can replace its declaration to make it static.
             typ.shape = tuple(shape)
-            if not any(s == ':' for s in typ.shape):
+            if not any(s == ":" for s in typ.shape):
                 typ.alloc = False
             nudecl = typ.to_decl(name)
             if isinstance(al, f03.Component_Decl):
@@ -875,12 +905,13 @@ def inject_const_evals(ast: f03.Program, inject_consts: Optional[List[types.Cons
                 lv, _, _ = dr.parent.children
                 if lv == dr:
                     continue
-            item = ast_utils.atmost_one(_find_items_applicable_to_instance(items, dr, alias_map))
-            if not item:
+            dr_item = ast_utils.atmost_one(_find_items_applicable_to_instance(items, dr, alias_map))
+            if not dr_item:
                 continue
             utils.replace_node(
-                dr, _val_2_lit(item.value,
-                               analysis.find_type_dataref(dr, analysis.find_scope_spec(dr), alias_map).spec))
+                dr,
+                _val_2_lit(dr_item.value, analysis.find_type_dataref(dr, analysis.find_scope_spec(dr), alias_map).spec),
+            )
 
         # --- Handle direct value injections for simple names --- #
         for nm in names:
@@ -892,21 +923,23 @@ def inject_const_evals(ast: f03.Program, inject_consts: Optional[List[types.Cons
             loc = analysis.search_real_local_alias_spec(nm, alias_map)
             if not loc or not isinstance(alias_map[loc], f03.Entity_Decl):
                 continue
-            item = ast_utils.atmost_one(_find_items_applicable_to_instance(items, nm, alias_map))
-            if not item:
+            nm_item = ast_utils.atmost_one(_find_items_applicable_to_instance(items, nm, alias_map))
+            if not nm_item:
                 # Found no direct-value item that applies to `nm`.
                 continue
             tspec = analysis.find_type_of_entity(alias_map[loc], alias_map)
+            assert tspec is not None
             # NOTE: We should replace only when it is not an output of the function. However, here we pass the
             # responsibilty to the user to provide valid injections.
             if isinstance(nm.parent, f03.Assignment_Stmt) and nm is nm.parent.children[0]:
                 # We're violating the rule of valid injection already: If we are assigning anything to this variable, we
                 # can just ignore it, since it has to be treated as a constant anyway.
                 print(
-                    f"`{nm} = {item.value}` is supposed to be a constant injection, yet found `{nm.parent}` ; "
+                    f"`{nm} = {nm_item.value}` is supposed to be a constant injection, yet found `{nm.parent}` ; "
                     f"dropping the assignment and moving on...",
-                    file=sys.stderr)
+                    file=sys.stderr,
+                )
                 utils.remove_self(nm.parent)
                 continue
-            utils.replace_node(nm, _val_2_lit(item.value, tspec.spec))
+            utils.replace_node(nm, _val_2_lit(nm_item.value, tspec.spec))
     return ast

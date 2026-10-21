@@ -8,12 +8,13 @@ pins one; otherwise the first one actually installed wins.  Stdlib-only on purpo
 :mod:`dace_fortran.emit_hlfir` and :mod:`dace_fortran.flang_codebase` import this
 without dragging in the compiled bridge.
 """
+
 import os
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence
 
 #: LLVM major versions the bridge builds against, in preference order.
 SUPPORTED_LLVM_VERSIONS = ("21", "22")
@@ -24,6 +25,23 @@ _UNVERSIONED = ("flang-new", "flang")
 _FLANG_VERSION_RE = re.compile(r"flang(?:-new)? version (\d+)")
 
 
+def build_parallelism() -> int:
+    """Bridge build jobs within the CPU affinity, Slurm allocation and CMake's requested limit.
+
+    Limit an unconfigured build to 32 jobs. Explicit limits must be positive integers;
+    an invalid allocation must fail before CMake starts rather than launch an unbounded build.
+    """
+    available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    limits = [32, available]
+    for name in ("CMAKE_BUILD_PARALLEL_LEVEL", "SLURM_CPUS_PER_TASK"):
+        value = os.environ.get(name)
+        if value is not None:
+            if not value.isdecimal() or int(value) < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            limits.append(int(value))
+    return min(limits)
+
+
 def requested_version() -> str:
     """The LLVM major pinned by ``$LLVM_VERSION``, or ``''`` to auto-detect."""
     return os.environ.get("LLVM_VERSION", "").strip()
@@ -32,10 +50,10 @@ def requested_version() -> str:
 def candidate_versions() -> Sequence[str]:
     """Majors to probe, in order: the pinned one alone, else all supported ones."""
     pinned = requested_version()
-    return (pinned, ) if pinned else SUPPORTED_LLVM_VERSIONS
+    return (pinned,) if pinned else SUPPORTED_LLVM_VERSIONS
 
 
-def flang_names(version: Optional[str] = None) -> List[str]:
+def flang_names(version: str | None = None) -> list[str]:
     """flang binary names to probe, most specific first.
 
     Debian/Ubuntu ship ``flang-new-<major>`` / ``flang-<major>``; spack and upstream
@@ -59,7 +77,7 @@ def flang_major(binary: str) -> str:
     return match.group(1) if match else ""
 
 
-def find_flang(version: Optional[str] = None) -> Optional[str]:
+def find_flang(version: str | None = None) -> str | None:
     """Path to a supported flang on ``$PATH``, or ``None``.
 
     ``$FC`` wins when it points at an LLVM flang of an acceptable major.
@@ -72,21 +90,22 @@ def find_flang(version: Optional[str] = None) -> Optional[str]:
         found = shutil.which(name)
         if not found:
             continue
-        if os.path.basename(name) in _UNVERSIONED or name == override:
-            if flang_major(found) not in wanted:
-                continue
+        if (os.path.basename(name) in _UNVERSIONED or name == override) and flang_major(found) not in wanted:
+            continue
         return found
     return None
 
 
-def require_flang(version: Optional[str] = None) -> str:
+def require_flang(version: str | None = None) -> str:
     """:func:`find_flang`, or raise naming every binary and major that was tried."""
     found = find_flang(version)
     if found is None:
         majors = "/".join([version] if version else list(candidate_versions()))
-        raise RuntimeError(f"No LLVM flang for LLVM {majors} on PATH (tried "
-                           f"{', '.join(flang_names(version))}); install LLVM/Flang "
-                           f"{majors} to use the HLFIR frontend, or point $FC at one.")
+        raise RuntimeError(
+            f"No LLVM flang for LLVM {majors} on PATH (tried "
+            f"{', '.join(flang_names(version))}); install LLVM/Flang "
+            f"{majors} to use the HLFIR frontend, or point $FC at one."
+        )
     return found
 
 

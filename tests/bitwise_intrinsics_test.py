@@ -5,11 +5,8 @@ not the sign-extending ``arith.shrsi`` -- the key gotcha the tests below pin."""
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_bitwise_set_clear_xor_shift_and(tmp_path: Path):
@@ -25,7 +22,7 @@ subroutine probe(x, y, out)
   out(6) = ior(x, y)
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     x_in, y_in = 0b1010, 0b1100
     out = np.zeros(6, dtype=np.int32)
     sdfg(x=x_in, y=y_in, out=out)
@@ -50,7 +47,7 @@ subroutine probe(x, s, o_var, o_negconst, o_negx)
   o_negx     = ishft(-100, -2)  ! negative operand, logical right
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
 
     def fortran_ishft(x, s):
         u = np.uint32(np.int32(x))
@@ -81,10 +78,16 @@ subroutine probe(x, out_ibits, out_btest)
   end if
 end subroutine
 """
-    sdfg = build_sdfg(src, tmp_path, name='probe').build()
+    sdfg = build_sdfg(src, tmp_path, name="probe").build()
     x_in = 0b101110
     out_ibits = np.zeros(1, dtype=np.int32)
     out_btest = np.zeros(1, dtype=np.int32)
     sdfg(x=x_in, out_ibits=out_ibits, out_btest=out_btest)
     assert int(out_ibits[0]) == (x_in >> 2) & ((1 << 3) - 1)
     assert int(out_btest[0]) == 1 if (x_in & (1 << 1)) else 0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

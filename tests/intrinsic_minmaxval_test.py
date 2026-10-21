@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/intrinsic_minmaxval_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_minval_double(tmp_path):
@@ -22,7 +19,7 @@ res(4) = MINVAL(dt)
 
 END SUBROUTINE minval_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='minval_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="minval_test_function").build()
     size = 7
 
     d = np.full([size], 0, order="F", dtype=np.float64)
@@ -59,7 +56,7 @@ res(4) = MINVAL(dt)
 
 END SUBROUTINE minval_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='minval_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="minval_test_function").build()
     size = 7
 
     d = np.full([size], 0, order="F", dtype=np.int32)
@@ -106,7 +103,7 @@ res(4) = MAXVAL(dt)
 
 END SUBROUTINE minval_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='minval_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="minval_test_function").build()
     size = 7
 
     d = np.full([size], 0, order="F", dtype=np.float64)
@@ -143,7 +140,7 @@ res(4) = MAXVAL(dt)
 
 END SUBROUTINE minval_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='minval_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="minval_test_function").build()
     size = 7
 
     d = np.full([size], 0, order="F", dtype=np.int32)
@@ -212,7 +209,7 @@ MODULE test_minval
     END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path, name='minval_test_func', entry='minval_test_func').build()
+    sdfg = build_sdfg(src, tmp_path, name="minval_test_func", entry="minval_test_func").build()
 
     size = 7
     inp = np.full([size], 0, order="F", dtype=np.int32)
@@ -225,3 +222,9 @@ END MODULE
     assert res[1] == inp[6]
     assert res[2] == inp[5]
     assert res[3] == inp[4]
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

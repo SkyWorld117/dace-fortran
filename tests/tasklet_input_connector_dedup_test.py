@@ -6,13 +6,9 @@ textual expression when they disagreed on count (e.g. the MIN/MAX cmp+select pat
 """
 
 import numpy as np
-import pytest
-
 from dace.sdfg import nodes as nd
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def _tasklet_for(sdfg, code_fragment: str):
@@ -34,10 +30,10 @@ def test_dedup_same_index_three_times(tmp_path):
                     ENDDO
                     END SUBROUTINE cube
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='cube', entry='cube').build()
-    t = _tasklet_for(sdfg, '_in_a')
+    sdfg = build_sdfg(test_string, tmp_path, name="cube", entry="cube").build()
+    t = _tasklet_for(sdfg, "_in_a")
     assert t is not None, "couldn't find the cube tasklet"
-    in_conns = [c for c in t.in_connectors if c.startswith('_in_a')]
+    in_conns = [c for c in t.in_connectors if c.startswith("_in_a")]
     # Contract: one connector per textual occurrence (no dedup) -- deduping by (array, index)
     # used to misalign the bridge's access list against the textual expression when they
     # disagreed on count (e.g. the MIN/MAX cmp+select pattern).
@@ -61,10 +57,10 @@ def test_no_dedup_when_index_differs(tmp_path):
                     ENDDO
                     END SUBROUTINE pair_sum
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='pair_sum', entry='pair_sum').build()
-    t = _tasklet_for(sdfg, '_in_a')
+    sdfg = build_sdfg(test_string, tmp_path, name="pair_sum", entry="pair_sum").build()
+    t = _tasklet_for(sdfg, "_in_a")
     assert t is not None
-    in_conns = sorted(c for c in t.in_connectors if c.startswith('_in_a'))
+    in_conns = sorted(c for c in t.in_connectors if c.startswith("_in_a"))
     assert len(in_conns) == 2, f"expected two _in_a* connectors, got {in_conns}"
 
     a = np.arange(1.0, 6.0, dtype=np.float64)
@@ -73,3 +69,9 @@ def test_no_dedup_when_index_differs(tmp_path):
     # a[i-1] + a[5-i-1+1-1=5-i-1] = a[i-1] + a[5-i]
     expected = np.array([a[i] + a[4 - i] for i in range(5)], dtype=np.float64)
     assert np.allclose(b, expected)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

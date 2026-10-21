@@ -10,14 +10,11 @@ patterns the bridge must tell apart:
 
 Each kernel checked against an f2py reference on several inputs.
 """
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _run(tmp_path, src, cases, argnames):
@@ -27,7 +24,7 @@ def _run(tmp_path, src, cases, argnames):
     for args in cases:
         s = np.zeros(10, dtype=np.float64)
         r = np.zeros(10, dtype=np.float64)
-        kw = {k: np.int32(v) for k, v in zip(argnames, args)}
+        kw = {k: np.int32(v) for k, v in zip(argnames, args, strict=False)}
         sdfg(out=s, **kw)
         # probe lives in probe_mod, so f2py exposes it under the module's submodule namespace.
         mod.probe_mod.probe(*args, r)
@@ -113,8 +110,12 @@ subroutine probe(sel, n1, n2, n3, n4, out)
 end subroutine probe
 end module probe_mod
 """
-    sdfg = _run(tmp_path, src, [(1, 5, 3, 7, 2), (2, 5, 3, 7, 2), (3, 5, 3, 7, 2), (4, 5, 3, 7, 2)],
-                ["sel", "n1", "n2", "n3", "n4"])
+    sdfg = _run(
+        tmp_path,
+        src,
+        [(1, 5, 3, 7, 2), (2, 5, 3, 7, 2), (3, 5, 3, 7, 2), (4, 5, 3, 7, 2)],
+        ["sel", "n1", "n2", "n3", "n4"],
+    )
     assert "a_alloc1" not in sdfg.arrays
     assert str(sdfg.arrays["a"].shape) == "(a_d0,)"
 
@@ -310,4 +311,8 @@ subroutine probe(n, out)
 end subroutine probe
 end module probe_mod
 """
-    _run(tmp_path, src, [(5, ), (3, ), (8, )], ["n"])
+    _run(tmp_path, src, [(5,), (3,), (8,)], ["n"])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

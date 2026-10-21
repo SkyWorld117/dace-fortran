@@ -1,23 +1,13 @@
 """E2e smoke for autotools/dace_fortran.m4: stages a project, runs
 aclocal -> autoconf -> automake -> configure -> make, asserts the preprocess rule fires.
 Skipped when autoconf/automake/aclocal aren't on PATH."""
-import os
-import shutil
+
 import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
-_HAVE_AUTOCONF = shutil.which("autoconf") is not None
-_HAVE_AUTOMAKE = shutil.which("automake") is not None
-_HAVE_ACLOCAL = shutil.which("aclocal") is not None
-_HAVE_MAKE = shutil.which("make") is not None
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _M4_DIR = _REPO_ROOT / "autotools"
-
-pytestmark = pytest.mark.skipif(not (_HAVE_AUTOCONF and _HAVE_AUTOMAKE and _HAVE_ACLOCAL and _HAVE_MAKE),
-                                reason="autoconf / automake / aclocal / make required")
 
 
 def _write_project(tmp_path: Path) -> Path:
@@ -73,7 +63,7 @@ END MODULE utils_mod
 
     # Makefile.am includes the rules file and remaps kernel.f90 via the helper macro; no compile
     # step, so the default target is a marker file depending on the rewritten output.
-    rules_mk = (_REPO_ROOT / "autotools" / "dace_fortran.mk")
+    rules_mk = _REPO_ROOT / "autotools" / "dace_fortran.mk"
     (tmp_path / "Makefile.am").write_text(f"""\
 include {rules_mk}
 
@@ -103,12 +93,12 @@ def test_configure_succeeds(tmp_path):
     """./configure succeeds -- DACE_FORTRAN_PREPROCESS macro expanded cleanly into the generated script."""
     proj = _write_project(tmp_path)
     _autoreconf(proj)
-    res = subprocess.run(["./configure"], cwd=str(proj), capture_output=True, text=True)
-    assert res.returncode == 0, \
-        f"configure failed:\nstdout={res.stdout}\nstderr={res.stderr}"
+    res = subprocess.run(["./configure"], check=False, cwd=str(proj), capture_output=True, text=True)
+    assert res.returncode == 0, f"configure failed:\nstdout={res.stdout}\nstderr={res.stderr}"
     # Sanity: the configure log mentions the macro's probe.
-    assert "checking whether" in res.stdout and "dace_fortran" in res.stdout, \
+    assert "checking whether" in res.stdout and "dace_fortran" in res.stdout, (
         f"configure didn't run the dace_fortran probe; stdout:\n{res.stdout}"
+    )
 
 
 def test_make_runs_preprocess_and_emits_sources(tmp_path):
@@ -117,14 +107,13 @@ def test_make_runs_preprocess_and_emits_sources(tmp_path):
     proj = _write_project(tmp_path)
     _autoreconf(proj)
     subprocess.check_call(["./configure"], cwd=str(proj), stdout=subprocess.DEVNULL)
-    res = subprocess.run(["make"], cwd=str(proj), capture_output=True, text=True)
-    assert res.returncode == 0, \
-        f"make failed:\nstdout={res.stdout}\nstderr={res.stderr}"
+    res = subprocess.run(["make"], check=False, cwd=str(proj), capture_output=True, text=True)
+    assert res.returncode == 0, f"make failed:\nstdout={res.stdout}\nstderr={res.stderr}"
     # default DACE_FORTRAN_BUILD_DIR = $(top_builddir)/dace_fortran_preprocessed; in-tree top_builddir = '.'.
     out = proj / "dace_fortran_preprocessed" / "src" / "kernel.preprocessed.f90"
-    assert out.is_file(), \
-        f"no preprocessed kernel at {out}; tree:\n" + \
-        "\n".join(str(p.relative_to(proj)) for p in proj.rglob("*"))
+    assert out.is_file(), f"no preprocessed kernel at {out}; tree:\n" + "\n".join(
+        str(p.relative_to(proj)) for p in proj.rglob("*")
+    )
     rewritten = out.read_text()
     # ``KIND=wp`` -> ``KIND=8``.
     assert "KIND=8" in rewritten
@@ -144,8 +133,14 @@ def test_make_is_incremental_on_unchanged_source(tmp_path):
     mtime1 = out.stat().st_mtime
     # sleep past 1s: some filesystems round mtime to whole seconds.
     import time
+
     time.sleep(1.05)
     subprocess.check_call(["make"], cwd=str(proj), stdout=subprocess.DEVNULL)
     mtime2 = out.stat().st_mtime
-    assert mtime1 == mtime2, \
-        f"unchanged source was re-preprocessed; mtime1={mtime1} mtime2={mtime2}"
+    assert mtime1 == mtime2, f"unchanged source was re-preprocessed; mtime1={mtime1} mtime2={mtime2}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -10,34 +10,39 @@ No sidecar is involved -- the plan comes off the frozen signature, which remembe
 both the caller's location and the kernel's.
 """
 
+import subprocess
+
 import dace
 import pytest
 
 from dace_fortran.bindings.acc_transfers import (
+    Directive,
     plan_frozen_transfers,
     render_data_close,
     render_data_open,
     render_host_data_open,
 )
 from dace_fortran.bindings.block_builders import splice_acc_staging
-from dace_fortran.bindings.frozen_signature import HOST_STORAGE, FrozenArg, FrozenSignature, refreeze
+from dace_fortran.bindings.frozen_signature import HOST_STORAGE, FrozenArg, FrozenArgKind, FrozenSignature, refreeze
 
 _ENTRY = "compute"
 
 
 def _arg(name: str, intent: str, **kw) -> FrozenArg:
-    return FrozenArg(fortran_name=name,
-                     sdfg_name=name,
-                     kind="array",
-                     dtype="float64",
-                     rank=1,
-                     shape=("n", ),
-                     intent=intent,
-                     **kw)
+    return FrozenArg(
+        fortran_name=name,
+        sdfg_name=name,
+        kind=FrozenArgKind.ARRAY,
+        dtype="float64",
+        rank=1,
+        shape=("n",),
+        intent=intent,
+        **kw,
+    )
 
 
 def _signature(*args: FrozenArg) -> FrozenSignature:
-    return FrozenSignature(entry=_ENTRY, mangled="_QPcompute", args=args, free_symbols=("n", ))
+    return FrozenSignature(entry=_ENTRY, mangled="_QPcompute", args=args, free_symbols=("n",))
 
 
 def _offloaded(*names: str) -> FrozenSignature:
@@ -45,7 +50,7 @@ def _offloaded(*names: str) -> FrozenSignature:
     sdfg = dace.SDFG(_ENTRY)
     sdfg.add_symbol("n", dace.int64)
     for name in ("host", "rd", "rw", "wr"):
-        sdfg.add_array(name, shape=(dace.symbol("n"), ), dtype=dace.float64, transient=False)
+        sdfg.add_array(name, shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
     sdfg._frozen_signature = _signature(_arg("host", "inout"), _arg("rd", "in"), _arg("rw", "inout"), _arg("wr", "out"))
     for name in names:
         sdfg.arrays[name].storage = dace.StorageType.GPU_Global
@@ -54,14 +59,14 @@ def _offloaded(*names: str) -> FrozenSignature:
 
 def _blocks() -> dict:
     return {
-        'wrapper_body':
-        "  ! body\n",
-        'wrapper_tail':
-        "\n".join([
-            f"  call dace_program_{_ENTRY}(handle, &",
-            "    a, b)",
-            f"  end subroutine {_ENTRY}_dace",
-        ]),
+        "wrapper_body": "  ! body\n",
+        "wrapper_tail": "\n".join(
+            [
+                f"  call dace_program_{_ENTRY}(handle, &",
+                "    a, b)",
+                f"  end subroutine {_ENTRY}_dace",
+            ]
+        ),
     }
 
 
@@ -77,15 +82,15 @@ def test_a_kernel_left_on_the_host_plans_nothing():
 
 def test_clause_follows_the_intent_of_each_relocated_arg():
     plan = plan_frozen_transfers(_offloaded("rd", "rw", "wr"))
-    assert plan.copyin == ("rd", )
-    assert plan.copy == ("rw", )
-    assert plan.copyout == ("wr", )
+    assert plan.copyin == ("rd",)
+    assert plan.copy == ("rw",)
+    assert plan.copyout == ("wr",)
     assert plan.active
 
 
 def test_an_arg_left_on_the_host_gets_no_clause():
     plan = plan_frozen_transfers(_offloaded("rd"))
-    assert plan.data_region == (("COPYIN", "rd"), )
+    assert plan.data_region == (("COPYIN", "rd"),)
     assert "host" not in plan.use_device
 
 
@@ -93,7 +98,7 @@ def test_moving_back_to_the_host_retires_the_region():
     """GPU -> CPU is a plan change, not a stale clause: refreeze clears the relocation."""
     sdfg = dace.SDFG(_ENTRY)
     sdfg.add_symbol("n", dace.int64)
-    sdfg.add_array("a", shape=(dace.symbol("n"), ), dtype=dace.float64, transient=False)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
     sdfg._frozen_signature = _signature(_arg("a", "inout", device_storage="GPU_Global"))
     assert plan_frozen_transfers(sdfg._frozen_signature).active
 
@@ -108,10 +113,12 @@ def test_every_relocated_arg_is_also_use_device():
 
 
 def test_scalars_never_reach_the_region():
-    frozen = _signature(_arg("a", "inout", device_storage="GPU_Global"),
-                        FrozenArg(fortran_name="alpha", sdfg_name="alpha", kind="scalar", dtype="float64", rank=0))
+    frozen = _signature(
+        _arg("a", "inout", device_storage="GPU_Global"),
+        FrozenArg(fortran_name="alpha", sdfg_name="alpha", kind=FrozenArgKind.SCALAR, dtype="float64", rank=0),
+    )
     plan = plan_frozen_transfers(frozen)
-    assert plan.data_region == (("COPY", "a"), )
+    assert plan.data_region == (("COPY", "a"),)
     assert "alpha" not in plan.use_device
 
 
@@ -155,7 +162,7 @@ def test_rendering_is_deterministic():
 
 def test_the_data_region_encloses_host_data_around_the_call():
     plan = plan_frozen_transfers(_offloaded("rd", "rw", "wr"))
-    tail = splice_acc_staging(_blocks(), _ENTRY, plan)['wrapper_tail'].splitlines()
+    tail = splice_acc_staging(_blocks(), _ENTRY, plan)["wrapper_tail"].splitlines()
     order = [i for i, ln in enumerate(tail) if "!$ACC DATA" in ln or "HOST_DATA" in ln or "END DATA" in ln]
     kinds = [tail[i].strip() for i in order]
 
@@ -167,7 +174,7 @@ def test_the_data_region_encloses_host_data_around_the_call():
 
 def test_the_whole_continued_call_sits_inside_the_region():
     plan = plan_frozen_transfers(_offloaded("rd"))
-    tail = splice_acc_staging(_blocks(), _ENTRY, plan)['wrapper_tail'].splitlines()
+    tail = splice_acc_staging(_blocks(), _ENTRY, plan)["wrapper_tail"].splitlines()
     call_at = next(i for i, ln in enumerate(tail) if ln.lstrip().startswith(f"call dace_program_{_ENTRY}("))
     close_at = next(i for i, ln in enumerate(tail) if ln.strip() == "!$ACC END DATA")
 
@@ -175,13 +182,92 @@ def test_the_whole_continued_call_sits_inside_the_region():
     assert close_at > call_at + 1
 
 
-@pytest.mark.parametrize("moved,expected", [
-    (("rd", ), "COPYIN(rd)"),
-    (("wr", ), "COPYOUT(wr)"),
-    (("rw", ), "COPY(rw)"),
-])
+@pytest.mark.parametrize(
+    "moved,expected",
+    [
+        (("rd",), "COPYIN(rd)"),
+        (("wr",), "COPYOUT(wr)"),
+        (("rw",), "COPY(rw)"),
+    ],
+)
 def test_each_direction_reaches_the_emitted_wrapper(moved, expected):
     plan = plan_frozen_transfers(_offloaded(*moved))
-    tail = splice_acc_staging(_blocks(), _ENTRY, plan)['wrapper_tail']
+    tail = splice_acc_staging(_blocks(), _ENTRY, plan)["wrapper_tail"]
     assert expected in tail
     assert render_host_data_open(plan, "  ")[0].endswith(f"USE_DEVICE({moved[0]})")
+
+
+# ----- OpenMP offload ---------------------------------------------------------
+
+
+def test_openmp_maps_each_clause_on_entry_and_exit():
+    """COPYIN maps to/release, COPY to/from, COPYOUT alloc/from -- the OpenACC data region's semantics."""
+    plan = plan_frozen_transfers(_offloaded("rd", "rw", "wr"))
+    assert render_data_open(plan, "", Directive.OPENMP) == [
+        "!$omp target enter data map(to: rd)",
+        "!$omp target enter data map(to: rw)",
+        "!$omp target enter data map(alloc: wr)",
+    ]
+    assert render_data_close(plan, "", Directive.OPENMP) == [
+        "!$omp target exit data map(release: rd)",
+        "!$omp target exit data map(from: rw)",
+        "!$omp target exit data map(from: wr)",
+    ]
+
+
+def test_openmp_hands_the_call_the_device_addresses():
+    plan = plan_frozen_transfers(_offloaded("rd", "rw", "wr"))
+    tail = splice_acc_staging(_blocks(), _ENTRY, plan, Directive.OPENMP)["wrapper_tail"].splitlines()
+    call_at = next(i for i, ln in enumerate(tail) if ln.lstrip().startswith(f"call dace_program_{_ENTRY}("))
+    opened = [ln.strip() for ln in tail[:call_at]]
+    closed = [ln.strip() for ln in tail[call_at + 2 :]]
+
+    assert opened[-3:] == [
+        "!$omp target data use_device_addr(rd, &",
+        "!$omp&   rw, &",
+        "!$omp&   wr)",
+    ]
+    assert closed[0] == "!$omp end target data"
+    assert not any("!$ACC" in ln for ln in tail)
+
+
+def test_openmp_staging_is_valid_openmp(tmp_path):
+    """The spliced wrapper compiles under ``gfortran -fopenmp`` (syntax and semantics, no offload device needed)."""
+    plan = plan_frozen_transfers(_offloaded("rd", "rw", "wr"))
+    blocks = {
+        "wrapper_body": "",
+        "wrapper_tail": "\n".join(
+            [
+                f"  call dace_program_{_ENTRY}(c_loc(rd), &",
+                "    c_loc(rw), c_loc(wr))",
+                f"  end subroutine {_ENTRY}_dace",
+            ]
+        ),
+    }
+    spliced = splice_acc_staging(blocks, _ENTRY, plan, Directive.OPENMP)
+    src = tmp_path / "wrapper.f90"
+    src.write_text(
+        "\n".join(
+            [
+                f"subroutine {_ENTRY}_dace(n, rd, rw, wr)",
+                "  use iso_c_binding",
+                "  implicit none",
+                "  integer, intent(in) :: n",
+                "  real(8), target :: rd(n), rw(n), wr(n)",
+                "  interface",
+                f"    subroutine dace_program_{_ENTRY}(a, b, c) bind(c)",
+                "      import :: c_ptr",
+                "      type(c_ptr), value :: a, b, c",
+                "    end subroutine",
+                "  end interface",
+                spliced["wrapper_body"],
+                spliced["wrapper_tail"],
+                "",
+            ]
+        )
+    )
+    subprocess.check_call(["gfortran", "-fopenmp", "-fsyntax-only", str(src)], cwd=tmp_path)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

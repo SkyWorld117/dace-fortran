@@ -22,46 +22,54 @@ caller's behalf:
   the above: hand it a built project's ``compile_commands.json``
   and it emits + lowers in a single step.
 
-All three return a built, validated :class:`dace.SDFG`.  ``entry``
-is the mangled Flang symbol of the target procedure (``_QPrun`` for
-a free subroutine, ``_QMmodPbar`` for a module procedure); it
-selects which procedure the SDFG represents (and, for the
-multi-file / multi-``.hlfir`` forms, which input the bridge starts
-from).
+All of them return a built, validated :class:`dace.SDFG`.  ``entry``
+is the Fortran name of the target procedure (``run``, or ``mod::run``
+to pick one of several procedures of that name); it selects which
+procedure the SDFG represents (and, for the multi-file /
+multi-``.hlfir`` forms, which input the bridge starts from).
 
 External (separately compiled) ``bind(c)`` functions a kernel calls
 are declared through :mod:`dace_fortran.external`
 (``register_external``); they are re-exported here for convenience.
 """
+
+import contextlib
 import re
-import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Union
 
 from dace import SDFG
 
 from dace_fortran.build_bridge import hb  # noqa: F401  -- ensures the bridge is built
+from dace_fortran.builder import DEFAULT_PIPELINE, SDFGBuilder
+from dace_fortran.entry_names import (
+    procedure_definitions,
+    require_fortran_name,
+    resolve_entry_name,
+    split_qualified_entry,
+)
 from dace_fortran.external import (
     Arg,
     ExternalSignature,
     keep_external,
-    register_external,  # noqa: F401
-    registered_names)
-from dace_fortran.hlfir_to_sdfg import DEFAULT_PIPELINE, SDFGBuilder
+    register_external,
+    registered_names,
+)
 from dace_fortran.llvm_toolchain import require_flang
-from dace_fortran.preprocess import preprocess_fortran_source
+from dace_fortran.preprocess import MergeEngine, preprocess_fortran_source
 
 __all__ = [
+    "Arg",
+    "ExternalSignature",
     "build_sdfg",
     "build_sdfg_from_files",
     "build_sdfg_from_hlfir",
     "build_sdfg_from_project",
-    "register_external",
     "keep_external",
-    "ExternalSignature",
-    "Arg",
+    "register_external",
 ]
 
 
@@ -70,7 +78,7 @@ def _find_flang() -> str:
     return require_flang()
 
 
-def _flang_intrinsic_modules_path(flang_bin: str) -> Optional[Path]:
+def _flang_intrinsic_modules_path(flang_bin: str) -> Path | None:
     """Locate the LLVM-flang intrinsic-modules directory shipped beside ``flang_bin``.
 
     Probed paths (first match wins):
@@ -106,120 +114,17 @@ def _flang_intrinsic_modules_path(flang_bin: str) -> Optional[Path]:
     return None
 
 
-def _entry_proc_name(entry: Optional[str]) -> Optional[str]:
-    """Reduce any accepted entry spelling to its bare Fortran procedure name.
-
-    Three forms reach this helper (see :func:`build_sdfg`):
-
-    * the friendly ``module::proc`` qualifier -- the procedure is the
-      segment after ``::`` (``mo_solve_nonhydro::solve_nh`` -> ``solve_nh``);
-    * a mangled Flang symbol -- Flang wraps uppercase tag letters (``M``
-      module, ``F`` function, ``S`` submodule, ``P`` procedure) around
-      lowercased identifiers, so the procedure is the segment after the
-      last ``P`` (``_QPmain`` -> ``main``; ``_QMmymodPbar`` -> ``bar``);
-    * a plain Fortran name -- returned unchanged.
-
-    The bare name is what selects the root file (the ``.f90`` whose
-    ``subroutine``/``function`` defines it).  ``None`` passes through (no
-    root selection needed).
-    """
-    if not entry:
-        return None
-    # Friendly ``module::proc`` form: the procedure follows ``::``.
-    if "::" in entry:
-        return entry.rsplit("::", 1)[-1]
-    # Mangled flang symbol ``_QM<mod>P<proc>`` / ``_QP<proc>``.
-    if entry.startswith("_Q") and "P" in entry:
-        return entry.rsplit("P", 1)[-1]
-    # Already a plain Fortran name.
-    return entry
+@contextlib.contextmanager
+def _scratch_dir(out_dir: Union[str, Path] | None, prefix: str) -> Iterator[Path]:
+    """``out_dir`` when given, else a temporary directory removed on exit."""
+    if out_dir is not None:
+        yield Path(out_dir)
+        return
+    with tempfile.TemporaryDirectory(prefix=prefix) as td:
+        yield Path(td)
 
 
-_PROC_RE = re.compile(
-    r"^\s*(?:(?:recursive|pure|impure|elemental|module)\s+)*"
-    r"(?:[\w*()]+\s+)*?(subroutine|function)\s+(\w+)", re.IGNORECASE)
-_MOD_RE = re.compile(r"^\s*module\s+(\w+)\s*$", re.IGNORECASE)
-_END_RE = re.compile(r"^\s*end\s*(module|interface|subroutine|function)?\b", re.IGNORECASE)
-_IFACE_RE = re.compile(r"^\s*(?:abstract\s+)?interface\b", re.IGNORECASE)
-
-
-def _resolve_entry(source: str, entry: Optional[str]) -> str:
-    """Return the mangled Flang entry symbol for ``entry``.
-
-    Three input forms, all keyed off a scan of ``source`` for procedure
-    *definitions* (``interface`` blocks and ``end`` lines are skipped):
-
-    - a mangled symbol (``_Q...`` ) -> returned verbatim;
-    - a plain Fortran name (``solve_nh`` or ``mod::proc`` ) -> resolved
-      against the scan to its mangled form;
-    - ``None`` -> auto-resolved, requiring exactly one definition (an SDFG
-      targets one specific procedure -- no "first of many" guessing).
-
-    Mangling is ``_QP<name>`` for a free procedure and ``_QM<mod>P<name>``
-    for a module procedure.
-
-    :raises ValueError: if the named procedure is not found or is ambiguous,
-        or (``None`` case) the source has no or more than one procedure.
-    """
-    if entry and entry.startswith("_Q"):
-        return entry  # already a mangled symbol
-    cur_mod: Optional[str] = None
-    iface_depth = 0
-    procs = []  # (module|None, name)
-    for raw in source.splitlines():
-        line = raw.strip()
-        if _IFACE_RE.match(line):
-            iface_depth += 1
-            continue
-        m_end = _END_RE.match(line)
-        if m_end:
-            kind = (m_end.group(1) or "").lower()
-            if kind == "interface" and iface_depth:
-                iface_depth -= 1
-            elif kind == "module":
-                cur_mod = None
-            continue
-        m_mod = _MOD_RE.match(line)
-        if m_mod and m_mod.group(1).lower() != "procedure":
-            cur_mod = m_mod.group(1)
-            continue
-        if iface_depth:
-            continue
-        m_p = _PROC_RE.match(line)
-        if m_p:
-            procs.append((cur_mod, m_p.group(2)))
-
-    def _mangle(mod, name):
-        return f"_QM{mod.lower()}P{name.lower()}" if mod else f"_QP{name.lower()}"
-
-    # Plain Fortran name given (``proc`` or ``mod::proc``): resolve against
-    # the scanned definitions so callers need not hand-write the mangled symbol.
-    if entry:
-        want_mod, _, want_proc = entry.lower().rpartition("::")
-        want_mod = want_mod or None
-        matches = {(m, n)
-                   for (m, n) in procs
-                   if n.lower() == want_proc and (want_mod is None or (m or "").lower() == want_mod)}
-        if not matches:
-            raise ValueError(f"build: no procedure {entry!r} defined in the source")
-        if len(matches) > 1:
-            cands = ", ".join(f"{(m or '<free>')}::{n}" for m, n in sorted(matches))
-            raise ValueError(f"build: entry {entry!r} is ambiguous ({cands}); "
-                             f"qualify it as module::proc")
-        return _mangle(*matches.pop())
-
-    # entry=None: derive from the single procedure definition.
-    if not procs:
-        raise ValueError("build: no SUBROUTINE/FUNCTION definition found to use as the "
-                         "SDFG entry; pass entry= explicitly")
-    if len(procs) > 1:
-        shown = ", ".join(n for _, n in procs)
-        raise ValueError(f"build: source defines multiple procedures ({shown}); pass "
-                         f"entry= (the Fortran name or mangled symbol of the target one)")
-    return _mangle(*procs[0])
-
-
-def _merge_external_names(external_names: Sequence[str] = ()) -> List[str]:
+def _merge_external_names(external_names: Sequence[str] = ()) -> list[str]:
     """The procedure names the module-merge must keep external (NOT inline) =
     any explicit ``external_names`` unioned with every name in the bridge's
     external registry (:func:`dace_fortran.external.registered_names`).
@@ -231,19 +136,21 @@ def _merge_external_names(external_names: Sequence[str] = ()) -> List[str]:
     return list(dict.fromkeys([*external_names, *registered_names()]))
 
 
-def _emit_hlfir(source: str,
-                out_dir: Path,
-                name: str,
-                *,
-                merge: bool,
-                preprocess: bool,
-                merge_entry: Optional[str] = None,
-                merge_engine: str = "regex",
-                external_names: Sequence[str] = (),
-                defines: Sequence[str] = (),
-                kind_map: dict = None,
-                kind_passthrough: bool = False,
-                resolve_intrinsic: Sequence[str] = ()) -> Path:
+def _emit_hlfir(
+    source: str,
+    out_dir: Path,
+    name: str,
+    *,
+    merge: bool,
+    preprocess: bool,
+    merge_entry: str | None = None,
+    merge_engine: MergeEngine = MergeEngine.REGEX,
+    resolve_intrinsic: Sequence[str] = (),
+    external_names: Sequence[str] = (),
+    defines: Sequence[str] = (),
+    kind_map: dict | None = None,
+    kind_passthrough: bool = False,
+) -> Path:
     """Write ``source`` to ``<out_dir>/<name>.F90``, preprocess
     (module-merge + opt-in rewrites), ``flang -fc1 -cpp -emit-hlfir``
     it, and return the ``.hlfir`` path.
@@ -283,16 +190,19 @@ def _emit_hlfir(source: str,
     # future flang changes its default.
     src = out_dir / f"{name}.F90"
     src.write_text(
-        preprocess_fortran_source(source,
-                                  search_dirs=[out_dir],
-                                  merge=merge,
-                                  merge_engine=merge_engine,
-                                  merge_entry=merge_entry,
-                                  external_names=merge_external,
-                                  resolve_intrinsic=resolve_intrinsic,
-                                  if_intvar=preprocess,
-                                  kind_map=kind_map,
-                                  kind_passthrough=kind_passthrough))
+        preprocess_fortran_source(
+            source,
+            search_dirs=[out_dir],
+            merge=merge,
+            merge_engine=merge_engine,
+            resolve_intrinsic=resolve_intrinsic,
+            merge_entry=merge_entry,
+            external_names=merge_external,
+            if_intvar=preprocess,
+            kind_map=kind_map,
+            kind_passthrough=kind_passthrough,
+        )
+    )
     hlfir = out_dir / f"{name}.hlfir"
     cmd = [_find_flang(), "-fc1", "-cpp", "-U_OPENMP", "-U_OPENACC", "-I", str(out_dir)]
     intrinsic_path = _flang_intrinsic_modules_path(cmd[0])
@@ -313,18 +223,21 @@ def _emit_hlfir(source: str,
     return hlfir
 
 
-def make_builder(source: str,
-                 *,
-                 entry: Optional[str] = None,
-                 name: str = "sdfg",
-                 pipeline: Optional[str] = None,
-                 out_dir: Optional[Union[str, Path]] = None,
-                 preprocess: bool = False,
-                 defines: Sequence[str] = (),
-                 kind_map: dict = None,
-                 kind_passthrough: bool = False,
-                 merge_engine: str = "regex",
-                 resolve_intrinsic: Sequence[str] = ()) -> SDFGBuilder:
+def make_builder(
+    source: str,
+    *,
+    entry: str | None = None,
+    name: str = "sdfg",
+    pipeline: str | None = None,
+    out_dir: Union[str, Path] | None = None,
+    preprocess: bool = False,
+    defines: Sequence[str] = (),
+    kind_map: dict | None = None,
+    kind_passthrough: bool = False,
+    merge_engine: MergeEngine = MergeEngine.REGEX,
+    resolve_intrinsic: Sequence[str] = (),
+    specialized_globals: dict | None = None,
+) -> SDFGBuilder:
     """Resolve the entry, lower ``source`` to HLFIR, and return a
     configured (not yet built) :class:`SDFGBuilder`.
 
@@ -333,74 +246,60 @@ def make_builder(source: str,
     goes through one real implementation (entry auto-resolution and
     all) while still wrapping the builder for per-test xdist naming.
 
-    ``entry`` may be ``None`` (:func:`_resolve_entry` derives it from the
-    single procedure in ``source``; error if none / ambiguous), a plain
-    Fortran name (``proc`` or ``mod::proc`` ), or a mangled ``_Q...`` symbol.
+    ``entry`` may be ``None`` (:func:`resolve_entry_name` derives it from the
+    single procedure in ``source``; error if none / ambiguous) or a
+    Fortran name (``proc`` or ``mod::proc`` ).
     The ``.hlfir`` is parsed into the bridge module at ``SDFGBuilder``
     construction, so a temporary scratch dir is fine.
     """
-    # ``_resolve_entry`` validates the auto case (it raises when an
+    # ``resolve_entry_name`` validates the auto case (it raises when an
     # entry-less source has zero or >1 procedures -- the contract is no
-    # "first of many") and resolves a plain Fortran name to its mangled
-    # symbol.  ``entry=None`` is forwarded unchanged: a validated
-    # single-procedure source must not call ``set_entry_symbol`` (it would
-    # perturb the single-proc lowering -- every entry-less test stays
-    # byte-identical).  A given entry (mangled or plain name) is forwarded
-    # as the resolved symbol so multi-proc / multi-file builds privatise
-    # the non-entry procedures.
-    resolved = _resolve_entry(source, entry)
-    fwd = None if entry is None else resolved
+    # "first of many") and qualifies a given name with its module.
+    # ``entry=None`` is forwarded unchanged: a validated single-procedure
+    # source must not call ``set_entry_symbol`` (it would perturb the
+    # single-proc lowering).  A given entry is forwarded qualified so
+    # multi-proc / multi-file builds privatise the non-entry procedures.
+    resolved = resolve_entry_name([source], entry)
+    fwd = None if entry is None else str(resolved)
     pipeline = pipeline or DEFAULT_PIPELINE
-    if out_dir is not None:
-        hlfir = _emit_hlfir(source,
-                            Path(out_dir),
-                            name,
-                            merge=True,
-                            preprocess=preprocess,
-                            merge_entry=None,
-                            merge_engine=merge_engine,
-                            defines=defines,
-                            kind_map=kind_map,
-                            kind_passthrough=kind_passthrough,
-                            resolve_intrinsic=resolve_intrinsic)
-        builder = SDFGBuilder(str(hlfir), pipeline=pipeline, entry=fwd)
-        builder._fortran_source = source
-        return builder
-    with tempfile.TemporaryDirectory(prefix=f"hlfir_{name}_") as td:
-        hlfir = _emit_hlfir(source,
-                            Path(td),
-                            name,
-                            merge=True,
-                            preprocess=preprocess,
-                            merge_entry=None,
-                            merge_engine=merge_engine,
-                            defines=defines,
-                            kind_map=kind_map,
-                            kind_passthrough=kind_passthrough,
-                            resolve_intrinsic=resolve_intrinsic)
-        builder = SDFGBuilder(str(hlfir), pipeline=pipeline, entry=fwd)
-        builder._fortran_source = source
-        return builder
+    with _scratch_dir(out_dir, f"hlfir_{name}_") as d:
+        hlfir = _emit_hlfir(
+            source,
+            d,
+            name,
+            merge=True,
+            preprocess=preprocess,
+            merge_entry=None,
+            merge_engine=merge_engine,
+            resolve_intrinsic=resolve_intrinsic,
+            defines=defines,
+            kind_map=kind_map,
+            kind_passthrough=kind_passthrough,
+        )
+        builder = SDFGBuilder(str(hlfir), pipeline=pipeline, entry=fwd, specialized_globals=specialized_globals)
+    builder.fortran_source = source
+    return builder
 
 
-def build_sdfg(source: str,
-               *,
-               entry: Optional[str] = None,
-               name: str = "sdfg",
-               pipeline: Optional[str] = None,
-               out_dir: Optional[Union[str, Path]] = None,
-               preprocess: bool = False,
-               defines: Sequence[str] = (),
-               kind_map: dict = None,
-               kind_passthrough: bool = False,
-               merge_engine: str = "regex",
-               resolve_intrinsic: Sequence[str] = ()) -> SDFG:
+def build_sdfg(
+    source: str,
+    *,
+    entry: str | None = None,
+    name: str = "sdfg",
+    pipeline: str | None = None,
+    out_dir: Union[str, Path] | None = None,
+    preprocess: bool = False,
+    defines: Sequence[str] = (),
+    kind_map: dict | None = None,
+    kind_passthrough: bool = False,
+    merge_engine: MergeEngine = MergeEngine.REGEX,
+    resolve_intrinsic: Sequence[str] = (),
+) -> SDFG:
     """Build a :class:`dace.SDFG` from a single inline Fortran source.
 
     :param source: Fortran source as one string.
-    :param entry: mangled Flang symbol of the target procedure
-        (``_QPrun`` for a free subroutine, ``_QMmodPbar`` for a module
-        procedure).  ``None`` (default) -> auto-resolved from the
+    :param entry: Fortran name of the target procedure (``run``, or
+        ``mod::run`` to disambiguate).  ``None`` (default) -> auto-resolved from the
         single procedure in ``source``; an error is raised if the
         source has no procedure or more than one (an SDFG targets one
         specific procedure -- no "first of many" guessing).
@@ -424,24 +323,26 @@ def build_sdfg(source: str,
         entirely -- for build pipelines that already resolve every
         kind alias upstream (e.g. via cpp expansion or by emitting
         HLFIR with the constants module pre-merged).
-    :param merge_engine: ``"regex"`` (default) or ``"fparser"`` -- which
+    :param merge_engine: ``MergeEngine.REGEX`` (default) or ``MergeEngine.FPARSER`` -- which
         ``USE``-merge engine preprocesses the source (see
         :func:`build_sdfg_from_files`).
     :returns: a built, validated SDFG.
     :raises ValueError: if ``entry`` is ``None`` and the source has no
         procedure or is ambiguous (more than one).
     """
-    return make_builder(source,
-                        entry=entry,
-                        name=name,
-                        pipeline=pipeline,
-                        out_dir=out_dir,
-                        preprocess=preprocess,
-                        defines=defines,
-                        kind_map=kind_map,
-                        kind_passthrough=kind_passthrough,
-                        merge_engine=merge_engine,
-                        resolve_intrinsic=resolve_intrinsic).build()
+    return make_builder(
+        source,
+        entry=entry,
+        name=name,
+        pipeline=pipeline,
+        out_dir=out_dir,
+        preprocess=preprocess,
+        defines=defines,
+        kind_map=kind_map,
+        kind_passthrough=kind_passthrough,
+        merge_engine=merge_engine,
+        resolve_intrinsic=resolve_intrinsic,
+    ).build()
 
 
 #: ``func.func @<symbol>(`` -- the MLIR opener for a procedure
@@ -462,23 +363,17 @@ def _resolve_hlfir_for_entry(root: Path, entry: str) -> Path:
     the entry symbol, not which TU it lives in.  This scan keeps the
     caller from having to track that mapping by hand.
 
-    ``entry`` is the user-facing PLAIN Fortran name (``csr_spmv``) or a
-    ``module::proc`` qualifier; the ``.hlfir`` defines the flang-MANGLED
-    symbol (``_QMmod_csrPcsr_spmv``), so we demangle-compare each
-    ``func.func @<sym>`` against the requested proc (and module, when
-    qualified).  A ``_Q...`` entry matches the symbol verbatim.
+    ``entry`` is the Fortran name (``csr_spmv``) or a ``module::proc``
+    qualifier; the ``.hlfir`` defines the flang-mangled symbol, so we
+    demangle-compare each ``func.func @<sym>`` against the requested proc
+    (and module, when qualified).
     """
-    from dace_fortran.builder import _demangle_fortran_proc, _module_of_fortran_sym
+    from dace_fortran.builder import demangle_fortran_proc, module_of_fortran_sym
 
-    mangled = entry.startswith("_Q")
-    want_mod, _, want_proc = entry.lower().rpartition("::")
-    want_mod = want_mod or None
+    want_mod, want_proc = split_qualified_entry(entry)
 
     def _is_entry(sym: str) -> bool:
-        if mangled:
-            return sym == entry
-        return _demangle_fortran_proc(sym) == want_proc \
-            and (want_mod is None or _module_of_fortran_sym(sym) == want_mod)
+        return demangle_fortran_proc(sym) == want_proc and (want_mod is None or module_of_fortran_sym(sym) == want_mod)
 
     matches = []
     for p in sorted(root.rglob("*.hlfir")):
@@ -491,19 +386,21 @@ def _resolve_hlfir_for_entry(root: Path, entry: str) -> Path:
                 matches.append(p)
                 break
     if not matches:
-        raise FileNotFoundError(f"no .hlfir under {root} defines a func.func matching entry "
-                                f"{entry!r}; check that the build emitted HLFIR for the TU "
-                                f"containing the entry")
+        raise FileNotFoundError(
+            f"no .hlfir under {root} defines a func.func matching entry "
+            f"{entry!r}; check that the build emitted HLFIR for the TU "
+            f"containing the entry"
+        )
     if len(matches) > 1:
-        raise ValueError(f"multiple .hlfir under {root} define @{entry} -- pick one explicitly: "
-                         f"{[str(p) for p in matches]}")
+        raise ValueError(
+            f"multiple .hlfir under {root} define @{entry} -- pick one explicitly: {[str(p) for p in matches]}"
+        )
     return matches[0]
 
 
-def build_sdfg_from_hlfir(hlfir_path: Union[str, Path],
-                          *,
-                          entry: Optional[str] = None,
-                          pipeline: Optional[str] = None) -> SDFG:
+def build_sdfg_from_hlfir(
+    hlfir_path: Union[str, Path], *, entry: str | None = None, pipeline: str | None = None
+) -> SDFG:
     """Build a :class:`dace.SDFG` from a pre-emitted ``.hlfir`` file
     produced by the project's own build system (the tier-3 path; see
     the module docstring for when to reach for it).
@@ -523,8 +420,8 @@ def build_sdfg_from_hlfir(hlfir_path: Union[str, Path],
 
     :param hlfir_path: path to a ``.hlfir`` file, or a directory
         containing one.
-    :param entry: mangled Flang symbol of the target procedure.
-        Optional when ``hlfir_path`` is a single file with one
+    :param entry: Fortran name of the target procedure (``proc`` or
+        ``module::proc``).  Optional when ``hlfir_path`` is a single file with one
         procedure; **required** when ``hlfir_path`` is a directory
         (it selects which ``.hlfir`` to load).
     :param pipeline: MLIR pass pipeline; defaults to
@@ -536,22 +433,27 @@ def build_sdfg_from_hlfir(hlfir_path: Union[str, Path],
         ``.hlfir`` files define the same entry symbol.
     """
     pipeline = pipeline or DEFAULT_PIPELINE
+    if entry:
+        require_fortran_name(entry)
     p = Path(hlfir_path)
     if p.is_dir():
         if not entry:
-            raise ValueError("build_sdfg_from_hlfir requires entry= when given a "
-                             "directory (it selects which .hlfir to load)")
+            raise ValueError(
+                "build_sdfg_from_hlfir requires entry= when given a directory (it selects which .hlfir to load)"
+            )
         p = _resolve_hlfir_for_entry(p, entry)
     return SDFGBuilder(str(p), pipeline=pipeline, entry=entry).build()
 
 
-def build_sdfg_from_project(compile_commands: Union[str, Path],
-                            *,
-                            entry: str,
-                            stubs: Sequence[Union[str, Path]] = (),
-                            out_dir: Optional[Union[str, Path]] = None,
-                            pipeline: Optional[str] = None,
-                            flang: Optional[str] = None) -> SDFG:
+def build_sdfg_from_project(
+    compile_commands: Union[str, Path],
+    *,
+    entry: str,
+    stubs: Sequence[Union[str, Path]] = (),
+    out_dir: Union[str, Path] | None = None,
+    pipeline: str | None = None,
+    flang: str | None = None,
+) -> SDFG:
     """Build a :class:`dace.SDFG` from a built project's
     ``compile_commands.json`` in one call -- tier 3.
 
@@ -572,10 +474,8 @@ def build_sdfg_from_project(compile_commands: Union[str, Path],
     see the README's *Building an SDFG from a real project* section.
 
     :param compile_commands: path to the build's ``compile_commands.json``.
-    :param entry: the target procedure -- either the mangled Flang symbol
-        (``_QMmo_solve_nonhydroPsolve_nh``) or the plain Fortran name
-        (``solve_nh`` / ``mo_solve_nonhydro::solve_nh``), resolved against
-        the project sources.  Selects which emitted ``.hlfir`` to lower and
+    :param entry: the Fortran name of the target procedure (``solve_nh`` /
+        ``mo_solve_nonhydro::solve_nh``), resolved against the project sources.  Selects which emitted ``.hlfir`` to lower and
         restricts emission to its USE-closure.
     :param stubs: flang-buildable stub sources for modules flang has
         no shipped ``.mod`` for (``mpi`` / ``netcdf`` / ``hdf5`` / ...),
@@ -587,41 +487,33 @@ def build_sdfg_from_project(compile_commands: Union[str, Path],
         LLVM flang on ``PATH``).
     :returns: a built, validated SDFG.
     """
-    from dace_fortran.emit_hlfir import emit, resolve_entry, _parse_compile_commands
+    from dace_fortran.emit_hlfir import emit
 
-    # Accept a plain Fortran name (``solve_nh`` / ``mod::proc``) and resolve
-    # it to the mangled symbol against the project's own sources, so callers
-    # need not hand-write ``_QMmo_solve_nonhydroPsolve_nh``.
-    sources = [s for s, _, _ in _parse_compile_commands(Path(compile_commands))]
-    entry_sym = resolve_entry(entry, sources)
-
-    def _do(d: Path) -> SDFG:
-        # Pass ``entry_sym`` so the emitter restricts a whole-project
-        # compile_commands.json to the entry's USE-closure (a codebase
-        # like ICON lists ~900 TUs; we only need the entry's plus what
-        # it transitively USEs).
-        emit(compile_commands=Path(compile_commands),
-             stubs=[Path(s) for s in stubs],
-             out_dir=d,
-             entry=entry_sym,
-             flang=flang)
-        return build_sdfg_from_hlfir(d, entry=entry_sym, pipeline=pipeline)
-
-    if out_dir is not None:
-        return _do(Path(out_dir))
-    with tempfile.TemporaryDirectory(prefix="hlfir_project_") as td:
-        return _do(Path(td))
+    with _scratch_dir(out_dir, "hlfir_project_") as d:
+        # ``entry`` restricts a whole-project compile_commands.json to the
+        # entry's USE-closure (a codebase like ICON lists ~900 TUs; we only
+        # need the entry's plus what it transitively USEs).
+        emit(
+            compile_commands=Path(compile_commands),
+            stubs=[Path(s) for s in stubs],
+            out_dir=d,
+            entry=entry,
+            flang=flang,
+        )
+        return build_sdfg_from_hlfir(d, entry=entry, pipeline=pipeline)
 
 
-def build_sdfg_from_files(files: Sequence[Union[str, Path]],
-                          *,
-                          entry: Optional[str] = None,
-                          name: str = "sdfg",
-                          pipeline: Optional[str] = None,
-                          out_dir: Optional[Union[str, Path]] = None,
-                          preprocess: bool = False,
-                          merge_engine: str = "regex",
-                          resolve_intrinsic: Sequence[str] = ()) -> SDFG:
+def build_sdfg_from_files(
+    files: Sequence[Union[str, Path]],
+    *,
+    entry: str | None = None,
+    name: str = "sdfg",
+    pipeline: str | None = None,
+    out_dir: Union[str, Path] | None = None,
+    preprocess: bool = False,
+    merge_engine: MergeEngine = MergeEngine.REGEX,
+    resolve_intrinsic: Sequence[str] = (),
+) -> SDFG:
     """Build a :class:`dace.SDFG` from a multi-file Fortran project.
 
     The files (a driver/root plus the modules it ``USE``s, in any
@@ -632,8 +524,8 @@ def build_sdfg_from_files(files: Sequence[Union[str, Path]],
 
     :param files: ``.f90`` paths (one defines ``entry``; the rest are
         its ``USE``-d modules).
-    :param entry: the target procedure -- a plain Fortran name, a
-        ``module::proc`` qualifier, or a mangled Flang symbol.
+    :param entry: the target procedure -- a Fortran name or a
+        ``module::proc`` qualifier.
         **Required**: it is what selects the root file.
     :param name: base filename for the merged ``.f90`` / ``.hlfir``.
     :param pipeline: MLIR pass pipeline; defaults to
@@ -641,8 +533,8 @@ def build_sdfg_from_files(files: Sequence[Union[str, Path]],
     :param out_dir: scratch directory; a temporary one is used and
         removed when omitted.
     :param preprocess: also run the opt-in ``IF (intvar)`` rewrite.
-    :param merge_engine: ``"regex"`` (default) inlines the ``USE``-d modules
-        with the text-splicer (:func:`merge_used_modules`); ``"fparser"``
+    :param merge_engine: ``MergeEngine.REGEX`` (default) inlines the ``USE``-d modules
+        with the text-splicer (:func:`merge_used_modules`); ``MergeEngine.FPARSER``
         uses the fparser AST engine, which resolves ``ONLY:`` / ``=>``
         renames the splicer cannot see.  Needs ``fparser > 0.2``.
     :returns: a built, validated SDFG.
@@ -652,28 +544,26 @@ def build_sdfg_from_files(files: Sequence[Union[str, Path]],
     if not entry:
         raise ValueError("build_sdfg_from_files requires entry= (it selects the root file)")
     paths = [Path(f) for f in files]
-    proc = _entry_proc_name(entry)
-    _def = re.compile(rf"^\s*(?:[\w()*]+\s+)*?(?:subroutine|function)\s+{re.escape(proc)}\b",
-                      re.IGNORECASE | re.MULTILINE)
-    roots = [p for p in paths if _def.search(p.read_text())]
+    want = split_qualified_entry(entry)
+    roots = [
+        p
+        for p in paths
+        if any(d.proc == want.proc and want.module in (None, d.module) for d in procedure_definitions(p.read_text()))
+    ]
     if not roots:
-        raise ValueError(f"no input file defines procedure {proc!r} (entry {entry!r}); "
-                         f"given {[p.name for p in paths]}")
+        raise ValueError(f"no input file defines procedure {entry!r}; given {[p.name for p in paths]}")
 
-    def _do(d: Path) -> SDFG:
+    with _scratch_dir(out_dir, f"hlfir_{name}_") as d:
         d.mkdir(parents=True, exist_ok=True)
         for p in paths:
             (d / p.name).write_text(p.read_text())
-        return build_sdfg(roots[0].read_text(),
-                          entry=entry,
-                          name=name,
-                          pipeline=pipeline,
-                          out_dir=d,
-                          preprocess=preprocess,
-                          merge_engine=merge_engine,
-                          resolve_intrinsic=resolve_intrinsic)
-
-    if out_dir is not None:
-        return _do(Path(out_dir))
-    with tempfile.TemporaryDirectory(prefix=f"hlfir_{name}_") as td:
-        return _do(Path(td))
+        return build_sdfg(
+            roots[0].read_text(),
+            entry=entry,
+            name=name,
+            pipeline=pipeline,
+            out_dir=d,
+            preprocess=preprocess,
+            merge_engine=merge_engine,
+            resolve_intrinsic=resolve_intrinsic,
+        )

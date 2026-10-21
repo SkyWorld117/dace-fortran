@@ -12,16 +12,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-from cloudsc.full._registries import (
+from tests._util import build_sdfg, f2py_compile
+from tests.cloudsc.full._harness import f2py_argnames, lower_keys, sdfg_call_args
+from tests.cloudsc.full._registries import (
     CLOUDSC_F90FLAGS,
     get_inputs_physical,
     get_outputs,
 )
-from cloudsc.full._harness import f2py_argnames, lower_keys, sdfg_call_args
 
 _HERE = Path(__file__).resolve().parent
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _module_wrap_drivers(src: str) -> str:
@@ -34,8 +33,7 @@ def _module_wrap_drivers(src: str) -> str:
     marker = "SUBROUTINE CLOUDSCOUTER"
     head, _, tail = src.partition(marker)
     assert tail, "CLOUDSCOUTER driver not found in cloudsc_top_half source"
-    return (f"{head}module cloudsc_top_half_mod\ncontains\n"
-            f"{marker}{tail.rstrip()}\nend module cloudsc_top_half_mod\n")
+    return f"{head}module cloudsc_top_half_mod\ncontains\n{marker}{tail.rstrip()}\nend module cloudsc_top_half_mod\n"
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +47,7 @@ def _f2py_top_half(tmp_path_factory):
         # -ffree-line-length-none: gfortran-only, non-semantic parser necessity for the
         # long-line source (flang has no line limit); rest is the flang-portable FP core
         extra_f90flags=CLOUDSC_F90FLAGS,
-        only=("cloudscouter", ),
+        only=("cloudscouter",),
     )
 
 
@@ -115,3 +113,7 @@ def test_cloudsc_top_half_zsolqa_zsolqb(tmp_path, _f2py_top_half, _strict_fp_cpu
         atol=1e-14,
         err_msg="ZSOLQB diverges between SDFG and f2py top-half references",
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -5,17 +5,13 @@ Each test drives one ``run_fft_interpolate_<dtype>`` entry of
 resulting SDFG contains a single
 :class:`dace.libraries.fft.nodes.FFTInterpolate` lib node.
 """
+
 from pathlib import Path
 
-import pytest
-
 import dace_fortran
-from _util import have_flang
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "fft_interpolate_probe.f90"
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _build_and_assert(entry: str, expected_kind: str, tmp_path):
@@ -25,8 +21,9 @@ def _build_and_assert(entry: str, expected_kind: str, tmp_path):
     sdfg.validate()
     matches = [n for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "FFTInterpolate"]
     assert matches, "no FFTInterpolate lib node emitted"
-    assert matches[0].dtype_kind == expected_kind, \
+    assert matches[0].dtype_kind == expected_kind, (
         f"expected dtype_kind={expected_kind!r}, got {matches[0].dtype_kind!r}"
+    )
 
 
 def test_fft_interpolate_complex_recognised(tmp_path):
@@ -35,3 +32,9 @@ def test_fft_interpolate_complex_recognised(tmp_path):
 
 def test_fft_interpolate_real_recognised(tmp_path):
     _build_and_assert("fft_interpolate_probe::run_fft_interpolate_real", "real", tmp_path)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

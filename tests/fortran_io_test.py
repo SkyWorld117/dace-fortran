@@ -3,20 +3,16 @@
 
 Each test writes arrays through a ``Write`` node (the shipped iso_c_binding
 Fortran wrappers perform the transfer) and reads them back through a ``Read``
-node, asserting the values survive the file round-trip.  Skips when no Fortran
-compiler is available, since the wrappers must be compiled + linked.
+node, asserting the values survive the file round-trip.  Needs a Fortran
+compiler, since the wrappers must be compiled + linked.
 """
-import shutil
-
-import numpy as np
-import pytest
 
 import dace
+import numpy as np
+
 from dace_fortran.libraries.fortran_io.nodes.namelist import NamelistRead
 from dace_fortran.libraries.fortran_io.nodes.read import Read
 from dace_fortran.libraries.fortran_io.nodes.write import Write
-
-pytestmark = pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not available")
 
 
 def _write_sdfg(path: str, shapes, dtype, tag: str = "") -> dace.SDFG:
@@ -128,7 +124,7 @@ def _namelist_sdfg(path, group, members, dtypes_, shapes, tag=""):
     state = sdfg.add_state()
     node = NamelistRead("nml", filename=path, group=group, members=members)
     state.add_node(node)
-    for i, (shape, dt) in enumerate(zip(shapes, dtypes_)):
+    for i, (shape, dt) in enumerate(zip(shapes, dtypes_, strict=False)):
         name = f"m{i}"
         sdfg.add_array(name, shape, dt)
         state.add_edge(node, f"_out_{i}", state.add_access(name), None, dace.Memlet.from_array(name, sdfg.arrays[name]))
@@ -139,8 +135,9 @@ def test_namelist_read(tmp_path):
     """Read scalar + array members of a namelist group into output arrays."""
     nml = tmp_path / "phys.nml"
     nml.write_text("&phys\n  alpha = 1.5,\n  nsteps = 7\n  coef = 10.0, 20.0, 30.0\n/\n")
-    sdfg = _namelist_sdfg(str(nml), "phys", ["alpha", "nsteps", "coef"], [dace.float64, dace.int32, dace.float64],
-                          [[1], [1], [3]])
+    sdfg = _namelist_sdfg(
+        str(nml), "phys", ["alpha", "nsteps", "coef"], [dace.float64, dace.int32, dace.float64], [[1], [1], [3]]
+    )
 
     alpha = np.zeros(1, dtype=np.float64)
     nsteps = np.zeros(1, dtype=np.int32)
@@ -157,8 +154,14 @@ def test_namelist_selects_named_group(tmp_path):
     across mixed member types (f32 scalar, i32 array, f64 scalar)."""
     nml = tmp_path / "multi.nml"
     nml.write_text("&other\n  scale = 99.0\n/\n&phys\n  scale = 2.5\n  flags = 1 2 3\n  ratio = 0.5\n/\n")
-    sdfg = _namelist_sdfg(str(nml), "phys", ["scale", "flags", "ratio"], [dace.float32, dace.int32, dace.float64],
-                          [[1], [3], [1]], "_multi")
+    sdfg = _namelist_sdfg(
+        str(nml),
+        "phys",
+        ["scale", "flags", "ratio"],
+        [dace.float32, dace.int32, dace.float64],
+        [[1], [3], [1]],
+        "_multi",
+    )
 
     scale = np.zeros(1, dtype=np.float32)
     flags = np.zeros(3, dtype=np.int32)
@@ -168,3 +171,9 @@ def test_namelist_selects_named_group(tmp_path):
     np.testing.assert_allclose(scale, [2.5], rtol=1e-6)
     np.testing.assert_array_equal(flags, [1, 2, 3])
     np.testing.assert_allclose(ratio, [0.5])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

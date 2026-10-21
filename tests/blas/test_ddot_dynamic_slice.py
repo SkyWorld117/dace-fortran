@@ -13,17 +13,14 @@ explicit reduction loop instead (``buildDdotDynamicSliceNodes``).
 These tests pin (1) the SDFG builds + validates and (2) the lowered loop is
 numerically exact against the gfortran/f2py reference.
 """
-import shutil
+
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 subroutine probe_ddot(a, s, e, b, n, r)
@@ -41,17 +38,13 @@ end subroutine probe_ddot
 
 
 def _f2py_ref(tmp_path: Path):
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
     out_dir = tmp_path / "ref"
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / "probe_ddot.f90"
     src.write_text(_SRC)
     subprocess.check_call(
-        [sys.executable, "-m", "numpy.f2py", "-c",
-         str(src), "-m", "probe_ddot_ref", "-lblas", "--quiet"], cwd=out_dir)
+        [sys.executable, "-m", "numpy.f2py", "-c", str(src), "-m", "probe_ddot_ref", "-lblas", "--quiet"], cwd=out_dir
+    )
     if str(out_dir) not in sys.path:
         sys.path.insert(0, str(out_dir))
     __import__("probe_ddot_ref")
@@ -86,3 +79,9 @@ def test_ddot_dynamic_slice_numerical(tmp_path):
     sdfg(a=a, s=s, e=e, b=b, n=n, r=r_sdfg)
 
     np.testing.assert_allclose(r_sdfg[0], r_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

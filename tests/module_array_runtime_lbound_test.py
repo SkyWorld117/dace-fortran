@@ -22,14 +22,12 @@ in the runtime descriptor.
 
 Companion doc: bug4_module_array_lbound.md
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # Minimal QE eigts shape: deferred-shape module allocatable, caller allocates
 # with lbound -nmax, kernel reads through an indirect (Miller-style) index.
@@ -109,10 +107,12 @@ def test_module_allocatable_runtime_negative_lbound(tmp_path: Path):
     sdfg(**kw)
 
     expected = np.array([complex(v, 0) for v in mill], dtype=np.complex128)
-    np.testing.assert_allclose(y,
-                               expected,
-                               err_msg="module allocatable's runtime lower bound ignored -- the "
-                               "kernel indexed eig[] 1-based (QE eigts structure-factor bug)")
+    np.testing.assert_allclose(
+        y,
+        expected,
+        err_msg="module allocatable's runtime lower bound ignored -- the "
+        "kernel indexed eig[] 1-based (QE eigts structure-factor bug)",
+    )
 
 
 def test_static_negative_lbound_module_array(tmp_path: Path):
@@ -133,3 +133,9 @@ def test_static_negative_lbound_module_array(tmp_path: Path):
         kw["offset_arr_d0"] = np.int64(-3)
     sdfg(**kw)
     assert out[0] == -20, f"static module-array lbound broken too: {out[0]}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

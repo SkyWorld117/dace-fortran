@@ -45,25 +45,28 @@ rewrites fold to no-ops and these tests continue to pass.  See
 ``ast_v1_h_psi.f90`` for the checkpoint provenance and
 ``h_psi_caller.f90`` for the C-callable driver harness.
 """
+
 import re
 from pathlib import Path
 
 import pytest
 
 import dace_fortran
-from _util import flang_binary, flang_intrinsic_modules_path, have_flang
+from dace_fortran.external import keep_external
+from tests._util import flang_binary, flang_intrinsic_modules_path
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "ast_v1_h_psi.f90"
 _ENTRY = "h_psi_module::h_psi"
 
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
-_FFT_INTERFACES_EMPTY_RE = re.compile(r"MODULE fft_interfaces\s*\n"
-                                      r"  IMPLICIT NONE\s*\n"
-                                      r"  INTERFACE invfft\s*\n  END INTERFACE\s*\n"
-                                      r"  INTERFACE fwfft\s*\n  END INTERFACE\s*\n"
-                                      r"END MODULE fft_interfaces\s*\n")
+_FFT_INTERFACES_EMPTY_RE = re.compile(
+    r"MODULE fft_interfaces\s*\n"
+    r"  IMPLICIT NONE\s*\n"
+    r"  INTERFACE invfft\s*\n  END INTERFACE\s*\n"
+    r"  INTERFACE fwfft\s*\n  END INTERFACE\s*\n"
+    r"END MODULE fft_interfaces\s*\n"
+)
 
 _FFT_INTERFACES_FULL = """MODULE fft_interfaces
   USE fft_types, ONLY: fft_type_descriptor
@@ -116,9 +119,11 @@ def _restore_fft_interfaces(source: str) -> str:
         return source
     out, n2 = re.subn(r"(END MODULE fft_types\s*\n)", r"\1" + _FFT_INTERFACES_FULL, stripped, count=1)
     if n2 == 0:
-        raise RuntimeError("_restore_fft_interfaces: ``END MODULE fft_types`` anchor not "
-                           "found; the QE checkpoint's module order may have changed.  "
-                           "Inspect ast_v1_h_psi.f90 and update the anchor.")
+        raise RuntimeError(
+            "_restore_fft_interfaces: ``END MODULE fft_types`` anchor not "
+            "found; the QE checkpoint's module order may have changed.  "
+            "Inspect ast_v1_h_psi.f90 and update the anchor."
+        )
     return out
 
 
@@ -215,59 +220,71 @@ def test_restore_and_nyfft_unblock_flang_parse(tmp_path):
     ``test_h_psi_parses`` flips.
     """
     import subprocess
+
     src = _preprocess(_SRC.read_text())
     rewritten = tmp_path / "h_psi_rewritten.F90"
     rewritten.write_text(src)
     out = tmp_path / "qe.hlfir"
-    result = subprocess.run([
-        flang_binary(), "-fc1", "-fintrinsic-modules-path",
-        flang_intrinsic_modules_path(), "-emit-hlfir",
-        str(rewritten), "-o",
-        str(out)
-    ],
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, \
-        f"flang rejected the rewritten source:\n{result.stderr[:2000]}"
-    assert out.exists() and out.stat().st_size > 0, \
-        "flang did not produce a HLFIR output"
+    result = subprocess.run(
+        [
+            flang_binary(),
+            "-fc1",
+            "-fintrinsic-modules-path",
+            flang_intrinsic_modules_path(),
+            "-emit-hlfir",
+            str(rewritten),
+            "-o",
+            str(out),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"flang rejected the rewritten source:\n{result.stderr[:2000]}"
+    assert out.exists() and out.stat().st_size > 0, "flang did not produce a HLFIR output"
 
 
-@pytest.mark.xfail(reason="bridge gap: get_ast's buildExpr reaches HLFIR/FIR ops it does not yet "
-                   "lower on the deeply-inlined h_psi body -- a long tail (fir.iterate_while, "
-                   "scf.index_switch, fir.allocmem, hlfir.elemental).  The earlier blockers are "
-                   "now FIXED: the two scatter-lowering gaps (scalar-broadcast source + a section "
-                   "source computed inside the rhs region), the extent-after-ALLOCATE symbol "
-                   "(VersionShapeScalars now FREEZES the extent at each ALLOCATE instead of "
-                   "refusing loop/branch reassignment), the O(n^2) literal-access extract, and "
-                   "nested scf.while in the AST builder.  This unhandled-op tail is the residual.",
-                   strict=False)
+# The full h_psi build takes ~25 minutes (h_psi inlines ~9.6k lines): a long test, run by the CI heavy lanes.
+@pytest.mark.long
+@pytest.mark.timeout(3600)
 def test_h_psi_parses(tmp_path):
     """End-to-end SDFG build for ``h_psi``: the QE checkpoint parses,
-    inlines, and lowers to a validated SDFG.
-
-    Currently xfails in ``get_ast``: ``buildExpr`` reaches HLFIR/FIR ops
-    it does not yet lower on a deeply-inlined call site in the h_psi
-    USE-closure (fir.iterate_while / scf.index_switch / fir.allocmem /
-    hlfir.elemental).  The parse itself
-    (``test_restore_and_nyfft_unblock_flang_parse``) already passes, and
-    the extent/scatter/perf/nested-while blockers are fixed; when this
-    op tail is covered the build returns cleanly and this test flips."""
+    inlines, and lowers to a validated SDFG, with the routines the bridge
+    does not lower kept external (see :func:`_keep_unlowerable_routines_external`)."""
+    _keep_unlowerable_routines_external()
     src = _preprocess(_SRC.read_text())
     sdfg = dace_fortran.build_sdfg(src, out_dir=str(tmp_path / "sdfg"), entry=_ENTRY, name="h_psi")
     sdfg.validate()
     assert sdfg is not None
-    assert any('h_psi' in name for name in sdfg.arrays) or \
-        'h_psi' in str(sdfg.label)
+    assert any("h_psi" in name for name in sdfg.arrays) or "h_psi" in str(sdfg.label)
 
 
 _CALLER = _HERE / "h_psi_caller.f90"
 
 
+def _keep_unlowerable_routines_external(libraries: tuple[str, ...] = ()) -> None:
+    """Leave the routines the bridge does not lower external, called through the
+    bind(c) shims in :file:`h_psi_caller.f90`:
+
+    * ``buffers::save_buffer`` (reached through ``p_psi``) writes into ``buiol``'s
+      module-global linked list of regrowable POINTER records
+      (``new(i) % data => old(i) % data``);
+    * ``exx_bp_utils::initialize_local_to_exact_map`` / ``transform_to_exx`` /
+      ``transform_to_local`` allocate and read the ragged members of its module-variable
+      communication packets (``ALLOCATE(comm_send_reverse(..) % msg(count, ..))``), which
+      the bridge flattens for local arrays of records only.
+
+    ``libraries`` names the shared library exporting the shims when the SDFG is compiled.
+    """
+    keep_external("save_buffer", c_name="h_psi_save_buffer_c", libraries=libraries)
+    for name in ("initialize_local_to_exact_map", "transform_to_exx", "transform_to_local"):
+        keep_external(name, c_name=f"h_psi_{name}_c", libraries=libraries)
+
+
 def _compile_reference(tmp_path):
     """Compile QE source + caller wrapper into a ctypes-loadable .so.
 
-    Returns ``(ctypes.CDLL, init, run)`` where ``init`` and ``run`` are
+    Returns ``(library path, init, run)`` where ``init`` and ``run`` are
     ready-to-call function objects.  The caller wrapper provides:
 
     * ``init_h_psi_state_c(lda, n, m, npol)`` -- one-shot module-state
@@ -290,24 +307,29 @@ def _compile_reference(tmp_path):
     never executes on the no-op path.
     """
     import ctypes
-    import shutil
     import subprocess
-
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran required for the reference build")
 
     src = _preprocess(_SRC.read_text())
     src_path = tmp_path / "qe_ref.f90"
     src_path.write_text(src)
     libpath = tmp_path / "libhpsi_ref.so"
-    subprocess.check_call([
-        "gfortran", "-shared", "-fPIC", "-O0", "-fno-fast-math", "-ffp-contract=off", "-ffree-line-length-none",
-        "-fallow-argument-mismatch",
-        str(src_path),
-        str(_CALLER), "-o",
-        str(libpath)
-    ],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        [
+            "gfortran",
+            "-shared",
+            "-fPIC",
+            "-O0",
+            "-fno-fast-math",
+            "-ffp-contract=off",
+            "-ffree-line-length-none",
+            "-fallow-argument-mismatch",
+            str(src_path),
+            str(_CALLER),
+            "-o",
+            str(libpath),
+        ],
+        cwd=str(tmp_path),
+    )
     lib = ctypes.CDLL(str(libpath))
 
     init = lib.init_h_psi_state_c
@@ -317,7 +339,7 @@ def _compile_reference(tmp_path):
     run = lib.run_h_psi_c
     run.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
     run.restype = None
-    return lib, init, run
+    return libpath, init, run
 
 
 def _make_random_inputs(lda, npol, m, *, seed=0):
@@ -329,6 +351,7 @@ def _make_random_inputs(lda, npol, m, *, seed=0):
     keep a pre-call snapshot for after-vs-before comparisons.
     """
     import numpy as np
+
     rng = np.random.default_rng(seed)
     shape = (lda * npol, m)
     psi = np.asfortranarray(rng.standard_normal(shape) + 1j * rng.standard_normal(shape), dtype=np.complex128)
@@ -346,6 +369,7 @@ def _expected_kinetic(psi, lda, n, m, npol):
     ``hpsi(i,j) = i*psi(i,j)`` and the rest are zero.
     """
     import numpy as np
+
     exp = np.zeros_like(psi)
     for j in range(m):
         for i in range(lda * npol):
@@ -372,6 +396,7 @@ def test_h_psi_reference_runs(tmp_path):
     fixture or wrapper changed shape, not the bridge.
     """
     import numpy as np
+
     _, init, run = _compile_reference(tmp_path)
     lda, n, m, npol = 4, 4, 1, 1
     init(lda, n, m, npol)
@@ -384,10 +409,9 @@ def test_h_psi_reference_runs(tmp_path):
     np.testing.assert_array_equal(psi, psi_snapshot)
 
 
-@pytest.mark.xfail(reason="depends on test_h_psi_parses: the SDFG build currently xfails "
-                   "in the MLIR pass pipeline (hlfir-expand-vector-subscript-"
-                   "scatter), so the binding is never emitted; flips with it.",
-                   strict=False)
+# Builds the same SDFG as test_h_psi_parses, then compiles it and its binding.
+@pytest.mark.long
+@pytest.mark.timeout(7200)
 def test_h_psi_numerical_correctness(tmp_path):
     """End-to-end numerical correctness for ``h_psi`` THROUGH the generated
     Fortran binding.
@@ -413,15 +437,16 @@ def test_h_psi_numerical_correctness(tmp_path):
 
     import numpy as np
 
-    from _util import build_sdfg
     from dace_fortran.bindings.build_fortran_library import build_fortran_library
     from dace_fortran.bindings.flatten_plan import FlattenPlan
     from dace_fortran.bindings.fortran_interface import build_auto_interface
+    from tests._util import build_sdfg
 
     lda, n, m, npol = 4, 4, 1, 1
 
     # --- gfortran reference (kinetic term on the no-op path) ---
-    _, init, run = _compile_reference(tmp_path)
+    ref_lib, init, run = _compile_reference(tmp_path)
+    _keep_unlowerable_routines_external(libraries=(str(ref_lib),))
     init(lda, n, m, npol)
     psi_ref, hpsi_ref = _make_random_inputs(lda, npol, m)
     psi_dace = psi_ref.copy(order="F")
@@ -454,7 +479,8 @@ def test_h_psi_numerical_correctness(tmp_path):
         # COMPLEX->REAL arg-kind mismatches behind ``IF(okvan)`` /
         # ``lda_plus_u`` -- never run on the no-op path; matches the
         # reference build's permissive flag.
-        extra_flags=["-fallow-argument-mismatch"])
+        extra_flags=["-fallow-argument-mismatch"],
+    )
     dace_lib = lib.load()
 
     fn = dace_lib.run_h_psi_dace_c
@@ -463,3 +489,7 @@ def test_h_psi_numerical_correctness(tmp_path):
     fn(lda, n, m, npol, psi_dace.ctypes.data, hpsi_dace.ctypes.data)
 
     np.testing.assert_allclose(hpsi_dace, hpsi_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -12,17 +12,13 @@ Flow: build SDFG, compile reference .so, init buffers once, snapshot for SDFG, r
 on one copy + SDFG on the other, compare outputs."""
 
 import ctypes
-import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-from icon.full._harness import _INIT_ARRAY_ORDER, _OUTPUT_NAMES, _allocate
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
+from tests.icon.full._harness import _INIT_ARRAY_ORDER, _OUTPUT_NAMES, _allocate
 
 _HERE = Path(__file__).resolve().parent
 _DRIVER_PATH = _HERE / "velocity_full.f90"
@@ -31,44 +27,26 @@ _CALLER_PATH = _HERE / "velocity_full_caller.f90"
 
 def _compile_caller_so(out_dir: Path) -> ctypes.CDLL:
     """gfortran -shared -fPIC compile driver + caller into a .so."""
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
     out_dir.mkdir(parents=True, exist_ok=True)
     so_path = out_dir / "libvelocity_caller.so"
     # cwd=out_dir keeps gfortran from picking up a stale .mod a prior flang run left in repo root.
-    subprocess.check_call([
-        "gfortran",
-        "-shared",
-        "-fPIC",
-        "-O0",
-        "-fno-fast-math",
-        "-ffp-contract=off",
-        "-ffree-line-length-none",
-        str(_DRIVER_PATH),
-        str(_CALLER_PATH),
-        "-o",
-        str(so_path),
-    ],
-                          cwd=str(out_dir))
+    subprocess.check_call(
+        [
+            "gfortran",
+            "-shared",
+            "-fPIC",
+            "-O0",
+            "-fno-fast-math",
+            "-ffp-contract=off",
+            "-ffree-line-length-none",
+            str(_DRIVER_PATH),
+            str(_CALLER_PATH),
+            "-o",
+            str(so_path),
+        ],
+        cwd=str(out_dir),
+    )
     return ctypes.CDLL(str(so_path))
-
-
-# ----- ctypes shape helpers -------------------------------------------------
-
-_F64 = ctypes.POINTER(ctypes.c_double)
-_I32 = ctypes.POINTER(ctypes.c_int)
-_I8 = ctypes.POINTER(ctypes.c_int8)
-
-
-def _ptr(arr: np.ndarray):
-    """numpy array -> typed pointer for the array's dtype."""
-    if arr.dtype == np.float64:
-        return arr.ctypes.data_as(_F64)
-    if arr.dtype == np.int32:
-        return arr.ctypes.data_as(_I32)
-    if arr.dtype == np.int8:
-        return arr.ctypes.data_as(_I8)
-    raise TypeError(f"unsupported dtype {arr.dtype}")
 
 
 # ----- buffer layout --------------------------------------------------------
@@ -110,32 +88,33 @@ def test_velocity_full_numerical(tmp_path: Path):
     )
 
     # Snapshot for SDFG.
-    bufs_sdfg = {k: v.copy(order='F') for k, v in bufs_ref.items()}
+    bufs_sdfg = {k: v.copy(order="F") for k, v in bufs_ref.items()}
 
     # Naked array buffers.
-    z_w_concorr_me_ref = np.zeros((nproma, nlev, nblks_e), dtype=np.float64, order='F')
-    z_kin_hor_e_ref = np.zeros((nproma, nlev, nblks_e), dtype=np.float64, order='F')
-    z_vt_ie_ref = np.zeros((nproma, nlevp1, nblks_e), dtype=np.float64, order='F')
-    z_w_concorr_me_sdfg = z_w_concorr_me_ref.copy(order='F')
-    z_kin_hor_e_sdfg = z_kin_hor_e_ref.copy(order='F')
-    z_vt_ie_sdfg = z_vt_ie_ref.copy(order='F')
+    z_w_concorr_me_ref = np.zeros((nproma, nlev, nblks_e), dtype=np.float64, order="F")
+    z_kin_hor_e_ref = np.zeros((nproma, nlev, nblks_e), dtype=np.float64, order="F")
+    z_vt_ie_ref = np.zeros((nproma, nlevp1, nblks_e), dtype=np.float64, order="F")
+    z_w_concorr_me_sdfg = z_w_concorr_me_ref.copy(order="F")
+    z_kin_hor_e_sdfg = z_kin_hor_e_ref.copy(order="F")
+    z_vt_ie_sdfg = z_vt_ie_ref.copy(order="F")
 
-    nrdmax_in = np.full(10, nlev, dtype=np.int32, order='F')
-    nflatlev_in = np.ones(10, dtype=np.int32, order='F')
+    nrdmax_in = np.full(10, nlev, dtype=np.int32, order="F")
+    nflatlev_in = np.ones(10, dtype=np.int32, order="F")
 
     # run_velocity_flat_c signature: dims (6 ints), scalars (ntnd, istep, lvn_only,
     # ldeepatmo, dtime, dt_linintp_ubc), module-data (nrdmax_in/nflatlev_in ptrs,
     # lvert_nest_in, lextra_diffu_in, timers_level), arrays in declaration order, z_* arrays.
     run = lib.run_velocity_flat_c
     run.restype = None
-    run.argtypes = ([ctypes.c_int] * 6  # dims
-                    + [ctypes.c_int, ctypes.c_int]  # ntnd, istep
-                    + [ctypes.c_int8, ctypes.c_int8]  # lvn_only, ldeepatmo
-                    + [ctypes.c_double, ctypes.c_double]  # dtime, dt_linintp_ubc
-                    + [ctypes.c_void_p, ctypes.c_void_p]  # nrdmax_in, nflatlev_in
-                    + [ctypes.c_int8, ctypes.c_int8, ctypes.c_int]  # lvert_nest_in, lextra_diffu_in, timers_level_in
-                    + [ctypes.c_void_p] * (len(_INIT_ARRAY_ORDER) + 3)  # arrays + z_*
-                    )
+    run.argtypes = (
+        [ctypes.c_int] * 6  # dims
+        + [ctypes.c_int, ctypes.c_int]  # ntnd, istep
+        + [ctypes.c_int8, ctypes.c_int8]  # lvn_only, ldeepatmo
+        + [ctypes.c_double, ctypes.c_double]  # dtime, dt_linintp_ubc
+        + [ctypes.c_void_p, ctypes.c_void_p]  # nrdmax_in, nflatlev_in
+        + [ctypes.c_int8, ctypes.c_int8, ctypes.c_int]  # lvert_nest_in, lextra_diffu_in, timers_level_in
+        + [ctypes.c_void_p] * (len(_INIT_ARRAY_ORDER) + 3)  # arrays + z_*
+    )
     run(
         nproma,
         nlev,
@@ -166,7 +145,7 @@ def test_velocity_full_numerical(tmp_path: Path):
 
     def scalar_or_arr(name, value, dtype):
         desc = arglist.get(name)
-        if desc is not None and type(desc).__name__ == 'Array':
+        if desc is not None and type(desc).__name__ == "Array":
             return np.asfortranarray(np.array([value], dtype=dtype))
         return dtype(value) if isinstance(dtype, type) else np.array(value, dtype=dtype).item()
 
@@ -175,55 +154,58 @@ def test_velocity_full_numerical(tmp_path: Path):
         z_w_concorr_me=z_w_concorr_me_sdfg,
         z_kin_hor_e=z_kin_hor_e_sdfg,
         z_vt_ie=z_vt_ie_sdfg,
-        ntnd=scalar_or_arr('ntnd', 1, np.int32),
-        istep=scalar_or_arr('istep', 1, np.int32),
-        lvn_only=scalar_or_arr('lvn_only', False, np.bool_),
-        dtime=scalar_or_arr('dtime', 60.0, np.float64),
-        dt_linintp_ubc=scalar_or_arr('dt_linintp_ubc', 0.0, np.float64),
-        ldeepatmo=scalar_or_arr('ldeepatmo', False, np.bool_),
+        ntnd=scalar_or_arr("ntnd", 1, np.int32),
+        istep=scalar_or_arr("istep", 1, np.int32),
+        lvn_only=scalar_or_arr("lvn_only", 0, np.uint32),
+        dtime=scalar_or_arr("dtime", 60.0, np.float64),
+        dt_linintp_ubc=scalar_or_arr("dt_linintp_ubc", 0.0, np.float64),
+        ldeepatmo=scalar_or_arr("ldeepatmo", 0, np.uint32),
         nrdmax=nrdmax_in,
         nflatlev=nflatlev_in,
-        lvert_nest=scalar_or_arr('lvert_nest', False, np.bool_),
-        lextra_diffu=scalar_or_arr('lextra_diffu', False, np.bool_),
-        i_am_accel_node=scalar_or_arr('i_am_accel_node', False, np.bool_),
-        timers_level=scalar_or_arr('timers_level', 0, np.int32),
-        timer_intp=scalar_or_arr('timer_intp', 0, np.int32),
-        timer_solve_nh_veltend=scalar_or_arr('timer_solve_nh_veltend', 0, np.int32),
-        p_patch_id=scalar_or_arr('p_patch_id', 1, np.int32),
-        p_patch_nblks_c=scalar_or_arr('p_patch_nblks_c', nblks_c, np.int32),
-        p_patch_nblks_e=scalar_or_arr('p_patch_nblks_e', nblks_e, np.int32),
-        p_patch_nblks_v=scalar_or_arr('p_patch_nblks_v', nblks_v, np.int32),
-        p_patch_nlev=scalar_or_arr('p_patch_nlev', nlev, np.int32),
-        p_patch_nlevp1=scalar_or_arr('p_patch_nlevp1', nlevp1, np.int32),
-        p_patch_nshift=scalar_or_arr('p_patch_nshift', 0, np.int32),
-        p_diag_ddt_vn_adv_is_associated=scalar_or_arr('p_diag_ddt_vn_adv_is_associated', False, np.bool_),
-        p_diag_ddt_vn_cor_is_associated=scalar_or_arr('p_diag_ddt_vn_cor_is_associated', False, np.bool_),
-        p_diag_max_vcfl_dyn=scalar_or_arr('p_diag_max_vcfl_dyn', 0.0, np.float64),
-        nproma=scalar_or_arr('nproma', nproma, np.int32),
+        lvert_nest=scalar_or_arr("lvert_nest", 0, np.uint32),
+        lextra_diffu=scalar_or_arr("lextra_diffu", 0, np.uint32),
+        i_am_accel_node=scalar_or_arr("i_am_accel_node", 0, np.uint32),
+        timers_level=scalar_or_arr("timers_level", 0, np.int32),
+        timer_intp=scalar_or_arr("timer_intp", 0, np.int32),
+        timer_solve_nh_veltend=scalar_or_arr("timer_solve_nh_veltend", 0, np.int32),
+        p_patch_id=scalar_or_arr("p_patch_id", 1, np.int32),
+        p_patch_nblks_c=scalar_or_arr("p_patch_nblks_c", nblks_c, np.int32),
+        p_patch_nblks_e=scalar_or_arr("p_patch_nblks_e", nblks_e, np.int32),
+        p_patch_nblks_v=scalar_or_arr("p_patch_nblks_v", nblks_v, np.int32),
+        p_patch_nlev=scalar_or_arr("p_patch_nlev", nlev, np.int32),
+        p_patch_nlevp1=scalar_or_arr("p_patch_nlevp1", nlevp1, np.int32),
+        p_patch_nshift=scalar_or_arr("p_patch_nshift", 0, np.int32),
+        p_diag_ddt_vn_adv_is_associated=scalar_or_arr("p_diag_ddt_vn_adv_is_associated", 0, np.uint32),
+        p_diag_ddt_vn_cor_is_associated=scalar_or_arr("p_diag_ddt_vn_cor_is_associated", 0, np.uint32),
+        p_diag_max_vcfl_dyn=scalar_or_arr("p_diag_max_vcfl_dyn", 0.0, np.float64),
+        nproma=scalar_or_arr("nproma", nproma, np.int32),
     )
     # Deferred-shape pointer/allocatable companions need <arr>_d<i> extent + offset_<arr>_d<i>
-    # lower-bound symbols per unresolved dim. All arrays here are 1-based, so offset=1.
+    # lower-bound symbols per unresolved dim.  The SDFG subscripts each array in the frame the reference
+    # allocates it in: velocity_full_caller.f90 allocates the refinement-control arrays
+    # (``*_{start,end}_{index,block}``, read at negative literals) with bounds (-16:16); every other array is 1-based.
+    refinement_control = ("_start_index", "_end_index", "_start_block", "_end_block")
     for nm, arr in list(sdfg_kw.items()):
-        if not hasattr(arr, 'shape'):
+        if not hasattr(arr, "shape"):
             continue
         for d in range(len(arr.shape)):
-            extent_sym = f'{nm}_d{d}'
-            offset_sym = f'offset_{nm}_d{d}'
+            extent_sym = f"{nm}_d{d}"
+            offset_sym = f"offset_{nm}_d{d}"
             if extent_sym in arglist:
                 sdfg_kw.setdefault(extent_sym, np.int64(arr.shape[d]))
             if offset_sym in arglist:
-                sdfg_kw.setdefault(offset_sym, np.int64(1))
-    # bridge stores LOGICAL arrays as bool8; ctypes/owner_mask is int8 ->
-    # convert to a writable bool view so DaCe's wrapper accepts it.
-    sdfg_kw['p_patch_cells_decomp_info_owner_mask'] = \
-        sdfg_kw['p_patch_cells_decomp_info_owner_mask'].astype(np.bool_, order='F')
+                sdfg_kw.setdefault(offset_sym, np.int64(-16 if nm.endswith(refinement_control) else 1))
+    # The SDFG works on the caller's LOGICAL(4) storage; ctypes/owner_mask is int8.
+    sdfg_kw["p_patch_cells_decomp_info_owner_mask"] = sdfg_kw["p_patch_cells_decomp_info_owner_mask"].astype(
+        np.uint32, order="F"
+    )
     sdfg(**sdfg_kw)
 
     mismatches = []
     extras = {
-        'z_w_concorr_me': (z_w_concorr_me_sdfg, z_w_concorr_me_ref),
-        'z_kin_hor_e': (z_kin_hor_e_sdfg, z_kin_hor_e_ref),
-        'z_vt_ie': (z_vt_ie_sdfg, z_vt_ie_ref)
+        "z_w_concorr_me": (z_w_concorr_me_sdfg, z_w_concorr_me_ref),
+        "z_kin_hor_e": (z_kin_hor_e_sdfg, z_kin_hor_e_ref),
+        "z_vt_ie": (z_vt_ie_sdfg, z_vt_ie_ref),
     }
     for nm in _OUTPUT_NAMES:
         if nm in extras:
@@ -234,3 +216,9 @@ def test_velocity_full_numerical(tmp_path: Path):
             d = np.abs(sd - rf)
             mismatches.append(f"{nm}: max_abs_diff={d.max():.3e} (n_diff={np.count_nonzero(d > 1e-10)})")
     assert not mismatches, "\n".join(mismatches)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

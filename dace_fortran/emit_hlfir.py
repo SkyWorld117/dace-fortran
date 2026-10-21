@@ -23,6 +23,9 @@ so the project's ``USE`` lines resolve.  The emitted directory feeds
 :func:`dace_fortran.build_sdfg_from_hlfir` /
 :func:`dace_fortran.build_sdfg_from_project`.
 """
+
+from __future__ import annotations
+
 import argparse
 import json
 import re
@@ -30,10 +33,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence
 
+from dace_fortran.entry_names import resolve_entry_name
 from dace_fortran.llvm_toolchain import require_flang
+
+#: (source_path, include_dirs, cpp_defines) of one Fortran translation unit.
+CompileEntry = tuple[Path, list[str], list[str]]
 
 #: ``MODULE <name>`` opener at the top of a Fortran source.  Used for
 #: the (fallback) ``--source`` topo-sort when no ``compile_commands.json``
@@ -43,7 +50,7 @@ _MODULE_DEF_RE = re.compile(r"^\s*MODULE\s+([A-Za-z_]\w*)\s*$", re.IGNORECASE | 
 _USE_DEP_RE = re.compile(r"^\s*USE[\s,]*(?:INTRINSIC\s*::\s*)?\s*([A-Za-z_]\w*)", re.IGNORECASE | re.MULTILINE)
 
 
-def _topo_order(sources: Sequence[Path]) -> List[Path]:
+def _topo_order(sources: Sequence[Path]) -> list[Path]:
     """USE-graph topo-sort over an explicit file list (fallback path
     for projects without ``compile_commands.json``).  Files defining
     no module sort last.  Multi-module files are emitted once.  A
@@ -64,7 +71,7 @@ def _topo_order(sources: Sequence[Path]) -> List[Path]:
     order: list = []
     state: dict = {}
 
-    def _visit(src: Path):
+    def _visit(src: Path) -> None:
         if state.get(src) == "done":
             return
         if state.get(src) == "visiting":
@@ -82,7 +89,7 @@ def _topo_order(sources: Sequence[Path]) -> List[Path]:
     return order
 
 
-def _parse_compile_commands(cc_path: Path):
+def parse_compile_commands(cc_path: Path) -> list[CompileEntry]:
     """Return ``[(source_path, include_dirs, cpp_defines), ...]``
     in the order cmake / ninja recorded -- they topo-sort Fortran
     via the same scanner the regular build uses, so reusing that
@@ -96,7 +103,7 @@ def _parse_compile_commands(cc_path: Path):
     """
     with open(cc_path) as f:
         entries = json.load(f)
-    out: list = []
+    out: list[CompileEntry] = []
     for e in entries:
         src = Path(e["file"])
         # Fortran TUs only -- a mixed project's C/C++ entries (yaxt,
@@ -115,8 +122,8 @@ def _parse_compile_commands(cc_path: Path):
         # Recorded command may be a string ("cc -I/x foo.c") or a list.
         cmd = e["command"] if "command" in e else " ".join(e.get("arguments", []))
         tokens = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
-        includes: list = []
-        defines: list = []
+        includes: list[str] = []
+        defines: list[str] = []
         i = 0
         while i < len(tokens):
             t = tokens[i]
@@ -141,138 +148,7 @@ def _parse_compile_commands(cc_path: Path):
     return out
 
 
-def _entry_module(entry: str) -> Optional[str]:
-    """Module name from a mangled entry symbol, or ``None`` for a free
-    subroutine.  ``_QM<module>P<proc>`` (module subroutine) / ``...F<proc>``
-    (function) -> ``<module>``; ``_QP<proc>`` has no module."""
-    m = re.match(r"_QM([a-z0-9_]+?)[PF][a-z0-9_]+$", entry, re.IGNORECASE)
-    return m.group(1).lower() if m else None
-
-
-def demangle_entry(sym: str) -> str:
-    """Flang mangled symbol -> the Fortran name.  ``_QM<mod>P<proc>`` /
-    ``_QM<mod>F<proc>`` -> ``<mod>::<proc>``; ``_QP<proc>`` -> ``<proc>``."""
-    m = re.match(r"_QM([a-z0-9_]+?)[PF]([a-z0-9_]+)$", sym, re.IGNORECASE)
-    if m:
-        return f"{m.group(1)}::{m.group(2)}"
-    m = re.match(r"_Q[PF]([a-z0-9_]+)$", sym, re.IGNORECASE)
-    return m.group(1) if m else sym
-
-
-_MOD_OPEN_RE = re.compile(r"^\s*module\s+([a-z_]\w*)\s*$", re.IGNORECASE)
-_MOD_END_RE = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
-_INTERFACE_RE = re.compile(r"^\s*(abstract\s+)?interface\b", re.IGNORECASE)
-_END_INTERFACE_RE = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
-_SUBR_DEF_RE = re.compile(r"^\s*(?:(?:recursive|pure|impure|elemental|module)\s+)*subroutine\s+([a-z_]\w*)",
-                          re.IGNORECASE)
-
-
-def _scan_subroutine_defs(text: str):
-    """``[(subroutine_lower, enclosing_module_lower_or_None), ...]`` for the
-    subroutine *definitions* in ``text``.  Tracks ``MODULE`` / ``END MODULE``
-    for the qualifier and skips ``INTERFACE`` blocks (those are declarations,
-    not definitions)."""
-    defs = []
-    mod = None
-    in_iface = False
-    for raw in text.splitlines():
-        line = raw.split("!", 1)[0]
-        if _INTERFACE_RE.match(line):
-            in_iface = True
-            continue
-        if _END_INTERFACE_RE.match(line):
-            in_iface = False
-            continue
-        if in_iface:
-            continue
-        mo = _MOD_OPEN_RE.match(line)
-        if mo and not re.match(r"^\s*module\s+procedure\b", line, re.IGNORECASE):
-            mod = mo.group(1).lower()
-            continue
-        if _MOD_END_RE.match(line):
-            mod = None
-            continue
-        sm = _SUBR_DEF_RE.match(line)
-        if sm:
-            defs.append((sm.group(1).lower(), mod))
-    return defs
-
-
-def _resolve_entry_with_module(name: str, sources):
-    """``(proc, module_or_None)`` for a Fortran entry, scanning ``sources``
-    for the subroutine definition.
-
-    The returned ``proc`` is ALWAYS a plain Fortran name (never the flang
-    ``_QM...`` mangling) -- the bridge's ``set_entry_symbol`` does the final
-    plain -> flang-symbol resolution against the emitted HLFIR.  The
-    companion ``module`` is kept so the caller can prune a whole-project
-    ``compile_commands`` to the entry's USE-closure (the module is context,
-    not part of the user-facing name).
-
-    Accepts ``module::proc`` to disambiguate; a bare ``proc`` resolves
-    uniquely or raises.  A mangled ``_Q...`` name passes through (demangled
-    to its plain ``proc`` + module) for back-compat.
-
-    :raises ValueError: ``name`` is not found, or is ambiguous across
-        modules (the message lists the candidates so the caller can
-        qualify it ``module::proc``).
-    """
-    if name.startswith("_Q"):
-        # Back-compat: a hand-written mangled symbol.  Demangle to the plain
-        # proc + module so the rest of the pipeline stays mangling-free.
-        mod = _entry_module(name)
-        m = re.match(r"_QM[a-z0-9_]+?[PF]([a-z0-9_]+)$", name, re.IGNORECASE) \
-            or re.match(r"_Q[PF]([a-z0-9_]+)$", name, re.IGNORECASE)
-        return (m.group(1).lower() if m else name), mod
-    want_mod, _, want_proc = name.lower().rpartition("::")
-    want_mod = want_mod or None
-
-    matches = set()
-    for src in sources:
-        # Each source is a file path (read it) or already-inline source text
-        # (tier-1 passes the kernel string straight through).
-        try:
-            text = Path(src).read_text(errors="ignore") if Path(src).is_file() else str(src)
-        except (OSError, ValueError):
-            text = str(src)
-        for proc, mod in _scan_subroutine_defs(text):
-            if proc == want_proc and (want_mod is None or mod == want_mod):
-                matches.add((proc, mod))
-    if not matches:
-        raise ValueError(f"resolve_entry: no subroutine {name!r} found in the sources")
-    if len(matches) > 1:
-        cands = ", ".join(f"{m or '<free>'}::{p}" for p, m in sorted(matches))
-        raise ValueError(f"resolve_entry: {name!r} is ambiguous ({cands}); "
-                         f"qualify it as module::proc or pass the mangled symbol")
-    return matches.pop()
-
-
-def resolve_entry(name: str, sources) -> str:
-    """Validate a Fortran procedure name against ``sources`` and return its
-    PLAIN Fortran name (never the flang ``_QM...`` mangling).
-
-    Entries are always plain Fortran names per the pipeline design; the
-    bridge resolves the plain name to the mangled flang symbol against the
-    emitted HLFIR.  ``module::proc`` is accepted to disambiguate and is
-    reduced to its plain ``proc`` (the module is context, not the name).
-    With no sources (``[]``) the name passes through unchanged.
-
-    Currently resolves SUBROUTINES (the usual SDFG entry, incl. the ICON
-    dycore ``solve_nh``); pass a function's name the same way.
-
-    :raises ValueError: ``name`` is not found, or is ambiguous across
-        modules (the message lists the candidates so the caller can
-        qualify it ``module::proc``).
-    """
-    if not sources:
-        # Nothing to resolve against -- reduce ``module::proc`` to its plain
-        # ``proc`` but otherwise pass the name straight through.
-        return name.rpartition("::")[2]
-    proc, _ = _resolve_entry_with_module(name, sources)
-    return proc
-
-
-def _select_use_closure(parsed, root_module: str):
+def _select_use_closure(parsed: list[CompileEntry], root_module: str) -> list[CompileEntry]:
     """Filter parsed ``(src, includes, defines)`` entries down to the TU
     that defines ``root_module`` plus the transitive ``USE``-closure it
     needs, preserving the original (build) order.
@@ -309,7 +185,7 @@ def _select_use_closure(parsed, root_module: str):
     return [t for t in parsed if t[0] in needed]
 
 
-def _flang_emit(flang: str, src: Path, out_dir: Path, includes: Sequence[str], defines: Sequence[str]):
+def _flang_emit(flang: str, src: Path, out_dir: Path, includes: Sequence[str], defines: Sequence[str]) -> None:
     """Run one ``flang -fc1 -emit-hlfir`` invocation.  ``cwd`` and
     ``-J/-I`` all point at ``out_dir`` so flang only ever sees the
     ``.mod`` files it wrote itself -- with ``cwd`` set to ``out_dir`` the
@@ -339,15 +215,17 @@ def _flang_emit(flang: str, src: Path, out_dir: Path, includes: Sequence[str], d
     subprocess.check_call(cmd, cwd=str(out_dir))
 
 
-def emit(*,
-         compile_commands: Optional[Path] = None,
-         sources: Sequence[Path] = (),
-         stubs: Sequence[Path] = (),
-         out_dir: Path,
-         extra_includes: Sequence[Path] = (),
-         extra_defines: Sequence[str] = (),
-         entry: Optional[str] = None,
-         flang: Optional[str] = None) -> List[Path]:
+def emit(
+    *,
+    compile_commands: Path | None = None,
+    sources: Sequence[Path] = (),
+    stubs: Sequence[Path] = (),
+    out_dir: Path,
+    extra_includes: Sequence[Path] = (),
+    extra_defines: Sequence[str] = (),
+    entry: str | None = None,
+    flang: str | None = None,
+) -> list[Path]:
     """Emit ``.hlfir`` files under ``out_dir``.  Exactly one of
     ``compile_commands`` or ``sources`` must drive the file list:
 
@@ -368,7 +246,7 @@ def emit(*,
     / ``hdf5`` / ...); they are emitted first (in the order given)
     so the project sources' ``USE`` lines resolve.
 
-    ``entry`` (a mangled symbol like ``_QMmodPproc``) restricts the
+    ``entry`` (the Fortran name ``proc`` or ``module::proc``) restricts the
     ``compile_commands`` run to the entry's TU + its transitive
     ``USE``-closure -- the only TUs the bridge needs to lower that entry.
     Without it every TU in the database is emitted (fine for small
@@ -389,15 +267,12 @@ def emit(*,
         emitted.append(out_dir / f"{src.stem}.hlfir")
     # 2. project sources.
     if compile_commands is not None:
-        parsed = _parse_compile_commands(Path(compile_commands))
+        parsed = parse_compile_commands(Path(compile_commands))
         if entry is not None:
-            # Accept a plain Fortran name / ``module::proc`` / a mangled
-            # symbol; keep ``entry`` plain and use its enclosing module
-            # (context, scanned from the sources) to keep only the entry's
-            # USE-closure.
-            entry, mod = _resolve_entry_with_module(entry, [t[0] for t in parsed])
-            if mod is not None:
-                parsed = _select_use_closure(parsed, mod)
+            # The entry's enclosing module (scanned from the sources) keeps only its USE-closure.
+            module = resolve_entry_name((src.read_text(errors="ignore") for src, _, _ in parsed), entry).module
+            if module is not None:
+                parsed = _select_use_closure(parsed, module)
         for src, incs, defs in parsed:
             _flang_emit(flang, src, out_dir, incs, list(defs) + extra_defs)
             emitted.append(out_dir / f"{src.stem}.hlfir")
@@ -409,73 +284,86 @@ def emit(*,
     return emitted
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(prog="python -m dace_fortran.emit_hlfir",
-                                description="Emit HLFIR for a Fortran project so "
-                                "dace_fortran.build_sdfg_from_hlfir can consume it.")
-    p.add_argument("compile_commands",
-                   nargs="?",
-                   type=Path,
-                   help="path to a cmake / ninja compile_commands.json "
-                   "(use -DCMAKE_EXPORT_COMPILE_COMMANDS=ON when "
-                   "configuring) -- preferred path; build order + "
-                   "-I/-D flags inferred from this artefact.")
-    p.add_argument("--source",
-                   action="append",
-                   default=[],
-                   type=Path,
-                   dest="sources",
-                   help="fallback: explicit .f90 file (repeat) when no "
-                   "compile_commands.json is available; ordering "
-                   "derived by USE-graph topo-sort.")
-    p.add_argument("--stub",
-                   action="append",
-                   default=[],
-                   type=Path,
-                   dest="stubs",
-                   help="flang-buildable stub source for an external "
-                   "module flang has no shipped .mod for "
-                   "(mpi / netcdf / hdf5 / ...); compiled first.")
-    p.add_argument("--include",
-                   action="append",
-                   default=[],
-                   type=Path,
-                   dest="extra_includes",
-                   help="extra -I path (--source mode only; "
-                   "compile_commands inherits its own -I list).")
-    p.add_argument("--define",
-                   "-D",
-                   action="append",
-                   default=[],
-                   dest="extra_defines",
-                   metavar="NAME[=val]",
-                   help="extra -D cpp macro for flang's preprocessor "
-                   "(repeat); the only way to set cpp config in "
-                   "--source mode, and an augment in compile_commands "
-                   "mode.")
-    p.add_argument("--entry",
-                   default=None,
-                   help="mangled entry symbol (_QMmodPproc); restricts a "
-                   "compile_commands run to that entry's USE-closure "
-                   "instead of emitting every TU.")
+def main(argv: Sequence[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="python -m dace_fortran.emit_hlfir",
+        description="Emit HLFIR for a Fortran project so dace_fortran.build_sdfg_from_hlfir can consume it.",
+    )
+    p.add_argument(
+        "compile_commands",
+        nargs="?",
+        type=Path,
+        help="path to a cmake / ninja compile_commands.json "
+        "(use -DCMAKE_EXPORT_COMPILE_COMMANDS=ON when "
+        "configuring) -- preferred path; build order + "
+        "-I/-D flags inferred from this artefact.",
+    )
+    p.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        type=Path,
+        dest="sources",
+        help="fallback: explicit .f90 file (repeat) when no "
+        "compile_commands.json is available; ordering "
+        "derived by USE-graph topo-sort.",
+    )
+    p.add_argument(
+        "--stub",
+        action="append",
+        default=[],
+        type=Path,
+        dest="stubs",
+        help="flang-buildable stub source for an external "
+        "module flang has no shipped .mod for "
+        "(mpi / netcdf / hdf5 / ...); compiled first.",
+    )
+    p.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        type=Path,
+        dest="extra_includes",
+        help="extra -I path (--source mode only; compile_commands inherits its own -I list).",
+    )
+    p.add_argument(
+        "--define",
+        "-D",
+        action="append",
+        default=[],
+        dest="extra_defines",
+        metavar="NAME[=val]",
+        help="extra -D cpp macro for flang's preprocessor "
+        "(repeat); the only way to set cpp config in "
+        "--source mode, and an augment in compile_commands "
+        "mode.",
+    )
+    p.add_argument(
+        "--entry",
+        default=None,
+        help="Fortran name of the entry procedure (proc or module::proc); restricts a "
+        "compile_commands run to that entry's USE-closure "
+        "instead of emitting every TU.",
+    )
     p.add_argument("--out", required=True, type=Path, help="output directory; .hlfir + .mod files land here.")
-    p.add_argument("--flang",
-                   default=None,
-                   help="flang binary to drive (default: the first supported LLVM flang on PATH).")
+    p.add_argument(
+        "--flang", default=None, help="flang binary to drive (default: the first supported LLVM flang on PATH)."
+    )
     args = p.parse_args(argv)
     if args.flang is not None and shutil.which(args.flang) is None:
         p.error(f"flang binary {args.flang!r} not on PATH")
     if (args.compile_commands is None) == (not args.sources):
-        p.error("pass either compile_commands.json (positional) or one or "
-                "more --source paths, not both / neither")
-    out = emit(compile_commands=args.compile_commands,
-               sources=args.sources,
-               stubs=args.stubs,
-               out_dir=args.out,
-               extra_includes=args.extra_includes,
-               extra_defines=args.extra_defines,
-               entry=args.entry,
-               flang=args.flang)
+        p.error("pass either compile_commands.json (positional) or one or more --source paths, not both / neither")
+    out = emit(
+        compile_commands=args.compile_commands,
+        sources=args.sources,
+        stubs=args.stubs,
+        out_dir=args.out,
+        extra_includes=args.extra_includes,
+        extra_defines=args.extra_defines,
+        entry=args.entry,
+        flang=args.flang,
+    )
     print(f"emitted {len(out)} .hlfir under {args.out}")
     return 0
 

@@ -14,19 +14,18 @@ the computation itself or the external-call routing (the bridge must not optimis
 Companion to ``test_dycore_velocity_external_e2e.py`` (full ICON-style sync prints + AoS
 marshalling) and ``test_dycore_struct_ext_e2e.py`` (small struct-external sibling).
 """
+
 import ctypes
-import shutil
 import subprocess
 from pathlib import Path
 
 import dace
 import numpy as np
-import pytest
 
-from _util import build_sdfg, gfortran_compile_so, have_flang
 from dace_fortran.bindings import build_fortran_library
 from dace_fortran.bindings.fortran_interface import build_auto_interface
-from dace_fortran.external import Arg, clear_external_registry, keep_external
+from dace_fortran.external import Arg, ArgKind, Intent, clear_external_registry, keep_external
+from tests._util import build_sdfg, gfortran_compile_so
 
 # ``-O0 -fno-fast-math -ffp-contract=off`` pinned on every layer (gfortran reference
 # link, SDFG-side gfortran link of the binding wrapper, DaCe's C++ codegen -- overriding
@@ -37,10 +36,6 @@ from dace_fortran.external import Arg, clear_external_registry, keep_external
 _O0_FFLAGS = ("-O0", "-fno-fast-math", "-ffp-contract=off", "-ffree-line-length-none")
 _O0_CXX_FLAGS = ("-O0", "-fno-fast-math", "-ffp-contract=off", "-fPIC", "-Wno-unused-parameter", "-Wno-unused-label")
 
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
 
 # "original" sync_patch_array_noop has no bind(c) (dycore calls it via the regular
 # Fortran interface); the companion sync_patch_array_noop_c IS bind(c) and rebuilds the
@@ -123,8 +118,8 @@ def _build_sync_lib(tmp_path: Path) -> tuple[Path, Path]:
     src.write_text(_SYNC_NOOP_SRC)
     so_path = build_dir / "libsync_noop.so"
     subprocess.check_call(
-        ["gfortran", "-shared", "-fPIC", "-O2", f"-J{build_dir}",
-         str(src), "-o", str(so_path)], cwd=build_dir)
+        ["gfortran", "-shared", "-fPIC", "-O2", f"-J{build_dir}", str(src), "-o", str(so_path)], cwd=build_dir
+    )
     return so_path, build_dir
 
 
@@ -134,7 +129,7 @@ def test_standalone_dycore_with_sync_external(tmp_path: Path):
     from ctypes with the same random input; bit-exact match confirms the SDFG's
     stencil lowering + external-call routing."""
     # 1. Pre-build the no-op sync library.
-    sync_so, sync_build_dir = _build_sync_lib(tmp_path)
+    sync_so, _sync_build_dir = _build_sync_lib(tmp_path)
 
     # 2. register BEFORE the SDFG build so the bridge externalises it instead of inlining.
     clear_external_registry()
@@ -142,10 +137,10 @@ def test_standalone_dycore_with_sync_external(tmp_path: Path):
         "sync_patch_array_noop",
         c_name="sync_patch_array_noop_c",
         args=(
-            Arg(kind="scalar", dtype="int32", intent="in"),  # tag
-            Arg(kind="array", dtype="float64", intent="inout"),  # field
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # tag
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),  # field
         ),
-        libraries=(str(sync_so), ),
+        libraries=(str(sync_so),),
         dynamic_extents_abi=True,
     )
     # 2b. pin DaCe's C++ codegen to O0/no-fast-math so arithmetic order matches gfortran;
@@ -201,8 +196,8 @@ def test_standalone_dycore_with_sync_external(tmp_path: Path):
     n0, n1, n2 = 11, 7, 5
     alpha = 2.5
     field_init = np.asfortranarray(rng.standard_normal((n0, n1, n2)))
-    field_sdfg = field_init.copy(order='F')
-    field_ref = field_init.copy(order='F')
+    field_sdfg = field_init.copy(order="F")
+    field_ref = field_init.copy(order="F")
 
     # bind_c_shim's flat-arg convention: dynamic extents ahead of the pointer, scalars
     # last -- the ref driver mirrors this so the same argtypes apply to both.
@@ -225,3 +220,9 @@ def test_standalone_dycore_with_sync_external(tmp_path: Path):
     # hard guarantee today: bit-exact.  Loosen to assert_allclose if a future flang
     # reorders the a*b + sqrt(c) chain and only 1 ULP can be sustained.
     np.testing.assert_array_equal(field_sdfg, field_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

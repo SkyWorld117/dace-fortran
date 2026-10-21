@@ -2,13 +2,12 @@
 bare ``hlfir.region_assign``) must raise, not be silently skipped by ``buildAST`` --
 skipping used to drop the computation and produce a wrong result with no error.
 """
+
 from pathlib import Path
 
 import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # WHERE lowers to hlfir.where; no pipeline pass rewrites it, so it reaches buildAST and must trigger the compute-drop guard.
 _WHERE_KERNEL = """
@@ -33,3 +32,7 @@ def test_where_masked_assign_raises(tmp_path: Path):
     msg = str(excinfo.value)
     assert "hlfir.where" in msg, f"diagnostic should name the unhandled op, got: {msg}"
     assert "unhandled compute statement" in msg, f"diagnostic should flag the compute drop, got: {msg}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

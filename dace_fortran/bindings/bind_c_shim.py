@@ -13,16 +13,25 @@ member is inline-flat (scalar or static-shape array of scalar).
 Unsupported (raises :class:`UnsupportedShimInterfaceError`): nested
 derived-type members; allocatable/pointer/dynamic-shape members.
 """
+
+from __future__ import annotations
+
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List
+from typing import TYPE_CHECKING
 
 from dace_fortran.bindings.fortran_interface import (
+    FORTRAN_C_TYPE,
     DerivedType,
     Member,
     OriginalArg,
     OriginalInterface,
+    fortran_c_type,
 )
+
+if TYPE_CHECKING:
+    from dace_fortran.bindings.flatten_plan import FlattenPlan
 
 # Identifier in a shape expr (e.g. nproma) -- recovers module-variable extents.
 _SHAPE_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
@@ -34,20 +43,20 @@ class UnsupportedShimInterfaceError(NotImplementedError):
     with no recorded layout."""
 
 
-def _dim_spec(shape) -> str:
+def _dim_spec(shape: Sequence[str]) -> str:
     """``(:,:)`` for rank-N, empty for scalars."""
     if not shape:
         return ""
     return "(" + ", ".join(":" for _ in shape) + ")"
 
 
-def _shape_literal(shape) -> str:
+def _shape_literal(shape: Sequence[str]) -> str:
     """``[d1, d2, ...]`` Fortran array constructor for the
     ``c_f_pointer`` extent argument."""
     return "[" + ", ".join(str(s) for s in shape) + "]"
 
 
-def _free_shape_symbols(iface: OriginalInterface) -> List[str]:
+def _free_shape_symbols(iface: OriginalInterface) -> list[str]:
     """Identifiers a flat array dummy's static shape references that
     aren't scalar dummy args -- module vars the kernel used for extents
     (``tracer(nproma, n_zlev)`` -> ``nproma``, ``n_zlev``).
@@ -60,7 +69,7 @@ def _free_shape_symbols(iface: OriginalInterface) -> List[str]:
     """
     scalar_dummies = {a.name for a in iface.args if a.rank == 0 and a.struct_type is None}
     seen: set = set()
-    out: List[str] = []
+    out: list[str] = []
     for a in iface.args:
         if a.struct_type is not None or a.rank == 0:
             continue
@@ -112,7 +121,7 @@ def _is_value_record(iface: OriginalInterface, struct_name: str) -> bool:
     return True
 
 
-def _validate_struct_layout_recursive(iface: OriginalInterface, st: DerivedType, arg_name: str, path: str):
+def _validate_struct_layout_recursive(iface: OriginalInterface, st: DerivedType, arg_name: str, path: str) -> None:
     """Walk ``st`` (and nested derived-type members), raise
     :class:`UnsupportedShimInterfaceError` on the first unhandleable leaf.
     ``path`` is the Fortran access path used in the error message."""
@@ -120,24 +129,28 @@ def _validate_struct_layout_recursive(iface: OriginalInterface, st: DerivedType,
         if m.struct_name:
             nested = iface.struct_types.get(m.struct_name)
             if nested is None:
-                raise UnsupportedShimInterfaceError(f"bind(c) shim: nested struct member {path}%{m.name} "
-                                                    f"is type {m.fortran_type} but no layout was recorded "
-                                                    f"for {m.struct_name!r} in OriginalInterface."
-                                                    f"struct_types.  The bridge's recursive struct walker "
-                                                    f"should have populated this; check that the bridge "
-                                                    f"build is current.")
+                raise UnsupportedShimInterfaceError(
+                    f"bind(c) shim: nested struct member {path}%{m.name} "
+                    f"is type {m.fortran_type} but no layout was recorded "
+                    f"for {m.struct_name!r} in OriginalInterface."
+                    f"struct_types.  The bridge's recursive struct walker "
+                    f"should have populated this; check that the bridge "
+                    f"build is current."
+                )
             _validate_struct_layout_recursive(iface, nested, arg_name, f"{path}%{m.name}")
             continue
         if not _is_inline_flat_member(m):
-            raise UnsupportedShimInterfaceError(f"bind(c) shim: argument {arg_name!r} has member "
-                                                f"{path}%{m.name} ({m.fortran_type}, rank={m.rank}, "
-                                                f"shape={m.shape}) the shim cannot handle.  Only scalar "
-                                                f"and array-of-scalar members (static or dynamic shape) "
-                                                f"are supported; complex / character / function-pointer "
-                                                f"members need a hand-authored shim.")
+            raise UnsupportedShimInterfaceError(
+                f"bind(c) shim: argument {arg_name!r} has member "
+                f"{path}%{m.name} ({m.fortran_type}, rank={m.rank}, "
+                f"shape={m.shape}) the shim cannot handle.  Only scalar "
+                f"and array-of-scalar members (static or dynamic shape) "
+                f"are supported; complex / character / function-pointer "
+                f"members need a hand-authored shim."
+            )
 
 
-def _collect_nested_struct_modules(iface: OriginalInterface, st: DerivedType, out_lines: List[str], seen: set):
+def _collect_nested_struct_modules(iface: OriginalInterface, st: DerivedType, out_lines: list[str], seen: set) -> None:
     """Append a ``use <mod>, only: ...`` line for every module a
     nested-derived-type member references, so ``type(<nested>)``
     resolves at compile time (the outer struct decl doesn't cover it)."""
@@ -163,8 +176,15 @@ def _struct_module_use(iface: OriginalInterface, struct_name: str) -> str:
     return ""
 
 
-def _emit_flat_arg(a: OriginalArg, header_args: List[str], decls_value: List[str], decls_ptr: List[str],
-                   decls_local: List[str], c_f_calls: List[str], call_args: List[str]):
+def _emit_flat_arg(
+    a: OriginalArg,
+    header_args: list[str],
+    decls_value: list[str],
+    decls_ptr: list[str],
+    decls_local: list[str],
+    c_f_calls: list[str],
+    call_args: list[str],
+) -> None:
     """Per-dummy split for a non-struct arg: scalar inputs by value,
     scalar outputs/arrays as ``c_ptr`` + ``c_f_pointer`` alias.
     Mutates the parallel lists in place.
@@ -172,12 +192,13 @@ def _emit_flat_arg(a: OriginalArg, header_args: List[str], decls_value: List[str
     Dynamic-shape arrays take extents from ``<name>_d<i>`` by-value args
     declared BEFORE the pointer -- caller must pass dims before pointer
     (same convention as :func:`_emit_struct_members_recursive`)."""
-    if a.rank == 0 and a.intent in ('in', ''):
+    if a.rank == 0 and a.intent in ("in", ""):
         header_args.append(a.name)
         decls_value.append(f"  {a.fortran_type}, value :: {a.name}")
         call_args.append(a.name)
         return
-    is_dynamic = a.rank > 0 and any(s in ('?', '*', ':') for s in a.shape)
+    is_dynamic = a.rank > 0 and any(s in ("?", "*", ":") for s in a.shape)
+    ext_names: list[str] = []
     if is_dynamic:
         ext_names = [f"{a.name}_d{i}" for i in range(a.rank)]
         for en in ext_names:
@@ -192,18 +213,26 @@ def _emit_flat_arg(a: OriginalArg, header_args: List[str], decls_value: List[str
         c_f_calls.append(f"  call c_f_pointer({ptr_name}, {a.name}, [1])")
     else:
         decls_local.append(f"  {a.fortran_type}, pointer :: {a.name}{_dim_spec(a.shape)}")
-        if is_dynamic:
-            shape_tok = "[" + ", ".join(ext_names) + "]"
-        else:
-            shape_tok = _shape_literal(a.shape)
-        c_f_calls.append(f"  call c_f_pointer({ptr_name}, {a.name}, "
-                         f"{shape_tok})")
+        shape_tok = "[" + ", ".join(ext_names) + "]" if is_dynamic else _shape_literal(a.shape)
+        c_f_calls.append(f"  call c_f_pointer({ptr_name}, {a.name}, {shape_tok})")
     call_args.append(a.name)
 
 
-def _emit_value_record_array(iface: OriginalInterface, vt_name: str, outer_rank: int, inst_path: str, flat_prefix: str,
-                             intent: str, header_args: List[str], decls_value: List[str], decls_ptr: List[str],
-                             decls_local: List[str], c_f_calls: List[str], copy_in: List[str], copy_out: List[str]):
+def _emit_value_record_array(
+    iface: OriginalInterface,
+    vt_name: str,
+    outer_rank: int,
+    inst_path: str,
+    flat_prefix: str,
+    intent: str,
+    header_args: list[str],
+    decls_value: list[str],
+    decls_ptr: list[str],
+    decls_local: list[str],
+    c_f_calls: list[str],
+    copy_in: list[str],
+    copy_out: list[str],
+) -> None:
     """Reconstruct an ARRAY of a value record (see :func:`_is_value_record`,
     e.g. ``t_cartesian_coordinates``) element-wise.  ``outer_rank`` is the
     record array's rank; ``inst_path`` is the Fortran instance to assemble.
@@ -261,10 +290,10 @@ def _emit_value_record_array(iface: OriginalInterface, vt_name: str, outer_rank:
 #: Double-buffer lane source expr, ``<prefix>%<aor>(<sym>)%<leaf>`` (e.g.
 #: ``p%prog(nnow)%rho``).  Never matches a plain AoS member (index there
 #: rides ``$i`` placeholders, not a literal ``(<sym>)``).
-_DBUF_OUTER_RE = re.compile(r'^(?P<prefix>.+)%(?P<aor>\w+)\((?P<sym>\w+)\)%(?P<leaf>.+)$')
+_DBUF_OUTER_RE = re.compile(r"^(?P<prefix>.+)%(?P<aor>\w+)\((?P<sym>\w+)\)%(?P<leaf>.+)$")
 
 
-def _build_dbuf_map(plan) -> dict:
+def _build_dbuf_map(plan: FlattenPlan | None) -> dict:
     """Group the FlattenPlan's double-buffer lane recipes by
     ``(struct-instance prefix, AoR member)`` for per-time-level
     reconstruction.
@@ -282,19 +311,28 @@ def _build_dbuf_map(plan) -> dict:
         if not r.flat_names:
             continue
         info = {
-            'leaf': m['leaf'],
-            'flat': r.flat_names[0],
-            'rank': r.rank,
-            'dtype': r.scratch_dtype,
-            'intent': e.writeback_intent,
+            "leaf": m["leaf"],
+            "flat": r.flat_names[0],
+            "rank": r.rank,
+            "dtype": r.scratch_dtype,
+            "intent": e.writeback_intent,
         }
-        dbuf.setdefault((m['prefix'], m['aor']), {}).setdefault(m['sym'], []).append(info)
+        dbuf.setdefault((m["prefix"], m["aor"]), {}).setdefault(m["sym"], []).append(info)
     return dbuf
 
 
-def _emit_double_buffer_member(inst_path: str, aor: str, syms: dict, header_args: List[str], decls_value: List[str],
-                               decls_ptr: List[str], decls_local: List[str], c_f_calls: List[str], copy_in: List[str],
-                               copy_out: List[str]):
+def _emit_double_buffer_member(
+    inst_path: str,
+    aor: str,
+    syms: dict,
+    header_args: list[str],
+    decls_value: list[str],
+    decls_ptr: list[str],
+    decls_local: list[str],
+    c_f_calls: list[str],
+    copy_in: list[str],
+    copy_out: list[str],
+) -> None:
     """Reconstruct an ICON double-buffer AoR member (``p%prog``) from the
     SDFG's per-time-level lane buffers (``prog(nnow)``/``prog(nnew)`` split
     into static ``p_prog_nnow_rho``/``p_prog_nnew_rho`` lanes).  Allocates
@@ -305,8 +343,8 @@ def _emit_double_buffer_member(inst_path: str, aor: str, syms: dict, header_args
     copy_in.append(f"  allocate({inst_path}%{aor}({max_expr}))")
     for sym in sym_names:
         for info in syms[sym]:
-            flat, leaf, rank = info['flat'], info['leaf'], info['rank']
-            ftype = _MOD_FORWARD_SCALAR_FTYPE.get(info['dtype'], 'real(c_double)')
+            flat, leaf, rank = info["flat"], info["leaf"], info["rank"]
+            ftype = FORTRAN_C_TYPE.get(info["dtype"], "real(c_double)")
             ext_names = [f"{flat}_d{i}" for i in range(rank)]
             for en in ext_names:
                 header_args.append(en)
@@ -319,26 +357,28 @@ def _emit_double_buffer_member(inst_path: str, aor: str, syms: dict, header_args
             c_f_calls.append(f"  call c_f_pointer({ptr}, {flat}, [{', '.join(ext_names)}])")
             extents = "(" + ", ".join(ext_names) + ")"
             copy_in.append(f"  allocate({inst_path}%{aor}({sym})%{leaf}{extents})")
-            if info['intent'] in ('', 'in', 'inout'):
+            if info["intent"] in ("", "in", "inout"):
                 copy_in.append(f"  {inst_path}%{aor}({sym})%{leaf} = {flat}")
-            if info['intent'] in ('out', 'inout'):
+            if info["intent"] in ("out", "inout"):
                 copy_out.append(f"  {flat} = {inst_path}%{aor}({sym})%{leaf}")
 
 
-def _emit_struct_members_recursive(iface: OriginalInterface,
-                                   st: DerivedType,
-                                   inst_path: str,
-                                   flat_prefix: str,
-                                   intent: str,
-                                   header_args: List[str],
-                                   decls_value: List[str],
-                                   decls_ptr: List[str],
-                                   decls_local: List[str],
-                                   c_f_calls: List[str],
-                                   copy_in: List[str],
-                                   copy_out: List[str],
-                                   shape_syms: set,
-                                   dbuf_map: dict = None):
+def _emit_struct_members_recursive(
+    iface: OriginalInterface,
+    st: DerivedType,
+    inst_path: str,
+    flat_prefix: str,
+    intent: str,
+    header_args: list[str],
+    decls_value: list[str],
+    decls_ptr: list[str],
+    decls_local: list[str],
+    c_f_calls: list[str],
+    copy_in: list[str],
+    copy_out: list[str],
+    shape_syms: set,
+    dbuf_map: dict | None = None,
+) -> None:
     """Walk ``st``'s members: emit a C-ABI slot + ``c_f_pointer`` alias +
     copy-in/copy-out per leaf; descend into nested-struct members with
     extended paths.  ``inst_path`` is the Fortran access path,
@@ -355,36 +395,85 @@ def _emit_struct_members_recursive(iface: OriginalInterface,
             if m.rank == 0:
                 # Scalar nested record: descend in place, no index/alloc.
                 nested = iface.struct_types[m.struct_name]
-                _emit_struct_members_recursive(iface, nested, f"{inst_path}%{m.name}", f"{flat_prefix}_{m.name}",
-                                               intent, header_args, decls_value, decls_ptr, decls_local, c_f_calls,
-                                               copy_in, copy_out, shape_syms)
+                _emit_struct_members_recursive(
+                    iface,
+                    nested,
+                    f"{inst_path}%{m.name}",
+                    f"{flat_prefix}_{m.name}",
+                    intent,
+                    header_args,
+                    decls_value,
+                    decls_ptr,
+                    decls_local,
+                    c_f_calls,
+                    copy_in,
+                    copy_out,
+                    shape_syms,
+                )
             elif _is_value_record(iface, m.struct_name):
                 # Array of a value record: scatter element-wise.
-                _emit_value_record_array(iface, m.struct_name, m.rank, f"{inst_path}%{m.name}",
-                                         f"{flat_prefix}_{m.name}", intent, header_args, decls_value, decls_ptr,
-                                         decls_local, c_f_calls, copy_in, copy_out)
+                _emit_value_record_array(
+                    iface,
+                    m.struct_name,
+                    m.rank,
+                    f"{inst_path}%{m.name}",
+                    f"{flat_prefix}_{m.name}",
+                    intent,
+                    header_args,
+                    decls_value,
+                    decls_ptr,
+                    decls_local,
+                    c_f_calls,
+                    copy_in,
+                    copy_out,
+                )
             elif dbuf_map and (inst_path, m.name) in dbuf_map:
                 # ICON double-buffer AoR: bridge split into per-time-level lanes.
-                _emit_double_buffer_member(inst_path, m.name, dbuf_map[(inst_path, m.name)], header_args, decls_value,
-                                           decls_ptr, decls_local, c_f_calls, copy_in, copy_out)
+                _emit_double_buffer_member(
+                    inst_path,
+                    m.name,
+                    dbuf_map[(inst_path, m.name)],
+                    header_args,
+                    decls_value,
+                    decls_ptr,
+                    decls_local,
+                    c_f_calls,
+                    copy_in,
+                    copy_out,
+                )
             else:
                 # Array of a container record: ICON ocean kernels are
                 # single-patch, so allocate size 1 and descend into (1).
                 copy_in.append(f"  allocate({inst_path}%{m.name}(1))")
                 nested = iface.struct_types[m.struct_name]
-                _emit_struct_members_recursive(iface, nested, f"{inst_path}%{m.name}(1)", f"{flat_prefix}_{m.name}",
-                                               intent, header_args, decls_value, decls_ptr, decls_local, c_f_calls,
-                                               copy_in, copy_out, shape_syms, dbuf_map)
+                _emit_struct_members_recursive(
+                    iface,
+                    nested,
+                    f"{inst_path}%{m.name}(1)",
+                    f"{flat_prefix}_{m.name}",
+                    intent,
+                    header_args,
+                    decls_value,
+                    decls_ptr,
+                    decls_local,
+                    c_f_calls,
+                    copy_in,
+                    copy_out,
+                    shape_syms,
+                    dbuf_map,
+                )
             continue
         flat_name = f"{flat_prefix}_{m.name}"
-        if m.rank == 0 and intent in ('in', '') and flat_name in shape_syms:
+        if m.rank == 0 and intent in ("in", "") and flat_name in shape_syms:
             # Also a flat-array-dummy extent: one shared by-value arg.
             header_args.append(flat_name)
             decls_value.append(f"  {m.fortran_type}, value :: {flat_name}")
             copy_in.append(f"  {inst_path}%{m.name} = {flat_name}")
             continue
         ptr_name = f"{flat_name}_p"
-        is_dynamic = any(s in ('?', '*', ':') for s in m.shape)
+        is_dynamic = any(s in ("?", "*", ":") for s in m.shape)
+        lb_names: list[str] = []
+        ext_names = []
         if is_dynamic:
             # Per dim: lower bound then extent, both by-value ints
             # (``<flat>_lb<i>``/``<flat>_d<i>``) ahead of the pointer.
@@ -393,7 +482,7 @@ def _emit_struct_members_recursive(iface: OriginalInterface,
             # read at negative rl) -- defaulting lb to 1 broke end_block(-5).
             lb_names = [f"{flat_name}_lb{i}" for i in range(m.rank)]
             ext_names = [f"{flat_name}_d{i}" for i in range(m.rank)]
-            for lb, en in zip(lb_names, ext_names):
+            for lb, en in zip(lb_names, ext_names, strict=False):
                 header_args.append(lb)
                 decls_value.append(f"  integer(c_int), value :: {lb}")
                 header_args.append(en)
@@ -405,12 +494,8 @@ def _emit_struct_members_recursive(iface: OriginalInterface,
             c_f_calls.append(f"  call c_f_pointer({ptr_name}, {flat_name}, [1])")
         else:
             decls_local.append(f"  {m.fortran_type}, pointer :: {flat_name}{_dim_spec(m.shape)}")
-            if is_dynamic:
-                shape_tok = "[" + ", ".join(ext_names) + "]"
-            else:
-                shape_tok = _shape_literal(m.shape)
-            c_f_calls.append(f"  call c_f_pointer({ptr_name}, {flat_name}, "
-                             f"{shape_tok})")
+            shape_tok = "[" + ", ".join(ext_names) + "]" if is_dynamic else _shape_literal(m.shape)
+            c_f_calls.append(f"  call c_f_pointer({ptr_name}, {flat_name}, {shape_tok})")
         if is_dynamic and m.rank > 0:
             # Bridge can't distinguish POINTER vs ALLOCATABLE on fir.BoxType
             # extracts, so always ``allocate`` (works for both) + element
@@ -422,38 +507,42 @@ def _emit_struct_members_recursive(iface: OriginalInterface,
             # so lbound() matches offset_<member>_d<i>.  Whole-array copy from
             # the 1-based flat companion is by position, so member(lb) takes
             # flat(1).
-            bounds_tok = "(" + ", ".join(f"{lb} : {lb} + {en} - 1" for lb, en in zip(lb_names, ext_names)) + ")"
+            bounds_tok = (
+                "(" + ", ".join(f"{lb} : {lb} + {en} - 1" for lb, en in zip(lb_names, ext_names, strict=False)) + ")"
+            )
             copy_in.append(f"  allocate({inst_path}%{m.name}{bounds_tok})")
-            if intent in ('in', 'inout', ''):
+            if intent in ("in", "inout", ""):
                 copy_in.append(f"  {inst_path}%{m.name} = {flat_name}")
-            if intent in ('out', 'inout'):
+            if intent in ("out", "inout"):
                 copy_out.append(f"  {flat_name} = {inst_path}%{m.name}")
             continue
-        if intent in ('in', 'inout', ''):
+        if intent in ("in", "inout", ""):
             if m.rank == 0:
                 copy_in.append(f"  {inst_path}%{m.name} = {flat_name}(1)")
             else:
                 copy_in.append(f"  {inst_path}%{m.name} = {flat_name}")
-        if intent in ('out', 'inout'):
+        if intent in ("out", "inout"):
             if m.rank == 0:
                 copy_out.append(f"  {flat_name}(1) = {inst_path}%{m.name}")
             else:
                 copy_out.append(f"  {flat_name} = {inst_path}%{m.name}")
 
 
-def _emit_struct_arg(a: OriginalArg,
-                     st: DerivedType,
-                     iface: OriginalInterface,
-                     header_args: List[str],
-                     decls_value: List[str],
-                     decls_ptr: List[str],
-                     decls_local: List[str],
-                     c_f_calls: List[str],
-                     copy_in: List[str],
-                     copy_out: List[str],
-                     call_args: List[str],
-                     shape_syms: set,
-                     dbuf_map: dict = None):
+def _emit_struct_arg(
+    a: OriginalArg,
+    st: DerivedType,
+    iface: OriginalInterface,
+    header_args: list[str],
+    decls_value: list[str],
+    decls_ptr: list[str],
+    decls_local: list[str],
+    c_f_calls: list[str],
+    copy_in: list[str],
+    copy_out: list[str],
+    call_args: list[str],
+    shape_syms: set,
+    dbuf_map: dict | None = None,
+) -> None:
     """Per-member split for a derived-type argument.
 
     The dummy becomes a local ``type(<struct>), target :: <name>``; each
@@ -469,39 +558,65 @@ def _emit_struct_arg(a: OriginalArg,
     preserves the per_member_soa no-pack contract).
     """
     if a.rank > 0:
+        assert a.struct_type is not None
         # Array-of-record dummy: value record scatters element-wise;
         # container-record array has no path here -- reject loudly.
         if not _is_value_record(iface, a.struct_type):
-            raise UnsupportedShimInterfaceError(f"bind(c) shim: dummy {a.name!r} is an array (rank {a.rank}) of the "
-                                                f"container record {a.struct_type!r}; only arrays of flat value "
-                                                f"records (every member a static-shape leaf) are reconstructed "
-                                                f"element-wise today.")
-        _emit_value_record_array(iface, a.struct_type, a.rank, a.name, a.name, a.intent, header_args, decls_value,
-                                 decls_ptr, decls_local, c_f_calls, copy_in, copy_out)
+            raise UnsupportedShimInterfaceError(
+                f"bind(c) shim: dummy {a.name!r} is an array (rank {a.rank}) of the "
+                f"container record {a.struct_type!r}; only arrays of flat value "
+                f"records (every member a static-shape leaf) are reconstructed "
+                f"element-wise today."
+            )
+        _emit_value_record_array(
+            iface,
+            a.struct_type,
+            a.rank,
+            a.name,
+            a.name,
+            a.intent,
+            header_args,
+            decls_value,
+            decls_ptr,
+            decls_local,
+            c_f_calls,
+            copy_in,
+            copy_out,
+        )
         shape = ", ".join(":" for _ in range(a.rank))
         decls_local.append(f"  {a.fortran_type}, allocatable, target :: {a.name}({shape})")
         call_args.append(a.name)
         return
-    _emit_struct_members_recursive(iface, st, a.name, a.name, a.intent, header_args, decls_value, decls_ptr,
-                                   decls_local, c_f_calls, copy_in, copy_out, shape_syms, dbuf_map)
+    _emit_struct_members_recursive(
+        iface,
+        st,
+        a.name,
+        a.name,
+        a.intent,
+        header_args,
+        decls_value,
+        decls_ptr,
+        decls_local,
+        c_f_calls,
+        copy_in,
+        copy_out,
+        shape_syms,
+        dbuf_map,
+    )
     decls_local.append(f"  {a.fortran_type}, target :: {a.name}")
     call_args.append(a.name)
 
 
-# SDFG dtype -> iso_c_binding Fortran type for by-value scalar C ABI args.
-# Keep in sync with emit_library._sym2c so the two ABIs coincide.
-_MOD_FORWARD_SCALAR_FTYPE = {
-    "int32": "integer(c_int)",
-    "int64": "integer(c_long_long)",
-    "float32": "real(c_float)",
-    "float64": "real(c_double)",
-    "bool": "logical(c_bool)",
-}
-
-
-def _emit_module_symbol_forward(module_symbol_forward, header_args: List[str], decls_value: List[str],
-                                decls_ptr: List[str], decls_local: List[str], c_f_calls: List[str], copy_in: List[str],
-                                use_lines: List[str]):
+def _emit_module_symbol_forward(
+    module_symbol_forward: Sequence[tuple[str, str, str, int]],
+    header_args: list[str],
+    decls_value: list[str],
+    decls_ptr: list[str],
+    decls_local: list[str],
+    c_f_calls: list[str],
+    copy_in: list[str],
+    use_lines: list[str],
+) -> None:
     """Per ``(module, member, dtype, rank)``, extend the shim so the caller
     can write the INNER library's copy of ``<module>::<member>`` via the C
     ABI -- gfortran ships a per-library BSS copy of module vars, so an
@@ -514,12 +629,7 @@ def _emit_module_symbol_forward(module_symbol_forward, header_args: List[str], d
     """
     seen_use_aliases = set()
     for module, member, dtype, rank in module_symbol_forward:
-        ftype = _MOD_FORWARD_SCALAR_FTYPE.get(dtype)
-        if ftype is None:
-            raise ValueError(f"bind_c_shim module_symbol_forward: unsupported dtype "
-                             f"{dtype!r} for ``{module}::{member}``; extend "
-                             f"``_MOD_FORWARD_SCALAR_FTYPE`` for new pass-by-value "
-                             f"shapes.")
+        ftype = fortran_c_type(dtype)
         # Same module may repeat -- collapse into one `only:` list per module.
         alias = f"{member}__sink"
         if alias not in seen_use_aliases:
@@ -562,7 +672,7 @@ def scalar_pointer_members(iface: OriginalInterface) -> frozenset:
     shape_syms = set(_free_shape_symbols(iface))
     out: set = set()
 
-    def walk(st: DerivedType, flat_prefix: str, intent: str):
+    def walk(st: DerivedType, flat_prefix: str, intent: str) -> None:
         for m in st.members:
             flat_name = f"{flat_prefix}_{m.name}"
             if m.struct_name:
@@ -579,11 +689,13 @@ def scalar_pointer_members(iface: OriginalInterface) -> frozenset:
     return frozenset(out)
 
 
-def emit_bind_c_shim(iface: OriginalInterface,
-                     out_path: str,
-                     debug_prints: bool = False,
-                     module_symbol_forward=(),
-                     plan=None) -> Path:
+def emit_bind_c_shim(
+    iface: OriginalInterface,
+    out_path: str | Path,
+    debug_prints: bool = False,
+    module_symbol_forward: Sequence[tuple[str, str, str, int]] = (),
+    plan: FlattenPlan | None = None,
+) -> Path:
     """Emit ``<entry>_c.f90`` -- a thin ``bind(c)`` wrapper around the
     binding module's ``<entry>_dace`` procedure.
 
@@ -605,25 +717,27 @@ def emit_bind_c_shim(iface: OriginalInterface,
             continue
         st = iface.struct_types.get(a.struct_type)
         if st is None:
-            raise UnsupportedShimInterfaceError(f"bind(c) shim: dummy {a.name!r} is type {a.fortran_type} "
-                                                f"but no layout was recorded for {a.struct_type!r} in "
-                                                f"OriginalInterface.struct_types.  Supply a hand-authored "
-                                                f"interface with the member list.")
+            raise UnsupportedShimInterfaceError(
+                f"bind(c) shim: dummy {a.name!r} is type {a.fortran_type} "
+                f"but no layout was recorded for {a.struct_type!r} in "
+                f"OriginalInterface.struct_types.  Supply a hand-authored "
+                f"interface with the member list."
+            )
         _validate_struct_layout_recursive(iface, st, a.name, a.name)
 
     entry = iface.entry
     c_name = f"{entry}_c"
     bind_mod = f"{entry}_dace_bindings"
 
-    header_args: List[str] = []
-    decls_value: List[str] = []
-    decls_ptr: List[str] = []
-    decls_local: List[str] = []
-    c_f_calls: List[str] = []
-    copy_in: List[str] = []
-    copy_out: List[str] = []
-    call_args: List[str] = []
-    struct_use_lines: List[str] = []
+    header_args: list[str] = []
+    decls_value: list[str] = []
+    decls_ptr: list[str] = []
+    decls_local: list[str] = []
+    c_f_calls: list[str] = []
+    copy_in: list[str] = []
+    copy_out: list[str] = []
+    call_args: list[str] = []
+    struct_use_lines: list[str] = []
     seen_struct_uses = set()
     # Scalar struct member coinciding with a flat-array-dummy shape extent
     # forwards by value (shared), not as a length-1 pointer alias.
@@ -636,8 +750,21 @@ def emit_bind_c_shim(iface: OriginalInterface,
             _emit_flat_arg(a, header_args, decls_value, decls_ptr, decls_local, c_f_calls, call_args)
             continue
         st = iface.struct_types[a.struct_type]
-        _emit_struct_arg(a, st, iface, header_args, decls_value, decls_ptr, decls_local, c_f_calls, copy_in, copy_out,
-                         call_args, shape_syms, dbuf_map)
+        _emit_struct_arg(
+            a,
+            st,
+            iface,
+            header_args,
+            decls_value,
+            decls_ptr,
+            decls_local,
+            c_f_calls,
+            copy_in,
+            copy_out,
+            call_args,
+            shape_syms,
+            dbuf_map,
+        )
         # Pull in the struct's module use-line plus every nested member's.
         u = _struct_module_use(iface, a.struct_type)
         if u and u not in seen_struct_uses:
@@ -650,8 +777,8 @@ def emit_bind_c_shim(iface: OriginalInterface,
     # need them.  Skipped if already an arg.  Struct shape constants ride
     # the struct's module use-line instead.
     existing_args = set(header_args)
-    shape_sym_args: List[str] = []
-    shape_sym_decls: List[str] = []
+    shape_sym_args: list[str] = []
+    shape_sym_decls: list[str] = []
     for sym in _free_shape_symbols(iface):
         if sym in existing_args:
             continue
@@ -666,12 +793,20 @@ def emit_bind_c_shim(iface: OriginalInterface,
     # an outer-library write doesn't reach this library's copy.  The shim
     # takes the value as a C arg and writes the INNER copy directly.
     # (Root cause: velocity dycore+ext e2e ASan ODR diagnostic.)
-    module_forward_use_lines: List[str] = []
-    _emit_module_symbol_forward(module_symbol_forward, header_args, decls_value, decls_ptr, decls_local, c_f_calls,
-                                copy_in, module_forward_use_lines)
+    module_forward_use_lines: list[str] = []
+    _emit_module_symbol_forward(
+        module_symbol_forward,
+        header_args,
+        decls_value,
+        decls_ptr,
+        decls_local,
+        c_f_calls,
+        copy_in,
+        module_forward_use_lines,
+    )
 
     decl_block = "\n".join(decls_value + decls_ptr + decls_local)
-    body_parts: List[str] = []
+    body_parts: list[str] = []
     if debug_prints:
         body_parts.append(f"  write(0, *) '[{c_name}] enter'")
         body_parts.append("  flush(0)")
@@ -709,13 +844,12 @@ def emit_bind_c_shim(iface: OriginalInterface,
         "  use, intrinsic :: iso_c_binding",
         *struct_use_lines,
         *module_forward_use_lines,
-        f"  use {bind_mod}, only: {entry}_dace, {entry}_dace_finalize"
+        f"  use {bind_mod}, only: {entry}_dace, {entry}_dace_finalize",
     ]
     lines = [
         "! AUTO-GENERATED by dace_fortran.bindings.bind_c_shim -- do not edit.",
         f"! bind(c) shim around module procedure {bind_mod}::{entry}_dace.",
-        f"subroutine {c_name}({', '.join(header_args)}) "
-        f"bind(c, name='{c_name}')",
+        f"subroutine {c_name}({', '.join(header_args)}) bind(c, name='{c_name}')",
         *use_lines,
         "  implicit none",
         decl_block,
@@ -724,7 +858,7 @@ def emit_bind_c_shim(iface: OriginalInterface,
         "",
     ]
 
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines))
-    return out_path
+    out_file = Path(out_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text("\n".join(lines))
+    return out_file

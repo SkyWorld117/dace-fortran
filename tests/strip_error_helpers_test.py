@@ -8,20 +8,16 @@ contract (no-error path modeled, error path dead code at test time).
 
 Isolated single-file tests here; the QE e2e anchor is
 ``tests/qe/exx_bp/test_vexx_bp_k_gpu_parse.py``."""
+
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
-import pytest
-
-from _util import flang_binary, flang_intrinsic_modules_path, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import flang_binary, flang_intrinsic_modules_path
 
 
-def _emit_hlfir_and_strip(src: str, *, env_extra: dict = None) -> str:
+def _emit_hlfir_and_strip(src: str, *, env_extra: dict | None = None) -> str:
     """Compile ``src`` to HLFIR with flang, parse into the bridge, run
     ``hlfir-strip-error-helpers``, return the dumped IR.  Split out from
     ``build_sdfg`` so the test can inspect pre/post IR for this pre-pipeline pass."""
@@ -31,13 +27,19 @@ def _emit_hlfir_and_strip(src: str, *, env_extra: dict = None) -> str:
         f = Path(td) / "k.F90"
         f.write_text(src)
         h = Path(td) / "k.hlfir"
-        subprocess.check_call([
-            flang_binary(), "-fc1", "-fintrinsic-modules-path",
-            flang_intrinsic_modules_path(), "-emit-hlfir",
-            str(f), "-o",
-            str(h)
-        ],
-                              cwd=td)
+        subprocess.check_call(
+            [
+                flang_binary(),
+                "-fc1",
+                "-fintrinsic-modules-path",
+                flang_intrinsic_modules_path(),
+                "-emit-hlfir",
+                str(f),
+                "-o",
+                str(h),
+            ],
+            cwd=td,
+        )
         if env_extra:
             for k, v in env_extra.items():
                 os.environ[k] = v
@@ -249,3 +251,9 @@ END SUBROUTINE
     ir = _emit_hlfir_and_strip(src)
     # No call site to compare; the body must still be there.
     assert "func.func" in ir
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

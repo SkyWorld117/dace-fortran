@@ -1,11 +1,8 @@
 """Ported from f2dace/dev:tests/fortran/dace_support_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_simplify(tmp_path):
@@ -28,9 +25,15 @@ def test_fortran_frontend_simplify(tmp_path):
 
                     END SUBROUTINE symbol_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='symbol_test', entry='symbol_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="symbol_test", entry="symbol_test_function").build()
     a = np.full([2, 3], 42, order="F", dtype=np.float64)
     sdfg(d=a)
     assert a[0, 0] == 0
     assert a[0, 1] == 5
     assert a[1, 2] == 0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

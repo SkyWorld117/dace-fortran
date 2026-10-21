@@ -12,11 +12,8 @@ assign-dispatch site -- exercised by test_count_into_logical_destination_builds.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_count_full_array_comparison(tmp_path: Path):
@@ -29,9 +26,9 @@ integer :: res
 res = COUNT(first .eq. second)
 END SUBROUTINE main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
-    first = np.array([1, 1, 2, 1, 1], dtype=np.int32, order='F')
-    second = np.array([1, 2, 2, 2, 1], dtype=np.int32, order='F')
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
+    first = np.array([1, 1, 2, 1, 1], dtype=np.int32, order="F")
+    second = np.array([1, 2, 2, 2, 1], dtype=np.int32, order="F")
     res = np.zeros(1, dtype=np.int32)
     sdfg(first=first, second=second, res=res)
     assert int(res[0]) == 3  # matching positions: 0, 2, 4
@@ -47,9 +44,9 @@ integer :: res
 res = COUNT(first(1:3) .eq. second(3:5))
 END SUBROUTINE main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
-    first = np.array([10, 20, 30, 40, 50], dtype=np.int32, order='F')
-    second = np.array([99, 88, 10, 20, 30], dtype=np.int32, order='F')
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
+    first = np.array([10, 20, 30, 40, 50], dtype=np.int32, order="F")
+    second = np.array([99, 88, 10, 20, 30], dtype=np.int32, order="F")
     # first[0:3] vs second[2:5] = [10, 20, 30] vs [10, 20, 30] -> all 3 match.
     res = np.zeros(1, dtype=np.int32)
     sdfg(first=first, second=second, res=res)
@@ -73,5 +70,11 @@ res(1) = COUNT(a .eq. 1)
 res(2) = COUNT(a .gt. 0)
 END SUBROUTINE main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     assert sdfg is not None
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

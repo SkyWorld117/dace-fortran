@@ -33,7 +33,7 @@ bridge gains module-level AoR flattening, which is the signal to delete the mark
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
+from tests._util import build_sdfg, have_flang
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 

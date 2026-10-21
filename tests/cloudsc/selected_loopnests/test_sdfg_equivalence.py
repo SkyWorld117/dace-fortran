@@ -5,28 +5,21 @@ correctness check (no struct-typed cross-check).
 """
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
+from tests._helpers import sdfg_call_args
+from tests._util import build_sdfg
 
 _HERE = Path(__file__).resolve().parent
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _f2py_build(src_text: str, out_dir: Path, mod_name: str):
     """f2py-compile ``src_text`` as ``mod_name`` into ``out_dir`` and
-    return the imported Python module.  Skips if the toolchain is missing."""
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
+    return the imported Python module.  Fails if the toolchain is missing."""
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / f"{mod_name}.f90"
     src.write_text(src_text)
@@ -34,8 +27,7 @@ def _f2py_build(src_text: str, out_dir: Path, mod_name: str):
     # gfortran's 132-col limit -- lift the cap (append, don't clobber).
     env = {**os.environ, "FFLAGS": (os.environ.get("FFLAGS", "") + " -ffree-line-length-none").strip()}
     subprocess.check_call(
-        [sys.executable, "-m", "numpy.f2py", "-c",
-         str(src), "-m", mod_name, "--quiet"],
+        [sys.executable, "-m", "numpy.f2py", "-c", str(src), "-m", mod_name, "--quiet"],
         cwd=out_dir,
         env=env,
     )
@@ -52,21 +44,6 @@ def _sdfg_from_src(src: str, tmp: Path, name: str):
     ``ref.<proc>(...)`` directly."""
     tmp.mkdir(parents=True, exist_ok=True)
     return build_sdfg(src, tmp, name=name, pipeline="hlfir-propagate-shapes").build()
-
-
-def _sdfg_call_args(sdfg, int_values: dict) -> dict:
-    """Route each int arg to a plain int (Scalar) or length-1 numpy array (Array),
-    matching the SDFG's classification.  Mirrors the icon/selected_loopnests helper."""
-    from dace.data import Scalar
-    arglist = sdfg.arglist()
-    out = {}
-    for k, v in int_values.items():
-        desc = arglist.get(k)
-        if desc is None or isinstance(desc, Scalar):
-            out[k] = v
-        else:
-            out[k] = np.array([v], dtype=np.int32)
-    return out
 
 
 def test_cloudsc_lu_solver_sdfg_matches_f2py(tmp_path: Path):
@@ -96,7 +73,7 @@ def test_cloudsc_lu_solver_sdfg_matches_f2py(tmp_path: Path):
     ref.lu_solver_microphysics(kidia, kfdia, zqlhs_ref, zqxn_ref)
 
     kw = dict(zqlhs=zqlhs_sdfg, zqxn=zqxn_sdfg)
-    kw.update(_sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, nclv=nclv)))
+    kw.update(sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, nclv=nclv)))
     sdfg(**kw)
 
     np.testing.assert_allclose(zqlhs_sdfg, zqlhs_ref, atol=1e-10, rtol=1e-10)
@@ -119,16 +96,18 @@ def test_cloudsc_saturation_sdfg_matches_f2py(tmp_path: Path):
     pap = np.asfortranarray(1e3 + 1e5 * rng.random((klon, klev), dtype=np.float64))
 
     # CLOUDSC default physical constants -- same numbers on both backends.
-    consts = dict(rtt=273.16,
-                  retv=0.608,
-                  r2es=611.21,
-                  r3les=17.502,
-                  r3ies=22.587,
-                  r4les=32.19,
-                  r4ies=-0.7,
-                  rtice=250.0,
-                  rtwat=273.16,
-                  rtwat_rtice_r=1.0 / (273.16 - 250.0))
+    consts = dict(
+        rtt=273.16,
+        retv=0.608,
+        r2es=611.21,
+        r3les=17.502,
+        r3ies=22.587,
+        r4les=32.19,
+        r4ies=-0.7,
+        rtice=250.0,
+        rtwat=273.16,
+        rtwat_rtice_r=1.0 / (273.16 - 250.0),
+    )
 
     outs_sdfg = {
         k: np.zeros((klon, klev), order="F")
@@ -137,10 +116,12 @@ def test_cloudsc_saturation_sdfg_matches_f2py(tmp_path: Path):
 
     # f2py returns INTENT(OUT) arrays as a tuple; only IN/scalars positional; klon/klev auto-derived.
     out_tuple = ref.compute_saturation_values(kidia, kfdia, ztp1, pap, **consts)
-    outs_ref = dict(zip(("zfoealfa", "zfoeewmt", "zqsmix", "zfoeew", "zqsice", "zfoeeliqt", "zqsliq"), out_tuple))
+    outs_ref = dict(
+        zip(("zfoealfa", "zfoeewmt", "zqsmix", "zfoeew", "zqsice", "zfoeeliqt", "zqsliq"), out_tuple, strict=False)
+    )
 
     kw = dict(ztp1=ztp1, pap=pap, **outs_sdfg, **consts)
-    kw.update(_sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, klev=klev)))
+    kw.update(sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, klev=klev)))
     sdfg(**kw)
 
     for k in outs_ref:
@@ -162,9 +143,9 @@ def test_cloudsc_autoconversion_snow_sdfg_matches_f2py(tmp_path: Path):
     ncldqs, ncldqi = 4, 2
     kidia, kfdia = 1, klon
 
-    ztp1 = np.asfortranarray(250.0 + 30.0 * rng.random((klon, ), dtype=np.float64))
-    zicecld = np.asfortranarray(1e-5 + 1e-4 * rng.random((klon, ), dtype=np.float64))
-    pnice = np.asfortranarray(1e3 + 1e4 * rng.random((klon, ), dtype=np.float64))
+    ztp1 = np.asfortranarray(250.0 + 30.0 * rng.random((klon,), dtype=np.float64))
+    zicecld = np.asfortranarray(1e-5 + 1e-4 * rng.random((klon,), dtype=np.float64))
+    pnice = np.asfortranarray(1e3 + 1e4 * rng.random((klon,), dtype=np.float64))
     consts = dict(rtt=273.16, rlcritsnow=0.5e-4, rsnowlin1=1e-3, rsnowlin2=0.018, rnice=1.0, ptsphy=600.0, zepsec=1e-14)
     laericeauto = 1
 
@@ -172,32 +153,36 @@ def test_cloudsc_autoconversion_snow_sdfg_matches_f2py(tmp_path: Path):
     zsolqb_sdfg = np.zeros_like(zsolqb_ref, order="F")
 
     # f2py: zsnowaut (OUT) -> return; zsolqb (INOUT) -> positional.
-    zsnowaut_ref = ref.autoconversion_snow(kidia,
-                                           kfdia,
-                                           ztp1,
-                                           zicecld,
-                                           pnice,
-                                           zsolqb_ref,
-                                           rtt=consts["rtt"],
-                                           rlcritsnow=consts["rlcritsnow"],
-                                           rsnowlin1=consts["rsnowlin1"],
-                                           rsnowlin2=consts["rsnowlin2"],
-                                           rnice=consts["rnice"],
-                                           ptsphy=consts["ptsphy"],
-                                           zepsec=consts["zepsec"],
-                                           laericeauto=laericeauto,
-                                           ncldqs=ncldqs,
-                                           ncldqi=ncldqi)
-    zsnowaut_sdfg = np.zeros((klon, ), order="F")
+    zsnowaut_ref = ref.autoconversion_snow(
+        kidia,
+        kfdia,
+        ztp1,
+        zicecld,
+        pnice,
+        zsolqb_ref,
+        rtt=consts["rtt"],
+        rlcritsnow=consts["rlcritsnow"],
+        rsnowlin1=consts["rsnowlin1"],
+        rsnowlin2=consts["rsnowlin2"],
+        rnice=consts["rnice"],
+        ptsphy=consts["ptsphy"],
+        zepsec=consts["zepsec"],
+        laericeauto=laericeauto,
+        ncldqs=ncldqs,
+        ncldqi=ncldqi,
+    )
+    zsnowaut_sdfg = np.zeros((klon,), order="F")
 
-    kw = dict(ztp1=ztp1,
-              zicecld=zicecld,
-              pnice=pnice,
-              zsolqb=zsolqb_sdfg,
-              zsnowaut=zsnowaut_sdfg,
-              laericeauto=laericeauto,
-              **consts)
-    kw.update(_sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, nclv=nclv, ncldqs=ncldqs, ncldqi=ncldqi)))
+    kw = dict(
+        ztp1=ztp1,
+        zicecld=zicecld,
+        pnice=pnice,
+        zsolqb=zsolqb_sdfg,
+        zsnowaut=zsnowaut_sdfg,
+        laericeauto=laericeauto,
+        **consts,
+    )
+    kw.update(sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, nclv=nclv, ncldqs=ncldqs, ncldqi=ncldqi)))
     sdfg(**kw)
 
     np.testing.assert_allclose(zsnowaut_sdfg, zsnowaut_ref, atol=1e-12, rtol=1e-10)
@@ -217,16 +202,16 @@ def test_cloudsc_ice_supersat_sdfg_matches_f2py(tmp_path: Path):
     ncldql, ncldqi, ncldqv = 1, 2, 3
     nssopt = 1
 
-    ztp1 = np.asfortranarray(220.0 + 30.0 * rng.random((klon, ), dtype=np.float64))
-    za = np.asfortranarray(rng.random((klon, ), dtype=np.float64))
-    zqx_ncldqv = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon, ), dtype=np.float64))
-    zqsice = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon, ), dtype=np.float64))
-    zcorqsice = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon, ), dtype=np.float64))
-    zfokoop = np.asfortranarray(rng.random((klon, ), dtype=np.float64))
+    ztp1 = np.asfortranarray(220.0 + 30.0 * rng.random((klon,), dtype=np.float64))
+    za = np.asfortranarray(rng.random((klon,), dtype=np.float64))
+    zqx_ncldqv = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon,), dtype=np.float64))
+    zqsice = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon,), dtype=np.float64))
+    zcorqsice = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon,), dtype=np.float64))
+    zfokoop = np.asfortranarray(rng.random((klon,), dtype=np.float64))
     consts = dict(rtt=273.16, ramin=1e-12, rthomo=235.0, rkooptau=1e-4, ptsphy=600.0, zepsec=1e-14)
 
     zsolqa_ref = np.asfortranarray(rng.random((klon, nclv, nclv), dtype=np.float64) * 1e-3)
-    zsolac_ref = np.asfortranarray(rng.random((klon, ), dtype=np.float64))
+    zsolac_ref = np.asfortranarray(rng.random((klon,), dtype=np.float64))
     zqxfg_ref = np.asfortranarray(rng.random((klon, nclv), dtype=np.float64) * 1e-3)
     zsolqa_sdfg = np.array(zsolqa_ref, order="F")
     zsolac_sdfg = np.array(zsolac_ref, order="F")
@@ -235,31 +220,57 @@ def test_cloudsc_ice_supersat_sdfg_matches_f2py(tmp_path: Path):
     # f2py positional: kidia, kfdia, ztp1, za, zqx_ncldqv, zqsice, zcorqsice, zfokoop,
     #                  zsolqa, zsolac, zqxfg, rtt, ramin, rthomo, nssopt, rkooptau, ptsphy, zepsec,
     #                  ncldql, ncldqi, ncldqv   ([klon, nclv] auto-derived)
-    ref.ice_supersaturation_adjustment(kidia, kfdia, ztp1, za, zqx_ncldqv, zqsice, zcorqsice, zfokoop, zsolqa_ref,
-                                       zsolac_ref, zqxfg_ref, consts["rtt"], consts["ramin"], consts["rthomo"], nssopt,
-                                       consts["rkooptau"], consts["ptsphy"], consts["zepsec"], ncldql, ncldqi, ncldqv)
+    ref.ice_supersaturation_adjustment(
+        kidia,
+        kfdia,
+        ztp1,
+        za,
+        zqx_ncldqv,
+        zqsice,
+        zcorqsice,
+        zfokoop,
+        zsolqa_ref,
+        zsolac_ref,
+        zqxfg_ref,
+        consts["rtt"],
+        consts["ramin"],
+        consts["rthomo"],
+        nssopt,
+        consts["rkooptau"],
+        consts["ptsphy"],
+        consts["zepsec"],
+        ncldql,
+        ncldqi,
+        ncldqv,
+    )
 
-    kw = dict(ztp1=ztp1,
-              za=za,
-              zqx_ncldqv=zqx_ncldqv,
-              zqsice=zqsice,
-              zcorqsice=zcorqsice,
-              zfokoop=zfokoop,
-              zsolqa=zsolqa_sdfg,
-              zsolac=zsolac_sdfg,
-              zqxfg=zqxfg_sdfg,
-              **consts)
+    kw = dict(
+        ztp1=ztp1,
+        za=za,
+        zqx_ncldqv=zqx_ncldqv,
+        zqsice=zqsice,
+        zcorqsice=zcorqsice,
+        zfokoop=zfokoop,
+        zsolqa=zsolqa_sdfg,
+        zsolac=zsolac_sdfg,
+        zqxfg=zqxfg_sdfg,
+        **consts,
+    )
     kw.update(
-        _sdfg_call_args(
+        sdfg_call_args(
             sdfg,
-            dict(kidia=kidia,
-                 kfdia=kfdia,
-                 klon=klon,
-                 nclv=nclv,
-                 ncldql=ncldql,
-                 ncldqi=ncldqi,
-                 ncldqv=ncldqv,
-                 nssopt=nssopt)))
+            dict(
+                kidia=kidia,
+                kfdia=kfdia,
+                klon=klon,
+                nclv=nclv,
+                ncldql=ncldql,
+                ncldqi=ncldqi,
+                ncldqv=ncldqv,
+                nssopt=nssopt,
+            ),
+        )
+    )
     sdfg(**kw)
 
     np.testing.assert_allclose(zsolqa_sdfg, zsolqa_ref, atol=1e-12, rtol=1e-10)
@@ -279,37 +290,39 @@ def test_cloudsc_rain_evap_sdfg_matches_f2py(tmp_path: Path):
     kidia, kfdia = 1, klon
     ncldqv, ncldqr = 3, 4
 
-    ztp1 = np.asfortranarray(250.0 + 40.0 * rng.random((klon, ), dtype=np.float64))
-    zqx_ncldqv = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon, ), dtype=np.float64))
-    za = np.asfortranarray(rng.random((klon, ), dtype=np.float64))
-    zqsliq = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon, ), dtype=np.float64))
-    zqxfg_ncldqr = np.asfortranarray(1e-6 + 1e-4 * rng.random((klon, ), dtype=np.float64))
-    zcovptot = np.asfortranarray(rng.random((klon, ), dtype=np.float64))
-    zcovpclr = np.asfortranarray(rng.random((klon, ), dtype=np.float64))
-    zcovpmax = np.asfortranarray(rng.random((klon, ), dtype=np.float64))
-    zrho = np.asfortranarray(1.0 + 0.3 * rng.random((klon, ), dtype=np.float64))
-    pap = np.asfortranarray(1e4 + 1e5 * rng.random((klon, ), dtype=np.float64))
-    consts = dict(rtt=273.16,
-                  rv=461.5,
-                  rd=287.04,
-                  rprecrhmax=1.0,
-                  rcovpmin=1e-3,
-                  rdensref=1.0,
-                  ptsphy=600.0,
-                  zepsec=1e-14,
-                  rcl_fac1=1.0,
-                  rcl_fac2=1.0,
-                  rcl_cdenom1=1.0,
-                  rcl_cdenom2=1.0,
-                  rcl_cdenom3=1.0,
-                  rcl_ka273=2.4e-2,
-                  rcl_const1r=1.0,
-                  rcl_const2r=1.0,
-                  rcl_const3r=1.0,
-                  rcl_const4r=1.0)
+    ztp1 = np.asfortranarray(250.0 + 40.0 * rng.random((klon,), dtype=np.float64))
+    zqx_ncldqv = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon,), dtype=np.float64))
+    za = np.asfortranarray(rng.random((klon,), dtype=np.float64))
+    zqsliq = np.asfortranarray(1e-5 + 1e-3 * rng.random((klon,), dtype=np.float64))
+    zqxfg_ncldqr = np.asfortranarray(1e-6 + 1e-4 * rng.random((klon,), dtype=np.float64))
+    zcovptot = np.asfortranarray(rng.random((klon,), dtype=np.float64))
+    zcovpclr = np.asfortranarray(rng.random((klon,), dtype=np.float64))
+    zcovpmax = np.asfortranarray(rng.random((klon,), dtype=np.float64))
+    zrho = np.asfortranarray(1.0 + 0.3 * rng.random((klon,), dtype=np.float64))
+    pap = np.asfortranarray(1e4 + 1e5 * rng.random((klon,), dtype=np.float64))
+    consts = dict(
+        rtt=273.16,
+        rv=461.5,
+        rd=287.04,
+        rprecrhmax=1.0,
+        rcovpmin=1e-3,
+        rdensref=1.0,
+        ptsphy=600.0,
+        zepsec=1e-14,
+        rcl_fac1=1.0,
+        rcl_fac2=1.0,
+        rcl_cdenom1=1.0,
+        rcl_cdenom2=1.0,
+        rcl_cdenom3=1.0,
+        rcl_ka273=2.4e-2,
+        rcl_const1r=1.0,
+        rcl_const2r=1.0,
+        rcl_const3r=1.0,
+        rcl_const4r=1.0,
+    )
 
     zsolqa_ref = np.asfortranarray(rng.random((klon, nclv, nclv), dtype=np.float64) * 1e-4)
-    zevap_ref = np.zeros((klon, ), order="F")
+    zevap_ref = np.zeros((klon,), order="F")
     zsolqa_sdfg = np.array(zsolqa_ref, order="F")
     zevap_sdfg = np.zeros_like(zevap_ref, order="F")
     zcovptot_ref = np.array(zcovptot, order="F")
@@ -325,27 +338,58 @@ def test_cloudsc_rain_evap_sdfg_matches_f2py(tmp_path: Path):
     # rcl_fac1, rcl_fac2, rcl_cdenom1, rcl_cdenom2, rcl_cdenom3, rcl_ka273,
     # rcl_const1r, rcl_const2r, rcl_const3r, rcl_const4r, ncldqv, ncldqr  ([klon, nclv] auto)
     zevap_ref = ref.rain_evaporation_abel_boutle(
-        kidia, kfdia, ztp1, zqx_ncldqv, za, zqsliq, zqxfg_ref, zcovptot_ref, zcovpclr_ref, zcovpmax, zrho, pap,
-        zsolqa_ref, consts["rtt"], consts["rv"], consts["rd"], consts["rprecrhmax"], consts["rcovpmin"],
-        consts["rdensref"], consts["ptsphy"], consts["zepsec"], consts["rcl_fac1"], consts["rcl_fac2"],
-        consts["rcl_cdenom1"], consts["rcl_cdenom2"], consts["rcl_cdenom3"], consts["rcl_ka273"], consts["rcl_const1r"],
-        consts["rcl_const2r"], consts["rcl_const3r"], consts["rcl_const4r"], ncldqv, ncldqr)
-    zevap_sdfg = np.zeros((klon, ), order="F")
+        kidia,
+        kfdia,
+        ztp1,
+        zqx_ncldqv,
+        za,
+        zqsliq,
+        zqxfg_ref,
+        zcovptot_ref,
+        zcovpclr_ref,
+        zcovpmax,
+        zrho,
+        pap,
+        zsolqa_ref,
+        consts["rtt"],
+        consts["rv"],
+        consts["rd"],
+        consts["rprecrhmax"],
+        consts["rcovpmin"],
+        consts["rdensref"],
+        consts["ptsphy"],
+        consts["zepsec"],
+        consts["rcl_fac1"],
+        consts["rcl_fac2"],
+        consts["rcl_cdenom1"],
+        consts["rcl_cdenom2"],
+        consts["rcl_cdenom3"],
+        consts["rcl_ka273"],
+        consts["rcl_const1r"],
+        consts["rcl_const2r"],
+        consts["rcl_const3r"],
+        consts["rcl_const4r"],
+        ncldqv,
+        ncldqr,
+    )
+    zevap_sdfg = np.zeros((klon,), order="F")
 
-    kw = dict(ztp1=ztp1,
-              zqx_ncldqv=zqx_ncldqv,
-              za=za,
-              zqsliq=zqsliq,
-              zqxfg_ncldqr=zqxfg_sdfg,
-              zcovptot=zcovptot_sdfg,
-              zcovpclr=zcovpclr_sdfg,
-              zcovpmax=zcovpmax,
-              zrho=zrho,
-              pap=pap,
-              zsolqa=zsolqa_sdfg,
-              zevap_out=zevap_sdfg,
-              **consts)
-    kw.update(_sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, nclv=nclv, ncldqv=ncldqv, ncldqr=ncldqr)))
+    kw = dict(
+        ztp1=ztp1,
+        zqx_ncldqv=zqx_ncldqv,
+        za=za,
+        zqsliq=zqsliq,
+        zqxfg_ncldqr=zqxfg_sdfg,
+        zcovptot=zcovptot_sdfg,
+        zcovpclr=zcovpclr_sdfg,
+        zcovpmax=zcovpmax,
+        zrho=zrho,
+        pap=pap,
+        zsolqa=zsolqa_sdfg,
+        zevap_out=zevap_sdfg,
+        **consts,
+    )
+    kw.update(sdfg_call_args(sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, nclv=nclv, ncldqv=ncldqv, ncldqr=ncldqr)))
     sdfg(**kw)
 
     # rho**0.78 amplifies libm-vs-C++-codegen rounding diffs; ~1e-7 relative drift is
@@ -393,19 +437,18 @@ def test_cloudsc_full_microphysics_solve_sdfg_matches_f2py(tmp_path: Path):
     # jk_idx is a runtime INDEX (not the bound); klon/klev/nclv auto-derived.  ZQXN is
     # INTENT(OUT) -> returned.  Positional: kidia, kfdia, ncldqv, jk_idx, zfallsink,
     # zsolqa, zsolqb, zqx, zqlhs, zepsec
-    zqxn_ref = ref.full_microphysics_solve(kidia, kfdia, ncldqv, jk_idx, zfallsink, zsolqa, zsolqb, zqx, zqlhs_ref,
-                                           zepsec)
+    zqxn_ref = ref.full_microphysics_solve(
+        kidia, kfdia, ncldqv, jk_idx, zfallsink, zsolqa, zsolqb, zqx, zqlhs_ref, zepsec
+    )
 
-    kw = dict(zfallsink=zfallsink,
-              zsolqa=zsolqa,
-              zsolqb=zsolqb,
-              zqx=zqx,
-              zqlhs=zqlhs_sdfg,
-              zqxn=zqxn_sdfg,
-              zepsec=zepsec)
+    kw = dict(
+        zfallsink=zfallsink, zsolqa=zsolqa, zsolqb=zsolqb, zqx=zqx, zqlhs=zqlhs_sdfg, zqxn=zqxn_sdfg, zepsec=zepsec
+    )
     kw.update(
-        _sdfg_call_args(sdfg,
-                        dict(kidia=kidia, kfdia=kfdia, klon=klon, klev=klev, nclv=nclv, ncldqv=ncldqv, jk_idx=jk_idx)))
+        sdfg_call_args(
+            sdfg, dict(kidia=kidia, kfdia=kfdia, klon=klon, klev=klev, nclv=nclv, ncldqv=ncldqv, jk_idx=jk_idx)
+        )
+    )
     sdfg(**kw)
 
     # ulp-level tolerance: values <1 so 1ulp~2e-16; 1e-14 catches ~50ulp+.
@@ -438,7 +481,8 @@ def test_cloudsc_jk_precip_chain_sdfg_matches_f2py(tmp_path: Path):
 
     # Pressure increases with depth; T tapers near surface.  ZA random in [0,1].
     pap = np.asfortranarray(
-        np.linspace(2e4, 1e5, klev)[None, :].repeat(klon, axis=0) + 100.0 * rng.standard_normal((klon, klev)))
+        np.linspace(2e4, 1e5, klev)[None, :].repeat(klon, axis=0) + 100.0 * rng.standard_normal((klon, klev))
+    )
     paph = np.asfortranarray(np.linspace(1.5e4, 1.05e5, klev + 1)[None, :].repeat(klon, axis=0))
     ztp1 = np.asfortranarray(220.0 + 60.0 * rng.random((klon, klev), dtype=np.float64))
     za = np.asfortranarray(rng.random((klon, klev), dtype=np.float64))
@@ -455,33 +499,33 @@ def test_cloudsc_jk_precip_chain_sdfg_matches_f2py(tmp_path: Path):
     zcovptot_sdfg = np.zeros_like(zcovptot_ref, order="F")
 
     # f2py positional, returns the 3 OUTs as a tuple; klon/klev/nclv auto-derived.
-    zpfplsx_ref, zqpretot_ref, zcovptot_ref = ref.jk_precip_chain(kidia, kfdia, ncldqr, ncldqs, ncldtop, pap, paph,
-                                                                  ztp1, za, zqxn, zfallsink_in, rd, rg, ptsphy, zepsec)
+    zpfplsx_ref, zqpretot_ref, zcovptot_ref = ref.jk_precip_chain(
+        kidia, kfdia, ncldqr, ncldqs, ncldtop, pap, paph, ztp1, za, zqxn, zfallsink_in, rd, rg, ptsphy, zepsec
+    )
 
-    kw = dict(pap=pap,
-              paph=paph,
-              ztp1=ztp1,
-              za=za,
-              zqxn=zqxn,
-              zfallsink_in=zfallsink_in,
-              zpfplsx=zpfplsx_sdfg,
-              zqpretot=zqpretot_sdfg,
-              zcovptot=zcovptot_sdfg,
-              rd=rd,
-              rg=rg,
-              ptsphy=ptsphy,
-              zepsec=zepsec)
+    kw = dict(
+        pap=pap,
+        paph=paph,
+        ztp1=ztp1,
+        za=za,
+        zqxn=zqxn,
+        zfallsink_in=zfallsink_in,
+        zpfplsx=zpfplsx_sdfg,
+        zqpretot=zqpretot_sdfg,
+        zcovptot=zcovptot_sdfg,
+        rd=rd,
+        rg=rg,
+        ptsphy=ptsphy,
+        zepsec=zepsec,
+    )
     kw.update(
-        _sdfg_call_args(
+        sdfg_call_args(
             sdfg,
-            dict(kidia=kidia,
-                 kfdia=kfdia,
-                 klon=klon,
-                 klev=klev,
-                 nclv=nclv,
-                 ncldqr=ncldqr,
-                 ncldqs=ncldqs,
-                 ncldtop=ncldtop)))
+            dict(
+                kidia=kidia, kfdia=kfdia, klon=klon, klev=klev, nclv=nclv, ncldqr=ncldqr, ncldqs=ncldqs, ncldtop=ncldtop
+            ),
+        )
+    )
     sdfg(**kw)
 
     # ulp tolerance: if this passes, the JK precip carry is bit-correct and cloudsc_full's
@@ -509,14 +553,12 @@ def test_cloudsc_pow_kernel_sdfg_matches_f2py(tmp_path: Path):
     y_ref = ref.pow_kernel(x, exponent)
     y_sdfg = np.zeros(n, dtype=np.float64, order="F")
     kw = dict(x=x, exponent_val=exponent, y=y_sdfg)
-    kw.update(_sdfg_call_args(sdfg, dict(n=n)))
+    kw.update(sdfg_call_args(sdfg, dict(n=n)))
     sdfg(**kw)
 
-    np.testing.assert_allclose(y_sdfg,
-                               y_ref,
-                               atol=1e-14,
-                               rtol=1e-14,
-                               err_msg="pow_kernel: SDFG x**0.78 diverges from gfortran x**0.78")
+    np.testing.assert_allclose(
+        y_sdfg, y_ref, atol=1e-14, rtol=1e-14, err_msg="pow_kernel: SDFG x**0.78 diverges from gfortran x**0.78"
+    )
 
 
 def test_cloudsc_zsolqa_accumulator_sdfg_matches_f2py(tmp_path: Path):
@@ -545,21 +587,19 @@ def test_cloudsc_zsolqa_accumulator_sdfg_matches_f2py(tmp_path: Path):
 
     kw = dict(zevap=zevap, zsnowsrc=zsnowsrc, zsolqa=zsolqa_sdfg)
     kw.update(
-        _sdfg_call_args(sdfg, dict(n=n,
-                                   nclv=nclv,
-                                   kidia=kidia,
-                                   kfdia=kfdia,
-                                   ncldqv=ncldqv,
-                                   ncldqr=ncldqr,
-                                   ncldqs=ncldqs)))
+        sdfg_call_args(
+            sdfg, dict(n=n, nclv=nclv, kidia=kidia, kfdia=kfdia, ncldqv=ncldqv, ncldqr=ncldqr, ncldqs=ncldqs)
+        )
+    )
     sdfg(**kw)
 
-    np.testing.assert_allclose(zsolqa_sdfg,
-                               zsolqa_ref,
-                               atol=1e-14,
-                               rtol=1e-14,
-                               err_msg="zsolqa_accumulator: SDFG += diverges from gfortran "
-                               "(suggests WCR-instead-of-RMW lowering)")
+    np.testing.assert_allclose(
+        zsolqa_sdfg,
+        zsolqa_ref,
+        atol=1e-14,
+        rtol=1e-14,
+        err_msg="zsolqa_accumulator: SDFG += diverges from gfortran (suggests WCR-instead-of-RMW lowering)",
+    )
 
 
 def test_cloudsc_int_pow_kernel_sdfg_matches_f2py(tmp_path: Path):
@@ -580,7 +620,7 @@ def test_cloudsc_int_pow_kernel_sdfg_matches_f2py(tmp_path: Path):
     y2_sdfg = np.zeros(n, dtype=np.float64, order="F")
     y3_sdfg = np.zeros(n, dtype=np.float64, order="F")
     kw = dict(x=x, y2=y2_sdfg, y3=y3_sdfg)
-    kw.update(_sdfg_call_args(sdfg, dict(n=n)))
+    kw.update(sdfg_call_args(sdfg, dict(n=n)))
     sdfg(**kw)
 
     np.testing.assert_allclose(y2_sdfg, y2_ref, atol=1e-14, rtol=1e-14, err_msg="int_pow x**2 diverges")
@@ -594,11 +634,9 @@ def test_cloudsc_zterm2_kernel_sdfg_matches_f2py(tmp_path: Path):
     src = (_HERE / "cloudsc_zterm2_kernel.f90").read_text()
     ref = _f2py_build(src, tmp_path / "ref", "zterm2_ref")
     (tmp_path / "sdfg").mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src,
-                      tmp_path / "sdfg",
-                      name="zterm2_kernel",
-                      pipeline="hlfir-propagate-shapes",
-                      entry="zterm2_kernel").build()
+    sdfg = build_sdfg(
+        src, tmp_path / "sdfg", name="zterm2_kernel", pipeline="hlfir-propagate-shapes", entry="zterm2_kernel"
+    ).build()
 
     rng = np.random.default_rng(120)
     n = 32
@@ -610,23 +648,23 @@ def test_cloudsc_zterm2_kernel_sdfg_matches_f2py(tmp_path: Path):
 
     zterm2_ref = ref.zterm2_kernel(zpr02, zcorrfac, zrho, zcorrfac2, rcl_const3s, rcl_const4s, rcl_const5s, rcl_const6s)
     zterm2_sdfg = np.zeros(n, dtype=np.float64, order="F")
-    kw = dict(zpr02=zpr02,
-              zcorrfac=zcorrfac,
-              zrho=zrho,
-              zcorrfac2=zcorrfac2,
-              rcl_const3s=rcl_const3s,
-              rcl_const4s=rcl_const4s,
-              rcl_const5s=rcl_const5s,
-              rcl_const6s=rcl_const6s,
-              zterm2=zterm2_sdfg)
-    kw.update(_sdfg_call_args(sdfg, dict(n=n)))
+    kw = dict(
+        zpr02=zpr02,
+        zcorrfac=zcorrfac,
+        zrho=zrho,
+        zcorrfac2=zcorrfac2,
+        rcl_const3s=rcl_const3s,
+        rcl_const4s=rcl_const4s,
+        rcl_const5s=rcl_const5s,
+        rcl_const6s=rcl_const6s,
+        zterm2=zterm2_sdfg,
+    )
+    kw.update(sdfg_call_args(sdfg, dict(n=n)))
     sdfg(**kw)
 
-    np.testing.assert_allclose(zterm2_sdfg,
-                               zterm2_ref,
-                               atol=1e-14,
-                               rtol=1e-14,
-                               err_msg="ZTERM2 compound expression diverges")
+    np.testing.assert_allclose(
+        zterm2_sdfg, zterm2_ref, atol=1e-14, rtol=1e-14, err_msg="ZTERM2 compound expression diverges"
+    )
 
 
 def test_cloudsc_zbeta_kernel_sdfg_matches_f2py(tmp_path: Path):
@@ -639,11 +677,9 @@ def test_cloudsc_zbeta_kernel_sdfg_matches_f2py(tmp_path: Path):
     src = (_HERE / "cloudsc_zterm2_kernel.f90").read_text()  # same file
     ref = _f2py_build(src, tmp_path / "ref", "zbeta_ref")
     (tmp_path / "sdfg").mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src,
-                      tmp_path / "sdfg",
-                      name="zbeta_kernel",
-                      pipeline="hlfir-propagate-shapes",
-                      entry="zbeta_kernel").build()
+    sdfg = build_sdfg(
+        src, tmp_path / "sdfg", name="zbeta_kernel", pipeline="hlfir-propagate-shapes", entry="zbeta_kernel"
+    ).build()
 
     rng = np.random.default_rng(121)
     n = 32
@@ -657,30 +693,42 @@ def test_cloudsc_zbeta_kernel_sdfg_matches_f2py(tmp_path: Path):
     zfallcorr = np.asfortranarray(0.5 + 1.0 * rng.random(n, dtype=np.float64))
     rcl_const1r, rcl_const2r, rcl_const3r, rcl_const4r = 1.0, 0.3, 0.5, 0.4
 
-    zbeta_ref = ref.zbeta_kernel(zqsliq, ztp1, zesatliq, zcorr2, zevap_denom, zlambda, zrho, zfallcorr, rcl_const1r,
-                                 rcl_const2r, rcl_const3r, rcl_const4r)
+    zbeta_ref = ref.zbeta_kernel(
+        zqsliq,
+        ztp1,
+        zesatliq,
+        zcorr2,
+        zevap_denom,
+        zlambda,
+        zrho,
+        zfallcorr,
+        rcl_const1r,
+        rcl_const2r,
+        rcl_const3r,
+        rcl_const4r,
+    )
     zbeta_sdfg = np.zeros(n, dtype=np.float64, order="F")
-    kw = dict(zqsliq=zqsliq,
-              ztp1=ztp1,
-              zesatliq=zesatliq,
-              zcorr2=zcorr2,
-              zevap_denom=zevap_denom,
-              zlambda=zlambda,
-              zrho=zrho,
-              zfallcorr=zfallcorr,
-              rcl_const1r=rcl_const1r,
-              rcl_const2r=rcl_const2r,
-              rcl_const3r=rcl_const3r,
-              rcl_const4r=rcl_const4r,
-              zbeta=zbeta_sdfg)
-    kw.update(_sdfg_call_args(sdfg, dict(n=n)))
+    kw = dict(
+        zqsliq=zqsliq,
+        ztp1=ztp1,
+        zesatliq=zesatliq,
+        zcorr2=zcorr2,
+        zevap_denom=zevap_denom,
+        zlambda=zlambda,
+        zrho=zrho,
+        zfallcorr=zfallcorr,
+        rcl_const1r=rcl_const1r,
+        rcl_const2r=rcl_const2r,
+        rcl_const3r=rcl_const3r,
+        rcl_const4r=rcl_const4r,
+        zbeta=zbeta_sdfg,
+    )
+    kw.update(sdfg_call_args(sdfg, dict(n=n)))
     sdfg(**kw)
 
-    np.testing.assert_allclose(zbeta_sdfg,
-                               zbeta_ref,
-                               atol=1e-14,
-                               rtol=1e-14,
-                               err_msg="ZBETA compound expression diverges")
+    np.testing.assert_allclose(
+        zbeta_sdfg, zbeta_ref, atol=1e-14, rtol=1e-14, err_msg="ZBETA compound expression diverges"
+    )
 
 
 def test_cloudsc_zaplusb_kernel_sdfg_matches_f2py(tmp_path: Path):
@@ -691,11 +739,9 @@ def test_cloudsc_zaplusb_kernel_sdfg_matches_f2py(tmp_path: Path):
     src = (_HERE / "cloudsc_zterm2_kernel.f90").read_text()
     ref = _f2py_build(src, tmp_path / "ref", "zaplusb_ref")
     (tmp_path / "sdfg").mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src,
-                      tmp_path / "sdfg",
-                      name="zaplusb_kernel",
-                      pipeline="hlfir-propagate-shapes",
-                      entry="zaplusb_kernel").build()
+    sdfg = build_sdfg(
+        src, tmp_path / "sdfg", name="zaplusb_kernel", pipeline="hlfir-propagate-shapes", entry="zaplusb_kernel"
+    ).build()
 
     rng = np.random.default_rng(122)
     n = 32
@@ -706,18 +752,18 @@ def test_cloudsc_zaplusb_kernel_sdfg_matches_f2py(tmp_path: Path):
 
     zaplusb_ref = ref.zaplusb_kernel(zvpice, ztp1, pap, rcl_apb1, rcl_apb2, rcl_apb3)
     zaplusb_sdfg = np.zeros(n, dtype=np.float64, order="F")
-    kw = dict(zvpice=zvpice,
-              ztp1=ztp1,
-              pap=pap,
-              rcl_apb1=rcl_apb1,
-              rcl_apb2=rcl_apb2,
-              rcl_apb3=rcl_apb3,
-              zaplusb=zaplusb_sdfg)
-    kw.update(_sdfg_call_args(sdfg, dict(n=n)))
+    kw = dict(
+        zvpice=zvpice, ztp1=ztp1, pap=pap, rcl_apb1=rcl_apb1, rcl_apb2=rcl_apb2, rcl_apb3=rcl_apb3, zaplusb=zaplusb_sdfg
+    )
+    kw.update(sdfg_call_args(sdfg, dict(n=n)))
     sdfg(**kw)
 
-    np.testing.assert_allclose(zaplusb_sdfg,
-                               zaplusb_ref,
-                               atol=1e-14,
-                               rtol=1e-14,
-                               err_msg="ZAPLUSB compound expression diverges")
+    np.testing.assert_allclose(
+        zaplusb_sdfg, zaplusb_ref, atol=1e-14, rtol=1e-14, err_msg="ZAPLUSB compound expression diverges"
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

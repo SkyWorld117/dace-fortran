@@ -1,15 +1,12 @@
-"""Boolean/integer argument dtype correctness in the bridge bindings. Regression guard for
-the cloudsc_full PLUDE diagnosis: the registry allocated LOGICAL input as numpy ``int32``
-while the SDFG declared ``bool *``, silently corrupting LDCUM across element boundaries.
-E2e against an f2py-compiled reference."""
+"""Boolean/integer argument dtype correctness. Regression guard for the cloudsc_full PLUDE
+diagnosis (a LOGICAL array read with the wrong element width corrupted LDCUM across element
+boundaries): a default LOGICAL is its 4-byte storage on the SDFG signature. E2e against an
+f2py-compiled reference."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-from _helpers import f2py
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._helpers import f2py
+from tests._util import build_sdfg
 
 
 def test_bool_logical_array_pass_through(tmp_path):
@@ -30,10 +27,10 @@ DO i = 1, n
 ENDDO
 END SUBROUTINE bool_pass
 """
-    ref = f2py(src, tmp_path / 'ref', 'bool_pass_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", "bool_pass_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='bool_pass', entry='bool_pass').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="bool_pass", entry="bool_pass").build()
 
     flags = np.array([True, False, True, False, True, False, True, False], dtype=np.bool_)
     n = flags.size
@@ -41,7 +38,7 @@ END SUBROUTINE bool_pass
     out_ref = ref.bool_pass(flags)
 
     out = np.zeros(n, dtype=np.int32)
-    sdfg(flags=flags, out=out, n=n)
+    sdfg(flags=flags.astype(np.uint32), out=out, n=n)
     np.testing.assert_array_equal(out, out_ref)
 
 
@@ -64,17 +61,17 @@ DO j = 1, nblocks
 ENDDO
 END SUBROUTINE bool_2d_pass
 """
-    ref = f2py(src, tmp_path / 'ref', 'bool_2d_pass_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", "bool_2d_pass_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='bool_2d_pass', entry='bool_2d_pass').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="bool_2d_pass", entry="bool_2d_pass").build()
 
     klon, nblocks = 1, 4
-    flags = np.array([[False, True, True, False]], dtype=np.bool_, order='F')
+    flags = np.array([[False, True, True, False]], dtype=np.bool_, order="F")
     out_ref = ref.bool_2d_pass(flags)
 
-    out = np.zeros((klon, nblocks), dtype=np.int32, order='F')
-    sdfg(flags=flags, out=out, klon=klon, nblocks=nblocks)
+    out = np.zeros((klon, nblocks), dtype=np.int32, order="F")
+    sdfg(flags=np.asfortranarray(flags.astype(np.uint32)), out=out, klon=klon, nblocks=nblocks)
     np.testing.assert_array_equal(out, out_ref)
 
 
@@ -91,10 +88,10 @@ DO i = 1, n
 ENDDO
 END SUBROUTINE int_double
 """
-    ref = f2py(src, tmp_path / 'ref', 'int_double_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", "int_double_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='int_double', entry='int_double').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="int_double", entry="int_double").build()
 
     inp = np.array([1, 2, 3, 100, -5, 1000000], dtype=np.int32)
     n = inp.size
@@ -106,9 +103,7 @@ END SUBROUTINE int_double
 
 
 def test_bool_scalar_logical_pass_through(tmp_path):
-    """Scalar LOGICAL passed as a length-1 array argument. Closes the audit gap where the
-    cloudsc registry passed ``np.int32(np.bool_(True))`` to a ``bool *`` param -- worked by
-    LSB coincidence but silently corrupted for values with bit-0=0 (e.g. 256)."""
+    """Scalar LOGICAL passed in the storage dtype the SDFG declares for it."""
     src = """
 SUBROUTINE bool_scalar(flag, out, n)
 integer, intent(in) :: n
@@ -124,21 +119,22 @@ DO i = 1, n
 ENDDO
 END SUBROUTINE bool_scalar
 """
-    ref = f2py(src, tmp_path / 'ref', 'bool_scalar_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", "bool_scalar_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='bool_scalar', entry='bool_scalar').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="bool_scalar", entry="bool_scalar").build()
 
     from dace.data import Scalar
-    desc = sdfg.arglist().get('flag')
+
+    desc = sdfg.arglist().get("flag")
 
     def _route_bool(v):
-        """Route scalar LOGICAL to whatever the bridge declared: ``Scalar(bool)`` takes a
-        plain Python bool, ``Array(1,) bool`` takes a length-1 ``np.bool_`` array. Routing
-        as ``np.int32`` would mis-type the C ABI (silent corruption on bit-0=0 values)."""
+        """Route scalar LOGICAL to whatever the bridge declared (``Scalar`` or ``Array(1,)``)
+        in its LOGICAL storage dtype."""
+        storage = desc.dtype.as_numpy_dtype()
         if isinstance(desc, Scalar):
-            return bool(v)
-        return np.array([bool(v)], dtype=np.bool_)
+            return storage.type(v)
+        return np.array([v], dtype=storage)
 
     n = 5
     out_ref = ref.bool_scalar(True, n=n)
@@ -150,3 +146,9 @@ END SUBROUTINE bool_scalar
     out = np.zeros(n, dtype=np.int32)
     sdfg(flag=_route_bool(False), out=out, n=n)
     np.testing.assert_array_equal(out, out_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

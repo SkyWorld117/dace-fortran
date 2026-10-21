@@ -7,13 +7,11 @@ Origin of cloudsc_full's per-step flux errors at JK=22,34,39,48; running the ful
 over a JK loop catches cross-loopnest state interactions the per-piece tests miss.
 E2e against an f2py-compiled reference.
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-from _helpers import f2py
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._helpers import f2py
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_cloudsc_implicit_solver(tmp_path):
@@ -159,10 +157,10 @@ ENDDO
 END SUBROUTINE driver
 END MODULE kernel_mod
 """
-    ref = f2py(src, tmp_path / 'ref', 'cloudsc_solver_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", "cloudsc_solver_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='cloudsc_solver', entry='driver').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="cloudsc_solver", entry="driver").build()
 
     klon, klev, nclv, nblocks = 1, 137, 5, 4
     ncldqv, ncldqr, ncldqs, ncldtop = 5, 3, 4, 15
@@ -181,79 +179,84 @@ END MODULE kernel_mod
     zrdtgdp = np.asfortranarray(zrdtgdp)
     zepsec = 1.0e-12
 
-    def _alloc_io():
-        return (np.asfortranarray(rng.random(
-            (klon, klev, nclv, nblocks))), np.asfortranarray(rng.random(
-                (klon, nclv, nblocks))), np.asfortranarray(rng.random(
-                    (klon, klev + 1, nclv, nblocks))), np.asfortranarray(rng.random(
-                        (klon, nblocks))), np.asfortranarray(rng.random((klon, nblocks))))
-
     rng_io = np.random.default_rng(99)
 
     def _rng_io_alloc():
-        return (np.asfortranarray(rng_io.random(
-            (klon, klev, nclv, nblocks))), np.asfortranarray(rng_io.random(
-                (klon, nclv, nblocks))), np.asfortranarray(rng_io.random(
-                    (klon, klev + 1, nclv, nblocks))), np.asfortranarray(rng_io.random(
-                        (klon, nblocks))), np.asfortranarray(rng_io.random((klon, nblocks))))
+        return (
+            np.asfortranarray(rng_io.random((klon, klev, nclv, nblocks))),
+            np.asfortranarray(rng_io.random((klon, nclv, nblocks))),
+            np.asfortranarray(rng_io.random((klon, klev + 1, nclv, nblocks))),
+            np.asfortranarray(rng_io.random((klon, nblocks))),
+            np.asfortranarray(rng_io.random((klon, nblocks))),
+        )
 
     zqxn2d_init, zqxnm1_init, zpfplsx_init, zcovptot_init, zqpretot_init = _rng_io_alloc()
 
-    zqxn2d_r = zqxn2d_init.copy(order='F')
-    zqxnm1_r = zqxnm1_init.copy(order='F')
-    zpfplsx_r = zpfplsx_init.copy(order='F')
-    zcovptot_r = zcovptot_init.copy(order='F')
-    zqpretot_r = zqpretot_init.copy(order='F')
+    zqxn2d_r = zqxn2d_init.copy(order="F")
+    zqxnm1_r = zqxnm1_init.copy(order="F")
+    zpfplsx_r = zpfplsx_init.copy(order="F")
+    zcovptot_r = zcovptot_init.copy(order="F")
+    zqpretot_r = zqpretot_init.copy(order="F")
 
-    ref.kernel_mod.driver(zqxn2d=zqxn2d_r,
-                          zqxnm1=zqxnm1_r,
-                          zpfplsx=zpfplsx_r,
-                          zcovptot=zcovptot_r,
-                          zqpretot=zqpretot_r,
-                          zqx=zqx,
-                          zsolqa=zsolqa,
-                          zsolqb=zsolqb,
-                          zfallsink=zfallsink,
-                          zrdtgdp=zrdtgdp,
-                          zepsec=zepsec,
-                          ncldqv=ncldqv,
-                          ncldqr=ncldqr,
-                          ncldqs=ncldqs,
-                          ncldtop=ncldtop)
+    ref.kernel_mod.driver(
+        zqxn2d=zqxn2d_r,
+        zqxnm1=zqxnm1_r,
+        zpfplsx=zpfplsx_r,
+        zcovptot=zcovptot_r,
+        zqpretot=zqpretot_r,
+        zqx=zqx,
+        zsolqa=zsolqa,
+        zsolqb=zsolqb,
+        zfallsink=zfallsink,
+        zrdtgdp=zrdtgdp,
+        zepsec=zepsec,
+        ncldqv=ncldqv,
+        ncldqr=ncldqr,
+        ncldqs=ncldqs,
+        ncldtop=ncldtop,
+    )
 
-    zqxn2d = zqxn2d_init.copy(order='F')
-    zqxnm1 = zqxnm1_init.copy(order='F')
-    zpfplsx = zpfplsx_init.copy(order='F')
-    zcovptot = zcovptot_init.copy(order='F')
-    zqpretot = zqpretot_init.copy(order='F')
+    zqxn2d = zqxn2d_init.copy(order="F")
+    zqxnm1 = zqxnm1_init.copy(order="F")
+    zpfplsx = zpfplsx_init.copy(order="F")
+    zcovptot = zcovptot_init.copy(order="F")
+    zqpretot = zqpretot_init.copy(order="F")
 
     from dace.data import Scalar
 
     def _route(name, val, dtype):
         return val if isinstance(sdfg.arglist().get(name), Scalar) else np.array([val], dtype=dtype)
 
-    sdfg(zqxn2d=zqxn2d,
-         zqxnm1=zqxnm1,
-         zpfplsx=zpfplsx,
-         zcovptot=zcovptot,
-         zqpretot=zqpretot,
-         zqx=zqx,
-         zsolqa=zsolqa,
-         zsolqb=zsolqb,
-         zfallsink=zfallsink,
-         zrdtgdp=zrdtgdp,
-         zepsec=_route('zepsec', zepsec, np.float64),
-         klon=klon,
-         klev=klev,
-         nclv=nclv,
-         nblocks=nblocks,
-         ncldqv=ncldqv,
-         ncldqr=ncldqr,
-         ncldqs=ncldqs,
-         ncldtop=ncldtop)
+    sdfg(
+        zqxn2d=zqxn2d,
+        zqxnm1=zqxnm1,
+        zpfplsx=zpfplsx,
+        zcovptot=zcovptot,
+        zqpretot=zqpretot,
+        zqx=zqx,
+        zsolqa=zsolqa,
+        zsolqb=zsolqb,
+        zfallsink=zfallsink,
+        zrdtgdp=zrdtgdp,
+        zepsec=_route("zepsec", zepsec, np.float64),
+        klon=klon,
+        klev=klev,
+        nclv=nclv,
+        nblocks=nblocks,
+        ncldqv=ncldqv,
+        ncldqr=ncldqr,
+        ncldqs=ncldqs,
+        ncldtop=ncldtop,
+    )
 
     np.testing.assert_allclose(zqxn2d, zqxn2d_r, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(zqxnm1, zqxnm1_r, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(zpfplsx, zpfplsx_r, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(zcovptot, zcovptot_r, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(zqpretot, zqpretot_r, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

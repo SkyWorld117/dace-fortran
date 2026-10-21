@@ -6,15 +6,19 @@ libs ship gfortran-format ``.mod``s only, so :func:`prepare_flang_translation_un
 resolves the USE graph, stubs those libraries, patches flang-21 false positives,
 and replays the project's own ``-D``/``-I`` flags.
 """
+
+from __future__ import annotations
+
 import os
 import re
 import shutil
 import subprocess
 import tarfile
 import urllib.request
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, NamedTuple
 
 from .llvm_toolchain import require_flang
 from .preprocess import merge_used_modules
@@ -71,14 +75,14 @@ _MPI_INCDIR_PROBES = (
 )
 
 
-def openmpi_include_candidates() -> Tuple[str, ...]:
+def openmpi_include_candidates() -> tuple[str, ...]:
     """Every directory that might hold OpenMPI's ``mpif-*.h``, best guess first.
 
     Asks the installed wrapper (``mpicc --showme:incdirs``) before falling back to
     ``MPI_HOME``/``OPAL_PREFIX`` and finally the hardcoded distro paths, so a module-loaded
     or site-local OpenMPI is found rather than whichever one the distro happens to ship.
     """
-    found: List[str] = []
+    found: list[str] = []
     for exe, flag in _MPI_INCDIR_PROBES:
         if shutil.which(exe) is None:
             continue
@@ -99,7 +103,7 @@ def openmpi_include_candidates() -> Tuple[str, ...]:
     return tuple(dict.fromkeys(found))
 
 
-def find_openmpi_include() -> Optional[str]:
+def find_openmpi_include() -> str | None:
     """Returns the first candidate directory that contains ``mpif-config.h``, or ``None``."""
     for d in openmpi_include_candidates():
         if (Path(d) / "mpif-config.h").is_file():
@@ -113,9 +117,125 @@ def mpi_stub_source() -> str:
     return _MPI_STUB_SOURCE
 
 
+# MODULE openacc: the OpenACC runtime API (OpenACC 3.3, section 3.2) for code built
+# with an OpenACC compiler, whose ``openacc`` module flang does not ship.  Kinds,
+# device-type constants and the routines' Fortran interfaces; the data routines
+# take any variable (``type(*), dimension(..)``).  Values of the device-type
+# constants are implementation-defined; these are NVIDIA HPC SDK's.
+_OPENACC_STUB_SOURCE = """\
+! Stub ``MODULE openacc`` for the flang frontend: the OpenACC runtime API's
+! kinds, device-type constants and interfaces.  Runtime symbols are resolved at
+! link time against the OpenACC runtime -- this module only has to satisfy the
+! flang semantic checker.
+MODULE openacc
+  IMPLICIT NONE
+  INTEGER, PARAMETER :: openacc_version = 202211
+  INTEGER, PARAMETER :: acc_device_kind = 4
+  INTEGER, PARAMETER :: acc_device_property_kind = 4
+  INTEGER, PARAMETER :: acc_handle_kind = 4
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_none = 0
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_default = 1
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_host = 2
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_not_host = 3
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_nvidia = 4
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_radeon = 8
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_current = -1
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_noval = -1
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_sync = -2
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_default = -3
+  INTERFACE
+    INTEGER FUNCTION acc_get_num_devices(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_get_num_devices
+    SUBROUTINE acc_set_device_type(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_set_device_type
+    INTEGER(acc_device_kind) FUNCTION acc_get_device_type()
+      IMPORT :: acc_device_kind
+    END FUNCTION acc_get_device_type
+    SUBROUTINE acc_set_device_num(dev_num, dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER, VALUE :: dev_num
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_set_device_num
+    INTEGER FUNCTION acc_get_device_num(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_get_device_num
+    SUBROUTINE acc_init(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_init
+    SUBROUTINE acc_shutdown(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_shutdown
+    LOGICAL FUNCTION acc_async_test(wait_arg)
+      INTEGER, VALUE :: wait_arg
+    END FUNCTION acc_async_test
+    LOGICAL FUNCTION acc_async_test_all()
+    END FUNCTION acc_async_test_all
+    SUBROUTINE acc_wait(wait_arg)
+      INTEGER, VALUE :: wait_arg
+    END SUBROUTINE acc_wait
+    SUBROUTINE acc_wait_all()
+    END SUBROUTINE acc_wait_all
+    LOGICAL FUNCTION acc_on_device(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_on_device
+    LOGICAL FUNCTION acc_is_present(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END FUNCTION acc_is_present
+    SUBROUTINE acc_copyin(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_copyin
+    SUBROUTINE acc_create(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_create
+    SUBROUTINE acc_copyout(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_copyout
+    SUBROUTINE acc_delete(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_delete
+    SUBROUTINE acc_update_device(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_update_device
+    SUBROUTINE acc_update_self(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_update_self
+    SUBROUTINE acc_map_data(data_arg, data_dev, bytes)
+      USE, INTRINSIC :: iso_c_binding, ONLY: c_ptr, c_size_t
+      TYPE(*), DIMENSION(..) :: data_arg
+      TYPE(c_ptr), VALUE :: data_dev
+      INTEGER(c_size_t), VALUE :: bytes
+    END SUBROUTINE acc_map_data
+    SUBROUTINE acc_unmap_data(data_arg)
+      TYPE(*), DIMENSION(..) :: data_arg
+    END SUBROUTINE acc_unmap_data
+  END INTERFACE
+END MODULE openacc
+"""
+
+
+def openacc_stub_source() -> str:
+    """Fortran source for ``MODULE openacc``, the OpenACC runtime API; needs no ``-I`` flags."""
+    return _OPENACC_STUB_SOURCE
+
+
 # Not vendored (4 MB, updates yearly): fetched from upstream on first use
 # and cached, same layout as the bridge's own build (~/.cache/dace-fortran).
-_NETCDF_FORTRAN_URL = ("https://github.com/Unidata/netcdf-fortran/archive/refs/tags/v{version}.tar.gz")
+_NETCDF_FORTRAN_URL = "https://github.com/Unidata/netcdf-fortran/archive/refs/tags/v{version}.tar.gz"
 _NETCDF_FORTRAN_DEFAULT_VERSION = "4.6.2"
 
 
@@ -147,8 +267,7 @@ def vendor_netcdf_fortran(cache_dir: Path, version: str = _NETCDF_FORTRAN_DEFAUL
         # it rejects absolute/parent paths, links out of the tree, and device nodes.
         t.extractall(cache_dir, filter="data")
     if not fortran_dir.is_dir():
-        raise RuntimeError(f"netcdf-fortran tarball did not extract a fortran/ "
-                           f"subdirectory under {target}")
+        raise RuntimeError(f"netcdf-fortran tarball did not extract a fortran/ subdirectory under {target}")
     return fortran_dir
 
 
@@ -163,45 +282,47 @@ def netcdf_stub_source(fortran_dir: Path) -> str:
         :func:`vendor_netcdf_fortran` (or an equivalent local copy).
     """
     fortran_dir = Path(fortran_dir)
-    return ((fortran_dir / "module_typesizes.F90").read_text() + "\n" + (fortran_dir / "netcdf4.F90").read_text())
+    return (fortran_dir / "module_typesizes.F90").read_text() + "\n" + (fortran_dir / "netcdf4.F90").read_text()
 
 
 # Registry: name -> (stub source provider, include-path provider).  The
 # stub source goes into the merged TU; the include-path provider
 # returns a list of ``-I<dir>`` flags to append to flang's command line.
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LibraryStub:
     """A pluggable wrapper for an upstream Fortran library that ships
     only binary ``.mod`` files.  See :data:`LIBRARY_STUBS` for the
     built-in set."""
+
     name: str
     #: Returns Fortran source defining the library's module(s).
     source: Callable[..., str]
     #: Returns ``-I<dir>`` flags flang needs alongside the source.
-    flags: Callable[..., List[str]]
+    flags: Callable[..., list[str]]
 
 
-def _mpi_flags(openmpi_include: Optional[str] = None, **_) -> List[str]:
+def _mpi_flags(openmpi_include: str | None = None, **_: Any) -> list[str]:
     """``-I`` flags for the MPI stub.  Auto-probes a standard OpenMPI
     install when ``openmpi_include`` isn't passed."""
     inc = openmpi_include or find_openmpi_include()
     if inc is None:
-        raise RuntimeError("MPI stub needs OpenMPI's include directory (with "
-                           "mpif-config.h).  Pass openmpi_include=... or install "
-                           "libopenmpi-dev.")
+        raise RuntimeError(
+            "MPI stub needs OpenMPI's include directory (with "
+            "mpif-config.h).  Pass openmpi_include=... or install "
+            "libopenmpi-dev."
+        )
     return [f"-I{inc}"]
 
 
-def _netcdf_source(cache_dir: Optional[Path] = None, **_) -> str:
+def _netcdf_source(cache_dir: Path | None = None, **_: Any) -> str:
     """Source for the netcdf stub.  Requires ``cache_dir`` to vendor
     the upstream tarball."""
     if cache_dir is None:
-        raise ValueError("netcdf stub needs cache_dir for the vendored "
-                         "netcdf-fortran source.")
+        raise ValueError("netcdf stub needs cache_dir for the vendored netcdf-fortran source.")
     return netcdf_stub_source(vendor_netcdf_fortran(cache_dir))
 
 
-def _netcdf_flags(cache_dir: Optional[Path] = None, **_) -> List[str]:
+def _netcdf_flags(cache_dir: Path | None = None, **_: Any) -> list[str]:
     """``-I`` flags for the netcdf stub.  Same ``cache_dir`` as
     :func:`_netcdf_source`."""
     if cache_dir is None:
@@ -209,9 +330,10 @@ def _netcdf_flags(cache_dir: Optional[Path] = None, **_) -> List[str]:
     return [f"-I{vendor_netcdf_fortran(cache_dir)}"]
 
 
-LIBRARY_STUBS: Dict[str, LibraryStub] = {
+LIBRARY_STUBS: dict[str, LibraryStub] = {
     "mpi": LibraryStub(name="mpi", source=lambda **_: mpi_stub_source(), flags=_mpi_flags),
     "netcdf": LibraryStub(name="netcdf", source=_netcdf_source, flags=_netcdf_flags),
+    "openacc": LibraryStub(name="openacc", source=lambda **_: openacc_stub_source(), flags=lambda **_: []),
 }
 
 # ---------------------------------------------------------------------------
@@ -224,7 +346,9 @@ LIBRARY_STUBS: Dict[str, LibraryStub] = {
 # type, which is statically known, so we substitute the constant.
 _MPI_SIZEOF_RE = re.compile(
     r"(\s*)CALL\s+MPI_SIZEOF\s*\(\s*([A-Za-z_]\w*)\s*,\s*"
-    r"([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)", re.IGNORECASE)
+    r"([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)",
+    re.IGNORECASE,
+)
 
 
 def patch_mpi_sizeof(source: str) -> str:
@@ -239,14 +363,92 @@ def patch_mpi_sizeof(source: str) -> str:
         indent, arg, sz, err = m.group(1), m.group(2), m.group(3), m.group(4)
         small = any(k in arg.lower() for k in ("i4", "sp"))
         sz_val = 4 if small else 8
-        return (f"{indent}{sz} = {sz_val}; {err} = 0  "
-                f"! flang-21 stub for MPI_SIZEOF({arg})")
+        return f"{indent}{sz} = {sz_val}; {err} = 0  ! flang-21 stub for MPI_SIZEOF({arg})"
 
     return _MPI_SIZEOF_RE.sub(_replace, source)
 
 
+# A constant subscript outside an array's constant bounds, which flang-21 rejects even in code a constant condition
+# makes dead (``if (num_dims > 2) x(3) = ...`` with ``x(num_dims)`` and ``num_dims = 2``).
+_OUT_OF_BOUNDS_RE = re.compile(
+    r"^(?P<file>[^\n:]+):(?P<line>\d+):(?P<col>\d+): error: subscript (?P<value>-?\d+) is "
+    r"(?:greater than upper|less than lower) bound (?P<bound>-?\d+) for dimension (?P<dim>\d+) of array",
+    re.MULTILINE,
+)
+_LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?(\d+)\s+"([^"]+)"')
+
+
+def _origin_lines(source: str, path: str | None = None) -> dict[tuple[str, int], list[int]]:
+    """Map ``(file, line)`` as the line markers of ``source`` name it -- and, for ``path``, the file ``source`` is
+    compiled from, its own line numbers -- to the indices of the lines in ``source`` it stands for: several when a
+    preprocessor expanded that line more than once (a loop over directions, say)."""
+    origin: dict[tuple[str, int], list[int]] = {}
+    current: tuple[str, int] | None = None
+    for index, text in enumerate(source.splitlines()):
+        if path is not None:
+            origin.setdefault((path, index + 1), []).append(index)
+        marker = _LINE_MARKER_RE.match(text)
+        if marker:
+            current = (marker.group(2), int(marker.group(1)))
+            continue
+        if current is not None:
+            origin.setdefault(current, []).append(index)
+            current = (current[0], current[1] + 1)
+    return origin
+
+
+def _clamp_subscript(text: str, column: int, dim: int, value: int, bound: int) -> str | None:
+    """``text`` with the ``dim``-th subscript of the array reference starting at ``column`` (1-based) replaced by
+    ``bound`` when it is the integer literal ``value``; None when the reference does not look like that."""
+    start = column - 1
+    paren = text.find("(", start)
+    if paren < 0 or not re.fullmatch(r"[A-Za-z_][\w%]*\s*", text[start:paren]):
+        return None
+    depth, pieces, last = 0, [], paren + 1
+    for i in range(paren, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                pieces.append((last, i))
+                break
+        elif text[i] == "," and depth == 1:
+            pieces.append((last, i))
+            last = i + 1
+    if len(pieces) < dim:
+        return None
+    a, b = pieces[dim - 1]
+    if text[a:b].strip() != str(value):
+        return None
+    return f"{text[:a]}{bound}{text[b:]}"
+
+
+def clamp_out_of_bounds_constant_subscripts(source: str, flang_errors: str, path: str | None = None) -> tuple[str, int]:
+    """Clamp each constant subscript flang reports as outside its array's constant bounds to that bound.
+
+    Such a reference is undefined behaviour if it ever executes, so no valid execution runs it -- it sits in code a
+    constant condition rules out -- and any in-bounds value keeps every valid execution's meaning, while flang-21
+    rejects the source as it stands.  ``path``: the file flang compiled ``source`` from, for positions it reports in
+    that file itself.  Returns the patched source and the number of subscripts clamped.
+    """
+    origin = _origin_lines(source, path)
+    lines = source.splitlines(keepends=True)
+    clamped = 0
+    for m in _OUT_OF_BOUNDS_RE.finditer(flang_errors):
+        # The first of the lines it may stand for whose reference at that column has that literal subscript.
+        for index in origin.get((m.group("file"), int(m.group("line"))), []):
+            patched = _clamp_subscript(lines[index], int(m.group("col")), int(m.group("dim")), int(m.group("value")),
+                                       int(m.group("bound")))
+            if patched is not None and patched != lines[index]:
+                lines[index] = patched
+                clamped += 1
+                break
+    return "".join(lines), clamped
+
+
 # Patch registry: name -> source-to-source transform.
-FLANG_BUG_PATCHES: Dict[str, Callable[[str], str]] = {
+FLANG_BUG_PATCHES: dict[str, Callable[[str], str]] = {
     "mpi_sizeof": patch_mpi_sizeof,
 }
 
@@ -289,10 +491,9 @@ def extract_make_compile_args(makefile_dir: Path, target: str, make_program: str
     artefact = makefile_dir / target
     if artefact.is_file():
         artefact.unlink()
-    out = subprocess.check_output([make_program, "-n", target],
-                                  cwd=str(makefile_dir),
-                                  stderr=subprocess.STDOUT,
-                                  text=True)
+    out = subprocess.check_output(
+        [make_program, "-n", target], cwd=str(makefile_dir), stderr=subprocess.STDOUT, text=True
+    )
     # Pick the first line that mentions a Fortran source -- ICON's
     # ``mpifort -c ... mo_velocity_advection.f90`` style.
     compile_line = None
@@ -307,11 +508,14 @@ def extract_make_compile_args(makefile_dir: Path, target: str, make_program: str
                 compile_line = ln
                 break
     if compile_line is None:
-        raise RuntimeError(f"could not find a Fortran compile line for {target!r} in the "
-                           f"output of `{make_program} -n -B`")
+        raise RuntimeError(
+            f"could not find a Fortran compile line for {target!r} in the output of `{make_program} -n -B`"
+        )
     defines = sorted(set(_DEFINE_RE.findall(compile_line)))
     include_dirs = [Path(p) for p in _INCLUDE_RE.findall(compile_line)]
     src_match = _FORTRAN_SOURCE_RE.search(compile_line)
+    if src_match is None:
+        raise ValueError(f"no Fortran source file in compile command: {compile_line!r}")
     return {
         "defines": defines,
         "include_dirs": include_dirs,
@@ -325,17 +529,22 @@ def extract_make_compile_args(makefile_dir: Path, target: str, make_program: str
 # ---------------------------------------------------------------------------
 
 
+class TranslationUnit(NamedTuple):
+    source: str
+    flags: list[str]
+
+
 def prepare_flang_translation_unit(
     entry_source: str,
     *,
     search_dirs: Sequence[Path] = (),
     library_stubs: Sequence[str] = (),
-    patches: Sequence[str] = ("mpi_sizeof", ),
+    patches: Sequence[str] = ("mpi_sizeof",),
     defines: Sequence[str] = (),
     include_dirs: Sequence[Path] = (),
-    cache_dir: Optional[Path] = None,
-    openmpi_include: Optional[str] = None,
-) -> Tuple[str, List[str]]:
+    cache_dir: Path | None = None,
+    openmpi_include: str | None = None,
+) -> TranslationUnit:
     """Stitch a flang-ready translation unit from a real-world Fortran
     codebase.  Composes four steps:
 
@@ -352,7 +561,7 @@ def prepare_flang_translation_unit(
     :param search_dirs: directories scanned by
         :func:`merge_used_modules` for sibling modules.
     :param library_stubs: names of upstream-library stubs to opt into;
-        keys of :data:`LIBRARY_STUBS` (``'mpi'``, ``'netcdf'``).
+        keys of :data:`LIBRARY_STUBS` (``'mpi'``, ``'netcdf'``, ``'openacc'``).
     :param patches: names of flang-21 text patches to apply; keys of
         :data:`FLANG_BUG_PATCHES`.  Default is the single safe one
         (``'mpi_sizeof'``) -- only matches the literal call pattern
@@ -374,16 +583,15 @@ def prepare_flang_translation_unit(
         yourself.
     :raises KeyError: an unknown library stub or patch name.
     """
-    pieces: List[str] = []
-    flags: List[str] = list(f"-D{d}" for d in defines)
+    pieces: list[str] = []
+    flags: list[str] = [f"-D{d}" for d in defines]
     flags.extend(f"-I{p}" for p in include_dirs)
 
     for name in library_stubs:
         try:
             stub = LIBRARY_STUBS[name]
         except KeyError as e:
-            raise KeyError(f"unknown library stub {name!r}; available: "
-                           f"{sorted(LIBRARY_STUBS)}") from e
+            raise KeyError(f"unknown library stub {name!r}; available: {sorted(LIBRARY_STUBS)}") from e
         pieces.append(stub.source(cache_dir=cache_dir, openmpi_include=openmpi_include))
         flags.extend(stub.flags(cache_dir=cache_dir, openmpi_include=openmpi_include))
 
@@ -394,10 +602,9 @@ def prepare_flang_translation_unit(
         try:
             source = FLANG_BUG_PATCHES[name](source)
         except KeyError as e:
-            raise KeyError(f"unknown flang patch {name!r}; available: "
-                           f"{sorted(FLANG_BUG_PATCHES)}") from e
+            raise KeyError(f"unknown flang patch {name!r}; available: {sorted(FLANG_BUG_PATCHES)}") from e
 
-    return source, flags
+    return TranslationUnit(source, flags)
 
 
 # ---------------------------------------------------------------------------
@@ -406,18 +613,18 @@ def prepare_flang_translation_unit(
 
 
 def emit_hlfir_from_codebase(
-        entry_source: str,
-        out_path: Path,
-        *,
-        search_dirs: Sequence[Path] = (),
-        library_stubs: Sequence[str] = (),
-        patches: Sequence[str] = ("mpi_sizeof", ),
-        defines: Sequence[str] = (),
-        include_dirs: Sequence[Path] = (),
-        cache_dir: Optional[Path] = None,
-        openmpi_include: Optional[str] = None,
-        flang_program: Optional[str] = None,
-        extra_flang_flags: Sequence[str] = (),
+    entry_source: str,
+    out_path: Path,
+    *,
+    search_dirs: Sequence[Path] = (),
+    library_stubs: Sequence[str] = (),
+    patches: Sequence[str] = ("mpi_sizeof",),
+    defines: Sequence[str] = (),
+    include_dirs: Sequence[Path] = (),
+    cache_dir: Path | None = None,
+    openmpi_include: str | None = None,
+    flang_program: str | None = None,
+    extra_flang_flags: Sequence[str] = (),
 ) -> Path:
     """Compose a translation unit for ``entry_source`` via
     :func:`prepare_flang_translation_unit`, write it next to
@@ -448,24 +655,49 @@ def emit_hlfir_from_codebase(
     )
     tu_path = out_path.with_suffix(".F90")
     tu_path.write_text(tu_source)
+    base = [flang_program or require_flang(), "-fc1", "-cpp", "-U_OPENMP", "-U_OPENACC", *flang_flags, *extra_flang_flags]
+    # Constant subscripts outside constant bounds in dead code: clamp them and check again (a few rounds: flang stops
+    # reporting after the first errors of a scope).
+    for _ in range(8):
+        check = subprocess.run([*base, "-fsyntax-only", str(tu_path)], cwd=str(out_path.parent), capture_output=True,
+                               text=True)
+        if check.returncode == 0:
+            break
+        tu_source, clamped = clamp_out_of_bounds_constant_subscripts(tu_source, check.stderr + check.stdout, str(tu_path))
+        if not clamped:
+            # Mixed fypp line markers and surviving CPP conditionals can make the
+            # diagnostic's original location ambiguous. Expand CPP before dropping
+            # its markers so __LINE__/__FILE__ retain their meaning, then retry
+            # against physical TU locations. Never edit the original source files.
+            if (_OUT_OF_BOUNDS_RE.search(check.stderr + check.stdout)
+                    and any(_LINE_MARKER_RE.match(line) for line in tu_source.splitlines())):
+                expanded = subprocess.run([*base, "-E", "-P", str(tu_path)], cwd=str(out_path.parent),
+                                          capture_output=True, text=True, check=True)
+                tu_source = expanded.stdout
+                tu_path.write_text(tu_source)
+                continue
+            break
+        tu_path.write_text(tu_source)
     # Run flang with ``cwd = out_path.parent`` so its default module
     # search (which includes ".") doesn't pick up stale gfortran-format
     # ``.mod`` files left in the caller's working directory from prior
     # test runs.  Flang's ``.mod`` format is incompatible with
     # gfortran's; a chance collision surfaces as ``Cannot use module
     # file for module X``.
-    subprocess.check_call([
-        flang_program or require_flang(),
-        "-fc1",
-        "-cpp",
-        "-U_OPENMP",
-        "-U_OPENACC",
-        *flang_flags,
-        *extra_flang_flags,
-        "-emit-hlfir",
-        str(tu_path),
-        "-o",
-        str(out_path),
-    ],
-                          cwd=str(out_path.parent))
+    subprocess.check_call(
+        [
+            flang_program or require_flang(),
+            "-fc1",
+            "-cpp",
+            "-U_OPENMP",
+            "-U_OPENACC",
+            *flang_flags,
+            *extra_flang_flags,
+            "-emit-hlfir",
+            str(tu_path),
+            "-o",
+            str(out_path),
+        ],
+        cwd=str(out_path.parent),
+    )
     return out_path

@@ -380,6 +380,7 @@ add_library(hlfir_bridge_passes STATIC
     passes/InlineAll.cpp
     passes/LowerFirSelectCase.cpp
     passes/FlattenStructs.cpp
+    passes/RaggedAos.cpp
     passes/FlattenGlobalScalarReads.cpp
     passes/EliminateDoubleBufferToggle.cpp
     passes/DefaultIntent.cpp
@@ -389,6 +390,8 @@ add_library(hlfir_bridge_passes STATIC
     passes/FoldCopyInOut.cpp
     passes/ExpandVectorSubscriptGather.cpp
     passes/ExpandVectorSubscriptScatter.cpp
+    passes/MaterialiseArrayConstructors.cpp
+    passes/SinkScalarStores.cpp
     passes/RejectPolymorphism.cpp
     passes/RewritePointerAssigns.cpp
     passes/RewriteSequenceAssociation.cpp
@@ -406,6 +409,9 @@ add_library(hlfir_bridge_passes STATIC
     passes/FoldAssumedRankQueries.cpp
     passes/PruneNeverAllocatedMemberDeref.cpp
     passes/FoldConstantScalars.cpp
+    passes/RestoreCountedLoops.cpp
+    passes/SpecializeGlobals.cpp
+    passes/RecordAccess.cpp
 )
 target_link_libraries(hlfir_bridge_passes PUBLIC
     hlfir_bridge_core

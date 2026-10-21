@@ -2,19 +2,14 @@
 bridge emits ``MatMul(transA=True)`` instead of a Transpose->temp->MatMul chain.
 rtol=1e-12 for fp64 (well above ULP-level BLAS noise) since op order can differ.
 """
+
 from pathlib import Path
-import sys
 
 import numpy as np
-import pytest
 
 import dace_fortran
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent))
-from _util import have_flang  # noqa: E402
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def test_matmul_transpose_numerical(tmp_path):
@@ -33,17 +28,15 @@ SUBROUTINE matmul_t_kernel(n, m, k, A, B, C)
 END SUBROUTINE matmul_t_kernel
 END MODULE matmul_t_kernel_mod
 """
-    sdfg = dace_fortran.build_sdfg(src,
-                                   out_dir=str(tmp_path / "sdfg"),
-                                   entry="matmul_t_kernel_mod::matmul_t_kernel",
-                                   name="matmul_t_kernel")
+    sdfg = dace_fortran.build_sdfg(
+        src, out_dir=str(tmp_path / "sdfg"), entry="matmul_t_kernel_mod::matmul_t_kernel", name="matmul_t_kernel"
+    )
 
     # Fused path: exactly one MatMul + zero Transpose libcalls -- regression guard against
     # re-introducing the transient-+-transpose path (correct but wastes a copy).
     mm_count = sum(1 for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "MatMul")
     tr_count = sum(1 for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "Transpose")
-    assert mm_count == 1 and tr_count == 0, \
-        f"expected 1 MatMul + 0 Transpose, got mm={mm_count} tr={tr_count}"
+    assert mm_count == 1 and tr_count == 0, f"expected 1 MatMul + 0 Transpose, got mm={mm_count} tr={tr_count}"
 
     rng = np.random.default_rng(seed=42)
     n, m, k = 4, 7, 5
@@ -74,16 +67,14 @@ SUBROUTINE matmul_atb_kernel(n, m, k, A, B, C)
 END SUBROUTINE matmul_atb_kernel
 END MODULE matmul_atb_kernel_mod
 """
-    sdfg = dace_fortran.build_sdfg(src,
-                                   out_dir=str(tmp_path / "sdfg"),
-                                   entry="matmul_atb_kernel_mod::matmul_atb_kernel",
-                                   name="matmul_atb_kernel")
+    sdfg = dace_fortran.build_sdfg(
+        src, out_dir=str(tmp_path / "sdfg"), entry="matmul_atb_kernel_mod::matmul_atb_kernel", name="matmul_atb_kernel"
+    )
     # ZERO Transpose libcalls -- materialiser skips, BLAS does the transpose in-place via transB=True.
     mm_count = sum(1 for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "MatMul")
     tr_count = sum(1 for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "Transpose")
-    assert mm_count == 1 and tr_count == 0, \
-        f"expected 1 MatMul + 0 Transpose, got mm={mm_count} tr={tr_count}"
-    mm = [n for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "MatMul"][0]
+    assert mm_count == 1 and tr_count == 0, f"expected 1 MatMul + 0 Transpose, got mm={mm_count} tr={tr_count}"
+    mm = next(n for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "MatMul")
     assert mm.transB is True, f"expected transB=True, got {mm.transB}"
 
     rng = np.random.default_rng(seed=11)
@@ -112,18 +103,22 @@ SUBROUTINE matmul_atbt_kernel(n, m, k, A, B, C)
 END SUBROUTINE matmul_atbt_kernel
 END MODULE matmul_atbt_kernel_mod
 """
-    sdfg = dace_fortran.build_sdfg(src,
-                                   out_dir=str(tmp_path / "sdfg"),
-                                   entry="matmul_atbt_kernel_mod::matmul_atbt_kernel",
-                                   name="matmul_atbt_kernel")
+    sdfg = dace_fortran.build_sdfg(
+        src,
+        out_dir=str(tmp_path / "sdfg"),
+        entry="matmul_atbt_kernel_mod::matmul_atbt_kernel",
+        name="matmul_atbt_kernel",
+    )
     # Both flags fold + materialiser skip -- ZERO Transpose libcalls.
     mm_count = sum(1 for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "MatMul")
     tr_count = sum(1 for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "Transpose")
-    assert mm_count == 1 and tr_count == 0, \
+    assert mm_count == 1 and tr_count == 0, (
         f"expected 1 MatMul + 0 Transpose (both fold via BLAS), got mm={mm_count} tr={tr_count}"
-    mm = [n for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "MatMul"][0]
-    assert mm.transA is True and mm.transB is True, \
+    )
+    mm = next(n for s in sdfg.states() for n in s.nodes() if type(n).__name__ == "MatMul")
+    assert mm.transA is True and mm.transB is True, (
         f"expected transA=True transB=True, got transA={mm.transA} transB={mm.transB}"
+    )
 
     rng = np.random.default_rng(seed=21)
     n, m, k = 4, 7, 5
@@ -151,10 +146,9 @@ SUBROUTINE matmul_tv_kernel(n, m, A, v, y)
 END SUBROUTINE matmul_tv_kernel
 END MODULE matmul_tv_kernel_mod
 """
-    sdfg = dace_fortran.build_sdfg(src,
-                                   out_dir=str(tmp_path / "sdfg"),
-                                   entry="matmul_tv_kernel_mod::matmul_tv_kernel",
-                                   name="matmul_tv_kernel")
+    sdfg = dace_fortran.build_sdfg(
+        src, out_dir=str(tmp_path / "sdfg"), entry="matmul_tv_kernel_mod::matmul_tv_kernel", name="matmul_tv_kernel"
+    )
 
     rng = np.random.default_rng(seed=7)
     n, m = 4, 6
@@ -166,3 +160,9 @@ END MODULE matmul_tv_kernel_mod
 
     expected = A.T @ v
     np.testing.assert_allclose(y, expected, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

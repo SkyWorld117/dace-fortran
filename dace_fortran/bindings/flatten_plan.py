@@ -13,13 +13,14 @@ expressions stand for the N loop indices the copy nest declares;
 :func:`substitute_indices` fills in concrete names.
 """
 
+from __future__ import annotations
+
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Tuple
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FlattenRecipe:
     """One recorded unpacking.  Three emitter shapes, by flag combo:
     ``aliasable=True`` zero-copy ``c_f_pointer`` alias;
@@ -36,75 +37,85 @@ class FlattenRecipe:
         flats.  Empty when outer is read-only, the recipe is aliased,
         or aos_alloc (bespoke pack-out code instead).
     rank: number of loop indices used; 0 for scalar unpacks.  For
-        aos_alloc this is outer_rank + 1.
+        aos_alloc this is outer_rank + the member's rank.
     shape_exprs: per-rank extent expr, length == rank (typically
-        ``size(<outer>, dim=1)``, ...).  For aos_alloc the inner dim
-        is the cap symbol verbatim, not a size() call.
+        ``size(<outer>, dim=1)``, ...).  For aos_alloc the member dims
+        are the cap symbols verbatim, not size() calls.
     aliasable: True iff pure element identity + matching storage
         layout -- emitter skips allocate/copy, aliases via
         c_f_pointer.  Mutually exclusive with aos_alloc.
     scratch_dtype: SDFG element dtype for flat scratch buffers; all
         flats of one recipe share a dtype.
-    aos_alloc: Phase 5c-B (AoS + allocatable/pointer array member at
-        the SDFG boundary).  True switches to the padding-to-max
-        pack/unpack path::
+    aos_alloc: Phase 5c-B (AoS + allocatable/pointer array member of
+        rank R at the SDFG boundary).  True switches to the
+        padding-to-max pack/unpack path, per member dim k::
 
-            cap = max_i(merge(size(A(i)%w), 0, allocated(A(i)%w)))
-            allocate(A_w(N, cap)); A_w = 0
-            do i = 1, N; if (allocated(A(i)%w)) A_w(i, 1:size(A(i)%w)) = A(i)%w
+            lb_k = lbound(A(i)%w, k) of the first present element (all must agree)
+            cap_k = max_i(merge(size(A(i)%w, k), 0, present(A(i)%w)))
+            allocate(A_w(N, cap_1, ..., cap_R)); A_w = 0
+            do i = 1, N; if (present) A_w(i, 1:size(A(i)%w, 1), ...) = A(i)%w
             <SDFG call>
-            do i = 1, N; if (allocated(A(i)%w)) A(i)%w = A_w(i, 1:size(A(i)%w))   ! intent(out)/(inout)
+            do i = 1, N; if (present) A(i)%w = A_w(i, 1:size(A(i)%w, 1), ...)   ! intent(out)/(inout)
             deallocate(A_w)
 
-        Companion buffer is always ``A_<member>(N, cap)``, one flat
-        per recipe (complex-split doesn't combine with aos_alloc).
-        Mixed structs (one allocatable + one plain member) split
-        across two recipes: aos_alloc=True for the allocatable one,
-        aliasable=True for the rest.
-    cap_symbol: SDFG runtime symbol carrying the cap.  Empty unless
-        aos_alloc=True, else ``cap_<base>_<member>``.
-        ``_build_symbol_assigns`` skips it (pack-in computes it directly).
-    source_logical_kind: N when the source member is Fortran
-        LOGICAL(KIND=N) (1/2/4/8), else 0.  SDFG storage stays bool (1
-        byte) regardless; drives a boundary bridge (wrapper-local
-        pointer declared at the source kind + a bool scratch +
-        per-element conversion) so a default LOGICAL slot isn't
-        clobbered by a 1-byte SDFG write (root cause of the "free():
-        invalid next size" glibc diagnostic in the ICON
-        velocity_tendencies e2e).
+        where present is ``allocated`` or, for a pointer member,
+        ``associated``.  Companion buffer is always
+        ``A_<member>(N, cap...)``, one flat per recipe (complex-split
+        doesn't combine with aos_alloc).  Mixed structs (one
+        allocatable + one plain member) split across two recipes:
+        aos_alloc=True for the allocatable one, aliasable=True for the
+        rest.  The copies assume no two packed elements share storage
+        (pointer members of one or several dummies): pack-out writes
+        them back in order, so the last one would win.
+    cap_symbols: per member dim, the SDFG runtime symbol carrying the
+        padded extent (``cap_<base>_<member>`` for a rank-1 member,
+        ``cap_<base>_<member>_d<k>`` with a 0-based k otherwise).  Empty
+        unless aos_alloc.
+    lb_symbols: per member dim, the SDFG runtime symbol carrying the
+        lower bound the elements share (``lb_...``, named like the caps).
+        ``_build_symbol_assigns`` skips caps and lower bounds (pack-in
+        computes them directly).
+    member_pointer: the aos_alloc member is a POINTER (presence is
+        ``associated``), not an ALLOCATABLE (``allocated``).
     """
-    flat_names: Tuple[str, ...]
-    read_exprs: Tuple[str, ...]
-    write_expr: str = ''
+
+    flat_names: tuple[str, ...]
+    read_exprs: tuple[str, ...]
+    write_expr: str = ""
     rank: int = 0
-    shape_exprs: Tuple[str, ...] = field(default_factory=tuple)
+    shape_exprs: tuple[str, ...] = field(default_factory=tuple)
     aliasable: bool = False
-    scratch_dtype: str = 'float64'
+    scratch_dtype: str = "float64"
     aos_alloc: bool = False
-    cap_symbol: str = ''
-    source_logical_kind: int = 0
+    cap_symbols: tuple[str, ...] = field(default_factory=tuple)
+    lb_symbols: tuple[str, ...] = field(default_factory=tuple)
+    member_pointer: bool = False
 
     # ----- JSON I/O ---------------------------------------------------
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict (tuple fields become lists)."""
         d = asdict(self)
-        d['flat_names'] = list(self.flat_names)
-        d['read_exprs'] = list(self.read_exprs)
-        d['shape_exprs'] = list(self.shape_exprs)
+        d["flat_names"] = list(self.flat_names)
+        d["read_exprs"] = list(self.read_exprs)
+        d["shape_exprs"] = list(self.shape_exprs)
+        d["cap_symbols"] = list(self.cap_symbols)
+        d["lb_symbols"] = list(self.lb_symbols)
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'FlattenRecipe':
+    def from_dict(cls, d: dict) -> FlattenRecipe:
         """Rebuild from a :meth:`to_dict` mapping (lists back to tuples)."""
         d = dict(d)
-        d['flat_names'] = tuple(d.get('flat_names', []))
-        d['read_exprs'] = tuple(d.get('read_exprs', []))
-        d['shape_exprs'] = tuple(d.get('shape_exprs', []))
+        d["flat_names"] = tuple(d.get("flat_names", []))
+        d["read_exprs"] = tuple(d.get("read_exprs", []))
+        d["shape_exprs"] = tuple(d.get("shape_exprs", []))
+        d["cap_symbols"] = tuple(d.get("cap_symbols", []))
+        d["lb_symbols"] = tuple(d.get("lb_symbols", []))
         return cls(**d)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FlattenEntry:
     """One outer dummy / storage path that was unpacked.
 
@@ -115,6 +126,7 @@ class FlattenEntry:
         set triggers a copy-out loop.
     recipe: the FlattenRecipe describing the unpack.
     """
+
     outer_expr: str
     outer_type: str
     writeback_intent: str
@@ -123,24 +135,24 @@ class FlattenEntry:
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict (recurses into the recipe)."""
         return {
-            'outer_expr': self.outer_expr,
-            'outer_type': self.outer_type,
-            'writeback_intent': self.writeback_intent,
-            'recipe': self.recipe.to_dict(),
+            "outer_expr": self.outer_expr,
+            "outer_type": self.outer_type,
+            "writeback_intent": self.writeback_intent,
+            "recipe": self.recipe.to_dict(),
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'FlattenEntry':
+    def from_dict(cls, d: dict) -> FlattenEntry:
         """Rebuild from a :meth:`to_dict` mapping."""
         return cls(
-            outer_expr=d['outer_expr'],
-            outer_type=d['outer_type'],
-            writeback_intent=d.get('writeback_intent', ''),
-            recipe=FlattenRecipe.from_dict(d['recipe']),
+            outer_expr=d["outer_expr"],
+            outer_type=d["outer_type"],
+            writeback_intent=d.get("writeback_intent", ""),
+            recipe=FlattenRecipe.from_dict(d["recipe"]),
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SyntheticGlobal:
     """One scalar struct member ``hlfir-flatten-global-scalar-reads`` lifted
     out of a module-global record into a standalone ``fir.global``.
@@ -154,38 +166,40 @@ class SyntheticGlobal:
         the bridge derives from the synthetic global's mangled symbol).
     module: Fortran module the host struct lives in (``USE``d by the binding).
     entity: the host struct's Fortran name inside ``module``.
-    member: the scalar component read off ``entity``.
+    member: the scalar component read off ``entity``; a ``%``-joined path
+        for a member of a nested record (``a%b`` for ``entity%a%b``).
     dtype: SDFG element dtype of the member.
     """
+
     symbol: str
     module: str
     entity: str
     member: str
-    dtype: str = 'float64'
+    dtype: str = "float64"
 
     @property
     def sdfg_name(self) -> str:
         """Name the lifted scalar carries on the SDFG.  Composed from the side
         table, never decoded from ``symbol``."""
-        return f"{self.entity}_{self.member}"
+        return f"{self.entity}_{self.member.replace('%', '_')}"
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'SyntheticGlobal':
+    def from_dict(cls, d: dict) -> SyntheticGlobal:
         """Rebuild from a :meth:`to_dict` mapping."""
         return cls(
-            symbol=d['symbol'],
-            module=d['module'],
-            entity=d['entity'],
-            member=d['member'],
-            dtype=d.get('dtype', 'float64'),
+            symbol=d["symbol"],
+            module=d["module"],
+            entity=d["entity"],
+            member=d["member"],
+            dtype=d.get("dtype", "float64"),
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FlattenPlan:
     """All unpacks ``hlfir-flatten-structs`` performed for one entry
     subroutine.  One entry per flattened outer dummy; untouched
@@ -197,32 +211,33 @@ class FlattenPlan:
         record.  Each needs a ``<symbol> = <entity>%<member>`` assignment in
         the binding wrapper before the call.
     """
-    entries: Tuple[FlattenEntry, ...] = field(default_factory=tuple)
-    synthetic_globals: Tuple[SyntheticGlobal, ...] = field(default_factory=tuple)
+
+    entries: tuple[FlattenEntry, ...] = field(default_factory=tuple)
+    synthetic_globals: tuple[SyntheticGlobal, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict (one entry per flattened dummy)."""
         return {
-            'entries': [e.to_dict() for e in self.entries],
-            'synthetic_globals': [s.to_dict() for s in self.synthetic_globals],
+            "entries": [e.to_dict() for e in self.entries],
+            "synthetic_globals": [s.to_dict() for s in self.synthetic_globals],
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'FlattenPlan':
+    def from_dict(cls, d: dict) -> FlattenPlan:
         """Rehydrate from a plain dict -- the bridge returns the MLIR-side
         ``hlfir.flatten_plan`` attribute in this same nested shape."""
         return cls(
-            entries=tuple(FlattenEntry.from_dict(e) for e in d.get('entries', [])),
-            synthetic_globals=tuple(SyntheticGlobal.from_dict(s) for s in d.get('synthetic_globals', [])),
+            entries=tuple(FlattenEntry.from_dict(e) for e in d.get("entries", [])),
+            synthetic_globals=tuple(SyntheticGlobal.from_dict(s) for s in d.get("synthetic_globals", [])),
         )
 
-    def to_json(self, path: str):
+    def to_json(self, path: str) -> None:
         """Write the plan to ``path`` as indented JSON."""
-        with open(path, 'w') as fh:
+        with open(path, "w") as fh:
             json.dump(self.to_dict(), fh, indent=2)
 
     @classmethod
-    def from_json(cls, path: str) -> 'FlattenPlan':
+    def from_json(cls, path: str) -> FlattenPlan:
         """Load a plan previously written by :meth:`to_json`."""
         with open(path) as fh:
             return cls.from_dict(json.load(fh))
@@ -232,10 +247,10 @@ class FlattenPlan:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_INDEX_RE = re.compile(r'\$i(\d+)')
+_INDEX_RE = re.compile(r"\$i(\d+)")
 
 
-def substitute_indices(expr: str, names: Tuple[str, ...]) -> str:
+def substitute_indices(expr: str, names: tuple[str, ...]) -> str:
     """Replace ``$i1``, ``$i2``, ... placeholders with concrete loop
     variable names (``$i1`` -> ``names[0]``, etc).
 
@@ -256,5 +271,5 @@ def strip_index_args(expr: str) -> str:
     path alone -- ``c_loc`` needs the array, not an element.  Returns the
     input unchanged if it has no parenthesised placeholder suffix.
     """
-    m = re.match(r'^(.+?)\(\s*\$i\d+(?:\s*,\s*\$i\d+)*\s*\)\s*$', expr)
+    m = re.match(r"^(.+?)\(\s*\$i\d+(?:\s*,\s*\$i\d+)*\s*\)\s*$", expr)
     return m.group(1) if m else expr

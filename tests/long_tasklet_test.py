@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/long_tasklet_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_long_tasklet(tmp_path):
@@ -32,8 +29,14 @@ subroutine main(d)
   d(1) = arr(1)*arr(ind%indices(1))!+arr(2,2,2)*arr(ind%indices(2,2,2),2,2)!+arr(3,3,3)*arr(ind%indices(3,3,3),3,3)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     a = np.full([5], 42, order="F", dtype=np.float64)
     sdfg(d=a)
-    assert (a[1] == 5.5)
-    assert (a[0] == 4)
+    assert a[1] == 5.5
+    assert a[0] == 4
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

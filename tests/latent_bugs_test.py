@@ -6,13 +6,12 @@
 
 Convention: NaN==NaN and +/-inf==+/-inf for round-trip purposes -- printer emits them verbatim, tests
 assert via np.isnan/np.isinf + sign rather than equality."""
+
 import math
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +91,9 @@ SUBROUTINE atan2_zero_sign(out_pos, out_neg)
 END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path / "sdfg", name="atan2_zero_sign",
-                      entry="atan2_zero_sign_mod::atan2_zero_sign").build()
+    sdfg = build_sdfg(
+        src, tmp_path / "sdfg", name="atan2_zero_sign", entry="atan2_zero_sign_mod::atan2_zero_sign"
+    ).build()
     pos = np.zeros(1, dtype=np.float64)
     neg = np.zeros(1, dtype=np.float64)
     sdfg(out_pos=pos, out_neg=neg)
@@ -117,8 +117,9 @@ END MODULE
     out = np.zeros(1, dtype=np.float64)
     sdfg(out=out)
     assert out[0] == 0.0
-    assert math.copysign(1.0, out[0]) == -1.0, (f"expected -0.0 (sign bit set), got {out[0]} with sign "
-                                                f"{math.copysign(1.0, out[0])}")
+    assert math.copysign(1.0, out[0]) == -1.0, (
+        f"expected -0.0 (sign bit set), got {out[0]} with sign {math.copysign(1.0, out[0])}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -200,13 +201,18 @@ SUBROUTINE mixed_triplet_assign(s_y, out, i, n)
 END SUBROUTINE
 END MODULE
 """
-    sdfg = build_sdfg(src,
-                      tmp_path / "sdfg",
-                      name="mixed_triplet_assign",
-                      entry="mixed_triplet_assign_mod::mixed_triplet_assign").build()
+    sdfg = build_sdfg(
+        src, tmp_path / "sdfg", name="mixed_triplet_assign", entry="mixed_triplet_assign_mod::mixed_triplet_assign"
+    ).build()
     s_y = np.zeros((10, 100), order="F", dtype=np.float64)
     s_y[3, :5] = [1.0, 2.0, 3.0, 4.0, 5.0]
     out = np.zeros(100, dtype=np.float64, order="F")
     sdfg(s_y=s_y, out=out, i=np.int32(4), n=np.int32(5))
     np.testing.assert_array_equal(out[:5], [1.0, 2.0, 3.0, 4.0, 5.0])
     np.testing.assert_array_equal(out[5:], 0.0)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

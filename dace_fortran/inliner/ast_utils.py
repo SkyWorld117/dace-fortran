@@ -8,7 +8,9 @@ three pure-fparser helpers the desugaring/pruning/cleanup passes call
 helpers there aren't needed here.  Kept import-compatible so the copied
 ``ast_desugaring`` modules need no source edits.
 """
-from typing import Iterator, Optional, Tuple, Type, TypeVar, Union
+
+from collections.abc import Iterator
+from typing import TypeVar, Union, overload
 
 from fparser.two.utils import Base
 
@@ -22,7 +24,7 @@ def singular(items: Iterator[T]) -> T:
     return it
 
 
-def atmost_one(items: Iterator[T]) -> Optional[T]:
+def atmost_one(items: Iterator[T]) -> T | None:
     """Asserts `items` has at most 1 item; returns it or `None`."""
     try:
         it = next(items)
@@ -35,7 +37,19 @@ def atmost_one(items: Iterator[T]) -> Optional[T]:
     raise ValueError(f"`items` must have at most 1 item, got: {it}, {nit}, ...")
 
 
-def children_of_type(node: Base, typ: Union[str, Type[T], Tuple[Type, ...]]) -> Iterator[T]:
+@overload
+def children_of_type(node: Base, typ: str) -> Iterator[Base]: ...
+
+
+@overload
+def children_of_type(node: Base, typ: type[T]) -> Iterator[T]: ...
+
+
+@overload
+def children_of_type(node: Base, typ: tuple[type[T], ...]) -> Iterator[T]: ...
+
+
+def children_of_type(node: Base, typ: Union[str, type[T], tuple[type[T], ...]]) -> Iterator[Base] | Iterator[T]:
     """Generator over `node`'s children that are of type `typ`."""
     if isinstance(typ, str):
         return (c for c in node.children if type(c).__name__ == typ)

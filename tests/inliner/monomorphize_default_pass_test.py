@@ -5,12 +5,10 @@ Tests drive the real inline_to_ast pipeline (not the engine in isolation) to pin
 + ordering vs the call-resolution passes. SDFG-level proof (no ExternalCall) is in
 tests/sync_devirt_mpi_libnode_test.py.
 """
+
 import re
-import shutil
 import subprocess
 from pathlib import Path
-
-import pytest
 
 import fparser.two.Fortran2003 as f03
 from fparser.two.utils import walk
@@ -146,7 +144,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_retype_consolidates_arm_module_no_cycle(tmp_path: Path):
     """Cross-module retype that would create a circular dependency instead
     consolidates the arm into the base module, producing compilable Fortran."""
@@ -162,8 +159,9 @@ def test_retype_consolidates_arm_module_no_cycle(tmp_path: Path):
     # and it compiles -- no "used before defined" / circular USE
     src = tmp_path / "consolidated.f90"
     src.write_text(out)
-    subprocess.check_call(["gfortran", "-fsyntax-only", "-ffree-line-length-none", "consolidated.f90"],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        ["gfortran", "-fsyntax-only", "-ffree-line-length-none", "consolidated.f90"], cwd=str(tmp_path)
+    )
 
 
 #: Same cycle, but base is TYPES-ONLY (no CONTAINS) and the wrapper is in a THIRD
@@ -226,7 +224,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_retype_consolidates_into_types_only_base_with_third_module_wrapper(tmp_path: Path):
     """TYPES-ONLY base + arm + wrapper in three modules: consolidation adds CONTAINS
     to the base before END MODULE and imports the arm into the wrapper."""
@@ -236,8 +233,9 @@ def test_retype_consolidates_into_types_only_base_with_third_module_wrapper(tmp_
     assert not walk(ast, f03.Procedure_Designator)
     src = tmp_path / "consolidated3.f90"
     src.write_text(out)
-    subprocess.check_call(["gfortran", "-fsyntax-only", "-ffree-line-length-none", "consolidated3.f90"],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        ["gfortran", "-fsyntax-only", "-ffree-line-length-none", "consolidated3.f90"], cwd=str(tmp_path)
+    )
 
 
 #: Arm type is referenced by a type COMPONENT in yet another module (ICON's
@@ -305,7 +303,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_retype_imports_arm_into_module_with_component(tmp_path: Path):
     """Arm type used as a component in a separate module: consolidation imports
     the arm into that module so the type def resolves."""
@@ -403,7 +400,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_ladder_consolidates_every_arm_module_no_cycle(tmp_path: Path):
     """Multi-arm ladder merges every arm module into the base so the ladder's
     per-arm clones resolve their arm types/procedures locally: no residual
@@ -502,7 +498,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_ladder_clone_name_shortened_within_fortran_limit(tmp_path: Path):
     """Clone name exceeding Fortran's 63-char identifier limit is shortened (prefix +
     stable hash) so the TU compiles instead of a rejected SUBROUTINE header. Mirrors
@@ -614,7 +609,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_pointer_assoc_single_hop_devirtualizes(tmp_path: Path):
     """Two-arm CLASS POINTER slot set by pointer-association (no ALLOCATE) is
     discovered as a ladder: slot expands to tag + per-arm pointers, setup clones
@@ -727,7 +721,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_pointer_assoc_passthrough_devirtualizes(tmp_path: Path):
     """Concrete arm reaches the association two hops away through a pass-through
     constructor. Forward fixed point clones it end to end: the dummy-dispatch
@@ -958,7 +951,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_pointer_assoc_two_axes_through_allocate_ladder(tmp_path: Path):
     """Two independent pointer axes (trans, agen) share one constructor, reached
     through an ALLOCATE-laddered backend. Flows compose into a clone per (trans,
@@ -1069,7 +1061,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_pointer_assoc_data_carrying_slot_kept_class(tmp_path: Path):
     """Data-carrying CLASS POINTER slot read in a DECLARATION dimension stays CLASS
     (data reads lower natively); only its dispatch is laddered onto a per-arm
@@ -1224,7 +1215,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_pointer_assoc_generic_binding_resolves_per_arm(tmp_path: Path):
     """GENERIC call laddered onto a per-arm slot resolves to the arm's override.
     deconstruct_procedure_calls registers candidates on the declaring (abstract)
@@ -1334,7 +1324,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_generic_only_dispatch_axis_discovered(tmp_path: Path):
     """Deferred binding reached only via a generic (apply => lhs_wp) is still
     discovered and laddered. discover_axes keys liveness on the dispatched name, so
@@ -1424,7 +1413,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_slot_ladder_ignores_same_name_on_unrelated_type(tmp_path: Path):
     """Slot ladder retargets %slot textually, so it must be TYPE-AWARE: an unrelated
     type's same-named component (t_p_wrap_orig%p) must be left alone, else it's
@@ -1550,7 +1538,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_arm_merge_keeps_reexported_host_type_resolvable(tmp_path: Path):
     """Host-associated type re-exported through the arm's module survives the
     arm->base merge: the moved USE is prepended ahead of the base's type defs, and
@@ -1672,7 +1659,6 @@ end module
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_dummy_dispatch_helper_devirtualized(tmp_path: Path):
     """Dispatch on a helper's CLASS(base) dummy, called with the hybrid slot, is
     devirtualised: helper clones per arm (dummy retyped), call becomes a tag ladder.
@@ -1685,5 +1671,12 @@ def test_dummy_dispatch_helper_devirtualized(tmp_path: Path):
     assert "trans__t_triv" in low and "trans__t_sub" in low
     src = tmp_path / "dummy_dispatch.f90"
     src.write_text(ast.tofortran())
-    subprocess.check_call(["gfortran", "-fsyntax-only", "-ffree-line-length-none", "dummy_dispatch.f90"],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        ["gfortran", "-fsyntax-only", "-ffree-line-length-none", "dummy_dispatch.f90"], cwd=str(tmp_path)
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

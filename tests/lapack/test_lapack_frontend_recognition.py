@@ -1,16 +1,12 @@
 """Frontend-recognition tests for LAPACK calls: each test drives one run_<routine> entry of
 lapack_probes.f90 and asserts the SDFG contains the matching dace.libraries.lapack node."""
+
 from pathlib import Path
 
-import pytest
-
 import dace_fortran
-from _util import have_flang
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "lapack_probes.f90"
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _build_and_assert(entry: str, expected_node: str, tmp_path):
@@ -19,8 +15,7 @@ def _build_and_assert(entry: str, expected_node: str, tmp_path):
     sdfg = dace_fortran.build_sdfg(src, out_dir=str(tmp_path / name), entry=entry, name=name)
     sdfg.validate()
     classes = {type(n).__name__ for s in sdfg.states() for n in s.nodes()}
-    assert expected_node in classes, \
-        f"{entry}: expected a {expected_node!r} lib node, got {sorted(classes)!r}"
+    assert expected_node in classes, f"{entry}: expected a {expected_node!r} lib node, got {sorted(classes)!r}"
 
 
 def test_dgetrf_recognised(tmp_path):
@@ -29,3 +24,9 @@ def test_dgetrf_recognised(tmp_path):
 
 def test_dpotrf_recognised(tmp_path):
     _build_and_assert("lapack_probes::run_dpotrf", "Potrf", tmp_path)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

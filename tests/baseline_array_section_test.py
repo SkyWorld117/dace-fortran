@@ -6,11 +6,8 @@ per-feature split.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _build(src: str, tmp: Path, name: str):
@@ -36,3 +33,9 @@ end subroutine fill_range
     r_sdfg = np.zeros(6, dtype=np.int32)
     sdfg(res=r_sdfg, a=2, b=5)
     np.testing.assert_array_equal(r_sdfg, r_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

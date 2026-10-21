@@ -14,20 +14,28 @@ so a later write must be sequenced after that consumer, not after the access nod
 
 This runs on the realised graph, so it needs no per-emitter cooperation and no name matching.  Both
 matter: ``emit_cfg``'s emit-time guards split states only on the paths that reach them (a scalar
-assign flushed from ``_Ctx.flush`` never does), and they compare Fortran names while ``access.acc``
+assign flushed from ``Ctx.flush`` never does), and they compare Fortran names while ``access.acc``
 has already resolved every alias onto the source container's access node.
 
 Source order is recovered from ``state.node_id``: access nodes are created while their statement is
 emitted, so increasing node id is increasing Fortran statement order.  The pass therefore has to run
 on the freshly emitted graph, before anything renumbers nodes.
 """
-from collections import defaultdict
 
-from dace import Memlet
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import TYPE_CHECKING, NamedTuple
+
+from dace import Memlet, subsets
 from dace.sdfg import nodes
 
+if TYPE_CHECKING:
+    from dace import SDFG
+    from dace.sdfg.state import SDFGState
 
-def descendants(state, source):
+
+def descendants(state: SDFGState, source: nodes.Node) -> set[nodes.Node]:
     """Every node reachable from ``source`` along dataflow edges."""
     seen = set()
     stack = [source]
@@ -40,17 +48,27 @@ def descendants(state, source):
     return seen
 
 
-def completion_anchor(state, node):
+def completion_anchor(state: SDFGState, node: nodes.Node) -> nodes.Node:
     """Node whose completion implies ``node`` has run (a scope stands for its whole body)."""
-    return state.exit_node(node) if isinstance(node, nodes.EntryNode) else node
+    if not isinstance(node, nodes.EntryNode):
+        return node
+    exit_node = state.exit_node(node)
+    if exit_node is None:
+        raise ValueError(f"scope entry {node} has no exit node in state {state.label}")
+    return exit_node
 
 
-def start_anchor(state, node):
+def start_anchor(state: SDFGState, node: nodes.Node) -> nodes.Node:
     """Node whose start implies ``node`` has not run yet (a scope stands for its whole body)."""
-    return state.entry_node(node) if isinstance(node, nodes.ExitNode) else node
+    if not isinstance(node, nodes.ExitNode):
+        return node
+    entry_node = state.entry_node(node)
+    if entry_node is None:
+        raise ValueError(f"scope exit {node} has no entry node in state {state.label}")
+    return entry_node
 
 
-def store_anchors(state, node, seen=None):
+def store_anchors(state: SDFGState, node: nodes.Node, seen: set[int] | None = None) -> list[nodes.Node]:
     """Nodes that perform the store into ``node``.
 
     Walks back through intervening AccessNodes so an aliased write (``p(i) = c(i)`` with
@@ -69,7 +87,7 @@ def store_anchors(state, node, seen=None):
     return anchors or [node]
 
 
-def load_anchors(state, node, seen=None):
+def load_anchors(state: SDFGState, node: nodes.Node, seen: set[int] | None = None) -> list[nodes.Node]:
     """Nodes whose completion implies every read of ``node`` has happened.
 
     The consumer rule: a later write is sequenced after the reader's CONSUMER, never after the
@@ -88,19 +106,52 @@ def load_anchors(state, node, seen=None):
     return anchors or [node]
 
 
-def order_state(state):
+class SkippedEdge(NamedTuple):
+    container: str
+    src: nodes.Node
+    dst: nodes.Node
+
+
+def order_writers(state: SDFGState) -> list[SkippedEdge]:
+    """Order the writers of every access node that more than one statement stores into at elements that may be the
+    same: two stores into one node (``p = 0`` and, once a branch is folded, ``p = expr``) are otherwise unordered,
+    and the last store emitted wins whichever it is.  The later writer runs after the earlier one; stores into
+    elements that cannot be the same (``b(1) = ...``, ``b(2) = ...``), and accumulations (write-conflict resolved
+    stores), which commute, stay as they are.
+
+    :return: the edges that had to be skipped to keep the state acyclic.
+    """
+    skipped: list[SkippedEdge] = []
+    for node in state.data_nodes():
+        stores = [(e.src, e.data.get_dst_subset(e, state)) for e in state.in_edges(node)
+                  if not e.data.is_empty() and e.data.wcr is None]
+        stores.sort(key=lambda store: state.node_id(store[0]))
+        pairs = [(a, b) for i, (a, sa) in enumerate(stores) for b, sb in stores[i + 1:]
+                 if a is not b and (sa is None or sb is None or subsets.intersects(sa, sb) is not False)]
+        for earlier, later in pairs:
+            src, dst = completion_anchor(state, earlier), start_anchor(state, later)
+            if dst in descendants(state, src):
+                continue
+            if src in descendants(state, dst):
+                skipped.append(SkippedEdge(node.data, src, dst))
+                continue
+            state.add_nedge(src, dst, Memlet())
+    return skipped
+
+
+def order_state(state: SDFGState) -> list[SkippedEdge]:
     """Add ordering edges for every unordered same-container pair in ``state``.
 
     :return: list of ``(container, src, dst)`` triples that had to be skipped to keep the state
         acyclic.
     """
+    skipped = order_writers(state)
     scopes = state.scope_dict()
     by_container = defaultdict(list)
     for node in state.data_nodes():
         if scopes[node] is None:
             by_container[node.root_data].append(node)
 
-    skipped = []
     for container, access_nodes in by_container.items():
         if len(access_nodes) < 2:
             continue
@@ -108,16 +159,22 @@ def order_state(state):
         reach = {id(n): descendants(state, n) for n in ordered}
 
         for index, earlier in enumerate(ordered):
-            for later in ordered[index + 1:]:
-                if later in reach[id(earlier)] or earlier in reach[id(later)]:
+            for later in ordered[index + 1 :]:
+                if earlier in reach[id(later)]:
                     continue
                 earlier_writes = state.in_degree(earlier) > 0
                 later_writes = state.in_degree(later) > 0
                 if not earlier_writes and not later_writes:
                     continue
                 if later_writes:
+                    # A path from ``earlier`` to ``later`` orders only the readers on it: in ``w = p * q`` /
+                    # ``p = p * 2`` the update reads the node the first statement read, so ``p`` (read) reaches
+                    # ``p`` (written) through the update while the first statement's read stays unordered against
+                    # the store.  Every reader is checked; the ones already ordered are skipped below.
                     sources = load_anchors(state, earlier)
                     targets = store_anchors(state, later)
+                elif later in reach[id(earlier)]:
+                    continue
                 else:
                     sources = [earlier]
                     targets = [later]
@@ -136,7 +193,7 @@ def order_state(state):
                             dst_reach = descendants(state, dst)
                             reach[id(dst)] = dst_reach
                         if src in dst_reach:
-                            skipped.append((container, src, dst))
+                            skipped.append(SkippedEdge(container, src, dst))
                             continue
                         state.add_nedge(src, dst, Memlet())
                         gained = dst_reach | {dst}
@@ -146,9 +203,9 @@ def order_state(state):
     return skipped
 
 
-def enforce_statement_order(sdfg):
+def enforce_statement_order(sdfg: SDFG) -> list[SkippedEdge]:
     """Pin Fortran statement order into every state of ``sdfg`` and its nested SDFGs."""
-    skipped = []
+    skipped: list[SkippedEdge] = []
     for nested in sdfg.all_sdfgs_recursive():
         for state in nested.states():
             skipped.extend(order_state(state))

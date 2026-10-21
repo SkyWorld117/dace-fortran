@@ -15,25 +15,28 @@ STATUS: the outer-SDFG-builds gate below PASSES (marshal v2 landed: ``t_patch``'
 ``t_tangent_vectors``, now expands to one SoA leaf per record field). Remaining: wire the
 inner velocity ``.so`` + the full deep-copy-all differential run.
 """
+
 import re
-import shutil
 from pathlib import Path
 
 import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings.bind_c_shim import emit_bind_c_shim, scalar_pointer_members
 from dace_fortran.bindings.fortran_interface import build_auto_interface
 from dace_fortran.build import make_builder
-from dace_fortran.external import Arg, ExternalCall, apply_external_functions, clear_external_registry, keep_external
-from dace_fortran.flang_codebase import find_openmpi_include
+from dace_fortran.external import (
+    Arg,
+    ArgKind,
+    CAbi,
+    ExternalCall,
+    Intent,
+    apply_external_functions,
+    clear_external_registry,
+    keep_external,
+)
+from tests._util import build_sdfg
 
-pytestmark = [
-    pytest.mark.long,
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-    pytest.mark.skipif(find_openmpi_include() is None, reason="OpenMPI headers not found"),
-]
+pytestmark = pytest.mark.long
 
 _HERE = Path(__file__).resolve().parent
 _TU = _HERE / "solve_nonhydro_inlined_single_tu.f90"
@@ -44,24 +47,46 @@ _VELOCITY_ENTRY = "mo_velocity_advection::velocity_tendencies"
 # five derived types cross per-member SoA (matches the inner bind_c_shim), then three rank-3
 # arrays + scalars; same shape as scripts/build_icon_dace_libs.py's dycore wrapper.
 _VELOCITY_CALLBACK_ARGS = tuple(
-    [Arg(kind="aos", intent="inout", c_abi="per_member_soa")]  # p_prog
-    + [Arg(kind="aos", intent="in", c_abi="per_member_soa")]  # p_patch
-    + [Arg(kind="aos", intent="in", c_abi="per_member_soa")]  # p_int
-    + [Arg(kind="aos", intent="inout", c_abi="per_member_soa")]  # p_metrics
-    + [Arg(kind="aos", intent="inout", c_abi="per_member_soa")]  # p_diag
-    + [Arg(kind="array", dtype="float64", intent="inout")] * 3  # z_w_concorr_me / z_kin_hor_e / z_vt_ie
-    + [Arg(kind="scalar", dtype="int32", intent="in")] * 2  # ntnd / istep
-    + [Arg(kind="scalar", dtype="bool", intent="in")]  # lvn_only
-    + [Arg(kind="scalar", dtype="float64", intent="in")] * 2  # dtime / dt_linintp_ubc
-    + [Arg(kind="scalar", dtype="bool", intent="in")])  # ldeepatmo
+    [Arg(kind=ArgKind.AOS, intent=Intent.INOUT, c_abi=CAbi.PER_MEMBER_SOA)]  # p_prog
+    + [Arg(kind=ArgKind.AOS, intent=Intent.IN, c_abi=CAbi.PER_MEMBER_SOA)]  # p_patch
+    + [Arg(kind=ArgKind.AOS, intent=Intent.IN, c_abi=CAbi.PER_MEMBER_SOA)]  # p_int
+    + [Arg(kind=ArgKind.AOS, intent=Intent.INOUT, c_abi=CAbi.PER_MEMBER_SOA)]  # p_metrics
+    + [Arg(kind=ArgKind.AOS, intent=Intent.INOUT, c_abi=CAbi.PER_MEMBER_SOA)]  # p_diag
+    + [Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT)] * 3  # z_w_concorr_me / z_kin_hor_e / z_vt_ie
+    + [Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN)] * 2  # ntnd / istep
+    + [Arg(kind=ArgKind.SCALAR, dtype="bool", intent=Intent.IN)]  # lvn_only
+    + [Arg(kind=ArgKind.SCALAR, dtype="float64", intent=Intent.IN)] * 2  # dtime / dt_linintp_ubc
+    + [Arg(kind=ArgKind.SCALAR, dtype="bool", intent=Intent.IN)]
+)  # ldeepatmo
 
 # halo/sync/diagnostics dropped so no MPI survives and velocity is the only external;
 # same set as the atmo "external" harness config plus inlined-mode side effects.
 _DO_NOT_EMIT = [
-    "sync_patch_array", "sync_patch_array_mult", "exchange_data", "p_barrier", "p_max", "p_min", "p_sum", "global_max",
-    "global_min", "global_sum", "setup_comm_pattern", "finish", "message", "message_text", "warning", "print_status",
-    "print_value", "init_logger", "dbg_print", "work_mpi_barrier", "timer_start", "timer_stop", "new_timer",
-    "delete_timer", "check_patch_array_3d_dp"
+    "sync_patch_array",
+    "sync_patch_array_mult",
+    "exchange_data",
+    "p_barrier",
+    "p_max",
+    "p_min",
+    "p_sum",
+    "global_max",
+    "global_min",
+    "global_sum",
+    "setup_comm_pattern",
+    "finish",
+    "message",
+    "message_text",
+    "warning",
+    "print_status",
+    "print_value",
+    "init_logger",
+    "dbg_print",
+    "work_mpi_barrier",
+    "timer_start",
+    "timer_stop",
+    "new_timer",
+    "delete_timer",
+    "check_patch_array_3d_dp",
 ]
 
 
@@ -86,8 +111,10 @@ def test_solve_nh_velocity_callback_outer_sdfg_builds(tmp_path: Path):
         sdfg.validate()
         # velocity callback must emit as an external library node, not inlined/dropped
         from dace.sdfg import nodes as dnodes
+
         ext = [
-            n for n, _ in sdfg.all_nodes_recursive()
+            n
+            for n, _ in sdfg.all_nodes_recursive()
             if isinstance(n, dnodes.LibraryNode) and "velocity" in (n.label or "").lower()
         ]
         assert ext, "outer SDFG built but emitted no external velocity_tendencies call"
@@ -109,14 +136,13 @@ def test_callback_abi_aligns_slot_for_slot_with_inner_shim(tmp_path: Path):
       ``c_f_pointer`` dereferences the integer as an address.
     """
     clear_external_registry()
-    inner_builder = build_sdfg(_VELOCITY_TU.read_text(),
-                               tmp_path / "vel_sdfg",
-                               name="velocity_tendencies",
-                               entry=_VELOCITY_ENTRY)
+    inner_builder = build_sdfg(
+        _VELOCITY_TU.read_text(), tmp_path / "vel_sdfg", name="velocity_tendencies", entry=_VELOCITY_ENTRY
+    )
     inner_builder.build()
     iface = build_auto_interface(inner_builder._fortran_interface_raw, "velocity_tendencies")
     shim = emit_bind_c_shim(iface, str(tmp_path / "vel_c.f90")).read_text()
-    header = re.search(r"subroutine\s+velocity_tendencies_c\s*\(([^)]*)\)", shim, re.S)
+    header = re.search(r"subroutine\s+velocity_tendencies_c\s*\(([^)]*)\)", shim, re.DOTALL)
     inner_slots = [a.strip() for a in header.group(1).replace("&", " ").split(",") if a.strip()]
     ptr_members = scalar_pointer_members(iface)
 
@@ -142,15 +168,27 @@ def test_callback_abi_aligns_slot_for_slot_with_inner_shim(tmp_path: Path):
     # here is a dropped ``_lb`` slot on a deferred-shape member (count too low)
     # or a spurious lb on a value-record companion (count too high).
     assert len(outer_args) == len(inner_slots), (
-        f"velocity callback ABI slot-count desync: inner shim {len(inner_slots)} vs "
-        f"outer marshal {len(outer_args)}")
+        f"velocity callback ABI slot-count desync: inner shim {len(inner_slots)} vs outer marshal {len(outer_args)}"
+    )
 
     # TYPE: each grid-dim scalar member the shim takes as a pointer marshals as a
     # materialised ``&_pv_<sym>`` -- the member slot, distinct from that same
     # symbol's legitimate by-value ``(int)(<sym>)`` use as ANOTHER array's extent.
-    for member in ("p_patch_id", "p_patch_n_childdom", "p_patch_nblks_c", "p_patch_nblks_e", "p_patch_nblks_v",
-                   "p_patch_nlev", "p_patch_nlevp1"):
+    for member in (
+        "p_patch_id",
+        "p_patch_n_childdom",
+        "p_patch_nblks_c",
+        "p_patch_nblks_e",
+        "p_patch_nblks_v",
+        "p_patch_nlev",
+        "p_patch_nlevp1",
+    ):
         assert member in ptr_members, f"{member} should be a callee pointer member"
         assert f"&_pv_{member}" in outer_args, (
             f"grid-dim member {member} must marshal as a materialised pointer (&_pv_{member}); the "
-            f"inner shim declares it type(c_ptr), value and dereferences via c_f_pointer")
+            f"inner shim declares it type(c_ptr), value and dereferences via c_f_pointer"
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

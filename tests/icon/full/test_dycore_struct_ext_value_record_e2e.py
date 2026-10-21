@@ -6,7 +6,7 @@ This test RUNS both paths (not just checks ABI order) and verifies the fields ro
 mis-scattered SoA leaf or off-by-one stride changes the numerical output and trips here.
 
 Inner SDFG (inner_vrec) reads the value-record fields, built bind_c_shim=True (per-field SoA C ABI).
-Outer SDFG (outer_vrec) scales around a call to inner_vrec as a keep_external(c_abi='per_member_soa')
+Outer SDFG (outer_vrec) scales around a call to inner_vrec as a keep_external(c_abi=PER_MEMBER_SOA)
 so a dropped/miswired external changes the result. Reference is gfortran-compiled untransformed kernels
 + a hand bind(c) driver sharing the exact same C ABI, scattering/gathering SoA v1/v2 into AoS pnc(i)%v1/%v2.
 
@@ -14,23 +14,17 @@ so a dropped/miswired external changes the result. Reference is gfortran-compile
 reference so arithmetic order matches and the comparison (assert_array_equal) is genuinely bit-exact,
 not tolerance-based.
 """
+
 import ctypes
-import shutil
 from pathlib import Path
 
-import numpy as np
-import pytest
-
 import dace
-from _util import build_sdfg, gfortran_compile_so, have_flang
+import numpy as np
+
 from dace_fortran.bindings import FlattenPlan, build_fortran_library
 from dace_fortran.bindings.fortran_interface import build_auto_interface
-from dace_fortran.external import Arg, clear_external_registry, keep_external
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from dace_fortran.external import Arg, ArgKind, CAbi, Intent, clear_external_registry, keep_external
+from tests._util import build_sdfg, gfortran_compile_so
 
 # matches the reference's arithmetic order across all three build layers: DaCe's default -O3
 # -ffast-math would contract a*b+c into an FMA (~1 ULP drift), breaking the bit-exact comparison.
@@ -138,14 +132,16 @@ def _build_wrap(tmp_path: Path, tag: str, src: str, entry: str):
     plan = FlattenPlan.from_dict(sdfg._flatten_plan_raw or {})
     types_f90 = d / "lib_types.f90"
     types_f90.write_text(_TYPES_SRC)
-    return build_fortran_library(sdfg,
-                                 iface=iface,
-                                 plan=plan,
-                                 out_dir=str(d / "lib"),
-                                 name=f"{entry}_wrap",
-                                 bind_c_shim=True,
-                                 prelude_sources=[types_f90],
-                                 flags=_O0_FFLAGS)
+    return build_fortran_library(
+        sdfg,
+        iface=iface,
+        plan=plan,
+        out_dir=str(d / "lib"),
+        name=f"{entry}_wrap",
+        bind_c_shim=True,
+        prelude_sources=[types_f90],
+        flags=_O0_FFLAGS,
+    )
 
 
 def test_dycore_struct_ext_value_record_array_e2e(tmp_path: Path):
@@ -164,8 +160,8 @@ def test_dycore_struct_ext_value_record_array_e2e(tmp_path: Path):
         keep_external(
             "inner_vrec",
             c_name="inner_vrec_c",
-            args=(Arg(kind="aos", intent="inout", c_abi="per_member_soa"), ),
-            libraries=(str(inner_lib.so_path), ),
+            args=(Arg(kind=ArgKind.AOS, intent=Intent.INOUT, c_abi=CAbi.PER_MEMBER_SOA),),
+            libraries=(str(inner_lib.so_path),),
             dynamic_extents_abi=True,
         )
         # ---- 3. Outer dycore kernel -> bind_c_shim .so (dispatches to inner) ----
@@ -184,12 +180,14 @@ def test_dycore_struct_ext_value_record_array_e2e(tmp_path: Path):
     (ref_dir / "outer_vrec.f90").write_text(_OUTER_SRC)
     (ref_dir / "ref_driver.f90").write_text(_REF_DRIVER_SRC)
     ref_so = ref_dir / "libouter_vrec_ref.so"
-    gfortran_compile_so(ref_so,
-                        ref_dir / "m_vrec.f90",
-                        ref_dir / "inner_vrec.f90",
-                        ref_dir / "outer_vrec.f90",
-                        ref_dir / "ref_driver.f90",
-                        mod_dir=ref_dir)
+    gfortran_compile_so(
+        ref_so,
+        ref_dir / "m_vrec.f90",
+        ref_dir / "inner_vrec.f90",
+        ref_dir / "outer_vrec.f90",
+        ref_dir / "ref_driver.f90",
+        mod_dir=ref_dir,
+    )
     ref_lib = ctypes.CDLL(str(ref_so))
 
     # ---- 5. Drive both through the shared shim C ABI + compare bit-exact ----
@@ -204,7 +202,13 @@ def test_dycore_struct_ext_value_record_array_e2e(tmp_path: Path):
     # ABI: out_lb0, out_d0, out_p, v1_d0, v1_p, v2_d0, v2_p -- out (plain allocatable) carries a
     # lower bound ahead of its extent; the per-field value-record leaves carry only an extent.
     argtypes = [
-        ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
     ]
     for so in (sdfg_so, ref_lib):
         so.outer_vrec_c.restype = None
@@ -219,3 +223,9 @@ def test_dycore_struct_ext_value_record_array_e2e(tmp_path: Path):
     np.testing.assert_array_equal(out_sdfg, out_ref)
     np.testing.assert_array_equal(v1_sdfg, v1_ref)
     np.testing.assert_array_equal(v2_sdfg, v2_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

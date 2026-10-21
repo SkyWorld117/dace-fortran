@@ -5,13 +5,16 @@
 Stdlib-only (no dace imports) -- fparser inliner needs this without pulling in dace_fortran.external.
 Invariant: do_not_emit is a subset of don't-inline; dont_inline_names() is the single source of truth.
 """
+
+from __future__ import annotations
+
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional, Set
 
 __all__ = ["ExternalFunction", "dont_inline_names", "validate"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExternalFunction:
     """A procedure that is NOT inlined and IS emitted as an external call.
 
@@ -20,10 +23,10 @@ class ExternalFunction:
     """
 
     name: str
-    c_function: Optional[str] = None
-    library: Optional[str] = None
+    c_function: str | None = None
+    library: str | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.name or not self.name.strip():
             raise ValueError("ExternalFunction.name must be a non-empty procedure name")
 
@@ -33,7 +36,7 @@ class ExternalFunction:
         return self.c_function or self.name
 
 
-def dont_inline_names(external_functions: Iterable[ExternalFunction] = (), do_not_emit: Iterable[str] = ()) -> Set[str]:
+def dont_inline_names(external_functions: Iterable[ExternalFunction] = (), do_not_emit: Iterable[str] = ()) -> set[str]:
     """Lower-cased union of names that must NOT be inlined: emitted external-function names plus do_not_emit.
 
     Single set the inliner consumes; lower-cased to match its case-insensitive Fortran matching.
@@ -52,5 +55,6 @@ def validate(external_functions: Iterable[ExternalFunction] = (), do_not_emit: I
     ignore = {n.lower() for n in do_not_emit}
     both = sorted(set(emit_names) & ignore)
     if both:
-        raise ValueError(f"name(s) in both external_functions and do_not_emit "
-                         f"(emit and ignore are mutually exclusive): {both}")
+        raise ValueError(
+            f"name(s) in both external_functions and do_not_emit (emit and ignore are mutually exclusive): {both}"
+        )

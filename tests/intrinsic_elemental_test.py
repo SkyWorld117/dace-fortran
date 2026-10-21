@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/intrinsic_elemental_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_elemental_exp(tmp_path):
@@ -16,7 +13,7 @@ subroutine main(arg1, arg2, res1)
   res1 = exp(arg1)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -28,7 +25,7 @@ end subroutine main
     sdfg(arg1=arg1, res1=res)
 
     py_res = np.exp(arg1)
-    for f_res, p_res in zip(res, py_res):
+    for f_res, p_res in zip(res, py_res, strict=False):
         assert abs(f_res - p_res) < 10**-9
 
 
@@ -40,7 +37,7 @@ subroutine main(arg1, arg2, res1)
   res1 = exp(arg1(:))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -52,7 +49,7 @@ end subroutine main
     sdfg(arg1=arg1, res1=res)
 
     py_res = np.exp(arg1)
-    for f_res, p_res in zip(res, py_res):
+    for f_res, p_res in zip(res, py_res, strict=False):
         assert abs(f_res - p_res) < 10**-9
 
 
@@ -64,7 +61,7 @@ subroutine main(arg1, arg2, res1)
   res1(2:4) = exp(arg1(2:4))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -78,7 +75,7 @@ end subroutine main
     assert res[0] == 0
     assert res[4] == 0
     py_res = np.exp(arg1[1:4])
-    for f_res, p_res in zip(res[1:4], py_res):
+    for f_res, p_res in zip(res[1:4], py_res, strict=False):
         assert abs(f_res - p_res) < 10**-9
 
 
@@ -112,7 +109,7 @@ MODULE test_elemental
 END MODULE
 
 """
-    sdfg = build_sdfg(src, tmp_path, name='test_func', entry='test_func').build()
+    sdfg = build_sdfg(src, tmp_path, name="test_func", entry="test_func").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -126,7 +123,7 @@ END MODULE
     assert res[0] == 0
     assert res[4] == 0
     py_res = np.exp(arg1[1:4])
-    for f_res, p_res in zip(res[1:4], py_res):
+    for f_res, p_res in zip(res[1:4], py_res, strict=False):
         assert abs(f_res - p_res) < 10**-9
 
 
@@ -138,7 +135,7 @@ subroutine main(arg1, arg2, res1)
   res1(2:4) = 1.0 - exp(arg1(2:4))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -152,7 +149,7 @@ end subroutine main
     assert res[0] == 0
     assert res[4] == 0
     py_res = 1.0 - np.exp(arg1[1:4])
-    for f_res, p_res in zip(res[1:4], py_res):
+    for f_res, p_res in zip(res[1:4], py_res, strict=False):
         assert abs(f_res - p_res) < 10**-9
 
 
@@ -164,7 +161,7 @@ subroutine main(arg1, arg2, res1)
   res1(2:4) = arg1(2:4) - exp(arg1(2:4))
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
     arg1 = np.full([size], 42, order="F", dtype=np.float64)
@@ -178,7 +175,7 @@ end subroutine main
     assert res[0] == 0
     assert res[4] == 0
     py_res = arg1[1:4] - np.exp(arg1[1:4])
-    for f_res, p_res in zip(res[1:4], py_res):
+    for f_res, p_res in zip(res[1:4], py_res, strict=False):
         assert abs(f_res - p_res) < 10**-9
 
 
@@ -195,7 +192,7 @@ subroutine main(ng_var_114, od_var_115, trans_dir_dir_var_119)
   trans_dir_dir_var_119 = MAX(- MAX(od_var_115 * (1.0D0 / mu0), 0.0D0), - 1000.0D0)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 5
 
@@ -210,3 +207,9 @@ end subroutine main
     sdfg(ng_var_114=size, od_var_115=arg_in, trans_dir_dir_var_119=arg_out)
 
     assert np.allclose(arg_out, np.maximum(-np.maximum(arg_in * 1.0 / mu0, 0.0), -1000.0))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

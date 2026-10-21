@@ -8,13 +8,12 @@ scatter y(ymap(i))+=x(i); double y(ymap(i))+=x(xmap(i)).
 
 Index maps are distinct-target permutations (QE's uniformSample shape) so scatter order can't affect
 the result; PRNG matches the SC26 artifacts (Xor64Rng/splitmix64, see _prng.xor64_uniform01)."""
+
 import numpy as np
 import pytest
 
-from _prng import complex_stream
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._prng import complex_stream
+from tests._util import build_sdfg
 
 # (kind, indirection) -> Fortran kernel body. n=iteration count; ymap/xmap are 1-based index maps;
 # AoS uses complex(8), SoA uses paired real(8) re/im arrays.
@@ -123,3 +122,7 @@ def test_zaxpy_soa(tmp_path, indir):
     sdfg(n=np.int32(_N), ymap=ymap, xmap=xmap, xr=xr, xi=xi, yr=yr, yi=yi)
     np.testing.assert_allclose(yr, ref.real, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(yi, ref.imag, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

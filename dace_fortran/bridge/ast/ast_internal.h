@@ -42,6 +42,13 @@ ASTNode buildSelectCaseChain(fir::SelectCaseOp sel);
 
 std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign);
 
+/// ``target(...) = expr`` as a nest of ``loop`` nodes around one ``assign``: Fortran evaluates the whole right-hand
+/// side before assigning, so when the expression reads its target elsewhere than at the element being written
+/// (``v(2:3) = v(1:2)``, ``v = v(2)``) an in-place loop reads elements it already overwrote. Returns the nest
+/// evaluated into a fresh transient first and then assigned from it (declare + two nests over the same iteration
+/// space), or the nest unchanged when every read of the target is at the element written.
+std::vector<ASTNode> evaluateBeforeAssigning(ASTNode nest, mlir::Type elementType);
+
 // collectReadAccesses/exprDtypeString/exprResultShape/lowerIsPresent/resolveExtent/resolveIndex declared in
 // ast_helpers.h (included above).
 

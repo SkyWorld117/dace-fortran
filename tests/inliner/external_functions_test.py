@@ -3,6 +3,7 @@
 (:mod:`dace_fortran.external_functions`) -- the pure-stdlib declaration the
 inliner and the bridge share.  No dace / fparser dependency, so these run
 anywhere."""
+
 import pytest
 
 from dace_fortran.external_functions import ExternalFunction, dont_inline_names, validate
@@ -59,3 +60,7 @@ def test_validate_rejects_duplicate_emit_name():
 def test_validate_rejects_name_in_both_lists():
     with pytest.raises(ValueError, match="both"):
         validate([ExternalFunction("sync_patch_array")], ["Sync_Patch_Array"])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

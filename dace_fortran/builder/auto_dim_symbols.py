@@ -4,58 +4,82 @@
 
 Bindings-emitted callers always pass correct values; direct ``sdfg(...)``
 calls (test suite) need ``<arr>_d<i>``/``offset_<arr>_d<i>`` filled in -- from
-the passed array's shape when available, else a don't-care default.  SDFG
+the passed array's shape; an extent no argument supplies raises when the SDFG accesses that array (never silently
+defaulted).  SDFG
 signature itself is unchanged.
 """
+
+from __future__ import annotations
+
 import re
+from typing import Any, Protocol, runtime_checkable
 
 import dace
 
+
+@runtime_checkable
+class HasShape(Protocol):
+    """Any array-like call argument (numpy, cupy, torch, ...)."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+
 #: ``<arr>_d<i>`` / ``offset_<arr>_d<i>`` synthetic-extent symbol name; greedy
 #: ``.+`` matches the rightmost ``_d<i>`` since an array name may itself contain ``_d``.
-_DIM_SYMBOL_RE = re.compile(r'^(?P<off>offset_)?(?P<arr>.+)_d(?P<idx>\d+)$')
+_DIM_SYMBOL_RE = re.compile(r"^(?P<off>offset_)?(?P<arr>.+)_d(?P<idx>\d+)$")
 
 
-class _AutoDimSDFG(dace.SDFG):
+class AutoDimSDFG(dace.SDFG):
     """``SDFG`` that fills missing synthetic Fortran extent symbols from
-    the passed array arguments (or a don't-care default) before the
-    real call."""
+    the passed array arguments before the real call.  An extent that no argument supplies raises when the
+    array is accessed by the SDFG (its size would be observed); for an array no state touches it is irrelevant.
 
-    def __call__(self, *args, **kwargs):
+    The annotated attributes are the sidecars ``SDFGBuilder.build`` stashes for the binding emitter."""
+
+    _fortran_offset_values: dict[str, int]
+    _fortran_offset_floors: dict[str, int]
+    _fortran_interface_raw: Any
+    _flatten_plan_raw: Any
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         for sym in (str(s) for s in self.free_symbols):
             if sym in kwargs:
                 continue
             m = _DIM_SYMBOL_RE.match(sym)
             if m is None:
                 continue
-            is_offset = m.group('off') is not None
-            actual = kwargs.get(m.group('arr'))
-            shape = getattr(actual, 'shape', None)
-            idx = int(m.group('idx'))
+            is_offset = m.group("off") is not None
+            actual = kwargs.get(m.group("arr"))
+            shape = actual.shape if isinstance(actual, HasShape) else None
+            idx = int(m.group("idx"))
             if not is_offset and shape is not None and idx < len(shape):
                 kwargs[sym] = int(shape[idx])  # always the correct extent
             elif is_offset:
                 # Defaults to Fortran's 1-based lower bound (access lowers to
-                # ``arr[idx - offset]``); non-default bounds (e.g. ICON's
-                # ``end_block(min_rl:)``) are passed explicitly by the bindings
-                # emitter via ``lbound``.  Previously defaulted to 0 -- an
-                # off-by-one read of every such array.
-                kwargs[sym] = 1
+                # ``arr[idx - offset]``), or to the smallest sub-1 literal subscript the code uses on the array
+                # (its floor: ``end_block(-10)`` needs a bound at or below -10); the real bound of a
+                # caller-allocated array is passed by the bindings emitter via ``lbound``.
+                kwargs[sym] = getattr(self, "_fortran_offset_floors", {}).get(sym, 1)
             else:
-                kwargs[sym] = 1  # unused extent: don't care
+                arr = m.group("arr")
+                if arr in self._touched_arrays():
+                    raise ValueError(
+                        f"extent symbol {sym!r} is unbound: no argument {arr!r} supplies its extent "
+                        f"(pass {sym}=<extent> explicitly); refusing to default it"
+                    )
+                kwargs[sym] = 1  # extent of an array no state reads or writes: its size is never observed
         return super().__call__(*args, **kwargs)
 
-    def to_json(self, *args, **kwargs):
+    def _touched_arrays(self) -> set[str]:
+        """Names of the arrays some state of this SDFG reads or writes through an access node."""
+        return {node.data for state in self.all_states() for node in state.data_nodes()}
+
+    def to_json(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Serialise as plain ``SDFG`` so strict-type ``from_json`` (e.g.
         ``distributed_compile`` reloading a gzipped ``program.sdfgz`` per rank)
         accepts the dump; the auto-fill ``__call__`` wrapper isn't persisted
         state, so nothing is lost."""
         d = super().to_json(*args, **kwargs)
-        d['type'] = dace.SDFG.__name__
+        d["type"] = dace.SDFG.__name__
         return d
-
-
-def install_auto_dim_symbols(sdfg: dace.SDFG) -> dace.SDFG:
-    """Rebind ``sdfg`` so direct calls auto-resolve synthetic extents."""
-    sdfg.__class__ = _AutoDimSDFG
-    return sdfg

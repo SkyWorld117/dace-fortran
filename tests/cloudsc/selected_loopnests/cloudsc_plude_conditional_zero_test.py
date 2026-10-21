@@ -4,12 +4,9 @@ self-update, 3-conjunct IF reading the just-written value, ELSE branch
 unconditionally zeroes.  E2e against an f2py-compiled reference."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-from _helpers import f2py
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._helpers import f2py
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_cloudsc_plude_conditional_zero(tmp_path):
@@ -61,29 +58,25 @@ ENDDO
 END SUBROUTINE driver
 END MODULE kernel_mod
 """
-    ref = f2py(src, tmp_path / 'ref', 'cloudsc_plude_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", "cloudsc_plude_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='cloudsc_plude', entry='driver').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="cloudsc_plude", entry="driver").build()
 
     klon, klev, nblocks = 1, 137, 4
     ncldtop = 15
     rng = np.random.default_rng(42)
     plude_in = np.asfortranarray(rng.random((klon, klev, nblocks)))
     plu = np.asfortranarray(rng.random((klon, klev, nblocks)))
-    ldcum = np.asfortranarray(rng.integers(0, 2, (klon, nblocks)).astype(np.bool_))
-    zgdp = np.asfortranarray(rng.random((klon, )))
+    ldcum = np.asfortranarray(rng.integers(0, 2, (klon, nblocks)).astype(np.uint32))
+    zgdp = np.asfortranarray(rng.random((klon,)))
     ptsphy_val = rng.random()
     rlmin_val = rng.random()
 
     plude_ref = np.asfortranarray(plude_in.copy())
-    ref.kernel_mod.driver(plude=plude_ref,
-                          plu=plu,
-                          ldcum=ldcum,
-                          zgdp=zgdp,
-                          ptsphy=ptsphy_val,
-                          rlmin=rlmin_val,
-                          ncldtop=ncldtop)
+    ref.kernel_mod.driver(
+        plude=plude_ref, plu=plu, ldcum=ldcum, zgdp=zgdp, ptsphy=ptsphy_val, rlmin=rlmin_val, ncldtop=ncldtop
+    )
 
     plude = np.asfortranarray(plude_in.copy())
     from dace.data import Scalar
@@ -91,14 +84,22 @@ END MODULE kernel_mod
     def _route(name, val, dtype):
         return val if isinstance(sdfg.arglist().get(name), Scalar) else np.array([val], dtype=dtype)
 
-    sdfg(plude=plude,
-         plu=plu,
-         ldcum=ldcum,
-         zgdp=zgdp,
-         ptsphy=_route('ptsphy', ptsphy_val, np.float64),
-         rlmin=_route('rlmin', rlmin_val, np.float64),
-         klon=klon,
-         klev=klev,
-         nblocks=nblocks,
-         ncldtop=ncldtop)
+    sdfg(
+        plude=plude,
+        plu=plu,
+        ldcum=ldcum,
+        zgdp=zgdp,
+        ptsphy=_route("ptsphy", ptsphy_val, np.float64),
+        rlmin=_route("rlmin", rlmin_val, np.float64),
+        klon=klon,
+        klev=klev,
+        nblocks=nblocks,
+        ncldtop=ncldtop,
+    )
     np.testing.assert_allclose(plude, plude_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

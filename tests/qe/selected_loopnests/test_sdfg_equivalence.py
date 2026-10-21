@@ -11,19 +11,14 @@ kernel compiles through both the bridge and f2py, compared to rtol=1e-12.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 _LOOPNESTS_DIR = Path(__file__).parent
 
 
 def _src(name: str) -> str:
     p = _LOOPNESTS_DIR / f"{name}.f90"
-    if not p.is_file():
-        pytest.skip(f"missing kernel source: {p}")
     return p.read_text()
 
 
@@ -36,7 +31,7 @@ def test_e1_matrix_add(tmp_path: Path):
     src = _src("qe_e1_matrix_add")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
     mod = f2py_compile(src, tmp_path / "ref", "e1_matrix_add_ref")
 
     rng = np.random.default_rng(0)
@@ -60,7 +55,7 @@ def test_e2_conjugate_inplace(tmp_path: Path):
     src = _src("qe_e2_conjugate_inplace")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
     mod = f2py_compile(src, tmp_path / "ref", "e2_conjugate_ref")
 
     rng = np.random.default_rng(1)
@@ -81,13 +76,13 @@ def test_e3_transpose(tmp_path: Path):
     src = _src("qe_e3_transpose")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
     mod = f2py_compile(src, tmp_path / "ref", "e3_transpose_ref")
 
     rng = np.random.default_rng(2)
     n = 24
     a = np.asfortranarray(rng.random((n, n))).astype(np.float64)
-    b_sdfg = np.zeros((n, n), order='F', dtype=np.float64)
+    b_sdfg = np.zeros((n, n), order="F", dtype=np.float64)
     # f2py converts ``b`` (intent(out)) to a return value.
     b_ref = mod.kernel(a)
     sdfg(n=n, a=a, b=b_sdfg)
@@ -103,7 +98,7 @@ def test_e4_zaxpy(tmp_path: Path):
     src = _src("qe_e4_zaxpy")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
     mod = f2py_compile(src, tmp_path / "ref", "e4_zaxpy_ref")
 
     rng = np.random.default_rng(3)
@@ -127,7 +122,7 @@ def test_e5_usxx_scatter(tmp_path: Path):
     src = _src("qe_e5_usxx_scatter")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
     mod = f2py_compile(src, tmp_path / "ref", "e5_usxx_scatter_ref")
 
     rng = np.random.default_rng(4)
@@ -153,7 +148,7 @@ def test_e5_usxx_phase(tmp_path: Path):
     src = _src("qe_e5_usxx_phase")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
     mod = f2py_compile(src, tmp_path / "ref", "e5_usxx_phase_ref")
 
     rng = np.random.default_rng(5)
@@ -166,3 +161,9 @@ def test_e5_usxx_phase(tmp_path: Path):
     eigqts_ref = mod.kernel(xk, xkq, tau)
     sdfg(nat=nat, xk=xk, xkq=xkq, tau=tau, eigqts=eigqts_sdfg)
     np.testing.assert_allclose(eigqts_sdfg, eigqts_ref, rtol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

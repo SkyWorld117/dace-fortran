@@ -5,23 +5,16 @@ the dace-generated F90 binding and the direct flat-ABI SDFG call against a gfort
 reference; FlattenPlan asserted non-empty so a silent unpack regression fails loudly."""
 
 import ctypes
-import shutil
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, gfortran_compile_so, have_flang
 from dace_fortran.bindings import (
     FlattenPlan,
     emit_bindings,
 )
 from dace_fortran.bindings.fortran_interface import build_auto_interface
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from tests._util import build_sdfg, gfortran_compile_so
 
 _NX, _NY, _NZ = 4, 3, 2
 
@@ -160,3 +153,9 @@ def test_e2e_mixed_rank_struct(tmp_path: Path):
     coef_d = np.array([coef], dtype=np.float64)
     sdfg(w_vol=vol_d, w_coef=coef_d)
     np.testing.assert_allclose(vol_d, vol_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

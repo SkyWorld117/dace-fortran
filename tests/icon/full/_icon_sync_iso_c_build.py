@@ -1,10 +1,10 @@
 """Compiles ``icon_sync_iso_c.f90`` into ``libicon_sync_iso_c.so`` against ICON's ``.mod`` files.
 Returns ``None`` if the ICON build is missing; callers fall back to a ``stub=True`` path."""
+
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 _HERE = Path(__file__).resolve().parent
 _WRAPPER_SRC = _HERE / "icon_sync_iso_c.f90"
@@ -14,8 +14,8 @@ def build_icon_sync_iso_c_so(
     icon_build: Path,
     out_dir: Path,
     *,
-    fc: Optional[str] = None,
-) -> Optional[Path]:
+    fc: str | None = None,
+) -> Path | None:
     """Compile and link the wrapper into ``out_dir/libicon_sync_iso_c.so`` against
     ``icon_build``'s ``.mod`` files. ``fc`` defaults to ``$FC``/gfortran; pass an explicit
     compiler to target ICON's GPU build or a non-default toolchain. Returns ``None`` if the
@@ -59,8 +59,8 @@ def build_icon_sync_iso_c_so(
         base_flags = ["-O0", "-fPIC", "-fno-fast-math", "-ffp-contract=off", "-ffree-line-length-none"]
     include_flags = [f"-I{d}" for d in mod_dirs]
     subprocess.check_call(
-        [fc, *base_flags, *include_flags, "-c",
-         str(_WRAPPER_SRC), "-o", str(obj_path)], cwd=str(out_dir))
+        [fc, *base_flags, *include_flags, "-c", str(_WRAPPER_SRC), "-o", str(obj_path)], cwd=str(out_dir)
+    )
     # Link (-shared is supported by all three).
     link_pic = "-fpic" if "nvfortran" in fc_basename else "-fPIC"
     subprocess.check_call([fc, "-shared", link_pic, str(obj_path), "-o", str(so_path)], cwd=str(out_dir))

@@ -16,29 +16,23 @@ Architecture:
     ABI; ``ctypes`` invokes both identically and asserts bit-for-bit equality.
 
 Scaling to ``velocity_tendencies``: register each derived-type arg with
-``Arg(kind="aos", c_abi="per_member_soa")`` so :func:`emit_call` forwards per-member
+``Arg(kind=ArgKind.AOS, c_abi=CAbi.PER_MEMBER_SOA)`` so :func:`emit_call` forwards per-member
 pointers verbatim -- the inner's ``bind_c_shim`` already receives per-member slots, so
 the two sides agree by construction without an intermediate shim.
 """
+
 import ctypes
-import shutil
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, gfortran_compile_so, have_flang
 from dace_fortran.bindings import (
     OriginalArg,
     OriginalInterface,
     build_fortran_library,
 )
-from dace_fortran.external import Arg, clear_external_registry, keep_external
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from dace_fortran.external import Arg, ArgKind, Intent, clear_external_registry, keep_external
+from tests._util import build_sdfg, gfortran_compile_so
 
 _INNER_SRC = """
 subroutine inner_axpy(n, a, x, y)
@@ -120,8 +114,8 @@ def test_dycore_outer_calls_inner_via_sibling_sdfg(tmp_path: Path):
         args=(
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
             OriginalArg(name="a", fortran_type="real(c_double)", rank=0, intent="in"),
-            OriginalArg(name="x", fortran_type="real(c_double)", rank=1, shape=("n", ), intent="in"),
-            OriginalArg(name="y", fortran_type="real(c_double)", rank=1, shape=("n", ), intent="inout"),
+            OriginalArg(name="x", fortran_type="real(c_double)", rank=1, shape=("n",), intent="in"),
+            OriginalArg(name="y", fortran_type="real(c_double)", rank=1, shape=("n",), intent="inout"),
         ),
     )
     inner_lib = build_fortran_library(
@@ -139,12 +133,12 @@ def test_dycore_outer_calls_inner_via_sibling_sdfg(tmp_path: Path):
         "inner_axpy",
         c_name="inner_axpy_c",
         args=(
-            Arg(kind="scalar", dtype="int32", intent="in"),
-            Arg(kind="scalar", dtype="float64", intent="in"),
-            Arg(kind="array", dtype="float64", intent="in"),
-            Arg(kind="array", dtype="float64", intent="inout"),
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+            Arg(kind=ArgKind.SCALAR, dtype="float64", intent=Intent.IN),
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.IN),
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
         ),
-        libraries=(str(inner_lib.so_path), ),
+        libraries=(str(inner_lib.so_path),),
     )
     try:
         outer_dir = tmp_path / "outer"
@@ -198,3 +192,9 @@ def test_dycore_outer_calls_inner_via_sibling_sdfg(tmp_path: Path):
     expected = 0.5 * a * x + y_init
     np.testing.assert_allclose(y_ref, expected, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(y_sdfg, y_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

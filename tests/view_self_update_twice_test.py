@@ -9,12 +9,9 @@ an interstate edge). E2e against an f2py-compiled reference.
 """
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-from _helpers import f2py
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._helpers import f2py
+from tests._util import build_sdfg
 
 _DRIVER_PROLOGUE_HEAD = """
 MODULE kernel_mod
@@ -35,10 +32,10 @@ END MODULE kernel_mod
 
 
 def _run(tmp_path, src, name, klon=4, klev=5, nb=3, seed=7):
-    ref = f2py(src, tmp_path / 'ref', f'{name}_ref')
-    sdfg_dir = tmp_path / 'sdfg'
+    ref = f2py(src, tmp_path / "ref", f"{name}_ref")
+    sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name=name, entry='driver').build()
+    sdfg = build_sdfg(src, sdfg_dir, name=name, entry="driver").build()
 
     rng = np.random.default_rng(seed)
     t_in = np.asfortranarray(rng.random((klon, klev, nb)))
@@ -53,7 +50,9 @@ def _run(tmp_path, src, name, klon=4, klev=5, nb=3, seed=7):
 
 def test_fortran_frontend_view_self_update_twice(tmp_path):
     """Plain back-to-back self-updates on a view dummy  --  no IF wrap."""
-    src = _DRIVER_PROLOGUE_HEAD + """
+    src = (
+        _DRIVER_PROLOGUE_HEAD
+        + """
 SUBROUTINE accumulate(x, klon, klev)
 integer :: klon, klev
 double precision x(klon, klev)
@@ -65,14 +64,18 @@ DO j = 1, klev
     ENDDO
 ENDDO
 END SUBROUTINE accumulate
-""" + _DRIVER_PROLOGUE_TAIL
-    _run(tmp_path, src, 'view_self_update_twice')
+"""
+        + _DRIVER_PROLOGUE_TAIL
+    )
+    _run(tmp_path, src, "view_self_update_twice")
 
 
 def test_fortran_frontend_view_self_update_twice_in_if(tmp_path):
     """Same back-to-back self-updates, this time wrapped in an IF
-     --  exactly the cloudsc lines 1364-1385 shape."""
-    src = _DRIVER_PROLOGUE_HEAD + """
+    --  exactly the cloudsc lines 1364-1385 shape."""
+    src = (
+        _DRIVER_PROLOGUE_HEAD
+        + """
 SUBROUTINE accumulate(x, klon, klev)
 integer :: klon, klev
 double precision x(klon, klev)
@@ -86,5 +89,13 @@ DO j = 1, klev
     ENDDO
 ENDDO
 END SUBROUTINE accumulate
-""" + _DRIVER_PROLOGUE_TAIL
-    _run(tmp_path, src, 'view_self_update_twice_if')
+"""
+        + _DRIVER_PROLOGUE_TAIL
+    )
+    _run(tmp_path, src, "view_self_update_twice_if")
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

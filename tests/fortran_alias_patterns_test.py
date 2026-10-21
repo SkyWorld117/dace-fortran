@@ -29,14 +29,8 @@ Pattern catalogue (status as of 2026-06-09):
   N. Vector subscripts arr([1,3,5]) / arr(idx) -- spec forbids LHS alias semantics; IR
      routes through a temporary. No alias.
 """
-from pathlib import Path
 
-import numpy as np
-import pytest
-
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def _try_build(tmp_path, src, name, entry):
@@ -197,8 +191,8 @@ end module m
     sdfg, err = _try_build(tmp_path / "sdfg", src, name="fill", entry="m::fill")
     assert sdfg is None, "expected c_f_pointer-with-shape to be rejected at build"
     assert "unresolved free symbol" in str(err) or "cptr" in str(err), (
-        f"expected an unresolved-symbol rejection mentioning the opaque "
-        f"C pointer, got: {err}")
+        f"expected an unresolved-symbol rejection mentioning the opaque C pointer, got: {err}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -339,3 +333,9 @@ end module m
 """
     sdfg, err = _try_build(tmp_path / "sdfg", src, name="fill", entry="m::fill")
     assert sdfg is not None, f"build failed: {err}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

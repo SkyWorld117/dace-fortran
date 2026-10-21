@@ -7,15 +7,10 @@ PARAMETER constants stay baked in the constant pool (same dtype rule),
 exercised separately by
 ``module_global_vs_constant_test.py::test_parameter_is_baked_constant``.
 """
-import tempfile
-from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module m
@@ -54,3 +49,9 @@ def test_fp64_and_int_scalar_constants_keep_their_types(tmp_path):
     on every platform we target)."""
     assert _arg_dtype(tmp_path, "dscale") == np.float64
     assert _arg_dtype(tmp_path, "icount") == np.int32
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -11,13 +11,8 @@ ALLOC-IN (kernel allocates the component; binding skips copy-in).  Each
 builds the SDFG, generates the binding, links against the module + a driver,
 and compares to a plain-gfortran reference.
 """
+
 from pathlib import Path
-
-import pytest
-
-from _util import have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 # --- READ: out(:) += becxx(1)%k(:, jb), via an inlined callee ---------------
 _SRC_READ = """
@@ -86,9 +81,16 @@ end subroutine run_read_aos_ref
 
 def _compile_so(out_so, *sources, mod_dir, link_so=None):
     import subprocess
+
     cmd = [
-        "gfortran", "-shared", "-fPIC", "-O0", "-fno-fast-math", "-ffp-contract=off", "-ffree-line-length-none",
-        f"-J{mod_dir}"
+        "gfortran",
+        "-shared",
+        "-fPIC",
+        "-O0",
+        "-fno-fast-math",
+        "-ffp-contract=off",
+        "-ffree-line-length-none",
+        f"-J{mod_dir}",
     ]
     cmd += [str(s) for s in sources]
     cmd += ["-o", str(out_so)]
@@ -99,9 +101,9 @@ def _compile_so(out_so, *sources, mod_dir, link_so=None):
 
 def _build_module(src, name, entry, tmp_path):
     """Build the SDFG, emit the Fortran binding, return ``(builder, sdfg, so_path, binding_path)``."""
-    from _util import build_sdfg
-    from dace_fortran.bindings import emit_bindings, FlattenPlan
+    from dace_fortran.bindings import FlattenPlan, emit_bindings
     from dace_fortran.bindings.fortran_interface import build_auto_interface
+    from tests._util import build_sdfg
 
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
@@ -154,12 +156,8 @@ def test_read_aos_module_global_e2e(tmp_path):
     """Module-global AoS component read through an inlined callee: binding packs
     AoS->SoA into ``becxx_k`` and must match the gfortran reference."""
     import ctypes
-    import shutil
 
     import numpy as np
-
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran required")
 
     builder, _sdfg, so_path, binding = _build_module(_SRC_READ, "read_aos", _ENTRY_READ, tmp_path)
 
@@ -180,8 +178,15 @@ def test_read_aos_module_global_e2e(tmp_path):
 
     def _run(fn):
         out = out0.copy(order="F")
-        fn(ctypes.c_int(n), ctypes.c_int(jb), ctypes.c_int(nelem), ctypes.c_int(k0), ctypes.c_int(k1),
-           kvals.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p))
+        fn(
+            ctypes.c_int(n),
+            ctypes.c_int(jb),
+            ctypes.c_int(nelem),
+            ctypes.c_int(k0),
+            ctypes.c_int(k1),
+            kvals.ctypes.data_as(ctypes.c_void_p),
+            out.ctypes.data_as(ctypes.c_void_p),
+        )
         return out
 
     out_sdfg = _run(sdfg_lib.run_read_aos)
@@ -262,12 +267,8 @@ def test_write_aos_module_global_e2e(tmp_path):
     """Module-global AoS component WRITTEN by the kernel: binding adds the SoA->AoS
     copy-OUT loop; host ``becxx(1)%k`` must hold the kernel's result."""
     import ctypes
-    import shutil
 
     import numpy as np
-
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran required")
 
     builder, _sdfg, so_path, binding = _build_module(_SRC_WRITE, "write_aos", _ENTRY_WRITE, tmp_path)
 
@@ -279,8 +280,9 @@ def test_write_aos_module_global_e2e(tmp_path):
     # The generated binding must emit the copy-OUT, not just a deallocate.
     assert "copy-out" in binding.read_text()
 
-    sdfg_lib, ref_lib = _link_pair(_SRC_WRITE, "write_aos", _DRIVER_WRITE, _REF_DRIVER_WRITE, so_path, binding,
-                                   tmp_path)
+    sdfg_lib, ref_lib = _link_pair(
+        _SRC_WRITE, "write_aos", _DRIVER_WRITE, _REF_DRIVER_WRITE, so_path, binding, tmp_path
+    )
 
     n, jb, nelem, k0, k1 = 5, 2, 3, 5, 4
     rng = np.random.default_rng(1)
@@ -288,8 +290,15 @@ def test_write_aos_module_global_e2e(tmp_path):
 
     def _run(fn):
         kout = np.asfortranarray(np.zeros((k0, k1)))
-        fn(ctypes.c_int(n), ctypes.c_int(jb), ctypes.c_int(nelem), ctypes.c_int(k0), ctypes.c_int(k1),
-           src.ctypes.data_as(ctypes.c_void_p), kout.ctypes.data_as(ctypes.c_void_p))
+        fn(
+            ctypes.c_int(n),
+            ctypes.c_int(jb),
+            ctypes.c_int(nelem),
+            ctypes.c_int(k0),
+            ctypes.c_int(k1),
+            src.ctypes.data_as(ctypes.c_void_p),
+            kout.ctypes.data_as(ctypes.c_void_p),
+        )
         return kout
 
     k_sdfg = _run(sdfg_lib.run_write_aos)
@@ -357,12 +366,8 @@ def test_alloc_inside_module_global_e2e(tmp_path):
     """Module-global allocatable the kernel ALLOCATEs itself: binding flags
     ``global_alloc_inside``, skips copy-in, writes the result back on exit."""
     import ctypes
-    import shutil
 
     import numpy as np
-
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran required")
 
     builder, _sdfg, so_path, binding = _build_module(_SRC_ALLOC, "make_g", _ENTRY_ALLOC, tmp_path)
 
@@ -459,31 +464,41 @@ def test_allocated_module_global_presence_e2e(tmp_path):
     """Kernel branches on ``ALLOCATED(gbuf)``: binding sources ``gbuf_allocated`` from
     ``allocated(gbuf__mod)``; an unallocated host drives the ``else`` branch (``r=-1``)."""
     import ctypes
-    import shutil
 
     import numpy as np
 
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran required")
-
-    builder, _sdfg, so_path, binding = _build_module(_SRC_ALLOC_PRESENT, "sum_if_present", _ENTRY_ALLOC_PRESENT,
-                                                     tmp_path)
+    _builder, _sdfg, so_path, binding = _build_module(
+        _SRC_ALLOC_PRESENT, "sum_if_present", _ENTRY_ALLOC_PRESENT, tmp_path
+    )
 
     # The presence symbol is sourced from the REAL host, not left as a TODO.
     text = binding.read_text()
-    assert "gbuf_allocated = int(merge(1, 0, allocated(" in text, \
+    assert "gbuf_allocated = int(merge(1, 0, allocated(" in text, (
         f"presence symbol not sourced from host allocated():\n{text}"
+    )
 
-    sdfg_lib, ref_lib = _link_pair(_SRC_ALLOC_PRESENT, "sum_if_present", _DRIVER_ALLOC_PRESENT,
-                                   _REF_DRIVER_ALLOC_PRESENT, so_path, binding, tmp_path)
+    sdfg_lib, ref_lib = _link_pair(
+        _SRC_ALLOC_PRESENT,
+        "sum_if_present",
+        _DRIVER_ALLOC_PRESENT,
+        _REF_DRIVER_ALLOC_PRESENT,
+        so_path,
+        binding,
+        tmp_path,
+    )
 
     n, nelem = 3, 3
     vals = np.asfortranarray(np.array([1.0, 2.0, 4.0]))
 
     def _run(fn, present):
         r = np.asfortranarray(np.array([0.0]))
-        fn(ctypes.c_int(n), ctypes.c_int(present), ctypes.c_int(nelem), vals.ctypes.data_as(ctypes.c_void_p),
-           r.ctypes.data_as(ctypes.c_void_p))
+        fn(
+            ctypes.c_int(n),
+            ctypes.c_int(present),
+            ctypes.c_int(nelem),
+            vals.ctypes.data_as(ctypes.c_void_p),
+            r.ctypes.data_as(ctypes.c_void_p),
+        )
         return r[0]
 
     for present, expect in ((1, 7.0), (0, -1.0)):  # present -> sum=7; absent -> -1
@@ -562,29 +577,34 @@ def test_associated_pointer_module_global_presence_e2e(tmp_path):
     """Kernel branches on ``ASSOCIATED(gptr)``: binding sources ``gptr_allocated`` from
     ``associated(gptr__mod)``; an unassociated host drives the ``else`` branch (``r=-2``)."""
     import ctypes
-    import shutil
 
     import numpy as np
 
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran required")
-
-    builder, _sdfg, so_path, binding = _build_module(_SRC_ASSOC_PRESENT, "sum_if_assoc", _ENTRY_ASSOC_PRESENT, tmp_path)
+    _builder, _sdfg, so_path, binding = _build_module(
+        _SRC_ASSOC_PRESENT, "sum_if_assoc", _ENTRY_ASSOC_PRESENT, tmp_path
+    )
 
     text = binding.read_text()
-    assert "gptr_allocated = int(merge(1, 0, associated(" in text, \
+    assert "gptr_allocated = int(merge(1, 0, associated(" in text, (
         f"presence symbol not sourced from host associated():\n{text}"
+    )
 
-    sdfg_lib, ref_lib = _link_pair(_SRC_ASSOC_PRESENT, "sum_if_assoc", _DRIVER_ASSOC_PRESENT, _REF_DRIVER_ASSOC_PRESENT,
-                                   so_path, binding, tmp_path)
+    sdfg_lib, ref_lib = _link_pair(
+        _SRC_ASSOC_PRESENT, "sum_if_assoc", _DRIVER_ASSOC_PRESENT, _REF_DRIVER_ASSOC_PRESENT, so_path, binding, tmp_path
+    )
 
     n, nelem = 3, 3
     vals = np.asfortranarray(np.array([1.0, 2.0, 4.0]))
 
     def _run(fn, present):
         r = np.asfortranarray(np.array([0.0]))
-        fn(ctypes.c_int(n), ctypes.c_int(present), ctypes.c_int(nelem), vals.ctypes.data_as(ctypes.c_void_p),
-           r.ctypes.data_as(ctypes.c_void_p))
+        fn(
+            ctypes.c_int(n),
+            ctypes.c_int(present),
+            ctypes.c_int(nelem),
+            vals.ctypes.data_as(ctypes.c_void_p),
+            r.ctypes.data_as(ctypes.c_void_p),
+        )
         return r[0]
 
     for present, expect in ((1, 7.0), (0, -2.0)):  # present -> sum=7; absent -> -2
@@ -592,3 +612,9 @@ def test_associated_pointer_module_global_presence_e2e(tmp_path):
         r_sdfg = _run(sdfg_lib.run_assoc_present, present)
         assert r_ref == expect, f"reference wrong for present={present}: {r_ref}"
         assert r_sdfg == r_ref, f"SDFG-via-binding != reference for present={present}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

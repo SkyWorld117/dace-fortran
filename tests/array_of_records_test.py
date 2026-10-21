@@ -4,12 +4,10 @@
 L1 static scalar member, L2 static array member, L3 pointer scalar, L4 pointer + allocatable inner
 (QE's ``tabxx(ia) % box(ir)`` shape).
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # L1: static AoR, scalar member
 
@@ -32,8 +30,8 @@ end module
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()
     assert "arr_x" in sdfg.arrays
-    arr_x = np.array([1.0, 2.0, 4.0], dtype=np.float64, order='F')
-    out = np.zeros((1, ), dtype=np.float64, order='F')
+    arr_x = np.array([1.0, 2.0, 4.0], dtype=np.float64, order="F")
+    out = np.zeros((1,), dtype=np.float64, order="F")
     sdfg(arr_x=arr_x, out=out)
     np.testing.assert_allclose(out[0], arr_x[0] + arr_x[1] + arr_x[2])
 
@@ -60,8 +58,8 @@ end module
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()
     assert "arr_x" in sdfg.arrays
     assert tuple(int(s) for s in sdfg.arrays["arr_x"].shape) == (3, 4)
-    arr_x = np.array([[1, 2, 3, 4], [10, 20, 30, 40], [100, 200, 300, 400]], dtype=np.float64, order='F')
-    out = np.zeros((1, ), dtype=np.float64, order='F')
+    arr_x = np.array([[1, 2, 3, 4], [10, 20, 30, 40], [100, 200, 300, 400]], dtype=np.float64, order="F")
+    out = np.zeros((1,), dtype=np.float64, order="F")
     sdfg(arr_x=arr_x, out=out)
     np.testing.assert_allclose(out[0], arr_x[0, 0] + arr_x[1, 1] + arr_x[2, 2])
 
@@ -90,8 +88,8 @@ end module
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()
     assert "arr_x" in sdfg.arrays
     n = 3
-    arr_x = np.array([[1, 2, 3, 4], [10, 20, 30, 40], [100, 200, 300, 400]], dtype=np.float64, order='F')
-    out = np.zeros((1, ), dtype=np.float64, order='F')
+    arr_x = np.array([[1, 2, 3, 4], [10, 20, 30, 40], [100, 200, 300, 400]], dtype=np.float64, order="F")
+    out = np.zeros((1,), dtype=np.float64, order="F")
     sdfg(arr_x=arr_x, n=np.int32(n), out=out)
     np.testing.assert_allclose(out[0], arr_x[:, 1].sum())
 
@@ -170,3 +168,9 @@ end module
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="driver", entry="m::driver").build()
     assert "arr_box" in sdfg.arrays
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -29,30 +29,29 @@ Usage::
 
 See ``docs/ICON_INTEGRATION.md`` for the surrounding workflow.
 """
+
 import argparse
 import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import dace
 
 _DACE_FORTRAN = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_DACE_FORTRAN / "tests"))
-from _util import build_sdfg, have_flang
-from icon._halo_modes import _MPI_STUB
-from icon.full._icon_solve_nh_patch import SOLVE_NH_WRAPPER_NAME
-from icon.full.test_dycore_from_icon_source import (
+import dace_fortran
+from dace_fortran.bindings import FlattenPlan, build_fortran_library
+from dace_fortran.bindings.fortran_interface import build_auto_interface
+from dace_fortran.flang_codebase import _DEFINE_RE, _INCLUDE_RE
+from tests._util import build_sdfg, have_flang
+from tests.icon._halo_modes import _MPI_STUB
+from tests.icon.full._icon_solve_nh_patch import SOLVE_NH_WRAPPER_NAME
+from tests.icon.full.test_dycore_from_icon_source import (
     _ICON_DEFINES_FALLBACK,
     _ICON_EXTERNAL_STUBS,
 )
-
-import dace_fortran
-from dace_fortran.bindings import build_fortran_library, FlattenPlan
-from dace_fortran.bindings.fortran_interface import build_auto_interface
-from dace_fortran.flang_codebase import _DEFINE_RE, _INCLUDE_RE
 
 _RELEASE_FFLAGS = (
     "-O3",
@@ -146,10 +145,9 @@ def _icon_compile_args(icon_src: Path, icon_build: Path) -> dict:
         artefact = icon_build / _SOLVE_NH_TARGET
         if artefact.is_file():
             artefact.unlink()
-        out = subprocess.check_output(["make", "-n", _SOLVE_NH_TARGET],
-                                      cwd=str(icon_build),
-                                      stderr=subprocess.STDOUT,
-                                      text=True)
+        out = subprocess.check_output(
+            ["make", "-n", _SOLVE_NH_TARGET], cwd=str(icon_build), stderr=subprocess.STDOUT, text=True
+        )
         for ln in out.splitlines():
             if real_src in ln and (" -c " in ln or ln.lstrip().startswith("mpifort") or "gfortran" in ln):
                 extracted = {
@@ -306,7 +304,7 @@ def _compile_single_tu_objects(sdfg_dir: Path, fflags: Sequence[str]) -> tuple[P
 
     # Only ``mo_mpi`` needs the stub interface for compilation; everything else
     # must resolve to ICON's real module files so the struct layouts match.
-    for mod_name in ("mo_mpi.mod", ):
+    for mod_name in ("mo_mpi.mod",):
         src_mod = obj_dir / mod_name
         dst_mod = mod_dir / mod_name
         if src_mod.is_file():
@@ -333,11 +331,9 @@ def build_solve_nh_sdfg_single_tu(sdfg_dir: Path):
     return sdfg
 
 
-def build_solve_nh_binding(icon_src: Path,
-                           icon_build: Path,
-                           out_dir: Path,
-                           release: bool = False,
-                           single_tu: bool = True):
+def build_solve_nh_binding(
+    icon_src: Path, icon_build: Path, out_dir: Path, release: bool = False, single_tu: bool = True
+):
     """Build ``libsolve_nh.so`` from either the single-TU checkpoint or real source.
 
     The output directory receives the .so, the .mod
@@ -414,19 +410,24 @@ def build_solve_nh_binding(icon_src: Path,
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--icon-src", type=Path, required=True, help="ICON source tree (e.g. tests/icon/full/icon-model).")
-    ap.add_argument("--icon-build",
-                    type=Path,
-                    required=True,
-                    help="Build dir of the ICON CONFIGURATION this lib will be linked into.")
+    ap.add_argument(
+        "--icon-build",
+        type=Path,
+        required=True,
+        help="Build dir of the ICON CONFIGURATION this lib will be linked into.",
+    )
     ap.add_argument("--out-dir", type=Path, required=True, help="Where libsolve_nh.so + .mod files go.")
     ap.add_argument("--release", action="store_true", help="Use -O3 -fno-fast-math -ffp-contract=off instead of -O0.")
-    ap.add_argument("--single-tu",
-                    action="store_true",
-                    default=True,
-                    help="Build the SDFG from the pre-merged single-TU checkpoint (default).")
+    ap.add_argument(
+        "--single-tu",
+        action="store_true",
+        default=True,
+        help="Build the SDFG from the pre-merged single-TU checkpoint (default).",
+    )
     ap.add_argument("--real-source", action="store_true", help="Build the SDFG from ICON's real mo_solve_nonhydro.f90.")
     args = ap.parse_args()
 

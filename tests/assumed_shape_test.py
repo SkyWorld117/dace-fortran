@@ -6,19 +6,14 @@ storage element (e.g. ``custom_array(-2)``), not caller-bound index 1.
 Ref: https://fortran-lang.discourse.group/t/6923
 """
 
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import flang_binary, have_flang
-
-from dace_fortran.hlfir_to_sdfg import SDFGBuilder  # noqa: E402
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from dace_fortran.builder import SDFGBuilder
+from tests._util import flang_binary
 
 # Two files (assumed-shape callee + custom-bounded driver) exercise the
 # multi-file driver (parse_files -> inline-all), the way ICON's cross-module kernels will.
@@ -60,16 +55,11 @@ def _hlfir(src: str, path: Path) -> Path:
 
 
 def _f2py_build(srcs: list[str], out_dir: Path, mod_name: str):
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
     out_dir.mkdir(parents=True, exist_ok=True)
     combined = out_dir / f"{mod_name}.f90"
     combined.write_text("\n".join(srcs))
     subprocess.check_call(
-        [sys.executable, "-m", "numpy.f2py", "-c",
-         str(combined), "-m", mod_name, "--quiet"],
+        [sys.executable, "-m", "numpy.f2py", "-c", str(combined), "-m", mod_name, "--quiet"],
         cwd=out_dir,
     )
     if str(out_dir) not in sys.path:
@@ -82,7 +72,7 @@ def test_inlined_hlfir_has_assumed_shape_alias_declare(tmp_path: Path):
     """After hlfir-inline-all+symbol-dce, IR must retain the alias-declare pattern
     behind assumed-shape re-basing (shape-less declare whose memref fir.converts the
     caller's shape_shift declare) -- pins IR shape, not yet SDFG correctness."""
-    from dace_fortran.build_bridge import hb  # noqa: E402
+    from dace_fortran.build_bridge import hb
 
     callee_hlfir = _hlfir(_CALLEE_SRC, tmp_path / "callee.hlfir")
     driver_hlfir = _hlfir(_DRIVER_SRC, tmp_path / "driver.hlfir")
@@ -96,8 +86,7 @@ def test_inlined_hlfir_has_assumed_shape_alias_declare(tmp_path: Path):
     # Outer declare: shape_shift with lbound=-2 on the caller's x.
     assert "shape_shift" in dump and "-2" in dump
     # Inlined alias declare: uniq_name _QFcalleeEarr, memref is a fir.convert (extent erasure).
-    assert '_QFcalleeEarr' in dump, \
-        "expected the inlined callee's alias declare to survive inline+dce"
+    assert "_QFcalleeEarr" in dump, "expected the inlined callee's alias declare to survive inline+dce"
     # fir.convert box<array<5xi32>> -> box<array<?xi32>> is the assumed-shape-alias signature to fold.
     assert "fir.convert" in dump
 
@@ -136,3 +125,9 @@ def test_sdfg_matches_gfortran_reference(tmp_path: Path):
     sdfg(x=x_sdfg)
 
     np.testing.assert_array_equal(x_sdfg, x_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

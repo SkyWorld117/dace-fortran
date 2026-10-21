@@ -1,11 +1,8 @@
-"""Verbatim port of f2dace/dev:tests/fortran/future/fortran_class_test.py."""
+"""Port of f2dace/dev:tests/fortran/future/fortran_class_test.py (``recv`` is zero-initialized: the original read it uninitialized)."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_class(tmp_path):
@@ -47,12 +44,19 @@ subroutine main(d)
   integer d(2)
   real recv(2, 2, 2)
   class(t_comm_pattern_orig), allocatable :: p_pat
+  recv = 0.0  ! exchange_data_r3d reads recv(1,1,1); the verbatim source left it uninitialized (UB)
   call setup_comm_pattern(p_pat, 400)
   call exchange_data_r3d(p_pat, recv)
   d(1) = p_pat%n_pnts
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     d = np.full([2], 42, order="F", dtype=np.int64)
     sdfg(d=d)
     assert np.all(d == [400, 42])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

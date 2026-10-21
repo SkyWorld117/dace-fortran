@@ -2,37 +2,18 @@
 minval/maxval each lower through Flang's HLFIR reduce op, matching the gfortran/f2py reference.
 """
 
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 _HERE = Path(__file__).resolve().parent
 _SRC_PATH = _HERE / "reduce_intrinsics.f90"
 
 
-def _f2py(src: Path, out_dir: Path, mod_name: str):
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call([sys.executable, "-m", "numpy.f2py", "-c", str(src), "-m", mod_name, "--quiet"], cwd=out_dir)
-    if str(out_dir) not in sys.path:
-        sys.path.insert(0, str(out_dir))
-    __import__(mod_name)
-    return sys.modules[mod_name]
-
-
 def test_scalar_reductions_numerical(tmp_path):
-    mod = _f2py(_SRC_PATH, tmp_path / "ref", "reduce_scalar_ref")
+    mod = f2py_compile(_SRC_PATH, tmp_path / "ref", "reduce_scalar_ref")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     sdfg = build_sdfg(_SRC_PATH.read_text(), sdfg_dir, name="reduce_scalar", pipeline="hlfir-propagate-shapes").build()
@@ -44,8 +25,12 @@ def test_scalar_reductions_numerical(tmp_path):
     a = rng.uniform(0.1, 2.0, size=n)
 
     # Reference.
-    t_ref, p_ref, lo_ref, hi_ref = (np.zeros(1, order="F"), np.zeros(1, order="F"), np.zeros(1, order="F"),
-                                    np.zeros(1, order="F"))
+    t_ref, p_ref, lo_ref, hi_ref = (
+        np.zeros(1, order="F"),
+        np.zeros(1, order="F"),
+        np.zeros(1, order="F"),
+        np.zeros(1, order="F"),
+    )
     mod.reduce_scalar(np.asfortranarray(a), t_ref, p_ref, lo_ref, hi_ref)
 
     # SDFG: intent(inout) scalars land as size-1 Array descriptors (DaCe can't put
@@ -69,8 +54,8 @@ def test_scalar_reductions_structure(tmp_path):
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     sdfg = build_sdfg(_SRC_PATH.read_text(), sdfg_dir, name="reduce_scalar", pipeline="hlfir-propagate-shapes").build()
 
-    from dace.sdfg.state import LoopRegion, SDFGState
     from dace.libraries.standard.nodes.reduce import Reduce
+    from dace.sdfg.state import LoopRegion, SDFGState
 
     def iter_states(region):
         for n in region.nodes():
@@ -80,10 +65,58 @@ def test_scalar_reductions_structure(tmp_path):
                 yield n
 
     reduces = [n for s in iter_states(sdfg) for n in s.nodes() if isinstance(n, Reduce)]
-    assert len(reduces) == 4, (f"expected 4 Reduce library nodes; got {len(reduces)}")
+    assert len(reduces) == 4, f"expected 4 Reduce library nodes; got {len(reduces)}"
 
     wcrs = sorted(r.wcr for r in reduces)
-    assert 'lambda a, b: a + b' in wcrs
-    assert 'lambda a, b: a * b' in wcrs
-    assert 'lambda a, b: min(a, b)' in wcrs
-    assert 'lambda a, b: max(a, b)' in wcrs
+    assert "lambda a, b: a + b" in wcrs
+    assert "lambda a, b: a * b" in wcrs
+    assert "lambda a, b: min(a, b)" in wcrs
+    assert "lambda a, b: max(a, b)" in wcrs
+
+
+_SYMBOL_TARGET_SRC = """
+subroutine number_sticks(n, st, index_map, total)
+  implicit none
+  integer, intent(in) :: n
+  integer, intent(in) :: st(n)
+  integer, intent(inout) :: index_map(n)
+  integer, intent(out) :: total
+  integer :: i, nct, nst
+  nct = maxval(index_map)
+  do i = 1, n
+    if (st(i) > 0) then
+      if (index_map(i) == 0) then
+        nct = nct + 1
+        index_map(i) = nct
+      end if
+    end if
+  end do
+  total = 0
+  do i = 1, nct
+    total = total + i
+  end do
+  nst = count(st > 0)
+  do i = 1, nst
+    total = total + 100
+  end do
+end subroutine
+"""
+
+
+def test_reductions_into_loop_bound_symbols(tmp_path):
+    """``nct = MAXVAL(index_map)`` / ``nst = COUNT(st > 0)`` where the result later bounds a loop, so it is a symbol
+    (QE ``sticks_map_index`` / ``sticks_map_set``): the library node writes a transient and the symbol is assigned
+    from it (``KeyError: 'nct'`` / ``'nst'`` before)."""
+    sdfg = build_sdfg(_SYMBOL_TARGET_SRC, tmp_path, name="number_sticks", entry="number_sticks").build()
+    st = np.array([1, 0, 1, 1], dtype=np.int32)
+    index_map = np.array([0, 0, 5, 0], dtype=np.int32)
+    total = np.zeros(1, dtype=np.int32)
+    sdfg(n=4, st=st, index_map=index_map, total=total)
+    np.testing.assert_array_equal(index_map, [6, 0, 5, 7])
+    assert total[0] == 28 + 3 * 100  # 1 + ... + 7, then one 100 per positive stick
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

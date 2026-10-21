@@ -1,8 +1,7 @@
-"""E2e LOGICAL -> logical(c_bool) bridge tests (build+compile+run, vs emit_bindings_test.py's string-match coverage).
+"""E2e LOGICAL binding tests: the SDFG works on the caller's LOGICAL storage (build+compile+run, vs emit_bindings_test.py's string-match coverage).
 Covers rank-1/2/3 default LOGICAL, LOGICAL(KIND=1/4/8), c_bool pass-through, and scalar LOGICAL."""
 
 import ctypes
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,19 +9,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings import (
     FlattenPlan,
     OriginalArg,
     OriginalInterface,
     emit_bindings,
 )
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-    pytest.mark.skipif(shutil.which("meson") is None, reason="meson not available (f2py)"),
-]
+from tests._util import build_sdfg
 
 
 def _module_wrap(free_subroutine_src: str, module_name: str) -> str:
@@ -76,7 +69,7 @@ def _build_e2e_module(
         "--f90flags=-Wl,--unresolved-symbols=ignore-all",
         "--quiet",
     ]
-    proc = subprocess.run(cmd, cwd=build_dir, capture_output=True, text=True)
+    proc = subprocess.run(cmd, check=False, cwd=build_dir, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"f2py compile failed:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
     if str(build_dir) not in sys.path:
@@ -86,7 +79,8 @@ def _build_e2e_module(
 
 def _f2py_ref(tmp_path: Path, src: str, name: str):
     """Plain f2py reference module (no bridge) -- gfortran-built ground truth."""
-    from _helpers import f2py
+    from tests._helpers import f2py
+
     return f2py(src, tmp_path / "ref", name)
 
 
@@ -126,10 +120,10 @@ end module flip_mask_driver
 
 
 def test_e2e_rank1_default(tmp_path: Path):
-    """LOGICAL, intent(in) :: mask(n) -- default kind rank 1; c_bool bridge widens np.bool_ to 4-byte default LOGICAL."""
+    """LOGICAL, intent(in) :: mask(n) -- default kind rank 1."""
     outer = (
-        OriginalArg(name="mask", fortran_type="logical", rank=1, shape=("n", ), intent="in"),
-        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n", ), intent="out"),
+        OriginalArg(name="mask", fortran_type="logical", rank=1, shape=("n",), intent="in"),
+        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n",), intent="out"),
         OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
     )
     mod = _build_e2e_module(
@@ -325,18 +319,18 @@ end module flip_kind{kind}_driver
 
 @pytest.mark.parametrize("kind", [1, 4, 8])
 def test_e2e_rank1_logical_kind(tmp_path: Path, kind: int):
-    """LOGICAL(KIND=1/4/8) rank-1 round-trip -- kind 1 matches c_bool size; all three bridge through the c_bool scratch."""
+    """LOGICAL(KIND=1/4/8) rank-1 round-trip on the caller's storage of each kind."""
     src = _kind_kernel(kind)
     outer = (
-        OriginalArg(name="mask", fortran_type=f"logical(kind={kind})", rank=1, shape=("n", ), intent="in"),
-        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n", ), intent="out"),
+        OriginalArg(name="mask", fortran_type=f"logical(kind={kind})", rank=1, shape=("n",), intent="in"),
+        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n",), intent="out"),
         OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
     )
     mod = _build_e2e_module(
         tmp_path,
         kernel_src=src,
         name=f"flip_kind{kind}",
-        entry=f"_QPflip_kind{kind}",
+        entry=f"flip_kind{kind}",
         outer_args=outer,
         driver_src=_kind_driver(kind),
         module_name=f"flip_kind{kind}_e2e",
@@ -351,7 +345,7 @@ def test_e2e_rank1_logical_kind(tmp_path: Path, kind: int):
 
 
 # ---------------------------------------------------------------------------
-# logical(c_bool) outer type: pass-through (no scratch / no cast bridge)
+# logical(c_bool) outer type
 # ---------------------------------------------------------------------------
 
 _CBOOL_KERNEL = """
@@ -372,9 +366,7 @@ END SUBROUTINE flip_cbool
 """
 
 _CBOOL_DRIVER = """
-! C-callable driver that exercises the pass-through path: ``mask`` is
-! ``logical(c_bool)`` matching the SDFG's bool ABI exactly, so the
-! bindings wrapper allocates NO scratch and emits NO intrinsic cast.
+! C-callable driver for a ``logical(c_bool)`` ``mask``.
 ! ``logical(c_bool)`` is not parseable by f2py (it emits ``unsigned_char``
 ! with underscore -- gcc rejects), so we expose this driver via plain
 ! ``bind(c)`` and invoke it with ctypes from Python.
@@ -393,23 +385,22 @@ end subroutine run_cbool_passthrough
 
 
 def test_e2e_rank1_cbool_passthrough(tmp_path: Path):
-    """logical(c_bool) matches the SDFG ABI -- pass-through, no scratch/cast bridge. f2py can't parse
+    """logical(c_bool) is LOGICAL(KIND=1) storage. f2py can't parse
     logical(c_bool) (emits an invalid `unsigned_char` cast), so this gfortran-compiles bindings+driver
     into one .so and calls via ctypes."""
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(_module_wrap(_CBOOL_KERNEL, "flip_cbool_mod"),
-                      sdfg_dir,
-                      name="flip_cbool",
-                      entry="flip_cbool_mod::flip_cbool").build()
+    sdfg = build_sdfg(
+        _module_wrap(_CBOOL_KERNEL, "flip_cbool_mod"), sdfg_dir, name="flip_cbool", entry="flip_cbool_mod::flip_cbool"
+    ).build()
     sdfg.name = "flip_cbool"
     compiled = sdfg.compile()
     so_path = Path(compiled._lib._library_filename)
     fs = sdfg._frozen_signature
 
     outer = (
-        OriginalArg(name="mask", fortran_type="logical(c_bool)", rank=1, shape=("n", ), intent="in"),
-        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n", ), intent="out"),
+        OriginalArg(name="mask", fortran_type="logical(c_bool)", rank=1, shape=("n",), intent="in"),
+        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n",), intent="out"),
         OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
     )
     iface = OriginalInterface(entry=fs.entry, args=outer)
@@ -421,19 +412,21 @@ def test_e2e_rank1_cbool_passthrough(tmp_path: Path):
 
     # cwd=tmp_path avoids picking up a stale iso_c_binding.mod left by a prior flang run in the repo root.
     driver_so = tmp_path / "flip_cbool_driver.so"
-    subprocess.check_call([
-        "gfortran",
-        "-shared",
-        "-fPIC",
-        str(bindings_path),
-        str(driver_path),
-        "-o",
-        str(driver_so),
-        f"-L{so_path.parent}",
-        f"-Wl,-rpath,{so_path.parent}",
-        f"-l:{so_path.name}",
-    ],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        [
+            "gfortran",
+            "-shared",
+            "-fPIC",
+            str(bindings_path),
+            str(driver_path),
+            "-o",
+            str(driver_so),
+            f"-L{so_path.parent}",
+            f"-Wl,-rpath,{so_path.parent}",
+            f"-l:{so_path.name}",
+        ],
+        cwd=str(tmp_path),
+    )
 
     lib = ctypes.CDLL(str(driver_so))
     lib.run_cbool_passthrough.argtypes = [
@@ -446,8 +439,11 @@ def test_e2e_rank1_cbool_passthrough(tmp_path: Path):
     mask_in = np.array([True, False, True, False, True, False], dtype=np.bool_)
     out = np.zeros(mask_in.size, dtype=np.int32)
     out_ref = mask_in.astype(np.int32)
-    lib.run_cbool_passthrough(mask_in.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
-                              out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)), mask_in.size)
+    lib.run_cbool_passthrough(
+        mask_in.ctypes.data_as(ctypes.POINTER(ctypes.c_bool)),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        mask_in.size,
+    )
     np.testing.assert_array_equal(out, out_ref)
 
 
@@ -488,10 +484,10 @@ end module scalar_flag_driver
 
 
 def test_e2e_scalar_logical(tmp_path: Path):
-    """Scalar LOGICAL intent(in) -- cloudsc LDMAINCALL/LDSLPHY pattern; bindings emitter passes a length-1 c_bool pointer to the SDFG."""
+    """Scalar LOGICAL intent(in) -- cloudsc LDMAINCALL/LDSLPHY pattern."""
     outer = (
         OriginalArg(name="flag", fortran_type="logical", rank=0, intent="in"),
-        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n", ), intent="out"),
+        OriginalArg(name="out", fortran_type="integer(c_int)", rank=1, shape=("n",), intent="out"),
         OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
     )
     mod = _build_e2e_module(
@@ -512,3 +508,7 @@ def test_e2e_scalar_logical(tmp_path: Path):
         out = mod.scalar_flag_driver.run(flag_value, n=n)
         np.testing.assert_array_equal(out, out_ref)
     mod.scalar_flag_dace_bindings.scalar_flag_dace_finalize()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

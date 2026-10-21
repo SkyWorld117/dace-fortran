@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/ranges_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_multiple_ranges_all(tmp_path):
@@ -19,7 +16,7 @@ res(:) = input1(:) - input2(:)
 
 END SUBROUTINE multiple_ranges_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_function").build()
 
     size = 7
     input1 = np.full([size], 0, order="F", dtype=np.float64)
@@ -43,7 +40,7 @@ res(:) = input1(:, 1) - input1(:, 2)
 
 END SUBROUTINE multiple_ranges_selection_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_selection_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_selection_function").build()
 
     size = 7
     size2 = 2
@@ -69,7 +66,7 @@ res(:) = input1(:, pos1) - input1(:, pos2)
 
 END SUBROUTINE multiple_ranges_selection_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_selection_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_selection_function").build()
 
     size = 7
     size2 = 2
@@ -97,7 +94,7 @@ res(:) = input1(1:3) - input1(4:6)
 
 END SUBROUTINE multiple_ranges_subset_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_subset_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_subset_function").build()
 
     size = 7
     input1 = np.full([size], 0, order="F", dtype=np.float64)
@@ -105,7 +102,7 @@ END SUBROUTINE multiple_ranges_subset_function
         input1[i] = i + 1
     res = np.full([3], 42, order="F", dtype=np.float64)
     sdfg(input1=input1, res=res)
-    for idx, val in enumerate(res):
+    for _idx, val in enumerate(res):
         assert val == -3.0
 
 
@@ -120,7 +117,7 @@ res(:) = input1(pos(1):pos(2)) - input1(pos(3):pos(4))
 
 END SUBROUTINE multiple_ranges_subset_var_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_subset_var_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_subset_var_function").build()
 
     size = 9
     input1 = np.full([size], 0, order="F", dtype=np.float64)
@@ -151,7 +148,7 @@ res(:, pos(1):pos(2)) = input1(:, pos(1):pos(2))
 
 END SUBROUTINE multiple_ranges_ecrad_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_ecrad_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_ecrad_function").build()
 
     size = 7
     input1 = np.full([size, size], 0, order="F", dtype=np.float64)
@@ -182,7 +179,7 @@ res(:, pos(1):pos(2)) = input1(:, pos(3):pos(4)) + input1(:, pos(5):pos(6))
 
 END SUBROUTINE multiple_ranges_ecrad_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_ecrad_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_ecrad_function").build()
 
     size = 7
     input1 = np.full([size, size], 0, order="F", dtype=np.float64)
@@ -222,7 +219,7 @@ res(:, pos(1):pos(2)) = input1(:, pos(3):pos(4)) + input1(:, pos(5):pos(6))
 
 END SUBROUTINE multiple_ranges_ecrad_offset_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_ecrad_offset_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_ecrad_offset_function").build()
 
     size = 7
     input1 = np.full([size, size], 0, order="F", dtype=np.float64)
@@ -274,7 +271,7 @@ res(:, pos(1) + 3) = input1 + input2(:)
 
 END SUBROUTINE multiple_ranges_ecrad_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_ecrad_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_ecrad_function").build()
 
     size = 7
     input1 = np.full([size], 0, order="F", dtype=np.float64)
@@ -311,7 +308,7 @@ res(nval, pos(1):pos(2)) = input1(nval, pos(3):pos(4))
 
 END SUBROUTINE multiple_ranges_ecrad_bug_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_ecrad_bug_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_ecrad_bug_function").build()
 
     size = 7
     input1 = np.full([size, size], 0, order="F", dtype=np.float64)
@@ -333,7 +330,7 @@ END SUBROUTINE multiple_ranges_ecrad_bug_function
     length = pos[1] - pos[0] + 1
 
     i = pos[0] - 1
-    for j in range(length):
+    for _ in range(length):
         assert res[i, iter_1 - 1] == input1[i, iter_2 - 1]
         iter_1 += 1
         iter_2 += 1
@@ -349,7 +346,7 @@ res(:) = input1(2) * input1(:)
 
 END SUBROUTINE multiple_ranges_ecrad_bug_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='multiple_ranges_ecrad_bug_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="multiple_ranges_ecrad_bug_function").build()
 
     size = 7
     input1 = np.full([size], 0, order="F", dtype=np.float64)
@@ -371,7 +368,7 @@ res = 3
 
 END SUBROUTINE ranges_noarray_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='ranges_noarray_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="ranges_noarray_function").build()
 
     res = np.full([7, 4], 42, order="F", dtype=np.float64)
     sdfg(res=res)
@@ -389,7 +386,7 @@ res = inp
 
 END SUBROUTINE ranges_noarray_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='ranges_noarray_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="ranges_noarray_function").build()
 
     size_x = 7
     size_y = 4
@@ -413,7 +410,7 @@ res = inp(:,:)
 
 END SUBROUTINE ranges_noarray_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='ranges_noarray_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="ranges_noarray_function").build()
 
     size_x = 7
     size_y = 4
@@ -436,7 +433,7 @@ subroutine main(input1, input2, res)
   res = 1.0 - input1
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 7
     input1 = np.full([size], 0, order="F", dtype=np.float64)
@@ -477,7 +474,7 @@ MODULE test_range
 
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path, name='test_function', entry='test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="test_function", entry="test_function").build()
 
     size_x = 5
     size_y = 4
@@ -523,7 +520,7 @@ MODULE test_transpose
 
 END MODULE
 """
-    sdfg = build_sdfg(src, tmp_path, name='test_function', entry='test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="test_function", entry="test_function").build()
 
     size_x = 5
     size_y = 4
@@ -537,3 +534,9 @@ END MODULE
     sdfg(arg1=arg1, res1=res1)
 
     assert np.all(res1 == (arg1 + 1))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

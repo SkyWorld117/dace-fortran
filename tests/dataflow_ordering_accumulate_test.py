@@ -4,41 +4,19 @@ consumer reads an array saved in an EARLY loop together with one produced in a L
 loop, across an intervening ``LoopRegion``.  Compared element-wise to f2py/gfortran;
 escalates to long multi-operand tasklets and large producer/consumer state distance."""
 
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
+from tests._util import build_sdfg, f2py_compile
 
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
-
-
-def _f2py(src_text: str, out_dir: Path, mod: str):
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{mod}.f90").write_text(src_text)
-    subprocess.check_call(
-        [
-            sys.executable, "-m", "numpy.f2py", "-c", f"{mod}.f90", "-m", mod, "--quiet",
-            "--f90flags=-O0 -fno-fast-math -ffp-contract=off"
-        ],
-        cwd=out_dir,
-    )
-    if str(out_dir) not in sys.path:
-        sys.path.insert(0, str(out_dir))
-    __import__(mod)
-    return sys.modules[mod]
+# Strict-FP flags for the gfortran reference: no FMA contraction or fast-math reassociation.
+_REF_F90FLAGS = "-O0 -fno-fast-math -ffp-contract=off"
 
 
 def _sdfg_kw(sdfg, ints: dict) -> dict:
     from dace.data import Scalar
+
     al = sdfg.arglist()
     out = {}
     for k, v in ints.items():
@@ -109,7 +87,7 @@ end module prefix_scan_mod
 def test_prefix_scan_early_save_vs_late_produced(tmp_path: Path):
     """``flux(jk+1)=flux(jk)+(qn-q0)*g`` where ``q0`` is saved early and
     ``qn`` produced in a later loop, per block.  Must equal gfortran."""
-    ref = _f2py(_PREFIX_SCAN, tmp_path / "ref", "scan_ref")
+    ref = f2py_compile(_PREFIX_SCAN, tmp_path / "ref", "scan_ref", extra_f90flags=_REF_F90FLAGS)
     sdfg = build_sdfg(_PREFIX_SCAN, _mkd(tmp_path / "sdfg"), name="outer", entry="prefix_scan_mod::outer").build()
 
     klon, klev, nb = 1, 40, 4
@@ -120,19 +98,21 @@ def test_prefix_scan_early_save_vs_late_produced(tmp_path: Path):
 
     paph, pclv = F(klon, klev + 1, nb), F(klon, klev, nb)
     ptend, pwin = F(klon, klev, nb), F(klon, klev, nb)
-    q0r, qnr, fr = ref.prefix_scan_mod.outer(paph, pclv, ptend, pwin)
+    _q0r, _qnr, fr = ref.prefix_scan_mod.outer(paph, pclv, ptend, pwin)
 
     q0s = np.zeros((klon, klev, nb), order="F")
     qns = np.zeros((klon, klev, nb), order="F")
     fs = np.zeros((klon, klev + 1, nb), order="F")
-    sdfg(paph=paph.copy(order="F"),
-         pclv=pclv.copy(order="F"),
-         ptend=ptend.copy(order="F"),
-         pwork_in=pwin.copy(order="F"),
-         q0=q0s,
-         qn=qns,
-         flux=fs,
-         **_sdfg_kw(sdfg, dict(klon=klon, klev=klev, nb=nb)))
+    sdfg(
+        paph=paph.copy(order="F"),
+        pclv=pclv.copy(order="F"),
+        ptend=ptend.copy(order="F"),
+        pwork_in=pwin.copy(order="F"),
+        q0=q0s,
+        qn=qns,
+        flux=fs,
+        **_sdfg_kw(sdfg, dict(klon=klon, klev=klev, nb=nb)),
+    )
 
     np.testing.assert_allclose(fs, fr, rtol=1e-12, atol=1e-12)
 
@@ -183,7 +163,7 @@ def test_very_long_accumulate_tasklet(tmp_path: Path):
     """Long (8-input + self) accumulate expression mixing early-saved (``s0``) and
     late-produced (``sn``) operands, prefix-scanned.  Pins the CLOUDSC
     ``ZQXN2D-ZQX0+...`` increment shape."""
-    ref = _f2py(_LONG_TASKLET, tmp_path / "ref", "long_ref")
+    ref = f2py_compile(_LONG_TASKLET, tmp_path / "ref", "long_ref", extra_f90flags=_REF_F90FLAGS)
     sdfg = build_sdfg(_LONG_TASKLET, _mkd(tmp_path / "sdfg"), name="kern", entry="long_tasklet_mod::kern").build()
 
     n, klev = 1, 50
@@ -193,23 +173,25 @@ def test_very_long_accumulate_tasklet(tmp_path: Path):
         return np.asfortranarray(rng.standard_normal((n, klev)))
 
     arrs = [F() for _ in range(8)]
-    s0r, snr, accr = ref.long_tasklet_mod.kern(*arrs)
+    _s0r, _snr, accr = ref.long_tasklet_mod.kern(*arrs)
 
     s0s = np.zeros((n, klev), order="F")
     sns = np.zeros((n, klev), order="F")
     accs = np.zeros((n, klev + 1), order="F")
-    sdfg(a=arrs[0].copy(order="F"),
-         b=arrs[1].copy(order="F"),
-         c=arrs[2].copy(order="F"),
-         d=arrs[3].copy(order="F"),
-         e=arrs[4].copy(order="F"),
-         f=arrs[5].copy(order="F"),
-         g=arrs[6].copy(order="F"),
-         h=arrs[7].copy(order="F"),
-         s0=s0s,
-         sn=sns,
-         acc=accs,
-         **_sdfg_kw(sdfg, dict(n=n, klev=klev)))
+    sdfg(
+        a=arrs[0].copy(order="F"),
+        b=arrs[1].copy(order="F"),
+        c=arrs[2].copy(order="F"),
+        d=arrs[3].copy(order="F"),
+        e=arrs[4].copy(order="F"),
+        f=arrs[5].copy(order="F"),
+        g=arrs[6].copy(order="F"),
+        h=arrs[7].copy(order="F"),
+        s0=s0s,
+        sn=sns,
+        acc=accs,
+        **_sdfg_kw(sdfg, dict(n=n, klev=klev)),
+    )
 
     np.testing.assert_allclose(accs, accr, rtol=1e-12, atol=1e-12)
 
@@ -217,3 +199,9 @@ def test_very_long_accumulate_tasklet(tmp_path: Path):
 def _mkd(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

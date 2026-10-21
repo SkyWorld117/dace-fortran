@@ -10,10 +10,12 @@ the complex via ``re/im + 1j``.
 Tier 1: DaCe-level tests pin the re/im codegen mechanism.  Tier 2: Fortran-level
 tests drive the bridge end-to-end on the seq-assoc pattern.
 """
+
+import dace
 import numpy as np
 import pytest
 
-import dace
+from tests._util import build_sdfg
 
 
 # ---------------------------------------------------------------------------
@@ -21,19 +23,19 @@ import dace
 # ---------------------------------------------------------------------------
 def test_dace_re_im_read_components(tmp_path):
     """``re(_in)``/``im(_in)`` in a tasklet read a complex connector's real/imaginary parts."""
-    sdfg = dace.SDFG('cc_read')
-    sdfg.add_array('z', (4, ), dace.complex128)
-    sdfg.add_array('outr', (4, ), dace.float64)
-    sdfg.add_array('outi', (4, ), dace.float64)
-    st = sdfg.add_state('s', is_start_block=True)
-    rz = st.add_read('z')
-    wr = st.add_write('outr')
-    wi = st.add_write('outi')
-    me, mx = st.add_map('m', dict(i='0:4'))
-    t = st.add_tasklet('t', {'zin'}, {'orr', 'oii'}, 'orr = re(zin)\noii = im(zin)')
-    st.add_memlet_path(rz, me, t, dst_conn='zin', memlet=dace.Memlet('z[i]'))
-    st.add_memlet_path(t, mx, wr, src_conn='orr', memlet=dace.Memlet('outr[i]'))
-    st.add_memlet_path(t, mx, wi, src_conn='oii', memlet=dace.Memlet('outi[i]'))
+    sdfg = dace.SDFG("cc_read")
+    sdfg.add_array("z", (4,), dace.complex128)
+    sdfg.add_array("outr", (4,), dace.float64)
+    sdfg.add_array("outi", (4,), dace.float64)
+    st = sdfg.add_state("s", is_start_block=True)
+    rz = st.add_read("z")
+    wr = st.add_write("outr")
+    wi = st.add_write("outi")
+    me, mx = st.add_map("m", dict(i="0:4"))
+    t = st.add_tasklet("t", {"zin"}, {"orr", "oii"}, "orr = re(zin)\noii = im(zin)")
+    st.add_memlet_path(rz, me, t, dst_conn="zin", memlet=dace.Memlet("z[i]"))
+    st.add_memlet_path(t, mx, wr, src_conn="orr", memlet=dace.Memlet("outr[i]"))
+    st.add_memlet_path(t, mx, wi, src_conn="oii", memlet=dace.Memlet("outi[i]"))
     sdfg.validate()
     z = np.array([1 + 2j, 3 + 4j, 5 + 6j, 7 + 8j], dtype=np.complex128)
     orr = np.zeros(4)
@@ -43,27 +45,29 @@ def test_dace_re_im_read_components(tmp_path):
     assert oii.tolist() == [2, 4, 6, 8]
 
 
-@pytest.mark.parametrize("ind,expect", [(1, 'real'), (2, 'imag')])
+@pytest.mark.parametrize("ind,expect", [(1, "real"), (2, "imag")])
 def test_dace_component_rmw_runtime_ind(ind, expect):
     """Component RMW with a RUNTIME index ``ind`` in {1,2}: adds 1 to re (ind==1) or im
     (ind==2) of ``z[i]``, reconstructed via ``component + 1j*other``.  QE ``qvan2`` shape."""
-    sdfg = dace.SDFG('cc_rmw')
-    sdfg.add_array('z', (4, ), dace.complex128)
-    sdfg.add_symbol('ind', dace.int64)
-    st = sdfg.add_state('s', is_start_block=True)
-    rz = st.add_read('z')
-    wz = st.add_write('z')
-    me, mx = st.add_map('m', dict(i='0:4'))
-    code = ("_cur = (re(zin) if (ind == 1) else im(zin))\n"
-            "_new = _cur + 1.0\n"
-            "zout = (_new + 1j*im(zin)) if (ind == 1) else (re(zin) + 1j*_new)")
-    t = st.add_tasklet('rmw', {'zin'}, {'zout'}, code)
-    st.add_memlet_path(rz, me, t, dst_conn='zin', memlet=dace.Memlet('z[i]'))
-    st.add_memlet_path(t, mx, wz, src_conn='zout', memlet=dace.Memlet('z[i]'))
+    sdfg = dace.SDFG("cc_rmw")
+    sdfg.add_array("z", (4,), dace.complex128)
+    sdfg.add_symbol("ind", dace.int64)
+    st = sdfg.add_state("s", is_start_block=True)
+    rz = st.add_read("z")
+    wz = st.add_write("z")
+    me, mx = st.add_map("m", dict(i="0:4"))
+    code = (
+        "_cur = (re(zin) if (ind == 1) else im(zin))\n"
+        "_new = _cur + 1.0\n"
+        "zout = (_new + 1j*im(zin)) if (ind == 1) else (re(zin) + 1j*_new)"
+    )
+    t = st.add_tasklet("rmw", {"zin"}, {"zout"}, code)
+    st.add_memlet_path(rz, me, t, dst_conn="zin", memlet=dace.Memlet("z[i]"))
+    st.add_memlet_path(t, mx, wz, src_conn="zout", memlet=dace.Memlet("z[i]"))
     sdfg.validate()
     z = np.array([1 + 2j, 3 + 4j, 5 + 6j, 7 + 8j], dtype=np.complex128)
     sdfg(z=z, ind=ind)
-    if expect == 'real':  # re += 1
+    if expect == "real":  # re += 1
         assert [zz.real for zz in z] == [2, 4, 6, 8]
         assert [zz.imag for zz in z] == [2, 4, 6, 8]
     else:  # im += 1
@@ -74,13 +78,6 @@ def test_dace_component_rmw_runtime_ind(ind, expect):
 # ---------------------------------------------------------------------------
 # Tier 2 -- the Fortran seq-assoc pattern end-to-end through the bridge.
 # ---------------------------------------------------------------------------
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _util import build_sdfg, have_flang  # noqa: E402
-
-_needs_flang = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _run_seq_assoc(tmp_path, ind, src_decls, call):
@@ -118,7 +115,6 @@ end subroutine fill
     return z
 
 
-@_needs_flang
 def test_seq_assoc_imag_component(tmp_path):
     """``ind=2`` -> imaginary part of each ``z`` element gets +1, real unchanged."""
     z = _run_seq_assoc(tmp_path, 2, "complex(8), intent(inout) :: z(n)", "call fill(n, z(1))")
@@ -126,7 +122,6 @@ def test_seq_assoc_imag_component(tmp_path):
     assert [zz.imag for zz in z] == [3, 5, 7, 9]
 
 
-@_needs_flang
 def test_seq_assoc_real_component(tmp_path):
     """``ind=1`` -> real part of each ``z`` element gets +1, imag unchanged."""
     z = _run_seq_assoc(tmp_path, 1, "complex(8), intent(inout) :: z(n)", "call fill(n, z(1))")
@@ -165,7 +160,6 @@ end subroutine fill
     return z
 
 
-@_needs_flang
 def test_seq_assoc_whole_zero(tmp_path):
     """``qg = 0`` zeros BOTH components of every element; lowers as a memset of the
     COMPLEX view, written back to the aliased source slab."""
@@ -174,7 +168,6 @@ def test_seq_assoc_whole_zero(tmp_path):
     assert [zz.imag for zz in z] == [0, 0, 0, 0]
 
 
-@_needs_flang
 def test_seq_assoc_rhs_reads_other_array(tmp_path):
     """Component RMW rhs references an ORDINARY array + literal alongside the ``qg``
     self-read: exercises per-occurrence connector wiring for non-``qg`` reads inside the
@@ -215,15 +208,14 @@ end subroutine fill
     assert [zz.imag for zz in z] == [2, 4, 6, 8]
 
 
-@_needs_flang
 def test_seq_assoc_zero_then_set_components(tmp_path):
     """``qg = 0`` then per-element ``qg(1,ig)=3``/``qg(2,ig)=4``: the memset and the
     component RMW writes compose -- every element ends at ``3 + 4j``."""
-    body = ("  qg = 0.0d0\n"
-            "  do ig = 1, ngy\n"
-            "    qg(1, ig) = 3.0d0\n"
-            "    qg(2, ig) = 4.0d0\n"
-            "  end do")
+    body = "  qg = 0.0d0\n  do ig = 1, ngy\n    qg(1, ig) = 3.0d0\n    qg(2, ig) = 4.0d0\n  end do"
     z = _build_run_fill(tmp_path, body, [1 + 2j, 9 - 1j, 5 + 6j, 0 + 0j])
     assert [zz.real for zz in z] == [3, 3, 3, 3]
     assert [zz.imag for zz in z] == [4, 4, 4, 4]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -5,15 +5,12 @@ dead code for a numerical-equivalence SDFG. The pass replaces each I/O call's
 SSA result(s) with a benign constant (i1->false, i32->0 iostat, cookie->
 fir.zero_bits) then erases the call.
 """
+
 import subprocess
 import tempfile
 from pathlib import Path
 
-import pytest
-
-from _util import flang_binary, flang_intrinsic_modules_path, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import flang_binary, flang_intrinsic_modules_path
 
 
 def _emit_hlfir_and_strip(src: str) -> str:
@@ -25,13 +22,19 @@ def _emit_hlfir_and_strip(src: str) -> str:
         f = Path(td) / "k.F90"
         f.write_text(src)
         h = Path(td) / "k.hlfir"
-        subprocess.check_call([
-            flang_binary(), "-fc1", "-fintrinsic-modules-path",
-            flang_intrinsic_modules_path(), "-emit-hlfir",
-            str(f), "-o",
-            str(h)
-        ],
-                              cwd=td)
+        subprocess.check_call(
+            [
+                flang_binary(),
+                "-fc1",
+                "-fintrinsic-modules-path",
+                flang_intrinsic_modules_path(),
+                "-emit-hlfir",
+                str(f),
+                "-o",
+                str(h),
+            ],
+            cwd=td,
+        )
         mod = hb.HLFIRModule()
         mod.parse_file(str(h))
         mod.run_passes("hlfir-strip-runtime-io")
@@ -170,3 +173,9 @@ END SUBROUTINE
     # CALL stop_clock(...) itself stays -- only IO calls are stripped, leaving
     # stop_clock an empty function (symbol-dce removes it later).
     assert "fir.call @_QPstop_clock" in ir
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

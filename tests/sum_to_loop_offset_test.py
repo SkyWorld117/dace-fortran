@@ -5,11 +5,8 @@ lower as SUM intrinsic calls with offsets handled by the memlet machinery.
 """
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_sum2loop_1d_without_offset(tmp_path):
@@ -31,7 +28,7 @@ def test_fortran_frontend_sum2loop_1d_without_offset(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
     size = 7
     d = np.full([size], 0, order="F", dtype=np.float64)
@@ -63,7 +60,7 @@ def test_fortran_frontend_sum2loop_1d_offset(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
     size = 5
     d = np.full([size], 0, order="F", dtype=np.float64)
@@ -96,7 +93,7 @@ def test_fortran_frontend_arr2loop_2d(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
     sizes = [5, 3]
     d = np.full(sizes, 42, order="F", dtype=np.float64)
@@ -132,7 +129,7 @@ def test_fortran_frontend_arr2loop_2d_offset(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
     sizes = [5, 4]
     d = np.full(sizes, 42, order="F", dtype=np.float64)
@@ -146,3 +143,9 @@ def test_fortran_frontend_arr2loop_2d_offset(tmp_path):
     assert res[0] == 190
     assert res[1] == 190
     assert res[2] == 57
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -10,11 +10,8 @@ bound is provably 1). Pins: every offset_a_d* == 1, kernel matches f2py ref."""
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 # Mirrors the cloudsc trigger: explicit-shape local 3-D array, PARAMETER
 # last extent, written with a constant PARAMETER 3rd index in one loop
@@ -62,8 +59,7 @@ def test_explicit_shape_offsets_not_poisoned(tmp_path: Path):
     offsets = {k: int(v) for k, v in consts.items() if k.startswith("offset_")}
     assert offsets, "expected per-dim offset constants"
     bad = {k: v for k, v in offsets.items() if v != 1}
-    assert not bad, (f"explicit-shape arrays must have offset 1 in every dim; "
-                     f"poisoned offsets: {bad}")
+    assert not bad, f"explicit-shape arrays must have offset 1 in every dim; poisoned offsets: {bad}"
 
     ref = f2py_compile(_SRC, ref_dir, "mixed_idx_ref")
 
@@ -80,3 +76,9 @@ def test_explicit_shape_offsets_not_poisoned(tmp_path: Path):
     sdfg(n=np.int32(n), m=np.int32(m), q=q_s, cl=cl_s, a=a_s)
 
     np.testing.assert_array_equal(a_s, a_r)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

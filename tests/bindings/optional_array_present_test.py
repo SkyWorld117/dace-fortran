@@ -10,21 +10,15 @@ bindings layer, not the SDFG.
 
 Companion doc: bug1_optional_array_present.md
 """
+
 import ctypes
-import shutil
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, gfortran_compile_so, have_flang
 from dace_fortran.bindings import FlattenPlan, emit_bindings
 from dace_fortran.bindings.fortran_interface import build_auto_interface
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from tests._util import build_sdfg, gfortran_compile_so
 
 # Minimal QE ``addusxx_g(becphi_c, ...)`` shape: an OPTIONAL ARRAY dummy whose
 # presence gates the whole computation.
@@ -124,10 +118,10 @@ def test_array_optional_presence_forwarded_in_binding(tmp_path: Path):
     assert "optional :: a(" in text, text
     # Presence must be sourced from the actual argument, exactly like the
     # (already-fixed) scalar-optional case:
-    assert "a_present = int(merge(1, 0, present(a)), c_int)" in text, \
+    assert "a_present = int(merge(1, 0, present(a)), c_int)" in text, (
         "array-optional presence not forwarded; found hardwired default instead"
-    assert "a_present = 0" not in text, \
-        "wrapper still hard-sets the array optional's presence to absent"
+    )
+    assert "a_present = 0" not in text, "wrapper still hard-sets the array optional's presence to absent"
 
 
 def test_array_optional_present_call_matches_reference(tmp_path: Path):
@@ -176,3 +170,9 @@ def test_array_optional_present_call_matches_reference(tmp_path: Path):
     # Absent: y stays zero on both sides.
     np.testing.assert_allclose(call(lib.run_opt_addv, 0), np.zeros(4))
     np.testing.assert_allclose(call(ref.run_opt_addv_ref, 0), np.zeros(4))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -13,14 +13,12 @@ access on an aliased object resolves to the source object's real flattened stora
 (resolve_object_member), so a live RMW updates the SOURCE (no lost update); the data-less
 rebind store itself is dropped at emit (emit_scalar_assign early return).
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # Module-global TARGET derived-type object (mirrors ICON's mo_ocean_physics_types::v_params)
 # with a POINTER array member, rebound by a local pointer. out0 = g%arr(1) reads directly (so
@@ -115,3 +113,9 @@ def test_opaque_struct_dead_rebind_prunes_clean(tmp_path: Path):
     original = y.copy()
     sdfg(y=y, n=np.int32(n), y_d0=n)
     np.testing.assert_allclose(y, original * 3.0, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

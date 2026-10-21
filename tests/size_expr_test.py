@@ -4,14 +4,10 @@ Extent from a constant-indexed array element (``buf(dims(1))``), an arithmetic e
 
 Each case builds an SDFG and an f2py reference from the same source, writes back the realised size, and compares numerically so a wrong extent shows up as a wrong value.  Assumes the element-extent source array is intent(in) -- reading it at SDFG entry is then equivalent to reading it at the allocation point.
 """
-from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def _run(tmp_path, src, dims, *, entry="probe_mod::probe", shape_of=None):
@@ -414,3 +410,9 @@ end module probe_mod
     mod = f2py_compile(src, tmp_path / "ref", f"size_ref_{tmp_path.name}")
     mod.probe_mod.probe(mat, np.int32(i), np.int32(j), out_r)
     np.testing.assert_array_equal(out_s, out_r)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

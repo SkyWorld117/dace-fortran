@@ -1,15 +1,13 @@
-"""HLFIR frontend test helpers: compile inline Fortran to ``.hlfir`` via LLVM flang, build SDFGs.  ``have_flang()`` reports availability so callers can skip collection; ``flang_binary()`` returns the resolved driver for any supported LLVM major."""
+"""HLFIR frontend test helpers: compile inline Fortran to ``.hlfir`` via LLVM flang, build SDFGs.  ``have_flang()`` reports availability; ``flang_binary()`` returns the resolved driver for any supported LLVM major."""
 
 import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
-import pytest
-
 from dace_fortran.llvm_toolchain import flang_names, intrinsic_modules_path
+from dace_fortran.preprocess import MergeEngine
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HLFIR_DIR = _REPO_ROOT / "dace" / "frontend" / "hlfir"
@@ -46,11 +44,13 @@ _HLFIR_DIR = _REPO_ROOT / "dace" / "frontend" / "hlfir"
 #     driver of function-size blowup here.
 #   * ``max-gcse-memory=524288`` (KB, so 512 MB; gcc default 131072 = 128 MB) is a hard budget for
 #     global CSE -- past it the pass bails out instead of growing without bound.
-BITEXACT_CPU_ARGS = ('-fPIC -O3 -march=native -fno-fast-math -ffp-contract=off -fno-math-errno '
-                     '-fno-trapping-math -Wno-unused-parameter -Wno-unused-label '
-                     '--param ggc-min-expand=100 --param ggc-min-heapsize=6291456 '
-                     '--param max-inline-recursive-depth=4 --param max-inline-recursive-depth-auto=4 '
-                     '--param max-gcse-memory=524288')
+BITEXACT_CPU_ARGS = (
+    "-fPIC -O3 -march=native -fno-fast-math -ffp-contract=off -fno-math-errno "
+    "-fno-trapping-math -Wno-unused-parameter -Wno-unused-label "
+    "--param ggc-min-expand=100 --param ggc-min-heapsize=6291456 "
+    "--param max-inline-recursive-depth=4 --param max-inline-recursive-depth-auto=4 "
+    "--param max-gcse-memory=524288"
+)
 
 # when set, build_sdfg(...).build() dumps its SDFG here; "1"/"true"/"yes" means _DEFAULT_DUMP_DIR.
 _DUMP_ENV = "__DACE_HLFIR_GEN_TEST_SDFGS"
@@ -78,8 +78,9 @@ def _resolve_flang() -> str | None:
         fc_path = shutil.which(fc) or (fc if os.path.isfile(fc) else None)
         if fc_path:
             try:
-                out = subprocess.check_output([fc_path, "--version"], stderr=subprocess.STDOUT,
-                                              timeout=5).decode(errors="replace")
+                out = subprocess.check_output([fc_path, "--version"], stderr=subprocess.STDOUT, timeout=5).decode(
+                    errors="replace"
+                )
                 if "flang version" in out:
                     return fc_path
             except (OSError, subprocess.SubprocessError):
@@ -99,14 +100,14 @@ def have_flang() -> bool:
 
 
 def flang_binary() -> str:
-    """Resolved LLVM-flang path, skipping the test when no supported major is installed.
+    """Resolved LLVM-flang path; raises FileNotFoundError when no supported major is installed.
 
     Every test that spawns flang goes through this rather than a literal binary name:
     the naming scheme differs per distribution and per LLVM major, so a hardcoded
     ``flang-new-21`` fails on an install that ships only ``flang-22``.
     """
     if _FLANG is None:
-        pytest.skip(f"no LLVM flang on PATH (tried {', '.join(_FLANG_NAMES)})")
+        raise FileNotFoundError(f"no LLVM flang on PATH (tried {', '.join(_FLANG_NAMES)})")
     return _FLANG
 
 
@@ -136,15 +137,11 @@ def f2py_compile(
     extra_f90flags: str | None = None,
     only: tuple[str, ...] | None = None,
 ):
-    """Build Fortran source via gfortran/f2py, return the compiled module.  Skips (pytest.skip) when gfortran/meson missing, so callers can call unconditionally.
+    """Build Fortran source via gfortran/f2py, return the compiled module.  Fails when gfortran/meson are missing.
 
     ``only``: subroutine names to expose -- dodges crackfortran's ``KeyError`` on derived-type dummies in unexposed inner subroutines.
     Policy: e2e tests compare against this non-transformed reference, never hand-tuned literal expectations.
     """
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
     out_dir.mkdir(parents=True, exist_ok=True)
     src_text = src if not isinstance(src, Path) else None
     if src_text is not None:
@@ -156,21 +153,16 @@ def f2py_compile(
     # meson backend (py>=3.12) ignores --f90flags, reads FFLAGS instead; lift line-length cap for f2py's long generated signature.
     env = {**os.environ, "FFLAGS": (os.environ.get("FFLAGS", "") + " -ffree-line-length-none").strip()}
     # retries on transient ENOMEM; rebuilds under a fresh name if `only` routine is missing (crackfortran flake under -n auto)
-    from _helpers import f2py_build_and_import
-    return f2py_build_and_import(src_file,
-                                 out_dir=out_dir,
-                                 mod_name=mod_name,
-                                 only=only,
-                                 extra_args=extra_args,
-                                 env=env)
+    from tests._helpers import f2py_build_and_import
+
+    return f2py_build_and_import(
+        src_file, out_dir=out_dir, mod_name=mod_name, only=only, extra_args=extra_args, env=env
+    )
 
 
-def compile_to_hlfir(source: str,
-                     out_dir: Path,
-                     name: str = "src",
-                     *,
-                     preprocess: bool = False,
-                     merge: bool = True) -> Path:
+def compile_to_hlfir(
+    source: str, out_dir: Path, name: str = "src", *, preprocess: bool = False, merge: bool = True
+) -> Path:
     """Write ``source`` to ``<out_dir>/<name>.f90``, compile to HLFIR, return the path.
 
     ``merge`` (default on): inline USE-d modules into one TU; no-op for self-contained input.
@@ -181,6 +173,7 @@ def compile_to_hlfir(source: str,
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / f"{name}.f90"
     from dace_fortran.preprocess import preprocess_fortran_source
+
     source = preprocess_fortran_source(source, search_dirs=[out_dir], merge=merge, if_intvar=preprocess)
     src.write_text(source)
     hlfir = out_dir / f"{name}.hlfir"
@@ -199,10 +192,8 @@ def _per_test_suffix() -> str:
     nodeid = raw.rsplit(" ", 1)[0]
     file_part, _, test_part = nodeid.partition("::")
     stem = Path(file_part).stem
-    if stem.endswith("_test"):
-        stem = stem[:-len("_test")]
-    if test_part.startswith("test_"):
-        test_part = test_part[len("test_"):]
+    stem = stem.removesuffix("_test")
+    test_part = test_part.removeprefix("test_")
     sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", f"{stem}_{test_part}").strip("_")
     return f"_{sanitized}" if sanitized else ""
 
@@ -232,22 +223,23 @@ class _TestBuilder:
         return sdfg
 
 
-def build_sdfg(source: str,
-               out_dir: Path,
-               name: str = "src",
-               pipeline=None,
-               entry: str | None = None,
-               defines=(),
-               merge_engine: str = "regex"):
-    """Test funnel over :func:`dace_fortran.build.make_builder`: adds the per-test xdist-safe SDFG naming / dump-dir wrapper on top of the real builder.  ``entry=None`` auto-resolves from the single procedure in ``source``."""
+def build_sdfg(
+    source: str,
+    out_dir: Path,
+    name: str = "src",
+    pipeline=None,
+    entry: str | None = None,
+    defines=(),
+    merge_engine: MergeEngine = MergeEngine.REGEX,
+    specialized_globals: dict | None = None,
+):
+    """Test funnel over :func:`dace_fortran.build.make_builder`: adds the per-test xdist-safe SDFG naming / dump-dir wrapper on top of the real builder.  ``entry=None`` auto-resolves from the single procedure in ``source``.  ``specialized_globals`` (``"module::name"`` -> value) bakes module variables into the code, as the recorded invariants do."""
     from dace_fortran.build import make_builder
-    builder = make_builder(source,
-                           entry=entry,
-                           name=name,
-                           pipeline=pipeline,
-                           out_dir=out_dir,
-                           defines=defines,
-                           merge_engine=merge_engine)
+
+    builder = make_builder(
+        source, entry=entry, name=name, pipeline=pipeline, out_dir=out_dir, defines=defines, merge_engine=merge_engine,
+        specialized_globals=specialized_globals,
+    )
     suffix = _per_test_suffix()
     dump = _dump_dir()
     if suffix or dump is not None:
@@ -261,27 +253,31 @@ def build_on_root(comm, build_fn, *, root: int = 0, broadcast: bool = True):
     ``broadcast=False``: return value (e.g. a non-picklable SDFG) stays root-only, for callers that follow with their own collective (:func:`dace.sdfg.utils.distributed_compile`).
     """
     import traceback
+
     rank = comm.Get_rank()
     error = None
     result = None
     if rank == root:
         try:
             result = build_fn()
-        except BaseException as exc:  # noqa: BLE001 -- re-raised on every rank
+        except BaseException as exc:
             error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
     if broadcast:
         error, result = comm.bcast((error, result), root=root)
     else:
         error = comm.bcast(error, root=root)
     if error is not None:
-        raise RuntimeError(f"MPI build on rank {root} failed; all ranks abort to avoid a "
-                           f"collective deadlock. Rank {root} traceback:\n{error}")
+        raise RuntimeError(
+            f"MPI build on rank {root} failed; all ranks abort to avoid a "
+            f"collective deadlock. Rank {root} traceback:\n{error}"
+        )
     return result
 
 
 def run_passes_dump(source: str, out_dir: Path, name: str = "src", pipeline: str = "builtin.module()") -> str:
     """Compile Fortran to HLFIR, run ``pipeline``, return the IR dump -- for tests inspecting post-pass MLIR directly rather than through SDFG extraction."""
     from dace_fortran.build_bridge import hb
+
     hlfir = compile_to_hlfir(source, out_dir, name)
     mod = hb.HLFIRModule()
     if not mod.parse_file(str(hlfir)):

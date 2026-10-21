@@ -27,34 +27,101 @@ wrapper that surfaces the intent ("leave this procedure external;
 do not inline its body").  It registers the same way -- the bridge
 treats every entry uniformly.
 """
+
+from __future__ import annotations
+
 import re
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import dace
 import dace.library
 import dace.properties
 import dace.sdfg.nodes
+from dace import SDFGState
+from dace.sdfg.nodes import LibraryNode
 from dace.transformation.transformation import ExpandTransformation
 
-#: ``Arg.dtype`` -> the C scalar type used in the ``extern "C"``
-#: declaration.  Array args take the pointer form (``<ctype> *``).
-_C_TYPES = {
+from dace_fortran.dace_types import library_node
+
+if TYPE_CHECKING:
+    from dace_fortran.external_functions import ExternalFunction
+
+#: SDFG dtype -> the C scalar type of an ``extern "C"`` declaration (array args take the pointer form
+#: ``<ctype> *``).  The unsigned dtypes are LOGICAL(KIND=1/2/4/8) storage.
+C_TYPES = {
     "float64": "double",
     "float32": "float",
+    "int8": "int8_t",
+    "int16": "int16_t",
     "int32": "int",
     "int64": "long long",
     "bool": "bool",
+    "uint8": "uint8_t",
+    "uint16": "uint16_t",
+    "uint32": "uint32_t",
+    "uint64": "uint64_t",
+    # Layout-compatible with Fortran ``complex(c_double_complex)`` / ``complex(c_float_complex)``.
+    "complex128": "dace::complex128",
+    "complex64": "dace::complex64",
 }
 
-#: C type emitted for an ``Arg(kind="comm")`` parameter.  Full
+#: C type emitted for an ``Arg(kind=ArgKind.COMM)`` parameter.  Full
 #: contract (opaque-retype, who calls ``MPI_Comm_f2c``) is on
-#: ``Arg`` 's ``kind="comm"`` docstring.
+#: ``Arg`` 's ``kind=COMM`` docstring.
 _OPAQUE_COMM_DTYPE = "MPI_Comm"
 
 
-@dataclass(frozen=True)
+class ArgKind(Enum):
+    """Fortran-side shape of an external argument (see :class:`Arg`)."""
+
+    ARRAY = "array"
+    SCALAR = "scalar"
+    AOS = "aos"
+    COMM = "comm"
+    #: An absent optional argument: the call passes a null pointer and the SDFG connects nothing.
+    NONE = "none"
+
+
+class CAbi(Enum):
+    """How an external argument crosses the C ABI (see :class:`Arg`)."""
+
+    VALUE = "value"
+    POINTER = "pointer"
+    AOS_STRUCT_PTR = "aos_struct_ptr"
+    PER_MEMBER_SOA = "per_member_soa"
+
+
+class Intent(Enum):
+    """Whether the external reads, writes or both reads and writes an argument."""
+
+    IN = "in"
+    OUT = "out"
+    INOUT = "inout"
+
+    @property
+    def reads(self) -> bool:
+        return self is not Intent.OUT
+
+    @property
+    def writes(self) -> bool:
+        return self is not Intent.IN
+
+
+class ModuleSymbolForward(NamedTuple):
+    """A Fortran module global forwarded across a library boundary (see
+    :attr:`ExternalSignature.module_symbol_forward`)."""
+
+    module: str
+    member: str
+    dtype: str
+    rank: int
+
+
+@dataclass(frozen=True, slots=True)
 class Arg:
     """One argument of a registered external function.
 
@@ -66,15 +133,18 @@ class Arg:
 
     :ivar kind: Fortran-side shape of the arg.
 
-        * ``'array'`` -- a flat array dummy.  C ABI defaults to a
+        * ``ARRAY`` -- a flat array dummy.  C ABI defaults to a
           pointer (``<ctype> *``).
-        * ``'scalar'`` -- a scalar dummy.  C ABI defaults to by-value.
-        * ``'aos'`` -- a whole derived-type dummy that
+        * ``SCALAR`` -- a scalar dummy.  C ABI defaults to by-value;
+          with ``c_abi=POINTER`` it crosses by address, as a Fortran
+          ``optional`` scalar of a ``bind(c)`` procedure does: a null
+          pointer where the call site leaves it absent.
+        * ``AOS`` -- a whole derived-type dummy that
           ``hlfir-marshal-external-structs`` expanded into per-member
           slots.  The :ivar:`c_abi` choice picks how those slots
           reach the external (see below).
-        * ``'comm'`` -- a C ``MPI_Comm`` handle.  ``c_abi`` is forced
-          opaque-by-value; ``intent`` is forced ``'in'``.  The
+        * ``COMM`` -- a C ``MPI_Comm`` handle.  ``c_abi`` is forced
+          opaque-by-value; ``intent`` is forced ``IN``.  The
           SDFG-side container is retyped to
           ``dace.dtypes.opaque("MPI_Comm")`` so DaCe codegen emits
           the parameter as ``MPI_Comm`` directly -- the ``bind(c)``
@@ -85,18 +155,18 @@ class Arg:
         ``None`` (the default) picks the natural mapping for the
         arg's :ivar:`kind`:
 
-        * ``'value'`` -- pass-by-value (the natural default for
-          ``kind='scalar'``).
-        * ``'pointer'`` -- pass-by-pointer (the natural default for
-          ``kind='array'``).
-        * ``'aos_struct_ptr'`` -- the natural default for
-          ``kind='aos'``: emit_call locally re-packs the SoA flats
+        * ``VALUE`` -- pass-by-value (the natural default for
+          ``kind=SCALAR``).
+        * ``POINTER`` -- pass-by-pointer (the natural default for
+          ``kind=ARRAY``).
+        * ``AOS_STRUCT_PTR`` -- the natural default for
+          ``kind=AOS``: emit_call locally re-packs the SoA flats
           into a stack AoS struct, passes ``&buf``, then unpacks out
           (the inline pack/unpack body that has shipped in this
           tree since v1).  ``intent`` drives the pack-in / unpack-out
           directions.  The C parameter is ``void *`` (the callee
           casts to its concrete struct).
-        * ``'per_member_soa'`` -- for ``kind='aos'`` only.  The
+        * ``PER_MEMBER_SOA`` -- for ``kind=AOS`` only.  The
           per-member SoA slots the marshal-expansion produced are
           forwarded *verbatim* to the external (no AoS buffer, no
           pack / unpack copy).  This is the shape a *sibling SDFG*
@@ -105,46 +175,37 @@ class Arg:
           work.  The C parameters expand to one pointer per leaf
           member, in marshal-expansion order.
 
-    :ivar dtype: element dtype string -- a key of :data:`_C_TYPES`
+    :ivar dtype: element dtype string -- a key of :data:`C_TYPES`
         (``'float64'`` / ``'int32'`` / ...).  Ignored when ``kind``
-        is ``'aos'`` or ``'comm'``.
-    :ivar intent: ``'in'`` | ``'out'`` | ``'inout'``.  Defaults to
-        ``'inout'`` -- an external function is opaque, so the safe
+        is ``AOS`` or ``COMM``.
+    :ivar intent: ``IN`` | ``OUT`` | ``INOUT``.  Defaults to
+        ``INOUT`` -- an external function is opaque, so the safe
         conservative assumption is that it both reads and writes an
         array arg: a missed write is a correctness bug (the mutation
         is invisible to dataflow -> wrong results / illegal
         reordering / DCE), an over-declared read/write only costs
-        optimisation.  Narrow to ``'in'`` / ``'out'`` only when the
+        optimisation.  Narrow to ``IN`` / ``OUT`` only when the
         true behaviour is known.  A by-value scalar is read-only
         regardless of this field (the callee gets a copy -- an ABI
-        fact, not a choice); ``'comm'`` is always read-only.
+        fact, not a choice); ``COMM`` is always read-only.
     """
 
-    kind: str
-    dtype: str = ""  # ignored when kind == "comm" or kind == "aos"
-    intent: str = "inout"
-    c_abi: Optional[str] = None
+    kind: ArgKind
+    dtype: str = ""  # ignored when kind is COMM or AOS
+    intent: Intent = Intent.INOUT
+    c_abi: CAbi | None = None
 
-    def resolved_c_abi(self) -> str:
+    def resolved_c_abi(self) -> CAbi:
         """The :ivar:`c_abi` choice resolved to its concrete value
         with the per-:ivar:`kind` natural default applied."""
         if self.c_abi is not None:
             return self.c_abi
-        if self.kind == "scalar":
-            return "value"
-        if self.kind == "array":
-            return "pointer"
-        if self.kind == "aos":
-            return "aos_struct_ptr"
-        if self.kind == "comm":
-            return "value"
-        raise ValueError(f"external Arg: unknown kind {self.kind!r}; "
-                         f"expected one of array / scalar / aos / comm")
+        return _DEFAULT_C_ABI[self.kind]
 
     def c_decl_type(self) -> str:
         """C parameter type for this arg's ``extern "C"`` declaration.
 
-        For ``kind='aos'`` with ``c_abi='per_member_soa'`` the decl
+        For ``kind=AOS`` with ``c_abi=PER_MEMBER_SOA`` the decl
         expands to multiple parameters (one per leaf member); that
         expansion is per-call-site and lives in
         :func:`builder.emit_library.emit_call`.  This method returns
@@ -153,28 +214,39 @@ class Arg:
 
         :raises ValueError: unsupported ``kind`` or ``dtype``.
         """
-        if self.kind == "comm":
+        if self.kind is ArgKind.NONE:
+            return "void *"
+        if self.kind is ArgKind.COMM:
             return _OPAQUE_COMM_DTYPE
-        if self.kind == "aos":
+        if self.kind is ArgKind.AOS:
             abi = self.resolved_c_abi()
-            if abi == "aos_struct_ptr":
+            if abi is CAbi.AOS_STRUCT_PTR:
                 return "void *"  # address of the re-packed AoS buffer
-            if abi == "per_member_soa":
+            if abi is CAbi.PER_MEMBER_SOA:
                 # The leaf-expanded decl is rendered by the caller
                 # from the marshal-expansion groups; nothing
                 # single-parameter to surface here.
                 return ""
-            raise ValueError(f"external Arg(kind='aos'): unsupported "
-                             f"c_abi {abi!r}; expected aos_struct_ptr "
-                             f"or per_member_soa")
-        base = _C_TYPES.get(self.dtype)
+            raise ValueError(
+                f"external Arg(kind=AOS): unsupported c_abi {abi}; expected AOS_STRUCT_PTR or PER_MEMBER_SOA"
+            )
+        base = C_TYPES.get(self.dtype)
         if base is None:
-            raise ValueError(f"external Arg: unsupported dtype {self.dtype!r}; "
-                             f"known: {sorted(_C_TYPES)}")
-        return f"{base} *" if self.kind == "array" else base
+            raise ValueError(f"external Arg: unsupported dtype {self.dtype!r}; known: {sorted(C_TYPES)}")
+        by_pointer = self.kind is ArgKind.ARRAY or self.resolved_c_abi() is CAbi.POINTER
+        return f"{base} *" if by_pointer else base
 
 
-@dataclass(frozen=True)
+#: The natural C ABI of each argument kind.
+_DEFAULT_C_ABI = {
+    ArgKind.SCALAR: CAbi.VALUE,
+    ArgKind.ARRAY: CAbi.POINTER,
+    ArgKind.AOS: CAbi.AOS_STRUCT_PTR,
+    ArgKind.COMM: CAbi.VALUE,
+}
+
+
+@dataclass(frozen=True, slots=True)
 class ExternalSignature:
     """Signature of a registered external ``bind(c)`` function.
 
@@ -194,11 +266,11 @@ class ExternalSignature:
     """
 
     c_name: str
-    args: Tuple[Arg, ...] = field(default_factory=tuple)
-    libraries: Tuple[str, ...] = field(default_factory=tuple)
+    args: tuple[Arg, ...] = field(default_factory=tuple)
+    libraries: tuple[str, ...] = field(default_factory=tuple)
     stub: bool = False
     # Fortran module globals to forward into the callee's library
-    # before each call.  Each tuple = ``(module, member, dtype, rank)``:
+    # before each call.  Each entry is a :class:`ModuleSymbolForward`:
     #
     #   * ``module``  -- defining module (``"mo_parallel_config"``).
     #   * ``member``  -- member name within that module (``"nproma"``).
@@ -221,12 +293,12 @@ class ExternalSignature:
     # outer's caller wrote.  See the velocity e2e ASan ODR-violation
     # diagnostic for the per-library Fortran-module-globals issue
     # this contract addresses.
-    module_symbol_forward: Tuple[Tuple[str, str, str, int], ...] = field(default_factory=tuple)
+    module_symbol_forward: tuple[ModuleSymbolForward, ...] = field(default_factory=tuple)
     # When true, ``emit_call`` prepends one ``int`` extent per
     # dynamic-shape dim ahead of every dynamic-shape leaf -- the C
     # ABI :func:`dace_fortran.bindings.emit_bind_c_shim` exports
     # ("dynamic-shape" = ``per_member_soa`` AoS member with ``nel ==
-    # 0``, or ``kind='array'`` whose connected SDFG array has any
+    # 0``, or ``kind=ARRAY`` whose connected SDFG array has any
     # symbolic shape entry).  Set this on every registration whose
     # callee was produced by ``build_fortran_library(...,
     # bind_c_shim=True)``: the shim needs the runtime extents to
@@ -254,16 +326,27 @@ class ExternalSignature:
         return f'extern "C" void {self.c_name}({params});'
 
 
-_REGISTRY: Dict[str, ExternalSignature] = {}
+class _RegistryState:
+    """Process-wide external registry: the signatures plus the linker config they mutated."""
 
-#: Snapshot of ``compiler.linker.args`` before the first registration
-#: that contributes libraries -- restored by
-#: :func:`clear_external_registry` so the global config mutation does
-#: not leak past the registry's lifetime.
-_ORIG_LINKER_ARGS: Optional[str] = None
+    __slots__ = ("orig_linker_args", "signatures")
+
+    signatures: dict[str, ExternalSignature]
+    #: Snapshot of ``compiler.linker.args`` before the first registration
+    #: that contributes libraries -- restored by
+    #: :func:`clear_external_registry` so the global config mutation does
+    #: not leak past the registry's lifetime.
+    orig_linker_args: str | None
+
+    def __init__(self) -> None:
+        self.signatures = {}
+        self.orig_linker_args = None
 
 
-def _link_flags(libraries: Tuple[str, ...]) -> List[str]:
+_STATE = _RegistryState()
+
+
+def _link_flags(libraries: tuple[str, ...]) -> list[str]:
     """Build the shared-linker flags for ``libraries``.
 
     For each registered ``.so`` the absolute path is passed verbatim
@@ -280,27 +363,28 @@ def _link_flags(libraries: Tuple[str, ...]) -> List[str]:
     """
     so_paths = [Path(lib).resolve() for lib in libraries]
     rpath_dirs = list(dict.fromkeys(p.parent for p in so_paths))
-    return (["-Wl,--no-as-needed"] + [str(p) for p in so_paths] + [f"-Wl,-rpath,{d}" for d in rpath_dirs])
+    return ["-Wl,--no-as-needed"] + [str(p) for p in so_paths] + [f"-Wl,-rpath,{d}" for d in rpath_dirs]
 
 
-def _apply_linker_config():
+def _apply_linker_config() -> None:
     """Recompute ``compiler.linker.args`` = original + the dedup'd link
     flags of every registration's libraries.  This is the global,
     register/clear-scoped config mutation the chosen design accepts
     (verbatim shared-linker flags -- not the CMake-list ``DACE_LIBS``)."""
     import dace
 
-    global _ORIG_LINKER_ARGS
-    if _ORIG_LINKER_ARGS is None:
-        _ORIG_LINKER_ARGS = dace.Config.get("compiler", "linker", "args") or ""
-    flags: List[str] = []
-    for sig in _REGISTRY.values():
+    orig_args = _STATE.orig_linker_args
+    if orig_args is None:
+        orig_args = str(dace.Config.get("compiler", "linker", "args") or "")
+        _STATE.orig_linker_args = orig_args
+    flags: list[str] = []
+    for sig in _STATE.signatures.values():
         flags += _link_flags(sig.libraries)
-    merged = (_ORIG_LINKER_ARGS + " " + " ".join(dict.fromkeys(flags))).strip()
+    merged = (orig_args + " " + " ".join(dict.fromkeys(flags))).strip()
     dace.Config.set("compiler", "linker", "args", value=merged)
 
 
-def register_external(name: str, signature: ExternalSignature):
+def register_external(name: str, signature: ExternalSignature) -> None:
     """Register ``name`` (the Fortran call-site name) as an external
     ``bind(c)`` function with ``signature``.
 
@@ -313,20 +397,22 @@ def register_external(name: str, signature: ExternalSignature):
         (for a ``bind(c, name=foo)`` interface this is ``foo``).
     :param signature: its :class:`ExternalSignature`.
     """
-    _REGISTRY[name] = signature
+    _STATE.signatures[name] = signature
     if signature.libraries:
         _apply_linker_config()
 
 
-def keep_external(name: str,
-                  *,
-                  c_name: Optional[str] = None,
-                  args: Tuple[Arg, ...] = (),
-                  libraries: Tuple[str, ...] = (),
-                  stub: bool = False,
-                  dynamic_extents_abi: bool = False,
-                  module_symbol_forward: Tuple[Tuple[str, str, str, int], ...] = (),
-                  callee_ptr_scalar_members: frozenset = frozenset()):
+def keep_external(
+    name: str,
+    *,
+    c_name: str | None = None,
+    args: tuple[Arg, ...] = (),
+    libraries: tuple[str, ...] = (),
+    stub: bool = False,
+    dynamic_extents_abi: bool = False,
+    module_symbol_forward: tuple[ModuleSymbolForward, ...] = (),
+    callee_ptr_scalar_members: frozenset = frozenset(),
+) -> None:
     """Mark ``name`` to be left external -- the bridge emits an
     :class:`ExternalCall` library node for every ``CALL name(...)``
     instead of inlining ``name`` 's body.
@@ -362,8 +448,8 @@ def keep_external(name: str,
         ``c_f_pointer`` aliases need the runtime extents (see
         :attr:`ExternalSignature.dynamic_extents_abi`).
     :param module_symbol_forward: Fortran module globals to forward
-        across the library boundary.  Each tuple is ``(module,
-        member, dtype, rank)`` -- see
+        across the library boundary.  Each entry is a
+        :class:`ModuleSymbolForward` ``(module, member, dtype, rank)`` -- see
         :attr:`ExternalSignature.module_symbol_forward` for the
         rationale (per-library Fortran-module-globals issue exposed
         by the velocity dycore + external e2e ASan diagnostic).
@@ -377,17 +463,21 @@ def keep_external(name: str,
     """
     register_external(
         name,
-        ExternalSignature(c_name=c_name or name,
-                          args=tuple(args),
-                          libraries=tuple(libraries),
-                          stub=stub,
-                          dynamic_extents_abi=dynamic_extents_abi,
-                          module_symbol_forward=tuple(module_symbol_forward),
-                          callee_ptr_scalar_members=frozenset(callee_ptr_scalar_members)))
+        ExternalSignature(
+            c_name=c_name or name,
+            args=tuple(args),
+            libraries=tuple(libraries),
+            stub=stub,
+            dynamic_extents_abi=dynamic_extents_abi,
+            module_symbol_forward=tuple(ModuleSymbolForward(*f) for f in module_symbol_forward),
+            callee_ptr_scalar_members=frozenset(callee_ptr_scalar_members),
+        ),
+    )
 
 
-def apply_external_functions(external_functions: Iterable["ExternalFunction"] = (),
-                             do_not_emit: Iterable[str] = ()) -> None:
+def apply_external_functions(
+    external_functions: Iterable[ExternalFunction] = (), do_not_emit: Iterable[str] = ()
+) -> None:
     """Register the bridge half of the unified external-function policy.
 
     This is the bridge-side mirror of the inliner's
@@ -422,17 +512,22 @@ def apply_external_functions(external_functions: Iterable["ExternalFunction"] = 
     do_not_emit = list(do_not_emit)
     validate(external_functions, do_not_emit)
     for f in external_functions:
-        keep_external(f.name, c_name=f.symbol, libraries=(f.library, ) if f.library else ())
+        keep_external(f.name, c_name=f.symbol, libraries=(f.library,) if f.library else ())
     for name in do_not_emit:
         keep_external(name, stub=True)
 
 
-def lookup_external(name: str) -> Optional[ExternalSignature]:
+def lookup_external(name: str) -> ExternalSignature | None:
     """Return the registered signature for ``name``, or ``None``."""
-    return _REGISTRY.get(name)
+    return _STATE.signatures.get(name)
 
 
-def registered_names() -> List[str]:
+def require_external(name: str) -> ExternalSignature:
+    """Return the registered signature for name; KeyError when it is not registered."""
+    return _STATE.signatures[name]
+
+
+def registered_names() -> list[str]:
     """Names registered as external (``keep_external`` / ``register_external``).
 
     The builder passes these to ``HLFIRModule.externalize_symbols`` so a
@@ -442,10 +537,10 @@ def registered_names() -> List[str]:
 
     :returns: the registry keys (Fortran call-site names).
     """
-    return list(_REGISTRY)
+    return list(_STATE.signatures)
 
 
-def inline_external(sdfg: 'dace.SDFG', name: str, callee_sdfg: 'dace.SDFG') -> int:
+def inline_external(sdfg: dace.SDFG, name: str, callee_sdfg: dace.SDFG) -> int:
     """Swap every ``ExternalCall`` library node for ``name`` in ``sdfg``
     with a :class:`dace.sdfg.nodes.NestedSDFG` wrapping ``callee_sdfg``.
 
@@ -468,11 +563,10 @@ def inline_external(sdfg: 'dace.SDFG', name: str, callee_sdfg: 'dace.SDFG') -> i
     :param callee_sdfg: The callee's pre-built SDFG.
     :returns: The number of ExternalCall sites replaced.
     """
-    from dace.sdfg.nodes import NestedSDFG
+
     sig = lookup_external(name)
     if sig is None:
-        raise ValueError(f"inline_external: {name!r} is not registered "
-                         f"as an external")
+        raise ValueError(f"inline_external: {name!r} is not registered as an external")
     target_c_name = sig.c_name
     replaced = 0
     # Walk every state for ExternalCall nodes; we mutate as we go but
@@ -480,7 +574,7 @@ def inline_external(sdfg: 'dace.SDFG', name: str, callee_sdfg: 'dace.SDFG') -> i
     targets = []
     for state in sdfg.all_states():
         for node in list(state.nodes()):
-            if (isinstance(node, ExternalCall) and node.c_name == target_c_name):
+            if isinstance(node, ExternalCall) and node.c_name == target_c_name:
                 targets.append((state, node))
     if not targets:
         return 0
@@ -498,8 +592,7 @@ def inline_external(sdfg: 'dace.SDFG', name: str, callee_sdfg: 'dace.SDFG') -> i
         for e in out_edges:
             # ``_a{i}_o`` -> strip ``_a`` prefix and the trailing ``_o``.
             tail = e.src_conn[2:]
-            if tail.endswith('_o'):
-                tail = tail[:-2]
+            tail = tail.removesuffix("_o")
             i = int(tail)
             out_map.setdefault(callee_args[i], e)
         # Symbol mapping: every callee free symbol that's also live in
@@ -523,15 +616,15 @@ def inline_external(sdfg: 'dace.SDFG', name: str, callee_sdfg: 'dace.SDFG') -> i
     return replaced
 
 
-def clear_external_registry():
+def clear_external_registry() -> None:
     """Drop all registrations and restore ``compiler.linker.args`` to
     its pre-registration value (test isolation / no global leak)."""
-    global _ORIG_LINKER_ARGS
-    _REGISTRY.clear()
-    if _ORIG_LINKER_ARGS is not None:
+    _STATE.signatures.clear()
+    if _STATE.orig_linker_args is not None:
         import dace
-        dace.Config.set("compiler", "linker", "args", value=_ORIG_LINKER_ARGS)
-        _ORIG_LINKER_ARGS = None
+
+        dace.Config.set("compiler", "linker", "args", value=_STATE.orig_linker_args)
+        _STATE.orig_linker_args = None
 
 
 @dace.library.expansion
@@ -545,22 +638,26 @@ class ExpandExternalCallPure(ExpandTransformation):
     surrounding dataflow is unchanged.
     """
 
-    environments = []
+    environments: ClassVar[list[type]] = []
 
     @staticmethod
-    def expansion(node, parent_state, parent_sdfg, **_kwargs):
+    def expansion(
+        node: LibraryNode, parent_state: SDFGState, parent_sdfg: dace.SDFG, *args: Any, **kwargs: Any
+    ) -> dace.nodes.Tasklet:
+        assert isinstance(node, ExternalCall)
         if node.c_decl:
-            parent_sdfg.append_global_code(node.c_decl)
-        tasklet = dace.sdfg.nodes.Tasklet(node.label,
-                                          dict(node.in_connectors),
-                                          dict(node.out_connectors),
-                                          node.body,
-                                          language=dace.dtypes.Language.CPP,
-                                          side_effects=True)
-        return tasklet
+            parent_sdfg.append_global_code(f"\n{node.c_decl}\n")  # on lines of its own: it may hold a pragma
+        return dace.sdfg.nodes.Tasklet(
+            node.label,
+            dict(node.in_connectors),
+            dict(node.out_connectors),
+            node.body,
+            language=dace.dtypes.Language.CPP,
+            side_effects=True,
+        )
 
 
-@dace.library.node
+@library_node
 class ExternalCall(dace.sdfg.nodes.LibraryNode):
     """SDFG library node calling a separately-compiled external
     ``bind(c)`` function.
@@ -593,7 +690,18 @@ class ExternalCall(dace.sdfg.nodes.LibraryNode):
     #: undeclared symbol.
     symbol_deps = dace.properties.ListProperty(element_type=str, default=[])
 
-    def __init__(self, name, *, c_name="", c_decl="", body="", symbol_deps=None, inputs=None, outputs=None, **kwargs):
+    def __init__(
+        self,
+        name: str,
+        *,
+        c_name: str = "",
+        c_decl: str = "",
+        body: str = "",
+        symbol_deps: Iterable[str] | None = None,
+        inputs: Collection[str] | Mapping[str, Any] | None = None,
+        outputs: Collection[str] | Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(name=name, inputs=inputs or set(), outputs=outputs or set(), **kwargs)
         self.c_name = c_name
         self.c_decl = c_decl
@@ -603,10 +711,18 @@ class ExternalCall(dace.sdfg.nodes.LibraryNode):
     @property
     def free_symbols(self) -> set:
         fsyms = super().free_symbols
-        fsyms.update(self.symbol_deps)
+        fsyms.update(str(dep) for dep in self.symbol_deps)  # dace types the Property as ``list[type[str]]``
         return fsyms
 
-    def validate(self, sdfg, state):
+    def specialize(self, values: Mapping[str, Any]) -> None:
+        """Replace the symbols the body forwards by ``values`` (the SDFG specialised to them: the symbols are gone,
+        the C text would still name them)."""
+        for name, value in values.items():
+            if name in self.symbol_deps:
+                self.body = re.sub(rf"\b{re.escape(name)}\b", f"({value})", self.body)
+                self.symbol_deps = [str(d) for d in self.symbol_deps if str(d) != name]
+
+    def validate(self, sdfg: dace.SDFG, state: SDFGState) -> None:
         """Reject the node if the C body does not actually call ``c_name``
         or leaves a connector unreferenced.
 
@@ -618,5 +734,4 @@ class ExternalCall(dace.sdfg.nodes.LibraryNode):
         connector: an ``inout`` array's read connector intentionally aliases
         its write connector, and only the writable one appears in the body.)"""
         if not re.search(r"\b" + re.escape(self.c_name) + r"\s*\(", self.body):
-            raise ValueError(f"ExternalCall {self.label!r}: body {self.body!r} does not "
-                             f"call {self.c_name!r}")
+            raise ValueError(f"ExternalCall {self.label!r}: body {self.body!r} does not call {self.c_name!r}")

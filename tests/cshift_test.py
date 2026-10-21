@@ -7,12 +7,10 @@ a negative shift in range).  These tests pin the numerics against
 ``numpy.roll`` -- Fortran ``CSHIFT(arr, s)`` shifts LEFT by ``s``, i.e.
 ``np.roll(arr, -s)``.
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_cshift_whole_array_positive(tmp_path):
@@ -74,3 +72,9 @@ end module
     res = np.zeros(5, dtype=np.float64, order="F")
     sdfg(arr=arr, res=res)
     np.testing.assert_allclose(res, 2.0 - np.roll(arr, -1))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -1,20 +1,19 @@
 """Coverage for the build-system-facing preprocess CLI: a fresh subprocess running
 ``python -m dace_fortran.preprocess_cli`` -- the single integration point
 ``cmake/DaceFortran.cmake`` and ``autotools/dace_fortran.m4`` both rely on."""
+
 import json
 import subprocess
 import sys
-from pathlib import Path
-
-import pytest
 
 
-def _run_cli(*argv: str, input_path: Path = None, expect_rc: int = 0) -> tuple:
+def _run_cli(*argv: str, expect_rc: int = 0) -> tuple:
     """Run the CLI in a fresh subprocess; returns (stdout, stderr)."""
     cmd = [sys.executable, "-m", "dace_fortran.preprocess_cli", *argv]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    assert res.returncode == expect_rc, (f"CLI rc={res.returncode} (expected {expect_rc})\n"
-                                         f"argv={argv}\nstdout={res.stdout}\nstderr={res.stderr}")
+    res = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    assert res.returncode == expect_rc, (
+        f"CLI rc={res.returncode} (expected {expect_rc})\nargv={argv}\nstdout={res.stdout}\nstderr={res.stderr}"
+    )
     return res.stdout, res.stderr
 
 
@@ -129,8 +128,7 @@ END SUBROUTINE
     out = tmp_path / "build" / "k.preprocessed.f90"
     _run_cli("--rewrite-string-enum", "--in", str(src), "--out", str(out))
     sidecar = out.with_suffix(out.suffix + ".enum_maps.json")
-    assert not sidecar.exists(), \
-        f"unexpected sidecar at {sidecar}"
+    assert not sidecar.exists(), f"unexpected sidecar at {sidecar}"
 
 
 # ---------------------------------------------------------------------------
@@ -172,11 +170,15 @@ END SUBROUTINE
 def test_stdin_to_stdout_works(tmp_path):
     """``--in -`` reads stdin; omitting ``--out`` writes stdout -- pipeline-friendly."""
     cmd = [sys.executable, "-m", "dace_fortran.preprocess_cli", "--all-defaults", "--in", "-"]
-    res = subprocess.run(cmd,
-                         input=_STRING_ENUM_KERNEL.replace("CHARACTER(LEN=1), INTENT(IN) :: action",
-                                                           "REAL(KIND=wp), INTENT(IN) :: dummy"),
-                         capture_output=True,
-                         text=True)
+    res = subprocess.run(
+        cmd,
+        check=False,
+        input=_STRING_ENUM_KERNEL.replace(
+            "CHARACTER(LEN=1), INTENT(IN) :: action", "REAL(KIND=wp), INTENT(IN) :: dummy"
+        ),
+        capture_output=True,
+        text=True,
+    )
     assert res.returncode == 0
     # Kind alias normalisation happened, and the output came to stdout.
     assert "KIND=8" in res.stdout
@@ -190,7 +192,7 @@ def test_stdin_to_stdout_works(tmp_path):
 def test_missing_in_flag_is_an_argument_error():
     """Without ``--in`` argparse exits rc=2 (its standard error code)."""
     cmd = [sys.executable, "-m", "dace_fortran.preprocess_cli", "--all-defaults"]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, check=False, capture_output=True, text=True)
     assert res.returncode == 2
 
 
@@ -244,10 +246,10 @@ def test_inplace_noop_when_no_pass_changes_source(tmp_path):
     src.write_text("SUBROUTINE k(); END SUBROUTINE\n")
     orig_mtime = src.stat().st_mtime
     import time
+
     time.sleep(1.05)  # past the FS mtime granularity
     _run_cli("--rewrite-string-enum", "--inplace", "--in", str(src))
-    assert src.stat().st_mtime == orig_mtime, \
-        "no-op rewrite should preserve mtime"
+    assert src.stat().st_mtime == orig_mtime, "no-op rewrite should preserve mtime"
 
 
 def test_inplace_and_out_are_mutually_exclusive(tmp_path):
@@ -256,14 +258,19 @@ def test_inplace_and_out_are_mutually_exclusive(tmp_path):
     src.write_text("SUBROUTINE k(); END SUBROUTINE\n")
     out = tmp_path / "out.f90"
     cmd = [
-        sys.executable, "-m", "dace_fortran.preprocess_cli", "--all-defaults", "--inplace", "--in",
-        str(src), "--out",
-        str(out)
+        sys.executable,
+        "-m",
+        "dace_fortran.preprocess_cli",
+        "--all-defaults",
+        "--inplace",
+        "--in",
+        str(src),
+        "--out",
+        str(out),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, check=False, capture_output=True, text=True)
     assert res.returncode != 0
-    assert "mutually exclusive" in res.stderr.lower() or \
-           "mutually exclusive" in res.stdout.lower()
+    assert "mutually exclusive" in res.stderr.lower() or "mutually exclusive" in res.stdout.lower()
 
 
 def test_warn_when_rewrite_external_without_search_dir(tmp_path):
@@ -273,5 +280,12 @@ def test_warn_when_rewrite_external_without_search_dir(tmp_path):
     src.write_text("SUBROUTINE k(); END SUBROUTINE\n")
     out = tmp_path / "k.preprocessed.f90"
     _, stderr = _run_cli("--rewrite-external", "--in", str(src), "--out", str(out))
-    assert "no-op" in stderr.lower() or "search-dir" in stderr.lower(), \
+    assert "no-op" in stderr.lower() or "search-dir" in stderr.lower(), (
         f"expected a search-dir warning, got stderr:\n{stderr}"
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

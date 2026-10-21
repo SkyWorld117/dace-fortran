@@ -2,14 +2,12 @@
 left the lower-bound result unhandled in ``control_flow.cpp``'s loop-bound ``buildExpr``,
 falling to the ``"?"`` sentinel and producing a SyntaxError in DaCe's
 ``unique_loop_iterators``.  Pins: assumed-shape sum builds and equals ``sum(a)``."""
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # ``a(10:)`` -> ``fir.shift %c10`` shape operand; ``ubound(a,1)`` lowers to
 # ``box_dims#0(lb) + box_dims#1(extent) - 1`` -- lb must resolve to ``offset_a_d0``, not ``?``.
@@ -37,7 +35,7 @@ def _bind_free_syms(sdfg, n: int) -> dict:
     for k in sdfg.arglist():
         if k.startswith("offset_") and k.endswith(tuple(f"_d{i}" for i in range(4))):
             out[k] = np.int64(1)
-        elif k == "a" or k == "out":
+        elif k in {"a", "out"}:
             continue
         elif k.endswith(tuple(f"_d{i}" for i in range(4))):
             out[k] = np.int64(n)
@@ -59,3 +57,9 @@ def test_assumed_shape_lbound_ubound_loop(tmp_path: Path):
     sdfg(a=a.copy(order="F"), out=out, **_bind_free_syms(sdfg, n))
 
     np.testing.assert_allclose(out[0], a.sum(), rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

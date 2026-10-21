@@ -17,16 +17,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from _util import f2py_compile, have_flang
-from cloudsc.full._registries import (
+from tests._util import f2py_compile
+from tests.cloudsc.full._harness import run_cloudsc
+from tests.cloudsc.full._registries import (
     CLOUDSC_F90FLAGS,
     program_outputs,
 )
-from cloudsc.full._harness import run_cloudsc
 
 _HERE = Path(__file__).resolve().parent
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +45,7 @@ def _f2py_ref(tmp_path_factory):
         ref_dir,
         "cloudsc_ref",
         extra_f90flags=CLOUDSC_F90FLAGS,
-        only=("cloudscouter", ),
+        only=("cloudscouter",),
     )
 
 
@@ -73,6 +71,9 @@ def test_cloudsc_full_numerical(tmp_path, _f2py_ref, _strict_fp_cpu_args):
         nbad = int(bad.sum())
         if nbad == 0:
             continue
-        report.append(f"{name}: {nbad} cell(s) exceed rtol={rtol} "
-                      f"(max |Δ|={np.abs(a - b)[bad].max():.3e})")
+        report.append(f"{name}: {nbad} cell(s) exceed rtol={rtol} (max |Δ|={np.abs(a - b)[bad].max():.3e})")
     assert not report, "cloudsc_full numerical mismatch:\n" + "\n".join(report)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

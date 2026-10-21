@@ -5,14 +5,12 @@ flattener must thread live extents through the companion alloca/shape
 ``makeCompanionAlloca`` in ``FlattenStructs.cpp``) instead of baking static literals.
 Each checks a closed form so a wrong companion shape shows up as a numeric mismatch.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # ---------------------------------------------------------------------------
 # Local runtime-sized AoS with SCALAR members -> per-member SoA companions (non-concat
@@ -154,14 +152,16 @@ def test_runtime_dummy_cartesian_aos_flattens_to_soa(tmp_path: Path):
     field_x = np.zeros((n1, n2, n3, 3), order="F", dtype=np.float64)
     field_x[1, 0, 2, :] = [3.0, 4.0, 12.0]
     out = np.zeros(1, dtype=np.float64)
-    sdfg(field_x=field_x,
-         out=out,
-         n1=np.int32(n1),
-         n2=np.int32(n2),
-         n3=np.int32(n3),
-         field_x_d0=n1,
-         field_x_d1=n2,
-         field_x_d2=n3)
+    sdfg(
+        field_x=field_x,
+        out=out,
+        n1=np.int32(n1),
+        n2=np.int32(n2),
+        n3=np.int32(n3),
+        field_x_d0=n1,
+        field_x_d1=n2,
+        field_x_d2=n3,
+    )
     assert abs(out[0] - 169.0) < 1e-12, out[0]
 
 
@@ -216,7 +216,7 @@ def test_runtime_local_cartesian_section_arg(tmp_path: Path):
     n, m, k = 3, 2, 4
     out = np.asfortranarray(np.zeros((n, m, k)))
     sdfg(out=out, n=np.int32(n), m=np.int32(m), k=np.int32(k), out_d0=n, out_d1=m, out_d2=k)
-    expected = np.fromfunction(lambda i, j, l: (i + 1) + (j + 1) + (l + 1), (n, m, k), dtype=np.float64)
+    expected = np.fromfunction(lambda i, j, k_: (i + 1) + (j + 1) + (k_ + 1), (n, m, k), dtype=np.float64)
     np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
 
 
@@ -298,3 +298,9 @@ def test_multiscope_samename_cartesian_companions(tmp_path: Path):
     # rotk: acc += (i+j); divk: acc += z(i,j,1)%x(1) = (i+j+1)  ->  acc = 2(i+j)+1
     expected = np.fromfunction(lambda i, j: 2.0 * ((i + 1) + (j + 1)) + 1.0, (n, m), dtype=np.float64)
     np.testing.assert_allclose(acc, expected, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

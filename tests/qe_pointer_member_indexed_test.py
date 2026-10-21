@@ -19,12 +19,10 @@ Pins the fix: walking expandDesignateChain/buildExpr through the pointer-box fir
 between designate{component} and designate(indices), and section-aliasing an inlined
 FUNCTION-RESULT section dummy.
 """
+
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_pointer_member_array_indexed_by_local(tmp_path):
@@ -139,3 +137,9 @@ END MODULE
     assert "tabxx_box" in sdfg.arrays
     # record dim + member dim
     assert len(sdfg.arrays["tabxx_box"].shape) == 2
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

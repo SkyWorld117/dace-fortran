@@ -5,14 +5,12 @@ types/host init). real(4) kernel widened by the bridge -> loose comparison. Modu
 saturation tables + lazy-init flag are kernel-written globals surfaced as inout args,
 filled by qsmith_init_w on first call.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 _HERE = Path(__file__).parent
 _KM = 40
@@ -31,8 +29,8 @@ def _column():
     k = np.arange(1, _KM + 1, dtype=np.float32)
     a = {
         "qv": 0.010 * (1.0 - 0.02 * k),
-        "ql": 0.0010 * np.sin(0.1 * k)**2,
-        "qr": 0.0010 * np.sin(0.1 * k)**2,
+        "ql": 0.0010 * np.sin(0.1 * k) ** 2,
+        "qr": 0.0010 * np.sin(0.1 * k) ** 2,
         "qi": np.zeros(_KM),
         "qs": np.zeros(_KM),
         "qg": np.zeros(_KM),
@@ -62,27 +60,34 @@ def test_fv3_warm_rain(tmp_path):
     # f2py reference: km is optional (derived from dp's shape), r1 is returned as the
     # intent(out) value, inout arrays are updated in place. Pass everything by keyword.
     rkw = {n: base[n].copy() for n in (*_IN, *_INOUT)}
-    r1_ref = ref.warm_rain_mod.warm_rain_driver(dt=scalars["dt"],
-                                                rh_rain=scalars["rh_rain"],
-                                                h_var=scalars["h_var"],
-                                                **rkw)
+    r1_ref = ref.warm_rain_mod.warm_rain_driver(
+        dt=scalars["dt"], rh_rain=scalars["rh_rain"], h_var=scalars["h_var"], **rkw
+    )
 
     # Bridge SDFG: km is a free symbol; saturation tables + lazy-init flag are kernel-written
     # globals surfaced as inout args -- pass module defaults, qsmith_init_w fills them on first call.
     skw = {n: base[n].copy() for n in (*_IN, *_INOUT)}
     r1_out = np.zeros(1, dtype=np.float32)
-    sdfg(km=np.int32(_KM),
-         dt=scalars["dt"],
-         rh_rain=scalars["rh_rain"],
-         h_var=scalars["h_var"],
-         r1=r1_out,
-         tablew=np.zeros(_QS_LENGTH, dtype=np.float32, order='F'),
-         desw=np.zeros(_QS_LENGTH, dtype=np.float32, order='F'),
-         tables_are_initialized=np.array([False]),
-         **skw)
+    sdfg(
+        km=np.int32(_KM),
+        dt=scalars["dt"],
+        rh_rain=scalars["rh_rain"],
+        h_var=scalars["h_var"],
+        r1=r1_out,
+        tablew=np.zeros(_QS_LENGTH, dtype=np.float32, order="F"),
+        desw=np.zeros(_QS_LENGTH, dtype=np.float32, order="F"),
+        tables_are_initialized=np.array([0], dtype=np.uint32),
+        **skw,
+    )
 
     # rtol 1e-5 holds everywhere except m1_rain (float32 prefix-sum whose round-off is
     # ~7e-5 relative but ~2e-6 absolute); atol 5e-6 covers it without loosening the relative check.
     np.testing.assert_allclose(r1_out[0], r1_ref, rtol=1e-5, atol=5e-6)
     for name in _INOUT:
         np.testing.assert_allclose(skw[name], rkw[name], rtol=1e-5, atol=5e-6, err_msg=f"mismatch in {name}")
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

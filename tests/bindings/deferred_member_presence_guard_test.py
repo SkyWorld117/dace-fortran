@@ -18,14 +18,11 @@ import ctypes
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings import FlattenPlan, emit_bindings
 from dace_fortran.bindings.fortran_interface import build_auto_interface
+from tests._util import build_sdfg
 from tests.bindings.struct_bindings_e2e_test import _build_reference_lib, _build_sdfg_lib
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 _TYPES_SRC = """
 module mo_opt_state
@@ -87,13 +84,17 @@ _DRIVER_BODY = """
   deallocate(st%base)
 """
 
-_DRIVER = ("subroutine run_opt(base_ptr, opt_ptr, mode) bind(c, name='run_opt')" +
-           _DRIVER_BODY.format(use_line="use kern_opt_dace_bindings", call_name="kern_opt_dace") +
-           "  call kern_opt_dace_finalize()\nend subroutine run_opt\n")
+_DRIVER = (
+    "subroutine run_opt(base_ptr, opt_ptr, mode) bind(c, name='run_opt')"
+    + _DRIVER_BODY.format(use_line="use kern_opt_dace_bindings", call_name="kern_opt_dace")
+    + "  call kern_opt_dace_finalize()\nend subroutine run_opt\n"
+)
 
-_REF_DRIVER = ("subroutine run_opt_ref(base_ptr, opt_ptr, mode) bind(c, name='run_opt_ref')" +
-               _DRIVER_BODY.format(use_line="use kern_opt_mod, only: kern_opt", call_name="kern_opt") +
-               "end subroutine run_opt_ref\n")
+_REF_DRIVER = (
+    "subroutine run_opt_ref(base_ptr, opt_ptr, mode) bind(c, name='run_opt_ref')"
+    + _DRIVER_BODY.format(use_line="use kern_opt_mod, only: kern_opt", call_name="kern_opt")
+    + "end subroutine run_opt_ref\n"
+)
 
 
 def test_emitted_guard_text(tmp_path: Path):
@@ -125,17 +126,17 @@ def test_emitted_guard_text(tmp_path: Path):
 def test_e2e_disassociated_pointer_member(tmp_path: Path):
     """mode=0: ``st%opt`` stays disassociated; guarded wrapper takes the kernel's
     absent branch and matches the reference."""
-    sdfg_lib = _build_sdfg_lib(tmp_path,
-                               kernel_src=_SRC,
-                               types_src=_TYPES_SRC,
-                               name="kern_opt",
-                               entry="kern_opt_mod::kern_opt",
-                               driver_src=_DRIVER)
-    ref_lib = _build_reference_lib(tmp_path,
-                                   types_src=_TYPES_SRC,
-                                   kernel_src=_KERNEL_SRC,
-                                   ref_driver_src=_REF_DRIVER,
-                                   name="kern_opt")
+    sdfg_lib = _build_sdfg_lib(
+        tmp_path,
+        kernel_src=_SRC,
+        types_src=_TYPES_SRC,
+        name="kern_opt",
+        entry="kern_opt_mod::kern_opt",
+        driver_src=_DRIVER,
+    )
+    ref_lib = _build_reference_lib(
+        tmp_path, types_src=_TYPES_SRC, kernel_src=_KERNEL_SRC, ref_driver_src=_REF_DRIVER, name="kern_opt"
+    )
     for fn in (sdfg_lib.run_opt, ref_lib.run_opt_ref):
         fn.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_int]
         fn.restype = None
@@ -145,11 +146,17 @@ def test_e2e_disassociated_pointer_member(tmp_path: Path):
     opt_vals = np.asfortranarray(rng.standard_normal(6))
 
     base_ref = base_init.copy(order="F")
-    ref_lib.run_opt_ref(base_ref.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                        opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), 0)
+    ref_lib.run_opt_ref(
+        base_ref.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        0,
+    )
     base_sdfg = base_init.copy(order="F")
-    sdfg_lib.run_opt(base_sdfg.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                     opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), 0)
+    sdfg_lib.run_opt(
+        base_sdfg.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        0,
+    )
     np.testing.assert_array_equal(base_sdfg, base_ref)
     np.testing.assert_array_equal(base_ref, base_init + 1.0)
 
@@ -157,18 +164,17 @@ def test_e2e_disassociated_pointer_member(tmp_path: Path):
 def test_e2e_associated_pointer_member(tmp_path: Path):
     """mode=1: ``st%opt`` associated -- the guard's PRESENT branch must behave like the
     unguarded alias did."""
-    sdfg_lib = _build_sdfg_lib(tmp_path,
-                               kernel_src=_SRC,
-                               types_src=_TYPES_SRC,
-                               name="kern_opt2",
-                               entry="kern_opt_mod::kern_opt",
-                               driver_src=_DRIVER.replace("run_opt",
-                                                          "run_opt2").replace("kern_opt_dace", "kern_opt2_dace"))
-    ref_lib = _build_reference_lib(tmp_path,
-                                   types_src=_TYPES_SRC,
-                                   kernel_src=_KERNEL_SRC,
-                                   ref_driver_src=_REF_DRIVER,
-                                   name="kern_opt2")
+    sdfg_lib = _build_sdfg_lib(
+        tmp_path,
+        kernel_src=_SRC,
+        types_src=_TYPES_SRC,
+        name="kern_opt2",
+        entry="kern_opt_mod::kern_opt",
+        driver_src=_DRIVER.replace("run_opt", "run_opt2").replace("kern_opt_dace", "kern_opt2_dace"),
+    )
+    ref_lib = _build_reference_lib(
+        tmp_path, types_src=_TYPES_SRC, kernel_src=_KERNEL_SRC, ref_driver_src=_REF_DRIVER, name="kern_opt2"
+    )
     for fn in (sdfg_lib.run_opt2, ref_lib.run_opt_ref):
         fn.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_int]
         fn.restype = None
@@ -178,10 +184,22 @@ def test_e2e_associated_pointer_member(tmp_path: Path):
     opt_vals = np.asfortranarray(rng.standard_normal(6))
 
     base_ref = base_init.copy(order="F")
-    ref_lib.run_opt_ref(base_ref.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                        opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), 1)
+    ref_lib.run_opt_ref(
+        base_ref.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        1,
+    )
     base_sdfg = base_init.copy(order="F")
-    sdfg_lib.run_opt2(base_sdfg.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                      opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), 1)
+    sdfg_lib.run_opt2(
+        base_sdfg.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        opt_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        1,
+    )
     np.testing.assert_array_equal(base_sdfg, base_ref)
     np.testing.assert_array_equal(base_ref, base_init + opt_vals)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

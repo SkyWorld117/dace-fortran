@@ -17,11 +17,8 @@ from pathlib import Path
 
 import dace
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module mo_test_types
@@ -60,14 +57,14 @@ def test_velocity_nested_struct_indirection(tmp_path: Path):
     """End-to-end numerical check on the velocity-tendencies indirect pattern."""
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(_SRC, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(_SRC, sdfg_dir, name="kernel").build()
 
     nproma, nblks, nlev = 32, 32, 32
     rng = np.random.default_rng(0)
     w = np.asfortranarray(rng.standard_normal((nproma, nlev, nblks)))
     cell_idx = np.asfortranarray(rng.integers(1, 32, size=(nproma, nblks, 2), dtype=np.int32))
     cell_blk = np.asfortranarray(rng.integers(1, 32, size=(nproma, nblks, 2), dtype=np.int32))
-    out_sdfg = np.zeros((nproma, nlev, nblks), dtype=np.float64, order='F')
+    out_sdfg = np.zeros((nproma, nlev, nblks), dtype=np.float64, order="F")
 
     # NumPy gather, Fortran 1-based -> 0-based on the indirect axes -- exact arithmetic
     # kernel performs for every (je, jk, jb).
@@ -143,7 +140,7 @@ def views_with_source_link(sdfg):
     views = {n: False for n, d in sdfg.arrays.items() if isinstance(d, dace.data.View)}
     for state in sdfg.all_states():
         for node in state.data_nodes():
-            if node.data in views and any(e.dst_conn == 'views' for e in state.in_edges(node)):
+            if node.data in views and any(e.dst_conn == "views" for e in state.in_edges(node)):
                 views[node.data] = True
     return views
 
@@ -155,8 +152,9 @@ def test_rebound_pointer_indirect_index_view_compiles(tmp_path: Path):
     ``sym_*`` indirection edges."""
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(_REBIND_SRC, sdfg_dir, name="cells2verts_entry",
-                      entry="mo_rebind_indirect::cells2verts_entry").build()
+    sdfg = build_sdfg(
+        _REBIND_SRC, sdfg_dir, name="cells2verts_entry", entry="mo_rebind_indirect::cells2verts_entry"
+    ).build()
     sdfg.validate()
 
     # precondition: must lower as a view_alias -- fail loudly here rather than pass vacuously.
@@ -169,3 +167,9 @@ def test_rebound_pointer_indirect_index_view_compiles(tmp_path: Path):
 
     # crash was at codegen, not build/validate -- compiling is what exercises get_view_edge.
     sdfg.compile()
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

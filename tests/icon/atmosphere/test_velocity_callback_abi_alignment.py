@@ -7,6 +7,7 @@ union (ATMO_*_UNION_COMPONENTS) is complete by comparing both committed artifact
 member-for-member. Pointer-to-record HANDLE members are skipped by both sides and
 excluded here. Pure text parse -- no flang/SDFG build -- runs everywhere.
 """
+
 import re
 from pathlib import Path
 
@@ -39,11 +40,11 @@ def _type_members(tu: Path) -> dict:
     types, cur, members = {}, None, []
     for ln in tu.read_text().splitlines():
         if cur is None:
-            m = re.match(r"\s*TYPE\s*::\s*(\w+)\s*$", ln, re.I)
+            m = re.match(r"\s*TYPE\s*::\s*(\w+)\s*$", ln, re.IGNORECASE)
             if m:
                 cur, members = m.group(1), []
             continue
-        if re.match(r"\s*END\s+TYPE\b", ln, re.I):
+        if re.match(r"\s*END\s+TYPE\b", ln, re.IGNORECASE):
             types[cur] = members
             cur = None
             continue
@@ -59,8 +60,15 @@ def test_shared_struct_layouts_match_member_for_member():
     velocity = _type_members(_VELOCITY_TU)
     shared = sorted(set(outer) & set(velocity))
     # The structs that actually cross the callback boundary must be shared.
-    for required in ("t_patch", "t_grid_edges", "t_tangent_vectors", "t_nh_prog", "t_nh_diag", "t_nh_metrics",
-                     "t_int_state"):
+    for required in (
+        "t_patch",
+        "t_grid_edges",
+        "t_tangent_vectors",
+        "t_nh_prog",
+        "t_nh_diag",
+        "t_nh_metrics",
+        "t_int_state",
+    ):
         assert required in shared, f"{required} missing from one of the extracted TUs"
 
     desyncs = {}
@@ -72,4 +80,12 @@ def test_shared_struct_layouts_match_member_for_member():
 
     assert not desyncs, "per-member-SoA ABI desync between the two extracted TUs:\n" + "\n".join(
         f"  {t}:\n    only in solve_nh: {[m for m in o if m not in v]}\n"
-        f"    only in velocity: {[m for m in v if m not in o]}" for t, (o, v) in desyncs.items())
+        f"    only in velocity: {[m for m in v if m not in o]}"
+        for t, (o, v) in desyncs.items()
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

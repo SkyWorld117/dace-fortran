@@ -6,43 +6,55 @@ Lowers a Fortran ``read`` statement (fused with its ``open``/``close``) to a
 C++ tasklet calling the shipped ``dace_fio_*`` wrappers, so the real Fortran
 runtime performs the transfer.
 """
+
+from __future__ import annotations
+
+from typing import Any
+
 import dace.library
 import dace.properties
-from dace import dtypes
+from dace import SDFG, SDFGState, dtypes
 from dace.sdfg import nodes
+from dace.sdfg.nodes import LibraryNode
 from dace.transformation.transformation import ExpandTransformation
 
-from .node import FortranIONode, fio_type
-from .write import _c_string
+from dace_fortran.dace_types import library_node
+
 from .. import environments
+from .node import FortranIONode, fio_type
+from .write import c_string
 
 
 @dace.library.expansion
 class ExpandReadFortranIO(ExpandTransformation):
-
     environments = [environments.FortranIO]
 
     @staticmethod
-    def expansion(node, parent_state, parent_sdfg):
-        items = node._ordered_items(parent_sdfg, parent_state, "_out_", edges_in=False)
-        path = _c_string(node.filename)
+    def expansion(
+        node: LibraryNode, parent_state: SDFGState, parent_sdfg: SDFG, *args: Any, **kwargs: Any
+    ) -> nodes.Tasklet:
+        assert isinstance(node, Read)
+        items = node.ordered_items(parent_sdfg, parent_state, "_out_", edges_in=False, num_items=node.num_items)
+        path = c_string(node.filename)
         lines = [f'int _u = dace_fio_open("{path}", {len(node.filename.encode())}, 0);']
         for conn, desc, count, is_value in items:
             suffix, ctype = fio_type(desc.dtype)
             if is_value:
-                lines.append(f'dace_fio_read_{suffix}(_u, ({ctype} *)&{conn});')
+                lines.append(f"dace_fio_read_{suffix}(_u, ({ctype} *)&{conn});")
             else:
-                lines.append(f'dace_fio_read_{suffix}_arr(_u, ({ctype} *){conn}, {count});')
+                lines.append(f"dace_fio_read_{suffix}_arr(_u, ({ctype} *){conn}, {count});")
         lines.append("dace_fio_close(_u);")
-        return nodes.Tasklet(node.name,
-                             node.in_connectors,
-                             node.out_connectors,
-                             "\n".join(lines),
-                             language=dtypes.Language.CPP,
-                             side_effects=True)
+        return nodes.Tasklet(
+            node.name,
+            node.in_connectors,
+            node.out_connectors,
+            "\n".join(lines),
+            language=dtypes.Language.CPP,
+            side_effects=True,
+        )
 
 
-@dace.library.node
+@library_node
 class Read(FortranIONode):
     """Read ``num_items`` connected outputs from ``filename`` (list-directed)."""
 
@@ -52,7 +64,7 @@ class Read(FortranIONode):
     filename = dace.properties.Property(dtype=str, default="", desc="Input file path")
     num_items = dace.properties.Property(dtype=int, default=0, desc="Number of items read")
 
-    def __init__(self, name, filename: str = "", num_items: int = 0, **kwargs):
+    def __init__(self, name: str, filename: str = "", num_items: int = 0, **kwargs: Any) -> None:
         super().__init__(name, inputs=set(), outputs={f"_out_{i}" for i in range(num_items)}, **kwargs)
         self.filename = filename
         self.num_items = num_items

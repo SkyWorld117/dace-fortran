@@ -1,9 +1,8 @@
-"""E2E LOGICAL intent(out)/intent(inout) binding tests -- the copy-out leg (narrowing the
-SDFG's 1-byte bool back into the caller's LOGICAL(KIND=N) image) that logical_bindings_e2e_test.py's
-copy-in-only kernels never exercised.
+"""E2E LOGICAL intent(out)/intent(inout) binding tests: the SDFG writes the caller's LOGICAL(KIND=N)
+storage directly (0 / 1) and reads any non-zero value as .TRUE.
 
-Covers: rank-1 intent(out) (default kind + KIND 1/2/4/8), rank-1 intent(inout) (both legs),
-scalar intent(inout). Each case checks both the SDFG-direct flat ABI call and the generated
+Covers: rank-1 intent(out) (default kind + KIND 1/2/4/8, with foreign .TRUE. values), rank-1
+intent(inout), scalar intent(inout). Each case checks both the SDFG-direct call and the generated
 F90 binding against a gfortran reference.
 
 gfortran + ctypes (not f2py) throughout, since f2py's crackfortran mis-maps LOGICAL(KIND=2)
@@ -11,28 +10,23 @@ and logical(c_bool).
 """
 
 import ctypes
-import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from _util import build_sdfg, gfortran_compile_so, have_flang
 from dace_fortran.bindings import (
     FlattenPlan,
     OriginalArg,
     OriginalInterface,
     emit_bindings,
 )
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from tests._util import build_sdfg, gfortran_compile_so
 
 
-def _build_binding_lib(tmp_path: Path, *, kernel_src: str, name: str, entry: str, iface: OriginalInterface,
-                       driver_src: str):
+def _build_binding_lib(
+    tmp_path: Path, *, kernel_src: str, name: str, entry: str, iface: OriginalInterface, driver_src: str
+):
     """Build the SDFG, emit its F90 binding, gfortran-link binding+driver against the SDFG .so.
     Returns (ctypes lib, compiled SDFG) -- SDFG returned so the same build can also run via flat ABI."""
     sdfg_dir = tmp_path / "sdfg"
@@ -129,25 +123,27 @@ _KIND_MATRIX = [
 
 @pytest.mark.parametrize("kind_spec, width, cty", _KIND_MATRIX)
 def test_e2e_logical_intent_out(tmp_path: Path, kind_spec: str, width: int, cty):
-    """logical(kind=N), intent(out) :: b -- copy-out leg narrowing the SDFG's 1-byte bool back
-    into the caller's KIND=N image. Checks both the SDFG-direct call and the F90 binding."""
+    """logical(kind=N), intent(out) :: b -- the SDFG writes the caller's KIND=N storage. Checks both the
+    SDFG-direct call and the F90 binding."""
     suffix = "" if kind_spec == "" else f"_{width}"
     name = f"inv_out{suffix}"
     kernel = _out_kernel(kind_spec, suffix)
     iface = OriginalInterface(
         entry=name,
         args=(
-            OriginalArg(name="a", fortran_type=f"logical{kind_spec}", rank=1, shape=("n", ), intent="in"),
-            OriginalArg(name="b", fortran_type=f"logical{kind_spec}", rank=1, shape=("n", ), intent="out"),
+            OriginalArg(name="a", fortran_type=f"logical{kind_spec}", rank=1, shape=("n",), intent="in"),
+            OriginalArg(name="b", fortran_type=f"logical{kind_spec}", rank=1, shape=("n",), intent="out"),
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         ),
     )
-    lib, sdfg = _build_binding_lib(tmp_path,
-                                   kernel_src=kernel,
-                                   name=name,
-                                   entry=f"_QP{name}",
-                                   iface=iface,
-                                   driver_src=_out_sdfg_driver(kind_spec, suffix))
+    lib, sdfg = _build_binding_lib(
+        tmp_path,
+        kernel_src=kernel,
+        name=name,
+        entry=name,
+        iface=iface,
+        driver_src=_out_sdfg_driver(kind_spec, suffix),
+    )
     ref = _build_ref_lib(tmp_path, kernel_src=kernel, ref_driver_src=_out_ref_driver(kind_spec, suffix), name=name)
 
     n = 9
@@ -172,11 +168,20 @@ def test_e2e_logical_intent_out(tmp_path: Path, kind_spec: str, width: int, cty)
     fbind(a_w2.ctypes.data_as(ctypes.POINTER(cty)), b_bind.ctypes.data_as(ctypes.POINTER(cty)), n)
     np.testing.assert_array_equal((b_bind != 0).astype(np.int8), expected)
 
-    # (2) SDFG-direct path (DaCe flat ABI: np.bool_).
-    a_d = a_bits.copy()
-    b_d = np.zeros(n, dtype=np.bool_)
+    # (2) SDFG-direct path on the KIND=N storage; .NOT. of any non-zero value (-1, HUGE) is .FALSE.
+    storage = f"uint{width * 8}"
+    a_d = a_bits.astype(storage)
+    a_d[a_bits] = np.iinfo(storage).max
+    b_d = np.full(n, 7, dtype=storage)
     sdfg(a=a_d, b=b_d, n=n)
-    np.testing.assert_array_equal(b_d.astype(np.int8), expected)
+    np.testing.assert_array_equal(b_d, expected)
+
+    # (3) The binding with the same foreign .TRUE. values: written values are flang's 0 / 1.
+    b_bind = np.full(n, 7, dtype=f"int{width * 8}")
+    fbind(
+        a_d.view(f"int{width * 8}").ctypes.data_as(ctypes.POINTER(cty)), b_bind.ctypes.data_as(ctypes.POINTER(cty)), n
+    )
+    np.testing.assert_array_equal(b_bind, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -223,21 +228,23 @@ end subroutine run_toggle_io_ref
 
 
 def test_e2e_logical_intent_inout(tmp_path: Path):
-    """logical, intent(inout) :: mask -- caller's buffer is read (copy-in) and written back
-    (copy-out) through the same c_bool scratch; both SDFG-direct and F90-binding paths checked."""
+    """logical, intent(inout) :: mask -- the SDFG reads and writes the caller's buffer in place;
+    both SDFG-direct and F90-binding paths checked."""
     iface = OriginalInterface(
         entry="toggle_io",
         args=(
-            OriginalArg(name="mask", fortran_type="logical", rank=1, shape=("n", ), intent="inout"),
+            OriginalArg(name="mask", fortran_type="logical", rank=1, shape=("n",), intent="inout"),
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         ),
     )
-    lib, sdfg = _build_binding_lib(tmp_path,
-                                   kernel_src=_INOUT_KERNEL,
-                                   name="toggle_io",
-                                   entry="toggle_io_mod::toggle_io",
-                                   iface=iface,
-                                   driver_src=_INOUT_SDFG_DRIVER)
+    lib, sdfg = _build_binding_lib(
+        tmp_path,
+        kernel_src=_INOUT_KERNEL,
+        name="toggle_io",
+        entry="toggle_io_mod::toggle_io",
+        iface=iface,
+        driver_src=_INOUT_SDFG_DRIVER,
+    )
     ref = _build_ref_lib(tmp_path, kernel_src=_INOUT_KERNEL, ref_driver_src=_INOUT_REF_DRIVER, name="toggle_io")
 
     n = 7
@@ -258,16 +265,16 @@ def test_e2e_logical_intent_inout(tmp_path: Path):
     fbind(m_bind.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), n)
     np.testing.assert_array_equal((m_bind != 0).astype(np.int8), expected)
 
-    m_direct = init.copy()
+    m_direct = init.astype(np.uint32)
     sdfg(mask=m_direct, n=n)
-    np.testing.assert_array_equal(m_direct.astype(np.int8), expected)
+    np.testing.assert_array_equal(m_direct, expected)
     # Symmetry: a second toggle restores the original pattern.
     sdfg(mask=m_direct, n=n)
     np.testing.assert_array_equal(m_direct, init)
 
 
 # ---------------------------------------------------------------------------
-# scalar LOGICAL intent(inout): the length-1 c_bool buffer round-trip
+# scalar LOGICAL intent(inout)
 # ---------------------------------------------------------------------------
 
 _SCALAR_INOUT_KERNEL = """
@@ -318,26 +325,27 @@ end subroutine run_flip_flag_ref
 
 
 def test_e2e_scalar_logical_intent_inout(tmp_path: Path):
-    """Scalar logical, intent(inout) :: flag -- kernel branches on flag then flips it, exercising
-    the length-1 c_bool buffer in both directions; checked for both initial flag values."""
+    """Scalar logical, intent(inout) :: flag -- kernel branches on flag then flips it; checked for
+    both initial flag values."""
     iface = OriginalInterface(
         entry="flip_flag",
         args=(
             OriginalArg(name="flag", fortran_type="logical", rank=0, intent="inout"),
-            OriginalArg(name="hits", fortran_type="integer(c_int)", rank=1, shape=("n", ), intent="out"),
+            OriginalArg(name="hits", fortran_type="integer(c_int)", rank=1, shape=("n",), intent="out"),
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         ),
     )
-    lib, sdfg = _build_binding_lib(tmp_path,
-                                   kernel_src=_SCALAR_INOUT_KERNEL,
-                                   name="flip_flag",
-                                   entry="flip_flag_mod::flip_flag",
-                                   iface=iface,
-                                   driver_src=_SCALAR_INOUT_SDFG_DRIVER)
-    ref = _build_ref_lib(tmp_path,
-                         kernel_src=_SCALAR_INOUT_KERNEL,
-                         ref_driver_src=_SCALAR_INOUT_REF_DRIVER,
-                         name="flip_flag")
+    lib, sdfg = _build_binding_lib(
+        tmp_path,
+        kernel_src=_SCALAR_INOUT_KERNEL,
+        name="flip_flag",
+        entry="flip_flag_mod::flip_flag",
+        iface=iface,
+        driver_src=_SCALAR_INOUT_SDFG_DRIVER,
+    )
+    ref = _build_ref_lib(
+        tmp_path, kernel_src=_SCALAR_INOUT_KERNEL, ref_driver_src=_SCALAR_INOUT_REF_DRIVER, name="flip_flag"
+    )
 
     n = 5
     for start in (True, False):
@@ -358,8 +366,20 @@ def test_e2e_scalar_logical_intent_inout(tmp_path: Path):
         np.testing.assert_array_equal(hits_bind, hits_ref)
         assert (flag_bind.value != 0) == flag_out_ref
 
-        flag_d = np.array([start], dtype=np.bool_)
+        flag_d = np.array([start], dtype=np.uint32)
         hits_d = np.zeros(n, dtype=np.int32)
         sdfg(flag=flag_d, hits=hits_d, n=n)
         np.testing.assert_array_equal(hits_d, hits_ref)
         assert bool(flag_d[0]) == flag_out_ref
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    for case in _KIND_MATRIX:
+        with tempfile.TemporaryDirectory() as tmp:
+            test_e2e_logical_intent_out(Path(tmp), *case.values)
+    with tempfile.TemporaryDirectory() as tmp:
+        test_e2e_logical_intent_inout(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_e2e_scalar_logical_intent_inout(Path(tmp))

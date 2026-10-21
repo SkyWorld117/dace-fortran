@@ -10,33 +10,15 @@ Exercises every case-label shape the bridge recognises:
     case default      -> else branch at the innermost nesting
 """
 
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 _HERE = Path(__file__).resolve().parent
 _SRC_PATH = _HERE / "select_case.f90"
-
-
-def _f2py(src: Path, out_dir: Path, mod_name: str):
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran not available")
-    if shutil.which("meson") is None:
-        pytest.skip("meson not available (f2py backend on Python>=3.12)")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call([sys.executable, "-m", "numpy.f2py", "-c", str(src), "-m", mod_name, "--quiet"], cwd=out_dir)
-    if str(out_dir) not in sys.path:
-        sys.path.insert(0, str(out_dir))
-    __import__(mod_name)
-    return sys.modules[mod_name]
 
 
 @pytest.mark.parametrize(
@@ -55,9 +37,10 @@ def _f2py(src: Path, out_dir: Path, mod_name: str):
         (-1, 500),
         (-50, 500),
         (7, 0),
-    ])
+    ],
+)
 def test_select_case_all_shapes(tmp_path, x, expected):
-    mod = _f2py(_SRC_PATH, tmp_path / "ref", "sel_all_ref")
+    mod = f2py_compile(_SRC_PATH, tmp_path / "ref", "sel_all_ref")
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     # lift-cf-to-scf refuses to walk past fir.select_case ("terminator with side effects"), so
@@ -72,3 +55,7 @@ def test_select_case_all_shapes(tmp_path, x, expected):
     out_sdfg = np.zeros(1, dtype=np.int32)
     sdfg(x=int(x), out=out_sdfg)
     assert out_sdfg[0] == expected, f"SDFG mismatch: x={x} -> {out_sdfg[0]}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -23,8 +23,8 @@ the real ``MPI_Sendrecv`` moved neighbour data in.
 Runs under ``mpirun --oversubscribe`` at any even rank count (CI: ``-n 4``); COMM_WORLD splits
 into adjacent 2-rank pairs. Skipped at odd/<2 rank count.
 """
+
 import ctypes
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -32,18 +32,19 @@ import dace
 import numpy as np
 import pytest
 
-from _util import build_on_root, have_flang
 from dace_fortran.bindings import build_fortran_library
 from dace_fortran.build import build_sdfg
-from dace_fortran.external import Arg, clear_external_registry, keep_external
-from icon.ocean._ocean_e2e import (_invoke, _resolve_module_seeds, _retarget_shim, _size_derived_module_dims,
-                                   synth_call_inputs)
+from dace_fortran.external import Arg, ArgKind, Intent, clear_external_registry, keep_external
+from tests._util import build_on_root
+from tests.icon.ocean._ocean_e2e import (
+    _invoke,
+    _resolve_module_seeds,
+    _retarget_shim,
+    _size_derived_module_dims,
+    synth_call_inputs,
+)
 
-pytestmark = [
-    pytest.mark.mpi,
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("mpifort") is None, reason="mpifort not on PATH (need an MPI Fortran wrapper)"),
-]
+pytestmark = pytest.mark.mpi
 
 _HERE = Path(__file__).resolve().parent
 _ENTRY = "mo_scalar_product::nonlinear_coriolis_3d_fast_scalar"
@@ -57,14 +58,18 @@ def _rewrite_coriolis_tu(src: str) -> str:
     """Thread ``comm`` through the kernel and rewrite its ``t_patch``-taking sync CALL to the
     patch-free, comm-carrying ``vort_v_halo_sync``. Same three edits the single-rank harness
     would need to make the kernel halo-aware."""
-    sig = ("SUBROUTINE nonlinear_coriolis_3d_fast_scalar(patch_3d, vn, p_vn_dual, "
-           "vort_v, operators_coefficients, vort_flux, lacc)")
+    sig = (
+        "SUBROUTINE nonlinear_coriolis_3d_fast_scalar(patch_3d, vn, p_vn_dual, "
+        "vort_v, operators_coefficients, vort_flux, lacc)"
+    )
     if src.count(sig) != 1:
         raise RuntimeError(f"coriolis signature anchor not unique (found {src.count(sig)})")
     src = src.replace(
-        sig, "SUBROUTINE nonlinear_coriolis_3d_fast_scalar(patch_3d, vn, p_vn_dual, "
+        sig,
+        "SUBROUTINE nonlinear_coriolis_3d_fast_scalar(patch_3d, vn, p_vn_dual, "
         "vort_v, operators_coefficients, vort_flux, comm, lacc)\n"
-        "    USE mo_vort_sync, ONLY: vort_v_halo_sync")
+        "    USE mo_vort_sync, ONLY: vort_v_halo_sync",
+    )
     decl = "    REAL(KIND = 8) :: vort_flux_old(nproma, n_zlev, patch_3d % p_patch_2d(1) % nblks_e)"
     if src.count(decl) != 1:
         raise RuntimeError("coriolis vort_flux_old decl anchor not unique")
@@ -75,8 +80,8 @@ def _rewrite_coriolis_tu(src: str) -> str:
     # explicit extents so the sync takes vort_v explicit-shape: an assumed-shape dummy would
     # make gfortran drop the halo writeback (see vort_sync_mpi.f90)
     return src.replace(
-        synccall, "    CALL vort_v_halo_sync(3, nproma, n_zlev, "
-        "patch_3d % p_patch_2d(1) % nblks_v, vort_v, comm)")
+        synccall, "    CALL vort_v_halo_sync(3, nproma, n_zlev, patch_3d % p_patch_2d(1) % nblks_v, vort_v, comm)"
+    )
 
 
 def _build_artifacts(tmp_path: Path) -> dict:
@@ -91,10 +96,9 @@ def _build_artifacts(tmp_path: Path) -> dict:
     sync_f90.write_text(sync_src)
     sync_so = tmp_path / "libvort_sync.so"
     subprocess.check_call(
-        ["mpifort", "-shared", "-fPIC", *_O0_FFLAGS, f"-J{tmp_path}",
-         str(sync_f90), "-o",
-         str(sync_so)],
-        cwd=str(tmp_path))
+        ["mpifort", "-shared", "-fPIC", *_O0_FFLAGS, f"-J{tmp_path}", str(sync_f90), "-o", str(sync_so)],
+        cwd=str(tmp_path),
+    )
 
     # 2. rewrite the coriolis TU (comm thread + halo-sync CALL).
     tu = _rewrite_coriolis_tu((_HERE / "coriolis_pv_single_tu.f90").read_text())
@@ -107,15 +111,16 @@ def _build_artifacts(tmp_path: Path) -> dict:
         "vort_v_halo_sync",
         c_name="vort_v_halo_sync_c",
         args=(
-            Arg(kind="scalar", dtype="int32", intent="in"),  # typ
-            Arg(kind="scalar", dtype="int32", intent="in"),  # n1 = nproma
-            Arg(kind="scalar", dtype="int32", intent="in"),  # n2 = n_zlev
-            Arg(kind="scalar", dtype="int32", intent="in"),  # n3 = nblks_v
-            Arg(kind="array", dtype="float64", intent="inout"),  # vort_v
-            Arg(kind="scalar", dtype="int32", intent="in"),  # comm
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # typ
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # n1 = nproma
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # n2 = n_zlev
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # n3 = nblks_v
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),  # vort_v
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # comm
         ),
-        libraries=(str(sync_so), ),
-        dynamic_extents_abi=False)
+        libraries=(str(sync_so),),
+        dynamic_extents_abi=False,
+    )
     cpu = dace.Config.get("compiler", "cpu", "args").replace("-ffast-math", "")
     if "-ffp-contract" not in cpu:
         cpu += " -ffp-contract=off"
@@ -123,10 +128,9 @@ def _build_artifacts(tmp_path: Path) -> dict:
     try:
         sdfg = build_sdfg(sync_src + "\n" + tu, entry=_ENTRY, name="coriolis_comm", out_dir=str(tmp_path / "sdfg"))
         dace_name = sdfg.name
-        lib = build_fortran_library(sdfg,
-                                    out_dir=str(tmp_path / "lib"),
-                                    prelude_sources=[sync_f90, rewritten_tu],
-                                    bind_c_shim=True)
+        lib = build_fortran_library(
+            sdfg, out_dir=str(tmp_path / "lib"), prelude_sources=[sync_f90, rewritten_tu], bind_c_shim=True
+        )
     finally:
         clear_external_registry()  # AFTER compile has linked libvort_sync.so
     shim = Path(lib.bind_c_shim_f90).read_text()
@@ -138,16 +142,28 @@ def _build_artifacts(tmp_path: Path) -> dict:
     ref_shim = tmp_path / f"{dace_name}_ref_c.f90"
     ref_shim.write_text(_retarget_shim(shim, dace_name, _ENTRY, module_dims, _N))
     ref_so = tmp_path / f"lib{dace_name}_ref.so"
-    r = subprocess.run([
-        "gfortran", "-shared", "-fPIC", "-ffree-line-length-none", "-ffp-contract=off", "-fno-fast-math", "-o",
-        str(ref_so),
-        str(sync_f90),
-        str(rewritten_tu),
-        str(ref_shim), f"-L{sync_so.parent}", f"-Wl,-rpath,{sync_so.parent}", f"-l:{sync_so.name}"
-    ],
-                       capture_output=True,
-                       text=True,
-                       cwd=str(tmp_path))
+    r = subprocess.run(
+        [
+            "gfortran",
+            "-shared",
+            "-fPIC",
+            "-ffree-line-length-none",
+            "-ffp-contract=off",
+            "-fno-fast-math",
+            "-o",
+            str(ref_so),
+            str(sync_f90),
+            str(rewritten_tu),
+            str(ref_shim),
+            f"-L{sync_so.parent}",
+            f"-Wl,-rpath,{sync_so.parent}",
+            f"-l:{sync_so.name}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
     if r.returncode != 0:
         raise RuntimeError(f"REF .so compile failed:\n{r.stderr[-3000:]}")
 
@@ -166,10 +182,10 @@ def _build_artifacts(tmp_path: Path) -> dict:
 def test_coriolis_with_real_mpi_halo_2rank(tmp_path: Path):
     """2-rank real coriolis kernel + real-MPI ``vort_v`` halo: SDFG vs gfortran per-rank bit-exact, plus a pair-vs-COMM_SELF check that ``MPI_Sendrecv`` moved neighbour data in."""
     from mpi4py import MPI
+
     world = MPI.COMM_WORLD
     rank, size = world.Get_rank(), world.Get_size()
-    if size < 2 or size % 2 != 0:
-        pytest.skip("needs an even rank count >= 2 (mpirun --oversubscribe -n 2 / -n 4 ...)")
+    assert size >= 2 and size % 2 == 0, "needs an even rank count >= 2 (mpirun --oversubscribe -n 2 / -n 4 ...)"
     pair = world.Split(color=rank // 2, key=rank)
 
     # Pin every rank to rank 0's tmp_path so the .so artefacts are shared.
@@ -187,10 +203,9 @@ def test_coriolis_with_real_mpi_halo_2rank(tmp_path: Path):
 
     # distinct per-rank seeds so the exchange surfaces a real swap; comm is the live pair handle
     handle = pair.py2f()
-    call_plan, inputs, ptr_args, ptr_local = synth_call_inputs(shim,
-                                                               n=_N,
-                                                               seed=42 + rank,
-                                                               scalar_overrides={"comm": handle})
+    call_plan, inputs, ptr_args, ptr_local = synth_call_inputs(
+        shim, n=_N, seed=42 + rank, scalar_overrides={"comm": handle}
+    )
     # vort_v: (nproma, n_zlev, nblks_v); numpy block 0 = Fortran block 1 (owned), block 1 = block 2 (halo)
     vort_v_key = next(h for h, local in ptr_local.items() if local == "vort_v")
 
@@ -226,4 +241,9 @@ def test_coriolis_with_real_mpi_halo_2rank(tmp_path: Path):
     _invoke(art["dut_so"], self_plan, self_bufs, f"{dace_name}_c", sdfg_so=art["sdfg_so"], module_seeds=seed_specs)
     assert not np.array_equal(dut_bufs[vort_v_key], self_bufs[vort_v_key]), (
         f"rank {rank}: vort_v identical on the pair communicator and COMM_SELF -- the real 2-rank "
-        "MPI_Sendrecv moved no neighbour data (sync no-op'd or comm was dropped)")
+        "MPI_Sendrecv moved no neighbour data (sync no-op'd or comm was dropped)"
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

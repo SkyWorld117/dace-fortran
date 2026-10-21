@@ -17,11 +17,8 @@ descriptor is a true ``Scalar`` and the bare name is correct).
 """
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_struct_with_inout_scalar_dummies(tmp_path):
@@ -60,7 +57,7 @@ subroutine fun(res, idx)
   res(idx%start:idx%end) = 42
 end subroutine fun
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     res = np.zeros(6, order="F", dtype=np.int32)
     # ``intent(inout)`` scalar dummies -> length-1 Arrays on the
@@ -74,3 +71,9 @@ end subroutine fun
     assert res[0] == 0
     assert all(res[1:5] == 42)
     assert res[5] == 0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

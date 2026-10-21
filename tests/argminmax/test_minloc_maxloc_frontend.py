@@ -15,7 +15,7 @@ import dace_fortran
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
-from _util import have_flang  # noqa: E402
+from tests._util import have_flang  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
@@ -108,3 +108,7 @@ def test_minloc_as_expression_operand_lifted(tmp_path):
     sdfg = _build("minloc_expr_operand_probe.f90", "minloc_expr_operand", tmp_path)
     nodes = _find_lib_nodes(sdfg, "ArgMin")
     assert len(nodes) == 1, f"expected one ArgMin lib node, got {len(nodes)}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

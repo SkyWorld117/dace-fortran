@@ -10,20 +10,20 @@ Pins: the patched file parses via ``gfortran -fsyntax-only`` against ICON's own
 resolves to a linker-satisfiable ``solve_nh_dace_icon``.  Doesn't yet require the
 SDFG ``.so`` to exist (runtime resolution is step 5).
 """
+
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from icon.full._fc import (
+from tests.icon.full._fc import (
     FORTRAN_COMPILERS,
     cpp_flag,
     fortran_compiler_flags,
     syntax_check_argv,
 )
-from icon.full._icon_solve_nh_patch import (
+from tests.icon.full._icon_solve_nh_patch import (
     SOLVE_NH_WRAPPER_NAME,
     apply_solve_nh_patch,
     write_patched_solve_nh,
@@ -48,7 +48,6 @@ def _real_source() -> Path:
     return _PRISTINE_BAK if _PRISTINE_BAK.is_file() else _PRISTINE
 
 
-_HAVE_ICON = _real_source().is_file()
 _HAVE_ICON_MODS = (_ICON_BUILD / "mod").is_dir()
 
 # Reads ICON's real mo_solve_nonhydro via the icon-model submodule (heavy CI lane only) -> long.
@@ -59,7 +58,6 @@ pytestmark = pytest.mark.long
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_patch_preserves_signature():
     """The patched file's signature line + 14 dummy declarations are byte-identical
     to the pristine -- any drift would break ICON's mo_nh_stepping call site."""
@@ -75,9 +73,9 @@ def test_patch_preserves_signature():
         end = start
         while lines[end].rstrip().endswith("&"):
             end += 1
-        surface = list(lines[start:end + 1])
+        surface = list(lines[start : end + 1])
         # Stop at the first INTERFACE block: the patch's wrapper interface has its
-        # own dummy decls (c_bool/c_int types, not solve_nh's) -- internal, not ABI.
+        # own dummy decls -- internal, not ABI.
         for i in range(end + 1, len(lines)):
             stripped = lines[i].lstrip().upper()
             if stripped.startswith("END SUBROUTINE SOLVE_NH"):
@@ -90,26 +88,41 @@ def test_patch_preserves_signature():
 
     pristine_sig = "\n".join(_signature_surface(pristine))
     patched_sig = "\n".join(_signature_surface(patched))
-    assert pristine_sig == patched_sig, ("patched signature drifted from pristine -- ICON callers "
-                                         "would see a different surface.\nFirst differing chars:\n"
-                                         f"  pristine: {pristine_sig[:200]!r}\n"
-                                         f"  patched:  {patched_sig[:200]!r}")
+    assert pristine_sig == patched_sig, (
+        "patched signature drifted from pristine -- ICON callers "
+        "would see a different surface.\nFirst differing chars:\n"
+        f"  pristine: {pristine_sig[:200]!r}\n"
+        f"  patched:  {patched_sig[:200]!r}"
+    )
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_patched_body_calls_wrapper():
     """The patched body's first executable statement is the
     forwarding ``CALL solve_nh_dace_icon(...)``."""
     patched = apply_solve_nh_patch(_real_source().read_text())
     assert f"CALL {SOLVE_NH_WRAPPER_NAME}(" in patched
     # Forward every one of the 14 dummy args -- a dropped one silently defaults on the wrapper side.
-    for arg in ("p_nh", "p_patch", "p_int", "prep_adv", "nnow", "nnew", "l_init", "l_recompute", "lsave_mflx",
-                "lprep_adv", "lclean_mflx", "idyn_timestep", "jstep", "dtime", "lacc"):
+    for arg in (
+        "p_nh",
+        "p_patch",
+        "p_int",
+        "prep_adv",
+        "nnow",
+        "nnew",
+        "l_init",
+        "l_recompute",
+        "lsave_mflx",
+        "lprep_adv",
+        "lclean_mflx",
+        "idyn_timestep",
+        "jstep",
+        "dtime",
+        "lacc",
+    ):
         # substring match only; arg order in the CALL is pinned by the template
         assert arg in patched, f"forwarded arg {arg!r} missing"
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_differential_driver_injected():
     """The patch keeps the original body as REF (renamed ``solve_nh_ref``) and
     injects the driver (clone -> DUT -> REF -> compare -> free) as the new
@@ -143,14 +156,17 @@ def test_differential_driver_injected():
     # fraction of the file so the ~3000-line body was not duplicated.
     pristine_n = len(pristine.splitlines())
     patched_n = len(patched.splitlines())
-    assert patched_n > pristine_n, ("the differential patch keeps the body as the REF, so the file must "
-                                    f"GROW: patched={patched_n} pristine={pristine_n}")
+    assert patched_n > pristine_n, (
+        "the differential patch keeps the body as the REF, so the file must "
+        f"GROW: patched={patched_n} pristine={pristine_n}"
+    )
     growth = patched_n - pristine_n
-    assert growth < pristine_n // 2, (f"patched grew by {growth} lines -- far more than the injected driver; "
-                                      "the original body may have been duplicated instead of renamed")
+    assert growth < pristine_n // 2, (
+        f"patched grew by {growth} lines -- far more than the injected driver; "
+        "the original body may have been duplicated instead of renamed"
+    )
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 def test_write_patched_solve_nh(tmp_path: Path):
     """Round-trip the patch through the disk-writing helper."""
     out = tmp_path / "mo_solve_nonhydro.f90"
@@ -164,7 +180,6 @@ def test_write_patched_solve_nh(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not _HAVE_ICON, reason="icon-model submodule not checked out")
 @pytest.mark.parametrize("fc", GFORTRAN_COMPILERS)
 def test_patched_source_parses_through_fortran_compiler(fc, tmp_path: Path, icon_build):
     """The compiler accepts the patched file (syntax-only) against ICON's own .mod
@@ -179,8 +194,7 @@ def test_patched_source_parses_through_fortran_compiler(fc, tmp_path: Path, icon
         header = mod_probe.read_bytes()[:64]
         is_gfortran_mod = header.startswith(b"\x1f\x8b") or b"GFORTRAN module" in header
         if is_gfortran_mod and fc_name != "gfortran":
-            pytest.skip(f"$ICON_BUILD/mod carries gfortran-format .mod; "
-                        f"{fc_name} can't read those")
+            pytest.skip(f"$ICON_BUILD/mod carries gfortran-format .mod; {fc_name} can't read those")
 
     out = tmp_path / "mo_solve_nonhydro_patched.f90"
     write_patched_solve_nh(_real_source(), out)
@@ -218,10 +232,20 @@ def test_patched_source_parses_through_fortran_compiler(fc, tmp_path: Path, icon
     # Patched module USEs mo_solve_nh_diff, so its .mod must exist first; passing it
     # before the patched source in one invocation makes that happen (mirrors
     # test_solve_nh_patch.py's ordered multi-source syntax check).
-    subprocess.check_call([
-        fc_path, *syntax_check_argv(fc_name, tmp_path),
-        cpp_flag(fc_name), *fortran_compiler_flags(fc_name), *include_flags, *defines,
-        str(_DIFF_F90),
-        str(out)
-    ],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        [
+            fc_path,
+            *syntax_check_argv(fc_name, tmp_path),
+            cpp_flag(fc_name),
+            *fortran_compiler_flags(fc_name),
+            *include_flags,
+            *defines,
+            str(_DIFF_F90),
+            str(out),
+        ],
+        cwd=str(tmp_path),
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

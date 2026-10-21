@@ -35,28 +35,41 @@ entry point: emit ONE combined ``.f90`` and return its path.  It also
 exposes the combined fparser AST via ``inline_to_ast(...)`` for callers
 that want to inspect / further-transform the tree before serialisation.
 """
+
+from __future__ import annotations
+
 import argparse
 import logging
 import re
 import subprocess
 import tempfile
-import warnings
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import NamedTuple, Union, cast
 
 import fparser.two.Fortran2003 as f03
 from fparser.api import get_reader
-
-from dace_fortran.llvm_toolchain import require_flang
 from fparser.two.C99Preprocessor import CPP_CLASS_NAMES
 from fparser.two.parser import ParserFactory
 from fparser.two.utils import Base, FortranSyntaxError, walk
 
+from dace_fortran.entry_names import resolve_entry_name
 from dace_fortran.external_functions import ExternalFunction, dont_inline_names, validate
-from dace_fortran.inliner.ast_desugaring import (analysis, cleanup, desugaring, optimizations, pruning,
-                                                 specialize_at_source as specialize_at_source_mod, types, utils)
+from dace_fortran.inliner.ast_desugaring import (
+    analysis,
+    cleanup,
+    desugaring,
+    optimizations,
+    pruning,
+    types,
+    utils,
+)
+from dace_fortran.inliner.ast_desugaring import (
+    specialize_at_source as specialize_at_source_mod,
+)
 from dace_fortran.inliner.ast_desugaring.monomorphize_rewrite import monomorphize_auto
 from dace_fortran.inliner.ast_utils import atmost_one, children_of_type, singular
+from dace_fortran.llvm_toolchain import require_flang
 
 logger = logging.getLogger(__name__)
 
@@ -138,10 +151,20 @@ BUILTIN_STUB_MODULE_NAMES = frozenset({"iso_c_binding", "iso_fortran_env"})
 #: instead capture these ``USE``s before the pipeline and restore them after.
 #: They are otherwise irrelevant to the SDFG dace emits (kinds resolve to plain
 #: integers downstream), so a verbatim pass-through is exactly right.
-INTRINSIC_MODULE_NAMES = frozenset({
-    "iso_c_binding", "iso_fortran_env", "ieee_arithmetic", "ieee_exceptions", "ieee_features", "omp_lib",
-    "omp_lib_kinds", "openacc", "mpi", "mpi_f08"
-})
+INTRINSIC_MODULE_NAMES = frozenset(
+    {
+        "iso_c_binding",
+        "iso_fortran_env",
+        "ieee_arithmetic",
+        "ieee_exceptions",
+        "ieee_features",
+        "omp_lib",
+        "omp_lib_kinds",
+        "openacc",
+        "mpi",
+        "mpi_f08",
+    }
+)
 
 #: The subset of the above that are EXTERNAL LIBRARIES (MPI / OpenMP / OpenACC)
 #: rather than Fortran-standard intrinsic modules.  flang supplies them when it
@@ -155,7 +178,7 @@ INTRINSIC_MODULE_NAMES = frozenset({
 EXTERNAL_LIBRARY_MODULE_NAMES = frozenset({"omp_lib", "omp_lib_kinds", "openacc", "mpi", "mpi_f08"})
 
 
-def _preserved_intrinsic_modules(ast: Optional[f03.Program] = None) -> frozenset:
+def _preserved_intrinsic_modules(ast: f03.Program | None = None) -> frozenset:
     """The compiler-provided modules whose ``USE`` is captured before the
     pipeline and restored after.  Under ``tolerate_external_uses`` the external
     -library group (:data:`EXTERNAL_LIBRARY_MODULE_NAMES`) is excluded so those
@@ -171,7 +194,7 @@ def _preserved_intrinsic_modules(ast: Optional[f03.Program] = None) -> frozenset
     ``-fallow-argument-mismatch`` on the reference build).  In the external halo
     mode no such stub is provided and ``mo_mpi`` is not inlined, so the group is
     still dropped as before.  Pass ``ast`` to enable the provided-module check."""
-    if not analysis.TOLERATE_EXTERNAL_USES:
+    if not analysis.OPTIONS.tolerate_external_uses:
         return INTRINSIC_MODULE_NAMES
     preserved = INTRINSIC_MODULE_NAMES - EXTERNAL_LIBRARY_MODULE_NAMES
     if ast is not None:
@@ -225,21 +248,61 @@ class ParseConfig:
     entry points, etc.).
     """
 
-    def __init__(self,
-                 sources: Union[None, List[Path], Dict[str, str]] = None,
-                 entry_points: Union[None, types.SPEC, List[types.SPEC]] = None,
-                 do_not_prune: Union[None, types.SPEC, List[types.SPEC]] = None,
-                 do_not_rename: Union[None, types.SPEC, List[types.SPEC]] = None,
-                 make_noop: Union[None, types.SPEC, List[types.SPEC]] = None,
-                 ast_checkpoint_dir: Union[None, str, Path] = None,
-                 consolidate_global_data: bool = False,
-                 rename_uniquely: bool = False,
-                 do_not_prune_type_components: bool = False,
-                 keep_type_components: Optional[Dict[str, Iterable[str]]] = None,
-                 monomorphize: bool = True,
-                 rename_specifics: Optional[Dict[str, str]] = None,
-                 specialize_at_source: Optional[Iterable[str]] = None,
-                 f2py_safe: bool = False):
+    __slots__ = (
+        "ast_checkpoint_dir",
+        "config_injections",
+        "consolidate_global_data",
+        "do_not_prune",
+        "do_not_prune_type_components",
+        "do_not_rename",
+        "drop_noop_calls",
+        "entry_points",
+        "f2py_safe",
+        "keep_type_components",
+        "make_noop",
+        "make_return_false",
+        "monomorphize",
+        "rename_specifics",
+        "rename_uniquely",
+        "sources",
+        "specialize_at_source",
+    )
+
+    sources: dict[str, str]
+    entry_points: list[types.SPEC]
+    config_injections: list
+    make_return_false: set[str]
+    do_not_prune: list[types.SPEC]
+    do_not_rename: list[types.SPEC]
+    make_noop: list[types.SPEC]
+    drop_noop_calls: set[str]
+    ast_checkpoint_dir: Path | None
+    consolidate_global_data: bool
+    rename_uniquely: bool
+    do_not_prune_type_components: bool
+    keep_type_components: dict[str, list[str]]
+    monomorphize: bool
+    rename_specifics: dict[str, str]
+    specialize_at_source: list[str]
+    f2py_safe: bool
+
+    def __init__(
+        self,
+        sources: Union[None, list[Path], dict[str, str]] = None,
+        entry_points: Union[None, types.SPEC, list[types.SPEC]] = None,
+        do_not_prune: Union[None, types.SPEC, list[types.SPEC]] = None,
+        do_not_rename: Union[None, types.SPEC, list[types.SPEC]] = None,
+        make_noop: Union[None, types.SPEC, list[types.SPEC]] = None,
+        ast_checkpoint_dir: Union[None, str, Path] = None,
+        consolidate_global_data: bool = False,
+        rename_uniquely: bool = False,
+        do_not_prune_type_components: bool = False,
+        keep_type_components: dict[str, Iterable[str]] | None = None,
+        monomorphize: bool = True,
+        rename_specifics: dict[str, str] | None = None,
+        specialize_at_source: Iterable[str] | None = None,
+        f2py_safe: bool = False,
+    ) -> None:
         # Make the configs canonical, by processing the various types upfront.
         if not sources:
             sources = {}
@@ -253,12 +316,12 @@ class ParseConfig:
             do_not_prune = []
         elif isinstance(do_not_prune, tuple):
             do_not_prune = [do_not_prune]
-        do_not_prune = list({x for x in entry_points + do_not_prune})
+        do_not_prune = list(set(entry_points + do_not_prune))
         if not do_not_rename:
             do_not_rename = []
         elif isinstance(do_not_rename, tuple):
             do_not_rename = [do_not_rename]
-        do_not_rename = list({x for x in entry_points + do_not_rename})
+        do_not_rename = list(set(entry_points + do_not_rename))
         if not make_noop:
             make_noop = []
         elif isinstance(make_noop, tuple):
@@ -266,22 +329,22 @@ class ParseConfig:
         if isinstance(ast_checkpoint_dir, str):
             ast_checkpoint_dir = Path(ast_checkpoint_dir)
 
-        self.sources: Dict[str, str] = sources
-        self.entry_points: List[types.SPEC] = entry_points
-        self.config_injections: list = []
+        self.sources = sources
+        self.entry_points = entry_points
+        self.config_injections = []
         #: Lower-cased names of stubbed LOGICAL functions whose body is replaced
         #: with ``<result> = .FALSE.`` (a subset of ``make_noop``); populated by
         #: :func:`inline_to_ast` from its ``make_return_false`` argument.
-        self.make_return_false: Set[str] = set()
-        self.do_not_prune: List[types.SPEC] = do_not_prune
-        self.do_not_rename: List[types.SPEC] = do_not_rename
-        self.make_noop: List[types.SPEC] = make_noop
+        self.make_return_false = set()
+        self.do_not_prune = do_not_prune
+        self.do_not_rename = do_not_rename
+        self.make_noop = make_noop
         #: Lower-cased names of the EXPLICIT make_noop procedures (snapshotted
-        #: before :func:`inline_to_ast` merges the do_not_emit/keep_external
+        #: before :func:`inline_to_ast` merges the do_not_emit / external-function
         #: stubs in).  A call to one of these is a semantic no-op and is
-        #: dropped outright; keep_external stubs keep their call sites (the
+        #: dropped outright; the external stubs keep their call sites (the
         #: bridge or an external implementation handles them).
-        self.drop_noop_calls: Set[str] = {s[-1].lower() for s in make_noop}
+        self.drop_noop_calls = {s[-1].lower() for s in make_noop}
         self.ast_checkpoint_dir = ast_checkpoint_dir
         self.consolidate_global_data = consolidate_global_data
         self.rename_uniquely = rename_uniquely
@@ -298,9 +361,8 @@ class ParseConfig:
         #: slot order, both being source declaration order).  Type / component
         #: names are matched case-insensitively.  Resolved to
         #: ``Component_Decl`` specs by :meth:`keep_named_type_components`.
-        self.keep_type_components: Dict[str, List[str]] = {
-            t.lower(): [c.lower() for c in comps]
-            for t, comps in (keep_type_components or {}).items()
+        self.keep_type_components = {
+            t.lower(): [c.lower() for c in comps] for t, comps in (keep_type_components or {}).items()
         }
         #: Run the single-level abstract-dispatch monomorphisation pass (default
         #: on, always): collapse a ``CLASS(base)`` virtual dispatch the bridge
@@ -312,7 +374,7 @@ class ParseConfig:
         #: name with the generic interface it belongs to (see
         #: :func:`cleanup.rename_clashing_specifics`).  Applied before the
         #: externalisation / interface deconstruction that the collision breaks.
-        self.rename_specifics: Dict[str, str] = dict(rename_specifics or {})
+        self.rename_specifics = dict(rename_specifics or {})
         #: Names of subprograms to SPECIALIZE to their call sites by source-level
         #: inlining (per-call-site monomorphization), in addition to the structural
         #: module merge.  Used for ICON's halo ``sync_patch_array`` family, whose
@@ -322,29 +384,30 @@ class ParseConfig:
         #: branch-prune collapses the ladder to a single-source rebind BEFORE the
         #: bridge's pointer-rewrite (HLFIR inlining is too late).  See
         #: :mod:`inliner.ast_desugaring.specialize_at_source`.
-        self.specialize_at_source: List[str] = [n.lower() for n in (specialize_at_source or [])]
+        self.specialize_at_source = [n.lower() for n in (specialize_at_source or [])]
         #: Apply f2py-safety transforms so numpy f2py can wrap the TU: a placeholder
         #: member for emptied derived types + CLASS(t)->TYPE(t) stub-dummy demotion.
         #: Only the f2py-wrapped path (CLOUDSC) sets this; a gfortran-only extraction
         #: leaves both alone to stay byte-identical to its committed TU.
         self.f2py_safe = f2py_safe
 
-    def set_all_possible_entry_points_from(self, ast: f03.Program):
+    def set_all_possible_entry_points_from(self, ast: f03.Program) -> None:
         """Treat every top-level subprogram / main program as an entry point
         (used when no explicit entry point was supplied)."""
         self.entry_points = [
             analysis.ident_spec(singular(children_of_type(c, utils.NAMED_STMTS_OF_INTEREST_CLASSES)))
-            for c in walk(ast, utils.ENTRY_POINT_OBJECT_CLASSES) if isinstance(c, utils.ENTRY_POINT_OBJECT_CLASSES)
+            for c in walk(ast, utils.ENTRY_POINT_OBJECT_CLASSES)
+            if isinstance(c, utils.ENTRY_POINT_OBJECT_CLASSES)
         ]
-        self.do_not_prune = list({x for x in self.entry_points + self.do_not_prune})
+        self.do_not_prune = list(set(self.entry_points + self.do_not_prune))
 
-    def avoid_pruning_type_components(self, ast: f03.Program):
+    def avoid_pruning_type_components(self, ast: f03.Program) -> None:
         """Mark every derived-type component to be preserved during pruning."""
         ident_map = analysis.identifier_specs(ast)
         comp_specs = [k for k, v in ident_map.items() if isinstance(v, f03.Component_Decl)]
-        self.do_not_prune = list({x for x in comp_specs + self.do_not_prune})
+        self.do_not_prune = list(set(comp_specs + self.do_not_prune))
 
-    def keep_named_type_components(self, ast: f03.Program):
+    def keep_named_type_components(self, ast: f03.Program) -> None:
         """Mark the specific derived-type components named in
         :attr:`keep_type_components` to be preserved during pruning.
 
@@ -357,25 +420,27 @@ class ParseConfig:
         if not self.keep_type_components:
             return
         ident_map = analysis.identifier_specs(ast)
-        keep: List[types.SPEC] = []
+        keep: list[types.SPEC] = []
         for spec, node in ident_map.items():
             if not isinstance(node, f03.Component_Decl) or len(spec) < 2:
                 continue
             tname, cname = spec[-2].lower(), spec[-1].lower()
             if cname in self.keep_type_components.get(tname, ()):
                 keep.append(spec)
-        self.do_not_prune = list({x for x in keep + self.do_not_prune})
+        self.do_not_prune = list(set(keep + self.do_not_prune))
 
 
-def top_level_objects_map(ast: f03.Program, path: str) -> Dict[str, Base]:
+def top_level_objects_map(ast: f03.Program, path: str) -> dict[str, Base]:
     """Map lowercase names of top-level objects (modules, main programs) to
     their fparser nodes.  Warns (and skips) leftover cpp directives."""
-    out: Dict[str, Base] = {}
+    out: dict[str, Base] = {}
     for top in ast.children:
         if type(top).__name__ in CPP_CLASS_NAMES:
             logger.warning(
-                "Resolve the C++ preprocessor statements before starting to do anything with it; got `%s` in %s", top,
-                path)
+                "Resolve the C++ preprocessor statements before starting to do anything with it; got `%s` in %s",
+                top,
+                path,
+            )
             continue
         name = utils.find_name_of_node(top)
         assert name
@@ -383,7 +448,9 @@ def top_level_objects_map(ast: f03.Program, path: str) -> Dict[str, Base]:
     return out
 
 
-def _get_toplevel_objects(path_f90: Tuple[str, str], parser, sources: Dict[str, str]) -> Dict[str, Base]:
+def _get_toplevel_objects(
+    path_f90: tuple[str, str], parser: Callable[..., f03.Program], sources: dict[str, str]
+) -> dict[str, Base]:
     """Parse one source file, resolve its ``INCLUDE`` statements by text
     substitution from ``sources``, and map its top-level objects."""
     path, f90 = path_f90
@@ -393,14 +460,18 @@ def _get_toplevel_objects(path_f90: Tuple[str, str], parser, sources: Dict[str, 
         cast = parser(get_reader(f90))
         inc_map = {}
         for inc in walk(cast, f03.Include_Stmt):
-            file, = inc.children
+            (file,) = inc.children
             repls = {k: c for k, c in sources.items() if k.endswith(f"{file}")}
             if not repls:
                 logger.warning("Could not find the file to include `%s` in %s; moving on", inc, path)
                 continue
             if len(repls) > 1:
-                logger.warning("Found multiple candidate files to include `%s` in %s: %s; proceeding arbitrarily", inc,
-                               path, sorted(repls.keys()))
+                logger.warning(
+                    "Found multiple candidate files to include `%s` in %s: %s; proceeding arbitrarily",
+                    inc,
+                    path,
+                    sorted(repls.keys()),
+                )
             _, content = repls.popitem()
             inc_map[inc.tofortran()] = content
         if inc_map:
@@ -414,36 +485,40 @@ def _get_toplevel_objects(path_f90: Tuple[str, str], parser, sources: Dict[str, 
         return {}
 
 
-def construct_full_ast(sources: Dict[str, str],
-                       parser,
-                       entry_points: Optional[Iterable[types.SPEC]] = None) -> f03.Program:
+def construct_full_ast(
+    sources: dict[str, str], parser: Callable[..., f03.Program], entry_points: Iterable[types.SPEC] | None = None
+) -> f03.Program:
     """Combine every source file into one fparser AST, resolving
     ``INCLUDE`` directives and pruning modules unreachable from
     ``entry_points`` (all modules kept when ``entry_points`` is ``None``)."""
-    tops: Dict[str, Base] = {}
+    tops: dict[str, Base] = {}
     for path, f90 in sources.items():
         ctops = _get_toplevel_objects((path, f90), parser=parser, sources=sources)
         if ctops.keys() & tops.keys():
             logger.warning("Found duplicate names for top-level objects: %s", ctops.keys() & tops.keys())
         tops.update(ctops)
 
-    ast = f03.Program(get_reader(''))
+    ast = f03.Program(get_reader(""))
     ast.content = []
-    for _, v in tops.items():
+    for v in tops.values():
         utils.append_children(ast, v)
 
-    ast = pruning.keep_sorted_used_modules(ast, entry_points)
-    return ast
+    return pruning.keep_sorted_used_modules(ast, entry_points)
 
 
-def _module_name_of_use(use: f03.Use_Stmt) -> Optional[str]:
+def _module_name_of_use(use: f03.Use_Stmt) -> str | None:
     """The module name a ``USE`` statement imports from (its first ``Name``
     child -- the ``ONLY:`` list / renames are separate child nodes)."""
     nm = next(iter(children_of_type(use, f03.Name)), None)
     return nm.string.lower() if nm else None
 
 
-def _scope_visible_names(scope: Base, host_spec: Optional[f03.Specification_Part]):
+class VisibleNames(NamedTuple):
+    bound: set[str]
+    whole_use_modules: set[str]
+
+
+def _scope_visible_names(scope: Base, host_spec: f03.Specification_Part | None) -> VisibleNames:
     """Names already bound in ``scope`` that must NOT be re-imported / shadowed,
     plus the set of modules ``scope`` imports *whole* (``USE x`` with no
     ``ONLY:``, which brings in every public name of ``x``).
@@ -452,8 +527,8 @@ def _scope_visible_names(scope: Base, host_spec: Optional[f03.Specification_Part
     entities, and every ``USE``-imported name -- from the scope's own
     specification part and, for a module-contained procedure, the host module's
     specification part (host association)."""
-    visible: Set[str] = set()
-    whole_use_mods: Set[str] = set()
+    visible: set[str] = set()
+    whole_use_mods: set[str] = set()
     own_stmt = atmost_one(children_of_type(scope, (f03.Subroutine_Stmt, f03.Function_Stmt, f03.Program_Stmt)))
     if own_stmt is not None:
         for nm in walk(own_stmt, f03.Name):  # proc name + dummy-arg names (+ result)
@@ -475,10 +550,10 @@ def _scope_visible_names(scope: Base, host_spec: Optional[f03.Specification_Part
             nm = next(iter(children_of_type(ent, f03.Name)), None)
             if nm:
                 visible.add(nm.string.lower())
-    return visible, whole_use_mods
+    return VisibleNames(visible, whole_use_mods)
 
 
-def _prepend_use(scope: Base, clause: str):
+def _prepend_use(scope: Base, clause: str) -> None:
     """Add a ``USE`` statement to the front of ``scope``'s specification part,
     creating one (in the correct position, right after the opening statement)
     when the scope has none -- so the ``USE`` lands before ``IMPLICIT`` /
@@ -496,13 +571,13 @@ _SCOPE_CLASSES = (f03.Module, f03.Main_Program, f03.Subroutine_Subprogram, f03.F
 _SCOPE_STMT_CLASSES = (f03.Module_Stmt, f03.Program_Stmt, f03.Subroutine_Stmt, f03.Function_Stmt)
 
 
-def _scope_qualname(scope: Base) -> Tuple[str, ...]:
+def _scope_qualname(scope: Base) -> tuple[str, ...]:
     """The qualified name of ``scope`` -- the lower-cased names of the enclosing
     program units, root-first (``('m', 'foo')`` for subprogram ``foo`` in module
     ``m``).  Stable across the (no-body-inlining) merge, so it keys a scope
     before and after the pipeline."""
-    names: List[str] = []
-    node: Optional[Base] = scope
+    names: list[str] = []
+    node: Base | None = scope
     while node is not None:
         if isinstance(node, _SCOPE_CLASSES):
             stmt = atmost_one(children_of_type(node, _SCOPE_STMT_CLASSES))
@@ -513,12 +588,12 @@ def _scope_qualname(scope: Base) -> Tuple[str, ...]:
     return tuple(reversed(names))
 
 
-def collect_intrinsic_uses(ast: f03.Program) -> Dict[Tuple[str, ...], List[str]]:
+def collect_intrinsic_uses(ast: f03.Program) -> dict[tuple[str, ...], list[str]]:
     """Record every ``USE`` of a compiler-provided intrinsic module
     (:data:`INTRINSIC_MODULE_NAMES`), keyed by the qualified name of the scope
     that holds it.  Run BEFORE the pipeline, which strips these ``USE``s."""
     preserved = _preserved_intrinsic_modules(ast)
-    captured: Dict[Tuple[str, ...], List[str]] = {}
+    captured: dict[tuple[str, ...], list[str]] = {}
     for use in walk(ast, f03.Use_Stmt):
         if _module_name_of_use(use) not in preserved:
             continue
@@ -531,7 +606,7 @@ def collect_intrinsic_uses(ast: f03.Program) -> Dict[Tuple[str, ...], List[str]]
     return captured
 
 
-def restore_intrinsic_uses(ast: f03.Program, captured: Dict[Tuple[str, ...], List[str]]) -> f03.Program:
+def restore_intrinsic_uses(ast: f03.Program, captured: dict[tuple[str, ...], list[str]]) -> f03.Program:
     """Re-add the intrinsic-module ``USE``s captured by
     :func:`collect_intrinsic_uses` to their original scopes (matched by
     qualified name), so the merged Fortran still compiles -- flang supplies the
@@ -560,9 +635,11 @@ def restore_intrinsic_uses(ast: f03.Program, captured: Dict[Tuple[str, ...], Lis
     #    A genuine flang-provided intrinsic (``iso_c_binding`` &c.) has no
     #    in-AST ``MODULE`` either but is NOT external-library, so it is still
     #    restored.
-    still_defined = {(stmt.children[1].string.lower() if stmt else None)
-                     for m in walk(ast, f03.Module)
-                     for stmt in [atmost_one(children_of_type(m, f03.Module_Stmt))]}
+    still_defined = {
+        (stmt.children[1].string.lower() if stmt else None)
+        for m in walk(ast, f03.Module)
+        for stmt in [atmost_one(children_of_type(m, f03.Module_Stmt))]
+    }
     for scope in walk(ast, _SCOPE_CLASSES):
         for clause in captured.get(_scope_qualname(scope), []):
             mod = _module_name_of_use(f03.Use_Stmt(clause))
@@ -572,12 +649,12 @@ def restore_intrinsic_uses(ast: f03.Program, captured: Dict[Tuple[str, ...], Lis
     return ast
 
 
-def _defined_proc_names(ast: f03.Program) -> Set[str]:
+def _defined_proc_names(ast: f03.Program) -> set[str]:
     """Names of every procedure DEFINED with a body (module / internal
     subprograms).  Interface-body declarations are not subprograms, so they are
     excluded -- which is exactly what lets us tell a declared-external procedure
     from a locally-defined one."""
-    names: Set[str] = set()
+    names: set[str] = set()
     for sp in walk(ast, (f03.Subroutine_Subprogram, f03.Function_Subprogram)):
         stmt = atmost_one(children_of_type(sp, (f03.Subroutine_Stmt, f03.Function_Stmt)))
         nm = utils.find_name_of_stmt(stmt) if stmt is not None else None
@@ -586,15 +663,16 @@ def _defined_proc_names(ast: f03.Program) -> Set[str]:
     return names
 
 
-def _interface_block_decl_names(ib: f03.Interface_Block) -> Set[str]:
+def _interface_block_decl_names(ib: f03.Interface_Block) -> set[str]:
     """The lower-cased names of the procedures an ``INTERFACE`` block declares."""
     return {
         nm.lower()
-        for nm in (utils.find_name_of_stmt(s) for s in walk(ib, (f03.Function_Stmt, f03.Subroutine_Stmt))) if nm
+        for nm in (utils.find_name_of_stmt(s) for s in walk(ib, (f03.Function_Stmt, f03.Subroutine_Stmt)))
+        if nm
     }
 
 
-def collect_external_interfaces(ast: f03.Program) -> Dict[Tuple[str, ...], List[str]]:
+def collect_external_interfaces(ast: f03.Program) -> dict[tuple[str, ...], list[str]]:
     """Capture ``INTERFACE`` blocks that declare *external* procedures -- an
     explicit interface for a procedure with no definition anywhere in the
     project (e.g. a C-library function via ``BIND(C)``), keyed by the scope's
@@ -603,7 +681,7 @@ def collect_external_interfaces(ast: f03.Program) -> Dict[Tuple[str, ...], List[
     object -- the external symbol is resolved at link time, which the bridge's
     compile-to-HLFIR step never does)."""
     defined = _defined_proc_names(ast)
-    captured: Dict[Tuple[str, ...], List[str]] = {}
+    captured: dict[tuple[str, ...], list[str]] = {}
     for ib in walk(ast, f03.Interface_Block):
         # An ABSTRACT INTERFACE declares deferred-binding *templates* (referenced
         # by ``PROCEDURE(name), DEFERRED``), never an external link-time
@@ -613,7 +691,7 @@ def collect_external_interfaces(ast: f03.Program) -> Dict[Tuple[str, ...], List[
         # comm-pattern ``interface_exchange_data_*`` import ``t_comm_pattern_collection``,
         # ``t_ptr_3d_dp``, ...), leaving a dangling ``IMPORT`` that cannot compile.
         istmt = ib.children[0]
-        if isinstance(istmt, f03.Interface_Stmt) and istmt.children[0] == 'ABSTRACT':
+        if isinstance(istmt, f03.Interface_Stmt) and istmt.children[0] == "ABSTRACT":
             continue
         decl = _interface_block_decl_names(ib)
         # Skip a generic interface (no procedure bodies -> ``MODULE PROCEDURE``)
@@ -630,7 +708,7 @@ def collect_external_interfaces(ast: f03.Program) -> Dict[Tuple[str, ...], List[
     return captured
 
 
-def restore_external_interfaces(ast: f03.Program, captured: Dict[Tuple[str, ...], List[str]]) -> f03.Program:
+def restore_external_interfaces(ast: f03.Program, captured: dict[tuple[str, ...], list[str]]) -> f03.Program:
     """Re-insert the external-procedure ``INTERFACE`` blocks captured by
     :func:`collect_external_interfaces` into their scopes' specification parts
     (matched by qualified name), so the calls to those external procedures have
@@ -650,9 +728,7 @@ def restore_external_interfaces(ast: f03.Program, captured: Dict[Tuple[str, ...]
         # existing block that overlaps a captured block's procedure names first;
         # the verbatim capture re-added below is the single source of truth.
         captured_names = {
-            n
-            for text in blocks
-            for n in _interface_block_decl_names(f03.Interface_Block(get_reader(text)))
+            n for text in blocks for n in _interface_block_decl_names(f03.Interface_Block(get_reader(text)))
         }
         if spec is not None:
             for ib in list(walk(spec, f03.Interface_Block)):
@@ -689,9 +765,9 @@ def restore_cross_module_uses(ast: f03.Program) -> f03.Program:
     untouched -- so a local array or variable that merely shares a name with
     some module procedure is never mis-imported."""
     # Map each module-procedure name to its defining module(s).
-    proc_mods: Dict[str, Set[str]] = {}
+    proc_mods: dict[str, set[str]] = {}
     for mod in walk(ast, f03.Module):
-        mname = utils.find_name_of_stmt(atmost_one(children_of_type(mod, f03.Module_Stmt)))
+        mname = utils.find_name_of_stmt(singular(children_of_type(mod, f03.Module_Stmt)))
         subpart = atmost_one(children_of_type(mod, f03.Module_Subprogram_Part))
         if not mname or subpart is None:
             continue
@@ -707,8 +783,8 @@ def restore_cross_module_uses(ast: f03.Program) -> f03.Program:
 
     # Plan the additions per target node (a module, or a free scope), so two
     # sibling procedures needing the same import add it once at module level.
-    plan: Dict[int, Tuple[Base, Dict[str, Set[str]]]] = {}
-    planned: Dict[int, Set[str]] = {}
+    plan: dict[int, tuple[Base, dict[str, set[str]]]] = {}
+    planned: dict[int, set[str]] = {}
     for scope in walk(ast, (f03.Subroutine_Subprogram, f03.Function_Subprogram, f03.Main_Program)):
         exec_part = atmost_one(children_of_type(scope, f03.Execution_Part))
         if exec_part is None:
@@ -719,7 +795,7 @@ def restore_cross_module_uses(ast: f03.Program) -> f03.Program:
             host = host.parent
         cmod, host_spec, target = None, None, scope
         if isinstance(host, f03.Module):
-            cmod = utils.find_name_of_stmt(atmost_one(children_of_type(host, f03.Module_Stmt)))
+            cmod = utils.find_name_of_stmt(singular(children_of_type(host, f03.Module_Stmt)))
             cmod = cmod.lower() if cmod else None
             host_spec = atmost_one(children_of_type(host, f03.Specification_Part))
             target = host
@@ -728,7 +804,7 @@ def restore_cross_module_uses(ast: f03.Program) -> f03.Program:
         # Procedure names referenced in this scope: CALL targets + function/array
         # references (the latter guarded by ``visible`` so a local array of the
         # same name is excluded).
-        refs: Set[str] = set()
+        refs: set[str] = set()
         for call in walk(exec_part, f03.Call_Stmt):
             nm = next(iter(children_of_type(call, f03.Name)), None)
             if nm:
@@ -755,33 +831,19 @@ def restore_cross_module_uses(ast: f03.Program) -> f03.Program:
     return ast
 
 
-def _resolve_dont_inline_names(keep_external: Iterable[str], external_functions: Iterable[ExternalFunction],
-                               do_not_emit: Iterable[str]) -> Set[str]:
+def _resolve_dont_inline_names(external_functions: Iterable[ExternalFunction], do_not_emit: Iterable[str]) -> set[str]:
     """Union the (lower-cased) don't-inline names the inliner must stub.
 
     The external-function policy (see :mod:`dace_fortran.external_functions`)
     is two collections: ``external_functions`` (don't-inline + the bridge EMITs
     an external call) and ``do_not_emit`` (don't-inline + the bridge DROPs the
     call).  The inliner treats both the same -- it only needs the *names* not to
-    inline -- so this returns their validated union (:func:`dont_inline_names`).
-
-    ``keep_external`` is the deprecated predecessor parameter; it is kept as a
-    thin backward-compatible shim meaning exactly ``do_not_emit`` (the bridge,
-    not the inliner, decides emit-vs-drop), and warns when used."""
+    inline -- so this returns their validated union (:func:`dont_inline_names`)."""
     validate(external_functions, do_not_emit)
-    names = dont_inline_names(external_functions, do_not_emit)
-    keep_external = list(keep_external)
-    if keep_external:
-        warnings.warn(
-            "inline_to_ast/inline_to_single_tu(keep_external=...) is deprecated; "
-            "pass do_not_emit=[names] (or external_functions=[ExternalFunction(...)]) instead.",
-            DeprecationWarning,
-            stacklevel=3)
-        names |= {n.lower() for n in keep_external}
-    return names
+    return dont_inline_names(external_functions, do_not_emit)
 
 
-def _keep_external_noop_specs(ast: f03.Program, names: Iterable[str]) -> List[types.SPEC]:
+def _external_noop_specs(ast: f03.Program, names: Iterable[str]) -> list[types.SPEC]:
     """Resolve a caller-supplied list of *external* procedure names to the
     ``make_noop`` specs that stub them.
 
@@ -796,7 +858,7 @@ def _keep_external_noop_specs(ast: f03.Program, names: Iterable[str]) -> List[ty
     targets = {n.lower() for n in names}
     if not targets:
         return []
-    specs: List[types.SPEC] = []
+    specs: list[types.SPEC] = []
     for fn in walk(ast, (f03.Subroutine_Stmt, f03.Function_Stmt)):
         spec = analysis.ident_spec(fn)
         nm = spec[-1].lower()
@@ -813,7 +875,10 @@ def _function_result_name(fn: f03.Function_Stmt) -> str:
         result = atmost_one(children_of_type(suffix, f03.Name))
         if result is not None:
             return result.string
-    return utils.find_name_of_stmt(fn)
+    name = utils.find_name_of_stmt(fn)
+    if name is None:
+        raise ValueError(f"function statement without a name: {fn}")
+    return name
 
 
 #: ``/group/ obj, obj, ...`` segment of a ``NAMELIST`` statement.
@@ -837,7 +902,8 @@ def _prune_namelists_to_declared(ast: f03.Program) -> None:
     declared = {
         nm.string.lower()
         for ed in walk(ast, f03.Entity_Decl)
-        for nm in (next(iter(children_of_type(ed, f03.Name)), None), ) if nm is not None
+        for nm in (next(iter(children_of_type(ed, f03.Name)), None),)
+        if nm is not None
     }
     for nml in list(walk(ast, f03.Namelist_Stmt)):
         groups = []
@@ -861,11 +927,11 @@ def create_fparser_ast(cfg: ParseConfig) -> f03.Program:
     return ast
 
 
-def _checkpoint_ast(cfg: ParseConfig, name: str, ast: f03.Program):
+def _checkpoint_ast(cfg: ParseConfig, name: str, ast: f03.Program) -> None:
     """Dump an intermediate AST as Fortran into the checkpoint dir, if set."""
     if cfg.ast_checkpoint_dir:
         cfg.ast_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        with open(cfg.ast_checkpoint_dir.joinpath(name), 'w') as f:
+        with open(cfg.ast_checkpoint_dir.joinpath(name), "w") as f:
             f.write(ast.tofortran())
 
 
@@ -884,7 +950,7 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
     ``make_practically_constant_arguments_constants``,
     ``exploit_locally_constant_variables``, ``const_eval_nodes``,
     ``prune_branches``).  This is the mode the HLFIR build path
-    (:func:`dace_fortran.preprocess._fparser_merge`) uses: flang and the
+    (:func:`dace_fortran.preprocess.fparser_merge`) uses: flang and the
     bridge do their own constant-folding / dead-branch elimination, so the
     merge only needs a valid inlined single TU -- and skipping the
     optimizers both matches the legacy regex merge's "splice and let flang
@@ -906,11 +972,11 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
     # them now and restore them at the end so the serialised Fortran compiles.
     captured_intrinsic_uses = collect_intrinsic_uses(ast)
     captured_external_interfaces = collect_external_interfaces(ast)
-    _checkpoint_ast(cfg, 'ast_v0.f90', ast)
+    _checkpoint_ast(cfg, "ast_v0.f90", ast)
 
     if cfg.make_noop:
         logger.debug("FParser Op: Making certain functions no-op in the AST...")
-        noop_missed: Set[types.SPEC] = set(cfg.make_noop)
+        noop_missed: set[types.SPEC] = set(cfg.make_noop)
         # CLASS(t)->TYPE(t) dummy demotion is an f2py-safety transform: a stubbed
         # module proc with a CLASS dummy makes numpy f2py emit a NULL module entry
         # (import segfault). Only the f2py path needs it; a gfortran-only extraction
@@ -936,8 +1002,11 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
                 if spec_part is not None:
                     for dts in walk(spec_part, f03.Declaration_Type_Spec):
                         kw, tname = dts.children
-                        if str(kw).upper() == 'CLASS' and isinstance(tname, f03.Type_Name) \
-                                and str(tname).lower() not in abstract_type_names:
+                        if (
+                            str(kw).upper() == "CLASS"
+                            and isinstance(tname, f03.Type_Name)
+                            and str(tname).lower() not in abstract_type_names
+                        ):
                             utils.replace_node(dts, f03.Declaration_Type_Spec(f"TYPE({tname})"))
             # A return-false stub keeps a valid body so the (kept) call sites
             # still bind: replace the emptied body with `<result> = .FALSE.`
@@ -964,10 +1033,18 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
         # polymorphism reject is the loud backstop if dispatch reaches it from
         # any other path).
         stats = monomorphize_auto(ast)
-        if any((stats.locals_rewritten, stats.components_rewritten, stats.interposers_cloned,
-                stats.declarations_retyped, stats.pointer_constructors_cloned, stats.dummy_dispatch_cloned)):
+        if any(
+            (
+                stats.locals_rewritten,
+                stats.components_rewritten,
+                stats.interposers_cloned,
+                stats.declarations_retyped,
+                stats.pointer_constructors_cloned,
+                stats.dummy_dispatch_cloned,
+            )
+        ):
             logger.debug("FParser Op: monomorphised abstract dispatch: %s", stats)
-            _checkpoint_ast(cfg, 'ast_v0b.f90', ast)
+            _checkpoint_ast(cfg, "ast_v0b.f90", ast)
 
     logger.debug("FParser Op: Removing local indirections from AST...")
     # fparser splits a scope's spec/exec parts at a decl-after-statement-function
@@ -985,7 +1062,7 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
     # resolution is expected.
     ast = pruning.prune_coarsely(ast, cfg.do_not_prune)
     ast.init([n for n in ast.children if n is not None])
-    _checkpoint_ast(cfg, 'ast_v1.f90', ast)
+    _checkpoint_ast(cfg, "ast_v1.f90", ast)
 
     logger.debug("FParser Op: Removing remote indirections from AST...")
     ast = desugaring.convert_data_statements_into_assignments(ast)
@@ -1002,7 +1079,7 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
     # derived-type dummies, which numpy f2py cannot wrap -- it emits a NULL
     # module entry and the import of the reference leg segfaults.  Scoped to
     # ``cfg.drop_noop_calls`` (the caller's explicit make_noop): the
-    # keep_external stubs merged into ``cfg.make_noop`` later MUST keep their
+    # external stubs merged into ``cfg.make_noop`` later MUST keep their
     # call sites -- those calls are real (the bridge / an external
     # implementation serves them).
     def drop_explicit_noop_calls(a: f03.Program) -> None:
@@ -1036,8 +1113,8 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
         ast = pruning.prune_coarsely(ast, cfg.do_not_prune)
         ast_f90_old, ast_f90_new = ast_f90_new, ast.tofortran()
     if walk(ast, f03.Interface_Stmt):
-        _checkpoint_ast(cfg, 'ast_v1.error.f90', ast)
-        if not analysis.TOLERATE_EXTERNAL_USES:
+        _checkpoint_ast(cfg, "ast_v1.error.f90", ast)
+        if not analysis.OPTIONS.tolerate_external_uses:
             raise RuntimeError("Could not remove all the interfaces from AST")
         # Tolerating externals: a generic interface whose calls could not all be
         # resolved to a specific is left in place.  This happens for a
@@ -1049,12 +1126,15 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
         # procedures resolve at the call site), and the final gfortran gate
         # rejects a genuinely uncompilable TU, so this is safe to leave.
         surviving = sorted(
-            {utils.find_name_of_stmt(i)
-             for i in walk(ast, f03.Interface_Stmt) if utils.find_name_of_stmt(i)})
-        logger.warning("Left %d generic interface(s) unresolved while tolerating externals: %s", len(surviving),
-                       ", ".join(surviving))
+            {name for i in walk(ast, f03.Interface_Stmt) if (name := utils.find_name_of_stmt(i)) is not None}
+        )
+        logger.warning(
+            "Left %d generic interface(s) unresolved while tolerating externals: %s",
+            len(surviving),
+            ", ".join(surviving),
+        )
     ast = cleanup.correct_for_function_calls(ast)
-    _checkpoint_ast(cfg, 'ast_v2.f90', ast)
+    _checkpoint_ast(cfg, "ast_v2.f90", ast)
 
     # Specialize the configured targets (ICON's halo ``sync_patch_array`` family)
     # to their call sites by source-level inlining.  Runs AFTER generic-interface /
@@ -1065,10 +1145,14 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
     if cfg.specialize_at_source:
         n_sub, n_fun = specialize_at_source_mod.specialize_at_source(ast, cfg.specialize_at_source)
         if n_sub or n_fun:
-            logger.debug("FParser Op: specialized-at-source %d subprogram call(s) + %d function ref(s): %s", n_sub,
-                         n_fun, cfg.specialize_at_source)
+            logger.debug(
+                "FParser Op: specialized-at-source %d subprogram call(s) + %d function ref(s): %s",
+                n_sub,
+                n_fun,
+                cfg.specialize_at_source,
+            )
             ast = pruning.prune_coarsely(ast, cfg.do_not_prune)
-            _checkpoint_ast(cfg, 'ast_v2b.f90', ast)
+            _checkpoint_ast(cfg, "ast_v2b.f90", ast)
 
     ast_f90_old, ast_f90_new = None, ast.tofortran()
     while not ast_f90_old or ast_f90_old != ast_f90_new:
@@ -1094,27 +1178,27 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
         ast = pruning.consolidate_uses(ast)
         ast_f90_old, ast_f90_new = ast_f90_new, ast.tofortran()
     logger.debug("FParser Op: AST-size settled at %d lines.", len(ast_f90_new.splitlines()))
-    _checkpoint_ast(cfg, 'ast_v3.f90', ast)
+    _checkpoint_ast(cfg, "ast_v3.f90", ast)
 
-    if analysis.TOLERATE_EXTERNAL_USES:
+    if analysis.OPTIONS.tolerate_external_uses:
         # Drop interface bodies left dangling by pruning external baggage -- the
         # halo-exchange comm-pattern abstract interfaces whose IMPORTed comm
         # types were pruned away.  A no-op under full resolution.
         ast = pruning.prune_dangling_interface_bodies(ast)
-        _checkpoint_ast(cfg, 'ast_v3b.f90', ast)
+        _checkpoint_ast(cfg, "ast_v3b.f90", ast)
 
     if cfg.consolidate_global_data:
         logger.debug("FParser Op: Consolidating the global variables of the AST...")
         ast = cleanup.consolidate_global_data_into_arg(ast)
         ast = pruning.prune_coarsely(ast, cfg.do_not_prune)
-        _checkpoint_ast(cfg, 'ast_v4.f90', ast)
+        _checkpoint_ast(cfg, "ast_v4.f90", ast)
 
     if cfg.rename_uniquely:
         logger.debug("FParser Op: Rename uniquely...")
         ast = cleanup.assign_globally_unique_subprogram_names(ast, set(cfg.do_not_rename))
         ast = cleanup.assign_globally_unique_variable_names(ast, set(cfg.do_not_rename))
         ast = pruning.consolidate_uses(ast)
-        _checkpoint_ast(cfg, 'ast_v5.f90', ast)
+        _checkpoint_ast(cfg, "ast_v5.f90", ast)
 
     # The pipeline resolves symbols through its own alias map and drops the
     # inter-module ``USE`` statements as redundant -- fine for the native
@@ -1126,12 +1210,12 @@ def run_fparser_transformations(ast: f03.Program, cfg: ParseConfig, *, optimize:
     ast = restore_cross_module_uses(ast)
     ast = restore_intrinsic_uses(ast, captured_intrinsic_uses)
     ast = restore_external_interfaces(ast, captured_external_interfaces)
-    _checkpoint_ast(cfg, 'ast_v6.f90', ast)
+    _checkpoint_ast(cfg, "ast_v6.f90", ast)
 
     return ast
 
 
-def parse_and_improve(sources: Dict[str, str], entry_points: Optional[Iterable[types.SPEC]] = None) -> f03.Program:
+def parse_and_improve(sources: dict[str, str], entry_points: Iterable[types.SPEC] | None = None) -> f03.Program:
     """Parse ``sources`` into one combined AST and apply the
     ``correct_for_function_calls`` improver -- the light-weight entry used
     by the ported unit tests (matches the upstream
@@ -1143,43 +1227,17 @@ def parse_and_improve(sources: Dict[str, str], entry_points: Optional[Iterable[t
     return ast
 
 
-def _demangle_spec(mangled: str) -> types.SPEC:
-    """Turn a flang-mangled symbol (``_QP<proc>`` / ``_QM<mod>P<proc>``)
-    into an fparser entry SPEC ``(proc,)`` / ``(mod, proc)``.
+def _entry_to_spec(source: str, entry: str | None) -> types.SPEC | None:
+    """Resolve ``entry`` (``proc`` / ``module::proc``) to an fparser entry-point SPEC ``(module, proc)`` or
+    ``(proc,)``.
 
-    Self-contained so the inliner's unit tests need not import the C++
-    bridge (which ``dace_fortran.builder`` pulls in eagerly).  Kept in
-    lock-step with ``dace_fortran.builder._demangle_fortran_proc`` /
-    ``_module_of_fortran_sym``: flang lower-cases every identifier, so the
-    only upper-case markers are the structural ``M`` / ``P`` / ``F``."""
-    if not mangled.startswith("_Q"):
-        return (mangled.lower(), )
-    p = mangled.rfind("P")
-    proc = mangled[p + 1:].lower() if p > 1 else mangled.lower()
-    if mangled.startswith("_QM"):
-        body = mangled[3:]
-        for i, ch in enumerate(body):
-            if ch in ("P", "F"):
-                if i > 0:
-                    return (body[:i].lower(), proc)
-                break
-    return (proc, )
-
-
-def _entry_to_spec(source: str, entry: Optional[str]) -> Optional[types.SPEC]:
-    """Resolve ``entry`` (plain name / ``module::proc`` / mangled ``_Q...``)
-    to an fparser entry-point SPEC ``(module, proc)`` or ``(proc,)``.
-
-    Resolution goes through dace-fortran's own ``_resolve_entry`` (so the
-    inliner agrees byte-for-byte with the HLFIR build path on which
-    procedure is the root); the result is demangled locally to avoid
-    importing the bridge-heavy ``dace_fortran.builder``.  ``None`` passes
-    through (every top-level subprogram is kept as an entry point)."""
+    Resolution goes through dace-fortran's own ``resolve_entry_name`` (so the inliner agrees with the HLFIR build path
+    on which procedure is the root).  ``None`` passes through (every top-level subprogram is kept as an entry
+    point)."""
     if entry is None:
         return None
-    from dace_fortran.build import _resolve_entry
-
-    return _demangle_spec(_resolve_entry(source, entry))
+    module, proc = resolve_entry_name([source], entry)
+    return (module, proc) if module else (proc,)
 
 
 #: One physical ``!$acc`` sentinel line (directive opener or continuation piece).
@@ -1194,7 +1252,12 @@ _ACC_MARKER_CALL_RE = re.compile(rf"^\s*CALL\s+{_ACC_MARKER_STEM}(\d+)\s*$", re.
 _ACC_SPEC_PART_HEADS = frozenset({"declare", "routine"})
 
 
-def encode_acc_directives(src_map: Dict[str, str]) -> Tuple[Dict[str, str], Dict[int, List[str]]]:
+class EncodedAccDirectives(NamedTuple):
+    sources: dict[str, str]
+    directives: dict[int, list[str]]
+
+
+def encode_acc_directives(src_map: dict[str, str]) -> EncodedAccDirectives:
     """Replace each logical ``!$acc`` directive (continuations joined) with a
     ``CALL dace_acc_dirmark_<n>`` marker statement, returning the rewritten
     sources and the ``{n: [original lines]}`` table :func:`decode_acc_directives`
@@ -1207,12 +1270,12 @@ def encode_acc_directives(src_map: Dict[str, str]) -> Tuple[Dict[str, str], Dict
     single TU is one whose statement context survived.  Specification-part
     directive heads (``DECLARE`` / ``ROUTINE``) stay comments: a CALL between
     declarations would not parse."""
-    table: Dict[int, List[str]] = {}
-    out_map: Dict[str, str] = {}
+    table: dict[int, list[str]] = {}
+    out_map: dict[str, str] = {}
     counter = 0
     for name, text in src_map.items():
         lines = text.splitlines()
-        out: List[str] = []
+        out: list[str] = []
         i = 0
         while i < len(lines):
             if not _ACC_SENTINEL_LINE_RE.match(lines[i]):
@@ -1225,23 +1288,25 @@ def encode_acc_directives(src_map: Dict[str, str]) -> Tuple[Dict[str, str], Dict
                 block.append(lines[i])
             i += 1
             first = _ACC_SENTINEL_LINE_RE.match(block[0])
-            head = re.match(r"\s*([A-Za-z_]\w*)", block[0][first.end():])
+            if first is None:
+                raise ValueError(f"not a !$acc sentinel line: {block[0]!r}")
+            head = re.match(r"\s*([A-Za-z_]\w*)", block[0][first.end() :])
             if head is not None and head.group(1).lower() in _ACC_SPEC_PART_HEADS:
                 out.extend(block)
                 continue
-            indent = block[0][:len(block[0]) - len(block[0].lstrip())]
+            indent = block[0][: len(block[0]) - len(block[0].lstrip())]
             table[counter] = block
             out.append(f"{indent}CALL {_ACC_MARKER_STEM}{counter}")
             counter += 1
         out_map[name] = "\n".join(out) + ("\n" if text.endswith("\n") else "")
-    return out_map, table
+    return EncodedAccDirectives(out_map, table)
 
 
-def decode_acc_directives(text: str, table: Dict[int, List[str]]) -> str:
+def decode_acc_directives(text: str, table: dict[int, list[str]]) -> str:
     """Inverse of :func:`encode_acc_directives` on serialised Fortran: each
     surviving marker CALL becomes its original ``!$acc`` line(s) again (verbatim,
     original indentation).  Markers whose region was pruned simply never appear."""
-    out: List[str] = []
+    out: list[str] = []
     for line in text.splitlines():
         match = _ACC_MARKER_CALL_RE.match(line)
         if match is not None and int(match.group(1)) in table:
@@ -1268,8 +1333,7 @@ def _strip_unparseable_attrs(text: str) -> str:
     return _STANDALONE_CONTIGUOUS_RE.sub(r"\1! CONTIGUOUS\2", text)
 
 
-def _cpp_expand_one(name: str, content: str, *, defines: List[str], include_dirs: List[Path],
-                    flang: Optional[str]) -> str:
+def _cpp_expand_one(name: str, content: str, *, defines: list[str], include_dirs: list[Path], flang: str | None) -> str:
     """Run the C preprocessor (via flang ``-cpp -E -P``) over one source's
     text and return the expanded Fortran.
 
@@ -1301,18 +1365,21 @@ def _cpp_expand_one(name: str, content: str, *, defines: List[str], include_dirs
         cmd += [f"-D{d}" for d in defines]
         cmd += [f"-I{Path(d)}" for d in inc]
         cmd += [str(srcf)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if proc.returncode != 0:
-            raise RuntimeError(f"cpp preprocessing failed for {name!r} (exit {proc.returncode}):\n"
-                               f"{proc.stderr.strip()}")
+            raise RuntimeError(
+                f"cpp preprocessing failed for {name!r} (exit {proc.returncode}):\n{proc.stderr.strip()}"
+            )
         return _strip_unparseable_attrs(proc.stdout)
 
 
-def cpp_expand_sources(src_map: Dict[str, str],
-                       *,
-                       defines: Iterable[str] = (),
-                       include_dirs: Iterable[Union[str, Path]] = (),
-                       flang: Optional[str] = None) -> Dict[str, str]:
+def cpp_expand_sources(
+    src_map: dict[str, str],
+    *,
+    defines: Iterable[str] = (),
+    include_dirs: Iterable[Union[str, Path]] = (),
+    flang: str | None = None,
+) -> dict[str, str]:
     """Preprocess every source in a ``{name: content}`` map through the C
     preprocessor and return the expanded map.
 
@@ -1331,31 +1398,32 @@ def cpp_expand_sources(src_map: Dict[str, str],
     }
 
 
-def inline_to_ast(sources: Union[Dict[str, str], Iterable[Union[str, Path]]],
-                  entry: Optional[str] = None,
-                  *,
-                  expand_cpp: bool = False,
-                  force_double_precision: bool = False,
-                  defines: Iterable[str] = (),
-                  include_dirs: Iterable[Union[str, Path]] = (),
-                  flang: Optional[str] = None,
-                  make_noop: Union[None, types.SPEC, List[types.SPEC]] = None,
-                  make_return_false: Iterable[str] = (),
-                  keep_external: Iterable[str] = (),
-                  external_functions: Iterable[ExternalFunction] = (),
-                  do_not_emit: Iterable[str] = (),
-                  consolidate_global_data: bool = False,
-                  rename_uniquely: bool = False,
-                  do_not_prune_type_components: bool = False,
-                  keep_type_components: Optional[Dict[str, Iterable[str]]] = None,
-                  checkpoint_dir: Union[None, str, Path] = None,
-                  include_builtins: bool = True,
-                  tolerate_external_uses: bool = False,
-                  monomorphize: bool = True,
-                  rename_specifics: Optional[Dict[str, str]] = None,
-                  specialize_at_source: Iterable[str] = (),
-                  f2py_safe: bool = False,
-                  optimize: bool = True) -> f03.Program:
+def inline_to_ast(
+    sources: Union[dict[str, str], Iterable[Union[str, Path]]],
+    entry: str | None = None,
+    *,
+    expand_cpp: bool = False,
+    force_double_precision: bool = False,
+    defines: Iterable[str] = (),
+    include_dirs: Iterable[Union[str, Path]] = (),
+    flang: str | None = None,
+    make_noop: Union[None, types.SPEC, list[types.SPEC]] = None,
+    make_return_false: Iterable[str] = (),
+    external_functions: Iterable[ExternalFunction] = (),
+    do_not_emit: Iterable[str] = (),
+    consolidate_global_data: bool = False,
+    rename_uniquely: bool = False,
+    do_not_prune_type_components: bool = False,
+    keep_type_components: dict[str, Iterable[str]] | None = None,
+    checkpoint_dir: Union[None, str, Path] = None,
+    include_builtins: bool = True,
+    tolerate_external_uses: bool = False,
+    monomorphize: bool = True,
+    rename_specifics: dict[str, str] | None = None,
+    specialize_at_source: Iterable[str] = (),
+    f2py_safe: bool = False,
+    optimize: bool = True,
+) -> f03.Program:
     """Run the full inliner pipeline and return the combined fparser AST.
 
     ``sources`` is either a ``{filename: content}`` mapping or an iterable
@@ -1373,15 +1441,12 @@ def inline_to_ast(sources: Union[Dict[str, str], Iterable[Union[str, Path]]],
     empty body so its internals (the halo-exchange ``%exchange_data`` type-bound
     call, MPI, I/O) never enter the TU.  Nothing ICON-specific is hardcoded.
 
-    ``keep_external`` is the deprecated predecessor of ``do_not_emit`` -- a plain
-    name list, kept as a backward-compatible shim (it warns).
-
     ``tolerate_external_uses`` lets the pipeline ingest a kernel whose
     enclosing module ``USE``s an external library with no Fortran source on
     the search path (ICON: ``netcdf`` / ``mpi`` / ``cdi``): such imports are
     left unresolved and the reachability pruning drops the procedures that
     referenced them (see
-    :data:`dace_fortran.inliner.ast_desugaring.analysis.TOLERATE_EXTERNAL_USES`).
+    :data:`dace_fortran.inliner.ast_desugaring.analysis.OPTIONS.tolerate_external_uses`).
 
     ``optimize=False`` skips the constant-propagation / branch-pruning
     optimization passes (see :func:`run_fparser_transformations`) -- used by
@@ -1400,7 +1465,7 @@ def inline_to_ast(sources: Union[Dict[str, str], Iterable[Union[str, Path]]],
         # is lowered and compared at uniform fp64 on both legs.  Integer kinds
         # (``SELECTED_INT_KIND``) are untouched.
         src_map = {
-            name: re.sub(r'SELECTED_REAL_KIND\s*\([^)]*\)', '8', src, flags=re.IGNORECASE)
+            name: re.sub(r"SELECTED_REAL_KIND\s*\([^)]*\)", "8", src, flags=re.IGNORECASE)
             for name, src in src_map.items()
         }
     spec = _entry_to_spec(_concat_sources(src_map), entry)
@@ -1420,7 +1485,7 @@ def inline_to_ast(sources: Union[Dict[str, str], Iterable[Union[str, Path]]],
     )
     if include_builtins:
         cfg.sources.setdefault("_builtins.f90", BUILTINS)
-    dont_inline = _resolve_dont_inline_names(keep_external, external_functions, do_not_emit)
+    dont_inline = _resolve_dont_inline_names(external_functions, do_not_emit)
     # Return-false stubs are also non-inlined (stubbed), then assigned .FALSE.
     cfg.make_return_false = {n.lower() for n in make_return_false}
     dont_inline |= cfg.make_return_false
@@ -1445,7 +1510,7 @@ def inline_to_ast(sources: Union[Dict[str, str], Iterable[Union[str, Path]]],
             # types (and any ``keep_type_components`` members riding on them),
             # yielding a body-less, member-stripped TU.  Entry specs are
             # subtracted from the resolved noop set here.
-            noop_specs = [s for s in _keep_external_noop_specs(ast, dont_inline) if s not in cfg.entry_points]
+            noop_specs = [s for s in _external_noop_specs(ast, dont_inline) if s not in cfg.entry_points]
             cfg.make_noop = list(cfg.make_noop or []) + noop_specs
         ast = run_fparser_transformations(ast, cfg, optimize=optimize)
         # NAMELIST statements survive pruning but may name variables pruning
@@ -1455,34 +1520,35 @@ def inline_to_ast(sources: Union[Dict[str, str], Iterable[Union[str, Path]]],
     return ast
 
 
-def inline_to_single_tu(sources: Union[Dict[str, str], Iterable[Union[str, Path]]],
-                        entry: Optional[str] = None,
-                        *,
-                        output: Union[None, str, Path] = None,
-                        out_dir: Union[None, str, Path] = None,
-                        name: str = "inlined",
-                        expand_cpp: bool = False,
-                        force_double_precision: bool = False,
-                        defines: Iterable[str] = (),
-                        include_dirs: Iterable[Union[str, Path]] = (),
-                        flang: Optional[str] = None,
-                        make_noop: Union[None, types.SPEC, List[types.SPEC]] = None,
-                        make_return_false: Iterable[str] = (),
-                        keep_external: Iterable[str] = (),
-                        external_functions: Iterable[ExternalFunction] = (),
-                        do_not_emit: Iterable[str] = (),
-                        consolidate_global_data: bool = False,
-                        rename_uniquely: bool = False,
-                        do_not_prune_type_components: bool = False,
-                        keep_type_components: Optional[Dict[str, Iterable[str]]] = None,
-                        checkpoint_dir: Union[None, str, Path] = None,
-                        include_builtins: bool = True,
-                        tolerate_external_uses: bool = False,
-                        monomorphize: bool = True,
-                        rename_specifics: Optional[Dict[str, str]] = None,
-                        specialize_at_source: Iterable[str] = (),
-                        f2py_safe: bool = False,
-                        keep_acc_directives: bool = False) -> Path:
+def inline_to_single_tu(
+    sources: Union[dict[str, str], Iterable[Union[str, Path]]],
+    entry: str | None = None,
+    *,
+    output: Union[None, str, Path] = None,
+    out_dir: Union[None, str, Path] = None,
+    name: str = "inlined",
+    expand_cpp: bool = False,
+    force_double_precision: bool = False,
+    defines: Iterable[str] = (),
+    include_dirs: Iterable[Union[str, Path]] = (),
+    flang: str | None = None,
+    make_noop: Union[None, types.SPEC, list[types.SPEC]] = None,
+    make_return_false: Iterable[str] = (),
+    external_functions: Iterable[ExternalFunction] = (),
+    do_not_emit: Iterable[str] = (),
+    consolidate_global_data: bool = False,
+    rename_uniquely: bool = False,
+    do_not_prune_type_components: bool = False,
+    keep_type_components: dict[str, Iterable[str]] | None = None,
+    checkpoint_dir: Union[None, str, Path] = None,
+    include_builtins: bool = True,
+    tolerate_external_uses: bool = False,
+    monomorphize: bool = True,
+    rename_specifics: dict[str, str] | None = None,
+    specialize_at_source: Iterable[str] = (),
+    f2py_safe: bool = False,
+    keep_acc_directives: bool = False,
+) -> Path:
     """Inline a multi-file Fortran project into ONE self-contained ``.f90``
     and return the path to it.
 
@@ -1528,7 +1594,7 @@ def inline_to_single_tu(sources: Union[Dict[str, str], Iterable[Union[str, Path]
         off no code path changes and the output stays byte-identical.
     :returns: the path to the written single-TU ``.f90``.
     """
-    acc_table: Optional[Dict[int, List[str]]] = None
+    acc_table: dict[int, list[str]] | None = None
     if keep_acc_directives:
         src_map = _normalize_sources(sources)
         if expand_cpp:
@@ -1537,29 +1603,30 @@ def inline_to_single_tu(sources: Union[Dict[str, str], Iterable[Union[str, Path]
             src_map = cpp_expand_sources(src_map, defines=defines, include_dirs=include_dirs, flang=flang)
             expand_cpp = False
         sources, acc_table = encode_acc_directives(src_map)
-    ast = inline_to_ast(sources,
-                        entry,
-                        expand_cpp=expand_cpp,
-                        force_double_precision=force_double_precision,
-                        defines=defines,
-                        include_dirs=include_dirs,
-                        flang=flang,
-                        make_noop=make_noop,
-                        make_return_false=make_return_false,
-                        keep_external=keep_external,
-                        external_functions=external_functions,
-                        do_not_emit=do_not_emit,
-                        consolidate_global_data=consolidate_global_data,
-                        rename_uniquely=rename_uniquely,
-                        do_not_prune_type_components=do_not_prune_type_components,
-                        keep_type_components=keep_type_components,
-                        checkpoint_dir=checkpoint_dir,
-                        include_builtins=include_builtins,
-                        tolerate_external_uses=tolerate_external_uses,
-                        monomorphize=monomorphize,
-                        rename_specifics=rename_specifics,
-                        specialize_at_source=specialize_at_source,
-                        f2py_safe=f2py_safe)
+    ast = inline_to_ast(
+        sources,
+        entry,
+        expand_cpp=expand_cpp,
+        force_double_precision=force_double_precision,
+        defines=defines,
+        include_dirs=include_dirs,
+        flang=flang,
+        make_noop=make_noop,
+        make_return_false=make_return_false,
+        external_functions=external_functions,
+        do_not_emit=do_not_emit,
+        consolidate_global_data=consolidate_global_data,
+        rename_uniquely=rename_uniquely,
+        do_not_prune_type_components=do_not_prune_type_components,
+        keep_type_components=keep_type_components,
+        checkpoint_dir=checkpoint_dir,
+        include_builtins=include_builtins,
+        tolerate_external_uses=tolerate_external_uses,
+        monomorphize=monomorphize,
+        rename_specifics=rename_specifics,
+        specialize_at_source=specialize_at_source,
+        f2py_safe=f2py_safe,
+    )
     # Drop the injected intrinsic-module stubs (``iso_c_binding`` / ``iso_fortran_env``)
     # before serialising: they exist only so ``USE`` resolves during parsing, but a
     # PARTIAL stub (the ``iso_c_binding`` one defines just ``c_int``) shadows the real
@@ -1571,7 +1638,7 @@ def inline_to_single_tu(sources: Union[Dict[str, str], Iterable[Union[str, Path]
     # fparser serialises a no-argument ``SUBROUTINE foo() BIND(C)`` without its
     # (mandatory) empty parentheses; restore them on the final text so an emitted
     # external C interface (ICON's ``util_abort``) compiles.
-    f90 = re.sub(r'(?im)^(\s*SUBROUTINE\s+\w+)\s+(BIND\s*\()', r'\1() \2', f90)
+    f90 = re.sub(r"(?im)^(\s*SUBROUTINE\s+\w+)\s+(BIND\s*\()", r"\1() \2", f90)
     if acc_table is not None:
         f90 = decode_acc_directives(f90, acc_table)
 
@@ -1585,12 +1652,12 @@ def inline_to_single_tu(sources: Union[Dict[str, str], Iterable[Union[str, Path]
     return out_path
 
 
-def _normalize_sources(sources: Union[Dict[str, str], Iterable[Union[str, Path]]]) -> Dict[str, str]:
+def _normalize_sources(sources: Union[dict[str, str], Iterable[Union[str, Path]]]) -> dict[str, str]:
     """Accept a ``{name: content}`` mapping or an iterable of file /
     directory paths and return a ``{name: content}`` mapping."""
     if isinstance(sources, dict):
-        return dict(sources)
-    out: Dict[str, str] = {}
+        return dict(cast(dict[str, str], sources))
+    out: dict[str, str] = {}
     for item in sources:
         p = Path(item)
         for f in find_all_f90_files(p):
@@ -1598,64 +1665,69 @@ def _normalize_sources(sources: Union[Dict[str, str], Iterable[Union[str, Path]]
     return out
 
 
-def _concat_sources(src_map: Dict[str, str]) -> str:
+def _concat_sources(src_map: dict[str, str]) -> str:
     """Join all source texts (for the entry-name scan)."""
     return "\n".join(src_map.values())
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """CLI: ``python -m dace_fortran.fparser_inliner -i SRC -k ENTRY -o OUT.f90``."""
     argp = argparse.ArgumentParser(
         prog="dace_fortran.fparser_inliner",
-        description="Inline a multi-file Fortran project into one self-contained .f90 (fparser engine).")
-    argp.add_argument("-i",
-                      "--in_src",
-                      action="append",
-                      default=[],
-                      required=True,
-                      help="A Fortran source file or directory (repeatable).")
-    argp.add_argument("-k",
-                      "--entry_point",
-                      default=None,
-                      help="Entry procedure: plain name, module::proc, or mangled _Q... symbol.")
-    argp.add_argument("-o",
-                      "--output",
-                      default=None,
-                      help="Output .f90 path (default: ./inlined.f90; '-' writes to stdout).")
-    argp.add_argument("--noop",
-                      action="append",
-                      default=[],
-                      help="Function/subroutine to make no-op, as dot-separated spec (repeatable).")
+        description="Inline a multi-file Fortran project into one self-contained .f90 (fparser engine).",
+    )
+    argp.add_argument(
+        "-i",
+        "--in_src",
+        action="append",
+        default=[],
+        required=True,
+        help="A Fortran source file or directory (repeatable).",
+    )
+    argp.add_argument("-k", "--entry_point", default=None, help="Entry procedure: plain name or module::proc.")
+    argp.add_argument(
+        "-o", "--output", default=None, help="Output .f90 path (default: ./inlined.f90; '-' writes to stdout)."
+    )
+    argp.add_argument(
+        "--noop",
+        action="append",
+        default=[],
+        help="Function/subroutine to make no-op, as dot-separated spec (repeatable).",
+    )
     argp.add_argument("-d", "--checkpoint_dir", default=None, help="Dump intermediate ASTs here.")
-    argp.add_argument("--consolidate_global_data",
-                      action="store_true",
-                      help="Consolidate module-level globals into one structure.")
-    argp.add_argument("--rename_uniquely",
-                      action="store_true",
-                      help="Rename variables/functions to globally unique names.")
+    argp.add_argument(
+        "--consolidate_global_data", action="store_true", help="Consolidate module-level globals into one structure."
+    )
+    argp.add_argument(
+        "--rename_uniquely", action="store_true", help="Rename variables/functions to globally unique names."
+    )
     args = argp.parse_args(argv)
 
     src_map = _normalize_sources(args.in_src)
     noops = [tuple(n.split(".")) for n in args.noop]
 
     if args.output == "-":
-        ast = inline_to_ast(src_map,
-                            args.entry_point,
-                            make_noop=noops or None,
-                            consolidate_global_data=args.consolidate_global_data,
-                            rename_uniquely=args.rename_uniquely,
-                            checkpoint_dir=args.checkpoint_dir)
+        ast = inline_to_ast(
+            src_map,
+            args.entry_point,
+            make_noop=noops or None,
+            consolidate_global_data=args.consolidate_global_data,
+            rename_uniquely=args.rename_uniquely,
+            checkpoint_dir=args.checkpoint_dir,
+        )
         print(ast.tofortran())
         return 0
 
-    out = inline_to_single_tu(src_map,
-                              args.entry_point,
-                              output=args.output,
-                              name="inlined",
-                              make_noop=noops or None,
-                              consolidate_global_data=args.consolidate_global_data,
-                              rename_uniquely=args.rename_uniquely,
-                              checkpoint_dir=args.checkpoint_dir)
+    out = inline_to_single_tu(
+        src_map,
+        args.entry_point,
+        output=args.output,
+        name="inlined",
+        make_noop=noops or None,
+        consolidate_global_data=args.consolidate_global_data,
+        rename_uniquely=args.rename_uniquely,
+        checkpoint_dir=args.checkpoint_dir,
+    )
     print(f"Wrote single-TU Fortran to: {out}")
     return 0
 

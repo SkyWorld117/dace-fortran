@@ -4,11 +4,8 @@ Fortran array-slice arguments: caller passes aa(:, :, k) (2-D view into a 3-D pa
 """
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_view_test(tmp_path):
@@ -56,7 +53,7 @@ aa(1,1)=res(1,1,1)
 
 END SUBROUTINE viewlens
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name=test_name, entry=f'_QP{test_name}_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name=test_name, entry=f"{test_name}_function").build()
     a = np.full([10, 11, 12], 42, order="F", dtype=np.float64)
     b = np.full([2, 2, 2], 42, order="F", dtype=np.float64)
     b[0, 0, 0] = 1
@@ -108,7 +105,7 @@ ENDDO
 
 END SUBROUTINE viewlens
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name=test_name, entry=f'_QP{test_name}_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name=test_name, entry=f"{test_name}_function").build()
     a = np.full([10, 11, 12], 42, order="F", dtype=np.float64)
     b = np.full([10, 11, 12], 42, order="F", dtype=np.float64)
     c = np.full([10, 11, 12], 42, order="F", dtype=np.float64)
@@ -159,7 +156,7 @@ ENDDO
 
 END SUBROUTINE viewlens
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name=test_name, entry=f'_QP{test_name}_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name=test_name, entry=f"{test_name}_function").build()
     a = np.full([10, 11, 12], 42, order="F", dtype=np.float64)
     b = np.full([10, 11, 12], 42, order="F", dtype=np.float64)
 
@@ -167,3 +164,9 @@ END SUBROUTINE viewlens
     sdfg(aa=a, bb=b, n=10)
     assert b[0, 0, 0] == 1
     assert b[0, 0, 1] == 43
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

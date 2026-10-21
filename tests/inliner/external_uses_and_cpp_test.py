@@ -9,20 +9,15 @@
    library with no source on the search path (netcdf/mpi/cdi); the import is left
    unresolved and reachability pruning drops procedures that referenced it.
 """
-import shutil
+
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
 
-from _util import have_flang
 from dace_fortran.fparser_inliner import cpp_expand_sources, inline_to_ast, inline_to_single_tu
 from dace_fortran.preprocess import merge_used_modules
-
-
-def _have_gfortran() -> bool:
-    return shutil.which("gfortran") is not None
 
 
 def _gfortran_compiles(src_text: str) -> bool:
@@ -30,10 +25,9 @@ def _gfortran_compiles(src_text: str) -> bool:
     with TemporaryDirectory() as td:
         f = Path(td) / "tu.f90"
         f.write_text(src_text)
-        r = subprocess.run(["gfortran", "-fsyntax-only", "-ffree-line-length-none",
-                            str(f)],
-                           cwd=td,
-                           capture_output=True)
+        r = subprocess.run(
+            ["gfortran", "-fsyntax-only", "-ffree-line-length-none", str(f)], check=False, cwd=td, capture_output=True
+        )
         if r.returncode != 0:
             print(r.stderr.decode())
         return r.returncode == 0
@@ -66,9 +60,11 @@ end module mo_thing
 def test_external_use_unreached_is_pruned():
     """Module USEs netcdf but the entry never calls it: with tolerance on, the
     netcdf-touching procedure (and dangling import) are pruned, leaving a self-contained TU."""
-    out = inline_to_ast({
-        "mo_thing.f90": _NETCDF_USER
-    }, entry="mo_thing::kernel_add", tolerate_external_uses=True).tofortran().lower()
+    out = (
+        inline_to_ast({"mo_thing.f90": _NETCDF_USER}, entry="mo_thing::kernel_add", tolerate_external_uses=True)
+        .tofortran()
+        .lower()
+    )
     assert "kernel_add" in out
     assert "writes_netcdf" not in out, "the unused netcdf procedure should be pruned"
     assert "nf90_" not in out, "the external netcdf calls should be gone"
@@ -84,9 +80,11 @@ def test_external_use_default_strict_still_asserts():
 def test_external_use_reached_does_not_crash():
     """Entry reaches the external call: tolerance keeps it rather than crashing
     (survives as unresolved external)."""
-    out = inline_to_ast({
-        "mo_thing.f90": _NETCDF_USER
-    }, entry="mo_thing::writes_netcdf", tolerate_external_uses=True).tofortran().lower()
+    out = (
+        inline_to_ast({"mo_thing.f90": _NETCDF_USER}, entry="mo_thing::writes_netcdf", tolerate_external_uses=True)
+        .tofortran()
+        .lower()
+    )
     assert "writes_netcdf" in out
     assert "nf90_open" in out
 
@@ -95,29 +93,26 @@ def test_external_use_reached_does_not_crash():
 # expand_cpp -- the C-preprocessor pre-pass (needs flang)
 # ---------------------------------------------------------------------------
 
-pytestmark_flang = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
-
-@pytestmark_flang
 def test_cpp_expand_sources_resolves_include_and_macro(tmp_path):
     """``cpp_expand_sources`` expands a cpp #include + #define macro into pure
     Fortran (no # directives left)."""
     (tmp_path / "defs.inc").write_text("#define WP 8\n")
-    src = '#include "defs.inc"\n' \
-          "module mo_kindy\n  real(WP) :: x\nend module mo_kindy\n"
+    src = '#include "defs.inc"\nmodule mo_kindy\n  real(WP) :: x\nend module mo_kindy\n'
     out = cpp_expand_sources({"mo_kindy.F90": src}, include_dirs=[tmp_path])
-    text = list(out.values())[0]
+    text = next(iter(out.values()))
     assert "#include" not in text
-    assert not any(l.lstrip().startswith("#") for l in text.splitlines())
+    assert not any(ln.lstrip().startswith("#") for ln in text.splitlines())
     assert "real(8)" in text.lower()
 
 
-@pytestmark_flang
 def test_inline_with_cpp_include(tmp_path):
     """End-to-end: a source with a cpp #include inlines once expand_cpp=True
     resolves it (would raise otherwise)."""
     (tmp_path / "kinds.inc").write_text("#define WP 8\n")
-    src = '#include "kinds.inc"\n' + """
+    src = (
+        '#include "kinds.inc"\n'
+        """
 module mo_calc
   implicit none
 contains
@@ -128,12 +123,15 @@ contains
   end function scaled
 end module mo_calc
 """
-    out = inline_to_single_tu({"mo_calc.F90": src},
-                              entry="mo_calc::scaled",
-                              out_dir=tmp_path / "o",
-                              name="calc",
-                              expand_cpp=True,
-                              include_dirs=[tmp_path])
+    )
+    out = inline_to_single_tu(
+        {"mo_calc.F90": src},
+        entry="mo_calc::scaled",
+        out_dir=tmp_path / "o",
+        name="calc",
+        expand_cpp=True,
+        include_dirs=[tmp_path],
+    )
     text = out.read_text().lower().replace(" ", "")
     assert "scaled" in text
     assert "#include" not in text
@@ -167,9 +165,9 @@ end module mo_cfg
 def test_namelist_fparser_prunes_consistently():
     """fparser keeps the namelist for the used variable (n_zlev), prunes unused
     variables from both declaration and namelist list, and drops an all-pruned group."""
-    txt = inline_to_ast({
-        "mo_cfg.f90": _NAMELIST_MODULE
-    }, entry="mo_cfg::uses_one").tofortran().lower().replace("  ", " ")
+    txt = (
+        inline_to_ast({"mo_cfg.f90": _NAMELIST_MODULE}, entry="mo_cfg::uses_one").tofortran().lower().replace("  ", " ")
+    )
     assert "n_zlev" in txt
     assert "namelist /ocean_dynamics_nml/ n_zlev" in txt
     assert "ab_beta" not in txt, "unused namelist variable should be pruned"
@@ -177,7 +175,6 @@ def test_namelist_fparser_prunes_consistently():
     assert "unused_nml" not in txt, "an all-pruned namelist group should be dropped"
 
 
-@pytest.mark.skipif(not _have_gfortran(), reason="gfortran not on PATH")
 def test_namelist_both_engines_compile(tmp_path):
     """Both engines produce compilable Fortran: regex keeps the whole module
     (every var declared); fparser keeps a consistent, pruned namelist."""
@@ -189,3 +186,7 @@ def test_namelist_both_engines_compile(tmp_path):
     # fparser engine: pruned, but the surviving namelist references only declared vars, so it still compiles
     tu = inline_to_single_tu({"mo_cfg.f90": _NAMELIST_MODULE}, entry="mo_cfg::uses_one", out_dir=tmp_path, name="cfg")
     assert _gfortran_compiles(tu.read_text()), "fparser-pruned namelist TU must compile"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

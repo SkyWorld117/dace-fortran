@@ -24,25 +24,27 @@ not an error.
 Once the pruning pipeline emits the specifics inline, _restore_fft_interfaces
 folds to a no-op and this test keeps passing.
 """
+
 import re
 from pathlib import Path
 
 import pytest
 
 import dace_fortran
-from _util import flang_binary, flang_intrinsic_modules_path, have_flang
+from tests._util import flang_binary, flang_intrinsic_modules_path
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "ast_v1_vexx_bp_k_gpu.f90"
 _ENTRY = "exx_bp::vexx_bp_k_gpu"
 
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
-_FFT_INTERFACES_EMPTY_RE = re.compile(r"MODULE fft_interfaces\s*\n"
-                                      r"  IMPLICIT NONE\s*\n"
-                                      r"  INTERFACE invfft\s*\n  END INTERFACE\s*\n"
-                                      r"  INTERFACE fwfft\s*\n  END INTERFACE\s*\n"
-                                      r"END MODULE fft_interfaces\s*\n")
+_FFT_INTERFACES_EMPTY_RE = re.compile(
+    r"MODULE fft_interfaces\s*\n"
+    r"  IMPLICIT NONE\s*\n"
+    r"  INTERFACE invfft\s*\n  END INTERFACE\s*\n"
+    r"  INTERFACE fwfft\s*\n  END INTERFACE\s*\n"
+    r"END MODULE fft_interfaces\s*\n"
+)
 
 _FFT_INTERFACES_FULL = """MODULE fft_interfaces
   USE fft_types, ONLY: fft_type_descriptor
@@ -87,9 +89,11 @@ def _restore_fft_interfaces(source: str) -> str:
         return source
     out, n2 = re.subn(r"(END MODULE fft_types\s*\n)", r"\1" + _FFT_INTERFACES_FULL, stripped, count=1)
     if n2 == 0:
-        raise RuntimeError("_restore_fft_interfaces: ``END MODULE fft_types`` anchor not "
-                           "found; the QE checkpoint's module order may have changed.  "
-                           "Inspect ast_v1_vexx_bp_k_gpu.f90 and update the anchor.")
+        raise RuntimeError(
+            "_restore_fft_interfaces: ``END MODULE fft_types`` anchor not "
+            "found; the QE checkpoint's module order may have changed.  "
+            "Inspect ast_v1_vexx_bp_k_gpu.f90 and update the anchor."
+        )
     return out
 
 
@@ -164,22 +168,28 @@ def test_restore_fft_interfaces_unblocks_flang_parse(tmp_path):
     independently of the bridge.
     """
     import subprocess
+
     src = _restore_fft_interfaces(_SRC.read_text())
     rewritten = tmp_path / "vexx_bp_k_gpu_rewritten.F90"
     rewritten.write_text(src)
     out = tmp_path / "qe.hlfir"
-    result = subprocess.run([
-        flang_binary(), "-fc1", "-fintrinsic-modules-path",
-        flang_intrinsic_modules_path(), "-emit-hlfir",
-        str(rewritten), "-o",
-        str(out)
-    ],
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, \
-        f"flang rejected the rewritten source:\n{result.stderr[:2000]}"
-    assert out.exists() and out.stat().st_size > 0, \
-        "flang did not produce a HLFIR output"
+    result = subprocess.run(
+        [
+            flang_binary(),
+            "-fc1",
+            "-fintrinsic-modules-path",
+            flang_intrinsic_modules_path(),
+            "-emit-hlfir",
+            str(rewritten),
+            "-o",
+            str(out),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"flang rejected the rewritten source:\n{result.stderr[:2000]}"
+    assert out.exists() and out.stat().st_size > 0, "flang did not produce a HLFIR output"
 
 
 def test_vexx_bp_k_gpu_parses(tmp_path):
@@ -190,8 +200,7 @@ def test_vexx_bp_k_gpu_parses(tmp_path):
     sdfg = dace_fortran.build_sdfg(src, out_dir=str(tmp_path / "sdfg"), entry=_ENTRY, name="vexx_bp_k_gpu")
     sdfg.validate()
     assert sdfg is not None
-    assert any('vexx_bp_k_gpu' in name for name in sdfg.arrays) or \
-        'vexx_bp_k_gpu' in str(sdfg.label)
+    assert any("vexx_bp_k_gpu" in name for name in sdfg.arrays) or "vexx_bp_k_gpu" in str(sdfg.label)
 
 
 _CALLER = _HERE / "vexx_bp_k_gpu_caller.f90"
@@ -213,24 +222,29 @@ def _compile_reference(tmp_path):
     IF (okvan) and never executes.
     """
     import ctypes
-    import shutil
     import subprocess
-
-    if shutil.which("gfortran") is None:
-        pytest.skip("gfortran required for the reference build")
 
     src = _restore_fft_interfaces(_SRC.read_text())
     src_path = tmp_path / "qe_ref.f90"
     src_path.write_text(src)
     libpath = tmp_path / "libvexx_ref.so"
-    subprocess.check_call([
-        "gfortran", "-shared", "-fPIC", "-O0", "-fno-fast-math", "-ffp-contract=off", "-ffree-line-length-none",
-        "-fallow-argument-mismatch",
-        str(src_path),
-        str(_CALLER), "-o",
-        str(libpath)
-    ],
-                          cwd=str(tmp_path))
+    subprocess.check_call(
+        [
+            "gfortran",
+            "-shared",
+            "-fPIC",
+            "-O0",
+            "-fno-fast-math",
+            "-ffp-contract=off",
+            "-ffree-line-length-none",
+            "-fallow-argument-mismatch",
+            str(src_path),
+            str(_CALLER),
+            "-o",
+            str(libpath),
+        ],
+        cwd=str(tmp_path),
+    )
     lib = ctypes.CDLL(str(libpath))
 
     init = lib.init_vexx_bp_k_gpu_state_c
@@ -248,6 +262,7 @@ def _make_random_inputs(lda, npol, max_ibands, *, seed=0):
 
     Returns Fortran-ordered complex128 (psi, hpsi) of shape (lda*npol, max_ibands), seeded by default_rng(seed)."""
     import numpy as np
+
     rng = np.random.default_rng(seed)
     shape = (lda * npol, max_ibands)
     psi = np.asfortranarray(rng.standard_normal(shape) + 1j * rng.standard_normal(shape), dtype=np.complex128)
@@ -266,6 +281,7 @@ def test_vexx_bp_k_gpu_reference_runs(tmp_path):
     Pins the caller wrapper/state-init/linker-stub harness independently of the SDFG build.
     """
     import numpy as np
+
     _, init, run = _compile_reference(tmp_path)
     lda, n, m, npol, max_ibands = 4, 4, 1, 1, 1
     init(lda, n, m, npol, max_ibands)
@@ -275,6 +291,8 @@ def test_vexx_bp_k_gpu_reference_runs(tmp_path):
     np.testing.assert_array_equal(hpsi_out, hpsi_in)
 
 
+# Builds, compiles and binds the whole vexx_bp_k_gpu SDFG: ~4 min on a CI runner, past the lanes' 300 s default.
+@pytest.mark.timeout(1200)
 def test_vexx_bp_k_gpu_numerical_correctness(tmp_path):
     """End-to-end numerical correctness for vexx_bp_k_gpu THROUGH the
     generated Fortran binding.
@@ -293,10 +311,10 @@ def test_vexx_bp_k_gpu_numerical_correctness(tmp_path):
 
     import numpy as np
 
-    from _util import build_sdfg
     from dace_fortran.bindings.build_fortran_library import build_fortran_library
     from dace_fortran.bindings.flatten_plan import FlattenPlan
     from dace_fortran.bindings.fortran_interface import build_auto_interface
+    from tests._util import build_sdfg
 
     lda, n, m, npol, max_ibands = 4, 4, 1, 1, 1
 
@@ -333,7 +351,8 @@ def test_vexx_bp_k_gpu_numerical_correctness(tmp_path):
         extra_sources=[_CALLER, driver_path],
         # pruned qvan2 has an implicit-interface COMPLEX->REAL arg-kind
         # mismatch (qg) behind IF(okvan) -- never run on the no-op path.
-        extra_flags=["-fallow-argument-mismatch"])
+        extra_flags=["-fallow-argument-mismatch"],
+    )
     dace_lib = lib.load()
 
     fn = dace_lib.run_vexx_dace_c
@@ -342,3 +361,7 @@ def test_vexx_bp_k_gpu_numerical_correctness(tmp_path):
     fn(lda, n, m, npol, max_ibands, psi_dace.ctypes.data, hpsi_dace.ctypes.data)
 
     np.testing.assert_allclose(hpsi_dace, hpsi_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

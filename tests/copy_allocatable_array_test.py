@@ -7,14 +7,12 @@ prove the per-dim shapes equal.  ``emit_copy`` drives the destination memlet off
 the SOURCE descriptor's shape so subsets align; these tests pin correct values
 (no truncation/overflow) both directions, 1-D/2-D, and allocatable-to-allocatable.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_copy_normal_into_allocatable_1d(tmp_path: Path):
@@ -32,10 +30,10 @@ subroutine main(n, src, out)
   deallocate(x)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     n = 7
-    src_a = np.arange(1, n + 1, dtype=np.float64).copy(order='F')
-    out = np.zeros(n, dtype=np.float64, order='F')
+    src_a = np.arange(1, n + 1, dtype=np.float64).copy(order="F")
+    out = np.zeros(n, dtype=np.float64, order="F")
     sdfg(n=n, src=src_a, out=out)
     np.testing.assert_array_equal(out, src_a)
 
@@ -56,10 +54,10 @@ subroutine main(n, src, out)
 end subroutine main
 """
     # Non-contiguous-valued input so a wrong subset would show up as garbage.
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     n = 5
-    src_a = (10.0 * np.sin(np.arange(n))).copy(order='F')
-    out = np.zeros(n, dtype=np.float64, order='F')
+    src_a = (10.0 * np.sin(np.arange(n))).copy(order="F")
+    out = np.zeros(n, dtype=np.float64, order="F")
     sdfg(n=n, src=src_a, out=out)
     np.testing.assert_allclose(out, src_a, rtol=1e-13)
 
@@ -82,10 +80,10 @@ subroutine main(n, src, out)
   deallocate(y)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     n = 6
-    src_a = np.arange(100, 100 + n, dtype=np.float64).copy(order='F')
-    out = np.zeros(n, dtype=np.float64, order='F')
+    src_a = np.arange(100, 100 + n, dtype=np.float64).copy(order="F")
+    out = np.zeros(n, dtype=np.float64, order="F")
     sdfg(n=n, src=src_a, out=out)
     np.testing.assert_array_equal(out, src_a)
 
@@ -105,10 +103,10 @@ subroutine main(m, n, src, out)
   deallocate(x)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     m, n = 3, 4
-    src_a = np.arange(1, m * n + 1, dtype=np.float64).reshape(m, n, order='F').copy(order='F')
-    out = np.zeros((m, n), dtype=np.float64, order='F')
+    src_a = np.arange(1, m * n + 1, dtype=np.float64).reshape(m, n, order="F").copy(order="F")
+    out = np.zeros((m, n), dtype=np.float64, order="F")
     sdfg(m=m, n=n, src=src_a, out=out)
     np.testing.assert_array_equal(out, src_a)
 
@@ -128,9 +126,15 @@ subroutine main(m, n, src, out)
   deallocate(x)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     m, n = 4, 2
-    src_a = (np.arange(m * n, dtype=np.float64).reshape(m, n, order='F') * 0.5).copy(order='F')
-    out = np.zeros((m, n), dtype=np.float64, order='F')
+    src_a = (np.arange(m * n, dtype=np.float64).reshape(m, n, order="F") * 0.5).copy(order="F")
+    out = np.zeros((m, n), dtype=np.float64, order="F")
     sdfg(m=m, n=n, src=src_a, out=out)
     np.testing.assert_array_equal(out, src_a)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/optional_args_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_optional(tmp_path):
@@ -40,8 +37,9 @@ def test_fortran_frontend_optional(tmp_path):
 
     END SUBROUTINE intrinsic_optional_test_function2
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_optional_test_function',
-                      entry='intrinsic_optional_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_optional_test_function", entry="intrinsic_optional_test_function"
+    ).build()
 
     size = 4
     res = np.full([size], 42, order="F", dtype=np.int32)
@@ -93,17 +91,22 @@ def test_fortran_frontend_optional_complex(tmp_path):
 
     END SUBROUTINE intrinsic_optional_test_function2
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_optional_test_function',
-                      entry='intrinsic_optional_test_function').build()
+    sdfg = build_sdfg(
+        src, tmp_path, name="intrinsic_optional_test_function", entry="intrinsic_optional_test_function"
+    ).build()
 
     size = 5
     res = np.full([size], 42, order="F", dtype=np.int32)
     res2 = np.full([size], 42, order="F", dtype=np.int32)
-    # c is Fortran LOGICAL -- pass True not 1; routing as a Python int triggers a
-    # runtime int32->bool* reinterpret warning even though c_present=0 means it's unread
     sdfg(res=res, res2=res2, a=5, a_present=1, b=7.0, b_present=1, c=True, c_present=0)
 
     # safe path only -- first call got a,b (c unpassed, UB if read); second call got
     # none (UB throughout, res2 left unchecked per "let it crash" policy)
     assert res[0] == 5
     assert res[1] == 7
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

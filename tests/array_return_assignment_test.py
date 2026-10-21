@@ -2,16 +2,11 @@
 
 Once emitted the bridge's unresolved-expression ``?`` placeholder and failed to parse; now lowers correctly and runs BIT-EXACT against gfortran/f2py.  Mirrors production patterns like graupel's ``precip1`` multi-value PURE FUNCTION returns.
 """
-from pathlib import Path
 
 import numpy as np
-import pytest
-
-from _util import f2py_compile, have_flang
 
 from dace_fortran import build_sdfg_from_files
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import f2py_compile
 
 _SRC = """
 module m_array_return
@@ -51,10 +46,16 @@ def test_whole_array_assignment_from_function_return(tmp_path):
     n = 5
     rng = np.random.default_rng(3)
     src_arr = np.asfortranarray(rng.standard_normal(n))
-    out = np.zeros((3, n), order='F', dtype=np.float64)
+    out = np.zeros((3, n), order="F", dtype=np.float64)
     sdfg(out_arr=out, src=src_arr, n=np.int32(n))
 
     # gfortran reference: out_arr is intent(out)->returned, n inferred from src; single-multiply per row so SDFG and reference are bit-identical.
-    ref = f2py_compile(_SRC, tmp_path / "ref", "array_return_ref", only=("kern", ))
-    out_ref = np.asfortranarray(ref.m_array_return.kern(src_arr.copy(order='F')))
+    ref = f2py_compile(_SRC, tmp_path / "ref", "array_return_ref", only=("kern",))
+    out_ref = np.asfortranarray(ref.m_array_return.kern(src_arr.copy(order="F")))
     np.testing.assert_array_equal(out, out_ref)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

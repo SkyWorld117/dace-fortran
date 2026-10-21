@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
+from tests._util import build_sdfg, have_flang
 
 pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
@@ -18,19 +18,19 @@ res(1) = ANY(d)
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
     size = 5
-    d = np.full([size], False, order="F", dtype=np.bool_)
-    res = np.full([2], False, order="F", dtype=np.bool_)
+    d = np.full([size], False, order="F", dtype=np.uint32)
+    res = np.full([2], False, order="F", dtype=np.uint32)
 
     d[2] = True
     sdfg(d=d, res=res)
-    assert res[0] == True
+    assert res[0]
 
     d[2] = False
     sdfg(d=d, res=res)
-    assert res[0] == False
+    assert not res[0]
 
 
 def test_fortran_frontend_any_array_dim(tmp_path):
@@ -43,7 +43,7 @@ res(1) = ANY(d, 1)
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
 
 def test_fortran_frontend_any_array_comparison(tmp_path):
@@ -65,24 +65,24 @@ res(7) = any(first(1:2) .eq. second(4:5))
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
     size = 5
     first = np.full([size], 1, order="F", dtype=np.int32)
     second = np.full([size], 2, order="F", dtype=np.int32)
     second[2] = 1
-    res = np.full([7], False, order="F", dtype=np.bool_)
+    res = np.full([7], False, order="F", dtype=np.uint32)
 
     sdfg(first=first, second=second, res=res)
     for val in res[0:-1]:
-        assert val == True
-    assert res[-1] == False
+        assert val
+    assert not res[-1]
 
     second = np.full([size], 2, order="F", dtype=np.int32)
-    res = np.full([7], False, order="F", dtype=np.bool_)
+    res = np.full([7], False, order="F", dtype=np.uint32)
     sdfg(first=first, second=second, res=res)
     for val in res:
-        assert val == False
+        assert not val
 
 
 def test_fortran_frontend_any_array_scalar_comparison(tmp_path):
@@ -103,16 +103,16 @@ res(6) = ANY(42 .ne. first)
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
     size = 5
     first = np.full([size], 1, order="F", dtype=np.int32)
-    res = np.full([6], False, order="F", dtype=np.bool_)
+    res = np.full([6], False, order="F", dtype=np.uint32)
 
     sdfg(first=first, res=res)
     for val in res[0:-1]:
-        assert val == False
-    assert res[-1] == True
+        assert not val
+    assert res[-1]
 
     first[1] = 42
     sdfg(first=first, res=res)
@@ -139,19 +139,19 @@ res(1) = ANY(d)
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
     sizes = [5, 7]
-    d = np.full(sizes, False, order="F", dtype=np.bool_)
-    res = np.full([2], False, order="F", dtype=np.bool_)
+    d = np.full(sizes, False, order="F", dtype=np.uint32)
+    res = np.full([2], False, order="F", dtype=np.uint32)
 
     d[2, 2] = True
     sdfg(d=d, res=res)
-    assert res[0] == True
+    assert res[0]
 
     d[2, 2] = False
     sdfg(d=d, res=res)
-    assert res[0] == False
+    assert not res[0]
 
 
 def test_fortran_frontend_any_array_comparison_2d(tmp_path):
@@ -172,23 +172,23 @@ res(7) = any(first(2:3, 3:4) .eq. second(2:3, 3:4))
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
     sizes = [5, 4]
     first = np.full(sizes, 1, order="F", dtype=np.int32)
     second = np.full(sizes, 2, order="F", dtype=np.int32)
     second[2, 2] = 1
-    res = np.full([7], False, order="F", dtype=np.bool_)
+    res = np.full([7], False, order="F", dtype=np.uint32)
 
     sdfg(first=first, second=second, res=res)
     for val in res:
-        assert val == True
+        assert val
 
     second = np.full(sizes, 2, order="F", dtype=np.int32)
-    res = np.full([7], False, order="F", dtype=np.bool_)
+    res = np.full([7], False, order="F", dtype=np.uint32)
     sdfg(first=first, second=second, res=res)
     for val in res:
-        assert val == False
+        assert not val
 
 
 def test_fortran_frontend_any_array_comparison_2d_subset(tmp_path):
@@ -205,7 +205,7 @@ res(2) = any(first(1:2, 3:4) .eq. second(4:5, 2:3))
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
     sizes = [5, 4]
     first = np.full(sizes, 1, order="F", dtype=np.int32)
@@ -217,7 +217,7 @@ END SUBROUTINE intrinsic_any_test_function
     second[3:5, 0] = 3
     second[3:5, 3:5] = 3
 
-    res = np.full([2], False, order="F", dtype=np.bool_)
+    res = np.full([2], False, order="F", dtype=np.uint32)
 
     sdfg(first=first, second=second, res=res)
     assert list(res) == [0, 1]
@@ -237,7 +237,7 @@ res(2) = any(first(20:21, 3:4) .eq. second(4:5, 8:9))
 
 END SUBROUTINE intrinsic_any_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_any_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_any_test_function").build()
 
     sizes = [5, 4]
     first = np.full(sizes, 1, order="F", dtype=np.int32)
@@ -249,7 +249,11 @@ END SUBROUTINE intrinsic_any_test_function
     second[3:5, 0] = 3
     second[3:5, 3:5] = 3
 
-    res = np.full([2], False, order="F", dtype=np.bool_)
+    res = np.full([2], False, order="F", dtype=np.uint32)
 
     sdfg(first=first, second=second, res=res)
     assert list(res) == [0, 1]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

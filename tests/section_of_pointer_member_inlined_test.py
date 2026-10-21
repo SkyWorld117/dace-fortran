@@ -16,14 +16,12 @@ flattened dummy lowers to a plain rank-3 array, called directly -- a wrong/dropp
 either crashes the build (rank mismatch) or reads the wrong block (caught by per-block-distinct
 data).
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # Two inlining levels are essential: mid takes the whole 3-D member and passes a per-block 2-D
 # SECTION to worker, so the section's base is an inlined ALIAS of the flat companion (chain
@@ -76,15 +74,23 @@ def test_section_of_3d_pointer_member_inlined(tmp_path: Path):
     gc = np.asfortranarray(rng.random((n, 2, nblk)))  # the flat companion
     out = np.asfortranarray(np.zeros((n, nblk)))
 
-    sdfg(coeff_gc=gc,
-         out=out,
-         n=np.int32(n),
-         nblk=np.int32(nblk),
-         coeff_gc_d0=n,
-         coeff_gc_d1=2,
-         coeff_gc_d2=nblk,
-         out_d0=n,
-         out_d1=nblk)
+    sdfg(
+        coeff_gc=gc,
+        out=out,
+        n=np.int32(n),
+        nblk=np.int32(nblk),
+        coeff_gc_d0=n,
+        coeff_gc_d1=2,
+        coeff_gc_d2=nblk,
+        out_d0=n,
+        out_d1=nblk,
+    )
 
     expected = gc[:, 0, :] * 10.0 + gc[:, 1, :]
     np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

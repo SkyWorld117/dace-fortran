@@ -6,11 +6,8 @@ At default ostream precision (6 digits) the mantissa tail is lost -- 3.141592653
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def test_module_parameter_keeps_f64_precision(tmp_path: Path):
@@ -31,7 +28,7 @@ subroutine main(out)
 end subroutine main
 end module main_mod
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main_mod::main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main_mod::main").build()
     out = np.zeros(1, dtype=np.float64)
     sdfg(out=out)
     expected = 3.14159265358979323846 * 2.0
@@ -47,7 +44,7 @@ subroutine main(out)
   out = 1.0d0 / 3.0d0
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     out = np.zeros(1, dtype=np.float64)
     sdfg(out=out)
     expected = 1.0 / 3.0
@@ -64,7 +61,7 @@ subroutine main(out)
   out = 1.234567890123456d0 * 2.0d0 + 0.987654321098765d0
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
     out = np.zeros(1, dtype=np.float64)
     sdfg(out=out)
     expected = 1.234567890123456 * 2.0 + 0.987654321098765
@@ -76,7 +73,8 @@ def _tasklet_code(sdfg) -> str:
     import dace
 
     return "\n".join(
-        str(n.code.as_string) for st in sdfg.states() for n in st.nodes() if isinstance(n, dace.nodes.Tasklet))
+        str(n.code.as_string) for st in sdfg.states() for n in st.nodes() if isinstance(n, dace.nodes.Tasklet)
+    )
 
 
 _SRC_F32 = """
@@ -87,6 +85,17 @@ subroutine cst32(y)
   a = 0.1
   y = a + 0.2
 end subroutine cst32
+"""
+
+# Combine each literal with a runtime argument so the pipeline cannot constant-fold it away.
+_SRC_F32_RUNTIME = """
+subroutine cst32r(x, y, z)
+  implicit none
+  real(4), intent(in) :: x
+  real(4), intent(out) :: y, z
+  y = x + 0.1
+  z = x * 0.2
+end subroutine cst32r
 """
 
 _SRC_F64 = """
@@ -128,8 +137,9 @@ def test_single_constant_emits_float32_cast(tmp_path: Path):
 
     code = _tasklet_code(sdfg)
     # bridge emits bare float32(...); d-face's cppunparse lowers it to dace::float32(...) at codegen for correct single-precision rounding (verified below).
-    assert "float32(" in code, (f"fp32 constant must be wrapped in a float32(...) cast for correct "
-                                f"rounding; tasklet code was: {code}")
+    assert "float32(" in code, (
+        f"fp32 constant must be wrapped in a float32(...) cast for correct rounding; tasklet code was: {code}"
+    )
     assert sdfg.arrays["y"].dtype.type == np.float32
 
     ref = f2py_compile(_SRC_F32, d / "ref", "cst32_ref")
@@ -147,12 +157,17 @@ def test_single_constant_uses_shortest_roundtrip_form(tmp_path: Path):
     """f32 literal stringifies to its shortest round-tripping form (float32(0.1)), not the f64-widened expansion -- bit-identical once cast, but stays close to the Fortran source."""
     d = tmp_path / "f32short"
     d.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(_SRC_F32, d, name="cst32s", entry="cst32").build()
+    sdfg = build_sdfg(_SRC_F32_RUNTIME, d, name="cst32s", entry="cst32r").build()
     sdfg.validate()
 
     code = _tasklet_code(sdfg)
-    assert "float32(0.1)" in code, (f"expected shortest-roundtrip f32 literal float32(0.1); "
-                                    f"got: {code}")
+    assert "float32(0.1)" in code, f"expected shortest-roundtrip f32 literal float32(0.1); got: {code}"
     assert "float32(0.2)" in code, code
-    assert "0.10000000149011612" not in code, (f"f32 constant widened to f64 17-digit form: {code}")
+    assert "0.10000000149011612" not in code, f"f32 constant widened to f64 17-digit form: {code}"
     assert "0.20000000298023224" not in code, code
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

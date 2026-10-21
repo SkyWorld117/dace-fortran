@@ -6,13 +6,21 @@ from pathlib import Path
 
 import dace
 import pytest
+from dace.properties import CodeBlock
+from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 
 from dace_fortran.bindings import (
     FrozenArg,
     FrozenSignature,
     SignatureDriftError,
 )
-from dace_fortran.bindings.frozen_signature import HOST_STORAGE, refreeze
+from dace_fortran.bindings.frozen_signature import (
+    HOST_STORAGE,
+    FrozenArgKind,
+    ModuleOrigin,
+    drop_unread_module_inputs,
+    refreeze,
+)
 
 
 def _demo_signature() -> FrozenSignature:
@@ -20,20 +28,24 @@ def _demo_signature() -> FrozenSignature:
         entry="compute",
         mangled="_QPcompute",
         args=(
-            FrozenArg(fortran_name="a",
-                      sdfg_name="a",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="in"),
-            FrozenArg(fortran_name="b",
-                      sdfg_name="b",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout"),
+            FrozenArg(
+                fortran_name="a",
+                sdfg_name="a",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="in",
+            ),
+            FrozenArg(
+                fortran_name="b",
+                sdfg_name="b",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+            ),
         ),
         free_symbols=("m", "n"),
     )
@@ -45,30 +57,40 @@ def _rich_signature() -> FrozenSignature:
         entry="compute",
         mangled="_QPcompute",
         args=(
-            FrozenArg(fortran_name="st%u",
-                      sdfg_name="st_u",
-                      kind="array",
-                      dtype="float64",
-                      rank=2,
-                      shape=("n", "m"),
-                      intent="inout",
-                      from_struct_member="st%u",
-                      layout="transpose",
-                      is_written=True,
-                      aos_origin_mod="mo_becxx",
-                      aos_origin_struct="becxx",
-                      aos_member_path="k",
-                      aos_outer_rank=1,
-                      global_alloc_inside=True,
-                      aos_struct_pointer=True,
-                      aos_member_pointer=True,
-                      module_origin_allocatable=True,
-                      module_origin_pointer=True),
-            FrozenArg(fortran_name="tol", sdfg_name="tol", kind="scalar", dtype="float64", rank=0, intent="in"),
-            FrozenArg(fortran_name="comm", sdfg_name="comm", kind="mpi_comm", dtype="MPI_Comm", rank=0, intent="in"),
+            FrozenArg(
+                fortran_name="st%u",
+                sdfg_name="st_u",
+                kind=FrozenArgKind.ARRAY,
+                dtype="float64",
+                rank=2,
+                shape=("n", "m"),
+                intent="inout",
+                from_struct_member="st%u",
+                is_written=True,
+                aos_origin_mod="mo_becxx",
+                aos_origin_struct="becxx",
+                aos_member_path="k",
+                aos_outer_rank=1,
+                global_alloc_inside=True,
+                aos_struct_pointer=True,
+                aos_member_pointer=True,
+                module_origin_allocatable=True,
+                module_origin_pointer=True,
+            ),
+            FrozenArg(
+                fortran_name="tol", sdfg_name="tol", kind=FrozenArgKind.SCALAR, dtype="float64", rank=0, intent="in"
+            ),
+            FrozenArg(
+                fortran_name="comm",
+                sdfg_name="comm",
+                kind=FrozenArgKind.MPI_COMM,
+                dtype="MPI_Comm",
+                rank=0,
+                intent="in",
+            ),
         ),
         free_symbols=("m", "n"),
-        module_symbol_origins={"tol": ("mo_cfg", "tol")},
+        module_symbol_origins={"tol": ModuleOrigin("mo_cfg", "tol")},
         user_comm_source="comm",
     )
 
@@ -111,7 +133,7 @@ def test_signature_absent_on_a_plain_sdfg():
 def test_refreeze_drops_specialized_scalar_and_symbol():
     sdfg = dace.SDFG("compute")
     sdfg.add_symbol("n", dace.int64)
-    sdfg.add_array("a", shape=(dace.symbol("n"), ), dtype=dace.float64, transient=False)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
 
     # Snapshot still claims a scalar and a symbol the live SDFG has folded away -- exactly
     # what specialization leaves behind.
@@ -119,36 +141,100 @@ def test_refreeze_drops_specialized_scalar_and_symbol():
         entry="compute",
         mangled="_QPcompute",
         args=(
-            FrozenArg(fortran_name="a", sdfg_name="a", kind="array", dtype="float64", rank=1, shape=("n", )),
-            FrozenArg(fortran_name="alpha", sdfg_name="alpha", kind="scalar", dtype="float64", rank=0),
-            FrozenArg(fortran_name="m", sdfg_name="m", kind="symbol", dtype="int64", rank=0),
+            FrozenArg(fortran_name="a", sdfg_name="a", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("n",)),
+            FrozenArg(fortran_name="alpha", sdfg_name="alpha", kind=FrozenArgKind.SCALAR, dtype="float64", rank=0),
+            FrozenArg(fortran_name="m", sdfg_name="m", kind=FrozenArgKind.SYMBOL, dtype="int64", rank=0),
         ),
         free_symbols=("m", "n"),
     )
 
     new = refreeze(sdfg)
     assert [a.sdfg_name for a in new.args] == ["a"]
-    assert new.free_symbols == ("n", )
+    assert new.free_symbols == ("n",)
     assert sdfg._frozen_signature == new
 
 
 def test_refreeze_refuses_dropped_array():
     sdfg = dace.SDFG("compute")
     sdfg.add_symbol("n", dace.int64)
-    sdfg.add_array("a", shape=(dace.symbol("n"), ), dtype=dace.float64, transient=False)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
 
     sdfg._frozen_signature = FrozenSignature(
         entry="compute",
         mangled="_QPcompute",
         args=(
-            FrozenArg(fortran_name="a", sdfg_name="a", kind="array", dtype="float64", rank=1, shape=("n", )),
-            FrozenArg(fortran_name="b", sdfg_name="b", kind="array", dtype="float64", rank=1, shape=("n", )),
+            FrozenArg(fortran_name="a", sdfg_name="a", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("n",)),
+            FrozenArg(fortran_name="b", sdfg_name="b", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("n",)),
         ),
-        free_symbols=("n", ),
+        free_symbols=("n",),
     )
 
-    with pytest.raises(SignatureDriftError, match="only scalars and free symbols may shrink"):
+    with pytest.raises(SignatureDriftError, match="only scalars, free symbols and module variables may shrink"):
         refreeze(sdfg)
+
+
+def test_refreeze_drops_a_module_variable_the_kernel_no_longer_reads():
+    # A module scalar crosses as a one-element array; once specialised to a constant the kernel no longer takes it,
+    # and the binding stops reading it from the module -- it was never a buffer of the caller's.
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
+
+    sdfg._frozen_signature = FrozenSignature(
+        entry="compute",
+        mangled="_QPcompute",
+        args=(
+            FrozenArg(fortran_name="a", sdfg_name="a", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("n",)),
+            FrozenArg(fortran_name="g", sdfg_name="g", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("1",)),
+        ),
+        free_symbols=("n",),
+        module_symbol_origins={"g": ModuleOrigin("params", "g")},
+    )
+
+    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a"]
+
+
+def test_drop_unread_module_inputs_keeps_the_callers_buffers():
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
+    for name, dtype in (("c", dace.int32), ("g", dace.float64), ("h", dace.float64)):
+        sdfg.add_array(name, shape=(1,), dtype=dtype, transient=False)
+    # A map reads g; a branch condition reads c; nothing reads h.
+    state = sdfg.add_state()
+    state.add_mapped_tasklet(
+        "scale",
+        {"i": "0:n"},
+        {"_g": dace.Memlet("g[0]")},
+        "_a = _g",
+        {"_a": dace.Memlet("a[i]")},
+        external_edges=True,
+    )
+    branch = ConditionalBlock("if_c")
+    sdfg.add_node(branch)
+    sdfg.add_edge(state, branch, dace.InterstateEdge())
+    body = ControlFlowRegion("then", sdfg=sdfg)
+    body.add_state("noop", is_start_block=True)
+    branch.add_branch(CodeBlock("c[0] > 0"), body)
+    sdfg._frozen_signature = FrozenSignature(
+        entry="compute",
+        mangled="_QPcompute",
+        args=tuple(
+            FrozenArg(fortran_name=n, sdfg_name=n, kind=FrozenArgKind.ARRAY, dtype=t, rank=1, shape=s)
+            for n, t, s in (
+                ("a", "float64", ("n",)),
+                ("c", "int32", ("1",)),
+                ("g", "float64", ("1",)),
+                ("h", "float64", ("1",)),
+            )
+        ),
+        free_symbols=("n",),
+        module_symbol_origins={name: ModuleOrigin("params", name) for name in ("c", "g", "h")},
+    )
+
+    # h is gone, and with it the binding's copy; g and c are read, a is the caller's.
+    assert drop_unread_module_inputs(sdfg) == ["h"]
+    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a", "c", "g"]
 
 
 # ----- OpenACC residency ---------------------------------------------------------
@@ -163,19 +249,21 @@ def _acc_sdfg(*names: str) -> "dace.SDFG":
     sdfg = dace.SDFG("compute")
     sdfg.add_symbol("n", dace.int64)
     for name in names:
-        sdfg.add_array(name, shape=(dace.symbol("n"), ), dtype=dace.float64, transient=False)
+        sdfg.add_array(name, shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
     return sdfg
 
 
 def _acc_arg(name: str, intent: str, **kw) -> FrozenArg:
-    return FrozenArg(fortran_name=name,
-                     sdfg_name=name,
-                     kind="array",
-                     dtype="float64",
-                     rank=1,
-                     shape=("n", ),
-                     intent=intent,
-                     **kw)
+    return FrozenArg(
+        fortran_name=name,
+        sdfg_name=name,
+        kind=FrozenArgKind.ARRAY,
+        dtype="float64",
+        rank=1,
+        shape=("n",),
+        intent=intent,
+        **kw,
+    )
 
 
 def test_storage_defaults_to_the_host():
@@ -192,7 +280,7 @@ def test_refreeze_records_a_cpu_to_gpu_relocation():
         entry="compute",
         mangled="_QPcompute",
         args=(_acc_arg("host", "inout"), _acc_arg("rd", "in"), _acc_arg("rw", "inout"), _acc_arg("wr", "out")),
-        free_symbols=("n", ),
+        free_symbols=("n",),
     )
 
     for name in ("rd", "rw", "wr"):
@@ -201,8 +289,7 @@ def test_refreeze_records_a_cpu_to_gpu_relocation():
     by_name = {a.sdfg_name: a for a in refreeze(sdfg).args}
     assert by_name["rd"].storage == HOST_STORAGE
     assert by_name["rd"].device_storage == "GPU_Global"
-    assert [by_name[n].acc_data_clause for n in ("rd", "wr", "rw", "host")] == \
-        ["copyin", "copyout", "copy", ""]
+    assert [by_name[n].acc_data_clause for n in ("rd", "wr", "rw", "host")] == ["copyin", "copyout", "copy", ""]
     assert by_name["host"].device_storage == ""
 
 
@@ -212,8 +299,8 @@ def test_refreeze_clears_device_storage_on_the_way_back():
     sdfg._frozen_signature = FrozenSignature(
         entry="compute",
         mangled="_QPcompute",
-        args=(_acc_arg("a", "inout", device_storage="GPU_Global"), ),
-        free_symbols=("n", ),
+        args=(_acc_arg("a", "inout", device_storage="GPU_Global"),),
+        free_symbols=("n",),
     )
     assert sdfg._frozen_signature.args[0].acc_data_clause == "copy"
 
@@ -229,8 +316,8 @@ def test_refreeze_ignores_host_side_storage_churn():
     sdfg._frozen_signature = FrozenSignature(
         entry="compute",
         mangled="_QPcompute",
-        args=(_acc_arg("a", "inout"), ),
-        free_symbols=("n", ),
+        args=(_acc_arg("a", "inout"),),
+        free_symbols=("n",),
     )
     sdfg.arrays["a"].storage = dace.StorageType.CPU_Pinned
 
@@ -246,12 +333,9 @@ def test_acc_clause_is_copy_for_a_written_input():
 def test_scalars_and_symbols_never_get_a_data_clause():
     """They ride the argument list by value, so there is no buffer to move."""
     for kind in ("scalar", "symbol"):
-        arg = FrozenArg(fortran_name="alpha",
-                        sdfg_name="alpha",
-                        kind=kind,
-                        dtype="float64",
-                        rank=0,
-                        device_storage="GPU_Global")
+        arg = FrozenArg(
+            fortran_name="alpha", sdfg_name="alpha", kind=kind, dtype="float64", rank=0, device_storage="GPU_Global"
+        )
         assert arg.acc_data_clause == ""
 
 
@@ -262,8 +346,8 @@ def test_device_relocation_survives_the_sdfg_roundtrip(tmp_path: Path):
     sdfg._frozen_signature = FrozenSignature(
         entry="compute",
         mangled="_QPcompute",
-        args=(_acc_arg("a", "in"), ),
-        free_symbols=("n", ),
+        args=(_acc_arg("a", "in"),),
+        free_symbols=("n",),
     )
     refreeze(sdfg)
 
@@ -287,7 +371,10 @@ def test_verify_against_happy_path():
     fs.verify_against(sdfg)
 
 
-def test_drift_detection_arg_reordering():
+def test_arg_reordering_is_not_drift():
+    """The names are compared as sets: the live arglist is in DaCe's lexicographic order while a snapshot lists the
+    elements of a split array of records in element order (``x_2`` before ``x_10``); the C interface takes its order
+    from the compiled signature, not from either list."""
     sdfg = dace.SDFG("compute")
     sdfg.add_symbol("m", dace.int64)
     sdfg.add_symbol("n", dace.int64)
@@ -303,8 +390,17 @@ def test_drift_detection_arg_reordering():
         args=(fs.args[1], fs.args[0]),
         free_symbols=fs.free_symbols,
     )
+    swapped.verify_against(sdfg)
+
+
+def test_drift_detection_arg_renamed():
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("m", dace.int64)
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"), dace.symbol("m")), dtype=dace.float64, transient=False)
+    sdfg.add_array("c", shape=(dace.symbol("n"), dace.symbol("m")), dtype=dace.float64, transient=False)
     with pytest.raises(SignatureDriftError):
-        swapped.verify_against(sdfg)
+        _demo_signature().verify_against(sdfg)
 
 
 def test_drift_detection_dtype_change():
@@ -337,3 +433,7 @@ def test_drift_detection_extra_free_symbol():
     fs = _demo_signature()
     with pytest.raises(SignatureDriftError):
         fs.verify_against(sdfg)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

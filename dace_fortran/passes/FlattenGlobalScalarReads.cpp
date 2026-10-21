@@ -3,10 +3,18 @@
 //                                    module-global struct into reads of a
 //                                    synthetic per-member global, and record
 //                                    the provenance in the flatten plan.
+//
+// The member may sit in a nested record (``entity%a%b`` lifts to
+// ``entity_a_b``).  A module-global array of records with a static shape is
+// handled the same way per element: ``entity(i)%member`` reads element ``i``
+// of a synthetic global array ``entity_member`` of the array's shape and
+// bounds, which the bindings fill from ``entity%member`` (the component over
+// every element).
 // ============================================================================
 
 #include <string>
 
+#include "bridge/trace_utils.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
@@ -15,7 +23,6 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -48,17 +55,6 @@ llvm::StringRef traceToGlobalSym(mlir::Value v) {
       v = boxAddr.getVal();
       continue;
     }
-    // A DESIGNATE IS NOT TRANSPARENT HERE -- DO NOT PEEL ONE.  For a module-level ARRAY of records
-    // the component read does sit on an element select (`hlfir.designate %decl(%i)` -> ref<record>,
-    // then `hlfir.designate %that{"x"}` -> ref<f64>), so peeling looks like the missing hop.  It is
-    // not: the SCAN already peels that element select before calling this (the `elemDg` capture in
-    // `run()`, which peels only a COMPONENT-LESS designate with indices).  Peeling unconditionally
-    // here additionally collapses a NESTED component: for `eqn_idx%cont%end` the walk also visits
-    // the inner `{"end"}` designate, and with a peel that designate resolves straight to the global
-    // and is accepted with `member = "end"`, emitting `eqn_idx_end` where the rest of the pipeline
-    // binds `eqn_idx_cont_end`.  The unbound leaf then bakes to 0 (`_bake_scalars` bakes every free
-    // symbol it has no value for), and every access of the form `eqn_idx%beg + i - 1` reads `[-1]`:
-    // `Memlet subset negative out-of-bounds`, in four kernel families at once.
     return {};
   }
   return {};
@@ -96,49 +92,48 @@ bool splitModuleScopeSymbol(llvm::StringRef sym, llvm::StringRef& mod, llvm::Str
   return true;
 }
 
-std::string scalarDtypeName(mlir::Type t) {
-  if (t.isF32()) return "float32";
-  if (t.isF64()) return "float64";
-  if (t.isInteger(8)) return "int8";
-  if (t.isInteger(16)) return "int16";
-  if (t.isInteger(32)) return "int32";
-  if (t.isInteger(64)) return "int64";
-  if (t.isInteger(1) || mlir::isa<fir::LogicalType>(t)) return "bool";
-  if (auto ct = mlir::dyn_cast<mlir::ComplexType>(t)) {
-    mlir::Type const et = ct.getElementType();
-    if (et.isF32()) return "complex64";
-    if (et.isF64()) return "complex128";
-  }
-  return "";
-}
-
 bool isPlainComponentDesignate(hlfir::DesignateOp d) {
   return d.getComponent().has_value() && d.getIndices().empty() && d.getSubstring().empty() && !d.getComponentShape() &&
          !d.getShape() && d.getTypeparams().empty() && !d.getComplexPart().has_value() && d->getNumResults() == 1;
 }
 
+/// For ``entity(i, ...)%member``: the element designate ``entity(i, ...)`` (scalar subscripts only) the component
+/// designate reads from; null when the component is taken off something else.
+hlfir::DesignateOp elementDesignateOf(hlfir::DesignateOp component) {
+  auto elem = component.getMemref().getDefiningOp<hlfir::DesignateOp>();
+  if (!elem || elem.getComponent().has_value() || elem.getIndices().empty() || !elem.getSubstring().empty() ||
+      elem.getComplexPart().has_value() || !elem.getTypeparams().empty())
+    return {};
+  for (bool const triplet : elem.getIsTriplet())
+    if (triplet) return {};
+  return elem;
+}
+
 struct Candidate {
+  /// The leaf component designate, then the record components above it up to the root (``entity%a%b``: ``%b``, ``%a``).
+  llvm::SmallVector<hlfir::DesignateOp, 2> chain;
   hlfir::DesignateOp designate;
+  /// ``entity(i, ...)`` when ``entity`` is an array of records, else null.
+  hlfir::DesignateOp element;
+  /// The host array's declare (its shape operand gives the synthetic array's bounds); null for a scalar record.
+  hlfir::DeclareOp hostDecl;
   std::string symbol;
   std::string module;
   std::string entity;
   std::string member;
   std::string dtype;
   mlir::Type scalarTy;
-  /// For a module-level ARRAY of records: the element select this component read sits on, and the
-  /// array's static shape.  Empty for a scalar struct global, which is the original (and still the
-  /// only other) case.
-  hlfir::DesignateOp elemDg;
-  llvm::SmallVector<int64_t, 4> outerShape;
-  /// RECORD-MAJOR: the entity is a static array of records whose fields all share the member's type,
-  /// so ONE 1-D companion holds the whole record array and the member is selected by index
-  /// arithmetic -- `arr(i)%x` -> `arr_cm(i * numFields + <x's ordinal>)`.  That is Fortran's layout
-  /// exactly, so a caller passes one base pointer instead of gathering fifteen strided views.  MFC's
-  /// own comment on `eos_coefficients` says the record exists to avoid those descriptors in the
-  /// Riemann kernels, so the per-member form costs precisely what MFC designed against.
+  /// Type of the synthetic global: ``scalarTy``, or an array of it in the host array's shape.
+  mlir::Type globalTy;
+  /// Name of the synthetic global.
+  std::string newSym;
+  /// RECORD-MAJOR (MFC's ``eos_coefficients``): one flattened companion ``<entity>_cm`` over a static 1-D
+  /// array of records whose fields all share the member's type; ``arr(i)%x`` -> ``arr_cm(i*numFields + ordinal)``.
+  /// That is Fortran's layout exactly, so a caller passes one base pointer instead of N strided views.
+  bool recordMajor = false;
   unsigned memberIndex = 0;
   unsigned numFields = 0;
-  bool recordMajor = false;
+  int64_t outerExtent = 0;
 };
 
 struct FlattenGlobalScalarReadsPass
@@ -149,11 +144,12 @@ struct FlattenGlobalScalarReadsPass
   llvm::StringRef getArgument() const final { return "hlfir-flatten-global-scalar-reads"; }
   llvm::StringRef getDescription() const final {
     return "Rewrite a never-written scalar component read of a module-scope "
-           "fir.global record (``mod%entity%member``) into a read of a "
-           "synthetic bodiless ``fir.global`` carrying that member alone, and "
-           "record {symbol, module, entity, member, dtype} in the "
-           "hlfir.flatten_plan side table so the bindings emitter can assign "
-           "``symbol = entity%member`` at the call boundary.";
+           "fir.global record (``mod%entity%member``, or ``entity(i)%member`` "
+           "of a static array of records) into a read of a synthetic bodiless "
+           "``fir.global`` carrying that member alone (an array of it for an "
+           "array of records), and record {symbol, module, entity, member, "
+           "dtype} in the hlfir.flatten_plan side table so the bindings "
+           "emitter can assign ``symbol = entity%member`` at the call boundary.";
   }
 
   void runOnOperation() override {
@@ -180,62 +176,62 @@ struct FlattenGlobalScalarReadsPass
     llvm::StringSet<> rejected;
     module.walk([&](hlfir::DesignateOp d) {
       if (!isPlainComponentDesignate(d)) return;
-      // The component read sits either directly on the global's declare (a scalar struct global)
-      // or on an element select of it (a module-level ARRAY of records).
-      hlfir::DesignateOp elemDg;
-      mlir::Value base = d.getMemref();
-      if (auto ed = mlir::dyn_cast_or_null<hlfir::DesignateOp>(base.getDefiningOp()))
-        if (!ed.getComponent().has_value() && !ed.getIndices().empty()) {
-          elemDg = ed;
-          base = ed.getMemref();
-        }
-      llvm::StringRef const sym = traceToGlobalSym(base);
+      // Walk up a nested record path ``entity%a%b`` to the component taken off the root.
+      llvm::SmallVector<hlfir::DesignateOp, 2> chain{d};
+      while (auto up = chain.back().getMemref().getDefiningOp<hlfir::DesignateOp>()) {
+        if (!isPlainComponentDesignate(up)) break;
+        chain.push_back(up);
+      }
+      hlfir::DesignateOp element = elementDesignateOf(chain.back());
+      llvm::StringRef const sym = traceToGlobalSym(element ? element.getMemref() : chain.back().getMemref());
       if (sym.empty()) return;
       llvm::StringRef mod;
       llvm::StringRef entity;
       if (!splitModuleScopeSymbol(sym, mod, entity)) return;
       auto g = module.lookupSymbol<fir::GlobalOp>(sym);
       if (!g || (g.getConstant().has_value() && *g.getConstant())) return;
-
-      // ACCEPT THE ARRAY-OF-RECORDS GLOBAL TOO.  A record-typed global is the original case; a
-      // STATIC sequence of records is MFC's `type(eos_coefficients), dimension(num_fluids_max) ::
-      // eos_coeffs`.  The shape must be static -- a dynamic one cannot name the companion's type
-      // here, and bailing is the right answer rather than emitting something unresolvable.
-      llvm::SmallVector<int64_t, 4> outerShape;
-      mlir::Type recTy = g.getType();
-      if (auto seq = mlir::dyn_cast<fir::SequenceType>(g.getType())) {
-        if (seq.getDimension() != 1) return;
-        for (int64_t d : seq.getShape())
-          if (d == fir::SequenceType::getUnknownExtent()) return;
-        outerShape.assign(seq.getShape().begin(), seq.getShape().end());
-        recTy = seq.getEleTy();
+      // A scalar record, or an array of records with a static shape read element-wise through its declare.
+      auto hostSeq = mlir::dyn_cast<fir::SequenceType>(g.getType());
+      hlfir::DeclareOp hostDecl;
+      if (element) {
+        hostDecl = element.getMemref().getDefiningOp<hlfir::DeclareOp>();
+        if (!hostSeq || hostSeq.hasDynamicExtents() || !hostDecl || !hostDecl.getShape() ||
+            !mlir::isa<fir::RecordType>(hostSeq.getEleTy()))
+          return;
+      } else if (!mlir::isa<fir::RecordType>(g.getType())) {
+        return;
       }
-      if (!mlir::isa<fir::RecordType>(recTy)) return;
-      if (!outerShape.empty() && !elemDg) return;   // array global must be read via an element select
 
-      llvm::StringRef const member = d.getComponent()->getValue();
+      // ``a%b`` for the table (the bindings read ``entity%a%b``), ``a_b`` for the synthetic symbol.
+      std::string member;
+      std::string symbolSuffix;
+      for (hlfir::DesignateOp step : llvm::reverse(chain)) {
+        llvm::StringRef const name = step.getComponent()->getValue();
+        member += (member.empty() ? "" : "%") + name.str();
+        symbolSuffix += (symbolSuffix.empty() ? "" : "_") + name.str();
+      }
       auto refTy = mlir::dyn_cast<fir::ReferenceType>(d.getResult().getType());
       if (!refTy) return;
-      std::string const dtype = scalarDtypeName(refTy.getEleTy());
-
-      // One companion can hold the whole record array only when every field has the member's type --
-      // MFC's `eos_coefficients` is fifteen `real(wp)` fields and qualifies.  Anything else keeps the
-      // per-member form, which is the conservative answer rather than an error.  Restricted to a 1-D
-      // record array because the flattened extent and the index arithmetic are written for that case.
+      std::string const dtype = dtypeName(refTy.getEleTy());
+      mlir::Type const scalarTy = refTy.getEleTy();
+      // RECORD-MAJOR: a static 1-D array of records whose fields all have the member's type.  One companion holds
+      // the whole record array; the member is an INDEX (MFC's eos_coefficients is fifteen real fields).
+      bool recordMajor = false;
       unsigned memberIndex = 0;
       unsigned numFields = 0;
-      bool recordMajor = false;
-      if (outerShape.size() == 1) {
-        if (auto rec = mlir::dyn_cast<fir::RecordType>(recTy)) {
-          memberIndex = rec.getFieldIndex(member);
+      int64_t outerExtent = 0;
+      if (element && chain.size() == 1 && hostSeq.getShape().size() == 1) {
+        if (auto rec = mlir::dyn_cast<fir::RecordType>(hostSeq.getEleTy())) {
+          memberIndex = rec.getFieldIndex(chain.front().getComponent()->getValue());
           numFields = rec.getNumFields();
+          outerExtent = hostSeq.getShape().front();
           recordMajor = true;
           for (auto const& f : rec.getTypeList())
-            if (f.second != refTy.getEleTy()) recordMajor = false;
+            if (f.second != scalarTy) recordMajor = false;
         }
       }
       std::string const newSym = recordMajor ? (llvm::Twine(sym) + "_cm").str()
-                                             : (llvm::Twine(sym) + "_" + member).str();
+                                             : (llvm::Twine(sym) + "_" + symbolSuffix).str();
 
       bool ok = !dtype.empty() && !writtenGlobals.contains(sym) && !takenNames.contains(newSym);
       for (mlir::Operation* user : d.getResult().getUsers())
@@ -244,11 +240,15 @@ struct FlattenGlobalScalarReadsPass
         rejected.insert(newSym);
         return;
       }
-      Candidate cand{d, sym.str(), mod.str(), entity.str(), member.str(), dtype,
-                     refTy.getEleTy(), elemDg, outerShape};
+      mlir::Type const globalTy =
+          recordMajor ? mlir::Type(fir::SequenceType::get({static_cast<int64_t>(numFields) * outerExtent}, scalarTy))
+                      : (element ? mlir::Type(fir::SequenceType::get(hostSeq.getShape(), scalarTy)) : scalarTy);
+      Candidate cand{chain, d, element, hostDecl, sym.str(), mod.str(), entity.str(), member, dtype, scalarTy, globalTy,
+                     newSym};
+      cand.recordMajor = recordMajor;
       cand.memberIndex = memberIndex;
       cand.numFields = numFields;
-      cand.recordMajor = recordMajor;
+      cand.outerExtent = outerExtent;
       candidates.push_back(cand);
     });
 
@@ -257,40 +257,24 @@ struct FlattenGlobalScalarReadsPass
     llvm::StringSet<> emitted;
     unsigned rewritten = 0;
     for (Candidate& c : candidates) {
-      std::string const newSym = c.recordMajor ? (c.symbol + "_cm") : (c.symbol + "_" + c.member);
+      std::string const& newSym = c.newSym;
       if (rejected.contains(newSym)) continue;
-      // THE COMPANION'S TYPE IS THE MEMBER'S OWN, EXTENDED BY THE RECORD ARRAY'S SHAPE.  For a
-      // scalar struct global that is just the scalar; for a module-level array of records it is a
-      // 1-D array of the scalar, indexed by the SAME record index the element select used -- so
-      // `arr(i)%x` becomes `arr_x(i)` and the access is one level shallower, not a different shape.
-      mlir::Type const compTy = c.scalarTy;
-      llvm::SmallVector<int64_t, 4> compShape;
-      if (c.recordMajor)
-        compShape.push_back(static_cast<int64_t>(c.numFields) * c.outerShape.front());
-      else
-        compShape.append(c.outerShape.begin(), c.outerShape.end());
-      mlir::Type const companionTy =
-          compShape.empty() ? compTy : mlir::Type(fir::SequenceType::get(compShape, compTy));
       if (emitted.insert(newSym).second) {
         mlir::OpBuilder gb(&getContext());
         gb.setInsertionPointToEnd(module.getBody());
-        gb.create<fir::GlobalOp>(c.designate.getLoc(), llvm::StringRef(newSym), companionTy,
+        gb.create<fir::GlobalOp>(c.designate.getLoc(), llvm::StringRef(newSym), c.globalTy,
                                  llvm::ArrayRef<mlir::NamedAttribute>{});
-        llvm::SmallVector<mlir::NamedAttribute, 6> entry{
+        llvm::SmallVector<mlir::NamedAttribute, 8> entry{
             b.getNamedAttr("symbol", b.getStringAttr(newSym)),
             b.getNamedAttr("module", b.getStringAttr(c.module)),
             b.getNamedAttr("entity", b.getStringAttr(c.entity)),
             b.getNamedAttr("member", b.getStringAttr(c.member)),
             b.getNamedAttr("dtype", b.getStringAttr(c.dtype)),
         };
-        // Say so when the companion is an ARRAY.  A consumer that materialises the flat array needs
-        // the record extent, and a consumer that does not can ignore the key -- which is why it is
-        // additive rather than a change to the existing entry shape.
-        if (!compShape.empty())
-          entry.push_back(b.getNamedAttr("outer_shape", b.getI64ArrayAttr(compShape)));
-        // A consumer MUST read these: record-major means one flattened array whose member is an index,
-        // not a symbol per member.  Assuming the per-member shape would size the argument wrongly.
         if (c.recordMajor) {
+          // A consumer MUST read these: record-major means one flattened array whose member is an index.
+          entry.push_back(b.getNamedAttr("outer_shape",
+                                         b.getI64ArrayAttr({static_cast<int64_t>(c.numFields) * c.outerExtent})));
           entry.push_back(b.getNamedAttr("record_major", b.getUnitAttr()));
           entry.push_back(b.getNamedAttr("field_count", b.getI64IntegerAttr(c.numFields)));
         }
@@ -298,46 +282,48 @@ struct FlattenGlobalScalarReadsPass
       }
       mlir::OpBuilder rb(c.designate);
       mlir::Location const loc = c.designate.getLoc();
-      auto refTy = fir::ReferenceType::get(companionTy);
-      auto addr = rb.create<fir::AddrOfOp>(loc, refTy, mlir::SymbolRefAttr::get(&getContext(), newSym));
-      mlir::Value shape;
-      if (!compShape.empty()) {
-        llvm::SmallVector<mlir::Value, 4> dims;
-        for (int64_t d : compShape)
-          dims.push_back(rb.create<mlir::arith::ConstantIndexOp>(loc, d));
+      auto addr = rb.create<fir::AddrOfOp>(loc, fir::ReferenceType::get(c.globalTy),
+                                           mlir::SymbolRefAttr::get(&getContext(), newSym));
+      mlir::Value shape = c.element ? c.hostDecl.getShape() : mlir::Value{};
+      if (c.recordMajor) {
+        llvm::SmallVector<mlir::Value, 1> dims;
+        dims.push_back(rb.create<mlir::arith::ConstantIndexOp>(
+            loc, static_cast<int64_t>(c.numFields) * c.outerExtent));
         shape = rb.create<fir::ShapeOp>(loc, dims).getResult();
       }
       auto decl = rb.create<hlfir::DeclareOp>(loc, addr.getResult(), newSym, shape);
-      mlir::Value repl = decl.getResult(0);
-      if (c.elemDg) {
-        // `arr(i)%x` -> `arr_x(i)`: keep the element select, drop the component.  Record-major folds
-        // the member's ordinal in ARITHMETICALLY -- `arr_cm(i * numFields + <ordinal>)` -- rather than
-        // as a leading dimension, because a shape-carried ordinate is what the bridge mis-bounds.
-        llvm::SmallVector<mlir::Value, 4> idx;
+      mlir::Value replacement = decl.getResult(0);
+      if (c.element) {
         if (c.recordMajor) {
-          mlir::Value acc = rb.create<mlir::arith::ConstantIndexOp>(
-              loc, static_cast<int64_t>(c.memberIndex));
-          mlir::Value const nfields = rb.create<mlir::arith::ConstantIndexOp>(
-              loc, static_cast<int64_t>(c.numFields));
-          for (mlir::Value v : c.elemDg.getIndices()) {
-            // The element select's index is NOT necessarily `index`-typed (the verifier rejected
-            // `arith.muli` on a mixed pair), so normalise it before scaling.
+          // ``arr(i)%x`` -> ``arr_cm(i * numFields + <x's ordinal>)``: the ordinal is ARITHMETIC, not a leading
+          // dimension (a shape-carried ordinate is what the bridge mis-bounds).
+          llvm::SmallVector<mlir::Value, 1> idx;
+          mlir::Value acc =
+              rb.create<mlir::arith::ConstantIndexOp>(loc, static_cast<int64_t>(c.memberIndex));
+          mlir::Value const nfields =
+              rb.create<mlir::arith::ConstantIndexOp>(loc, static_cast<int64_t>(c.numFields));
+          for (mlir::Value v : c.element.getIndices()) {
             mlir::Value const vi = v.getType().isIndex()
                                        ? v
                                        : rb.create<mlir::arith::IndexCastOp>(loc, rb.getIndexType(), v);
-            auto scaled = rb.create<mlir::arith::MulIOp>(loc, vi, nfields);
-            acc = rb.create<mlir::arith::AddIOp>(loc, scaled, acc);
+            acc = rb.create<mlir::arith::AddIOp>(loc, acc,
+                                                 rb.create<mlir::arith::MulIOp>(loc, vi, nfields));
           }
           idx.push_back(acc);
+          replacement =
+              rb.create<hlfir::DesignateOp>(loc, fir::ReferenceType::get(c.scalarTy), replacement, idx).getResult();
         } else {
-          for (mlir::Value v : c.elemDg.getIndices())
-            idx.push_back(v);
+          // ``entity(i, ...)%member`` -> ``entity_member(i, ...)``, subscripted like the host array.
+          replacement =
+              rb.create<hlfir::DesignateOp>(loc, fir::ReferenceType::get(c.scalarTy), replacement, c.element.getIndices())
+                  .getResult();
         }
-        repl = rb.create<hlfir::DesignateOp>(loc, fir::ReferenceType::get(compTy), decl.getResult(0),
-                                             idx);
       }
-      c.designate.getResult().replaceAllUsesWith(repl);
-      c.designate.erase();
+      c.designate.getResult().replaceAllUsesWith(replacement);
+      // The leaf, then every component above it and the element designate that no other read still uses.
+      for (hlfir::DesignateOp step : c.chain)
+        if (step->use_empty()) step.erase();
+      if (c.element && c.element->use_empty()) c.element.erase();
       ++rewritten;
     }
 

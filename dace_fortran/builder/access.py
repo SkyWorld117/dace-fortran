@@ -8,21 +8,33 @@ in a state connect through one graph. ``build_memlet_index`` converts a bridge
 0-based and resolving indirect-index expressions via ``collect_indirect``.
 """
 
+from __future__ import annotations
+
+import itertools
 import re
-from types import SimpleNamespace
+from collections.abc import Callable, Container, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+from dace_fortran.builder.records import AccessLike, ComplexAliasSpec, NodeLike, SyntheticAccess, SyntheticVar
+
+if TYPE_CHECKING:
+    from dace import SDFG
+    from dace.sdfg.nodes import AccessNode
+    from dace.sdfg.state import SDFGState
+
+    from dace_fortran.builder import SDFGBuilder
 
 # Process-level (not per-SDFG) counter for unique '<arr>_at<gid>' names; avoids collisions across multi-file runs.
-_INDIRECTION_GID_COUNTER = 0
+_INDIRECTION_GIDS = itertools.count()
 
 
-def _next_indirection_gid() -> int:
-    global _INDIRECTION_GID_COUNTER
-    gid = _INDIRECTION_GID_COUNTER
-    _INDIRECTION_GID_COUNTER += 1
-    return gid
+class ViewDim(NamedTuple):
+    src_dim: int
+    slot: str
+    dummy_dim: int | None
 
 
-def iter_view_dim_map(view_dim_map):
+def iter_view_dim_map(view_dim_map: Sequence[str]) -> Iterator[ViewDim]:
     """Decode one ``section_alias`` ``view_dim_map`` entry: ``"_d<N>"`` =
     surviving dim (dummy-dim index N), else a dropped scalar's 1-based
     Fortran expr. Yields ``(src_dim, slot, dummy_dim | None)``; callers
@@ -31,17 +43,17 @@ def iter_view_dim_map(view_dim_map):
     this decode is shared.
     """
     for src_dim, slot in enumerate(view_dim_map):
-        if slot.startswith('_d'):
+        if slot.startswith("_d"):
             try:
                 dummy_dim = int(slot[2:])
             except ValueError:
                 dummy_dim = src_dim
-            yield src_dim, slot, dummy_dim
+            yield ViewDim(src_dim, slot, dummy_dim)
         else:
-            yield src_dim, slot, None
+            yield ViewDim(src_dim, slot, None)
 
 
-def resolve_object_member(builder, name: str):
+def resolve_object_member(builder: SDFGBuilder, name: str) -> str | None:
     """Real flat descriptor for a member access on a whole-object pointer-rebind
     alias (``params_oce => v_params`` makes ``params_oce % a_veloc_v`` the same
     storage as ``v_params``'s ``a_veloc_v``), or ``None`` if not such an access.
@@ -54,13 +66,13 @@ def resolve_object_member(builder, name: str):
     """
     if name in builder.arrays or name in builder.scalars or name in builder.symbols:
         return None
-    aliases = vars(builder).get("object_aliases") or {}
+    aliases = builder.object_aliases
     if not aliases:
         return None
     for base in sorted(aliases, key=len, reverse=True):
         if name == base or not name.startswith(base + "_"):
             continue
-        member = name[len(base) + 1:]
+        member = name[len(base) + 1 :]
         src = base
         seen = {src}
         while src in aliases and aliases[src] not in seen:
@@ -69,14 +81,14 @@ def resolve_object_member(builder, name: str):
         cand = f"{src}_{member}"
         if cand in builder.arrays or cand in builder.scalars or cand in builder.symbols:
             return cand
-        hit = (vars(builder).get("object_alias_flat_members") or {}).get(member)
+        hit = builder.object_alias_flat_members.get(member)
         if hit is not None and (hit in builder.arrays or hit in builder.scalars or hit in builder.symbols):
             return hit
         return None
     return None
 
 
-def resolve_object_member_expr(builder, expr: str) -> str:
+def resolve_object_member_expr(builder: SDFGBuilder, expr: str) -> str:
     """Rewrite bare phantom object-alias scalar-member names to their real
     flattened SDFG symbol names.
 
@@ -88,10 +100,10 @@ def resolve_object_member_expr(builder, expr: str) -> str:
     data-scalar resolutions are left untouched  --  those are handled by the
     per-occurrence connector wiring in ``emit_tasklet`` / ``emit_scalar_assign``.
     """
-    if not isinstance(expr, str) or '_' not in expr:
+    if not isinstance(expr, str) or "_" not in expr:
         return expr
 
-    def _repl(m):
+    def _repl(m: re.Match[str]) -> str:
         tok = m.group(0)
         if tok in builder.arrays or tok in builder.scalars or tok in builder.symbols:
             return tok
@@ -100,10 +112,15 @@ def resolve_object_member_expr(builder, expr: str) -> str:
             return real
         return tok
 
-    return re.sub(r'\b[A-Za-z_]\w*\b', _repl, expr)
+    return re.sub(r"\b[A-Za-z_]\w*\b", _repl, expr)
 
 
-def resolve_section_alias(builder, array_name: str, access):
+class AliasResolution(NamedTuple):
+    name: str
+    access: AccessLike
+
+
+def resolve_section_alias(builder: SDFGBuilder, array_name: str, access: AccessLike) -> AliasResolution:
     """If ``array_name`` is a trivial ``section_alias`` slice (full-range
     triplets + scalar drops only), return ``(source_name, spliced_access)``
     with the source's index list spliced via ``view_dim_map``; otherwise
@@ -114,34 +131,36 @@ def resolve_section_alias(builder, array_name: str, access):
     # indices unchanged (same rank/shape), only descriptor name/offset symbols differ.
     obj_real = resolve_object_member(builder, array_name)
     if obj_real is not None:
-        return obj_real, access
+        return AliasResolution(obj_real, access)
     v = builder.arrays.get(array_name)
-    if v is None or getattr(v, 'role', '') != 'section_alias':
-        return array_name, access
+    if v is None or v.role != "section_alias":
+        return AliasResolution(array_name, access)
     src = v.view_source
-    if access is None:
-        return src, access
-    dummy_exprs = list(getattr(access, 'index_exprs', None) or [])
-    dummy_vars = list(getattr(access, 'index_vars', None) or [])
+    dummy_exprs = list(access.index_exprs or [])
+    dummy_vars = list(access.index_vars or [])
     new_exprs, new_vars = [], []
     for _src_dim, slot, dummy_dim in iter_view_dim_map(v.view_dim_map):
         if dummy_dim is not None:
-            new_exprs.append(dummy_exprs[dummy_dim] if dummy_dim < len(dummy_exprs) else '')
-            new_vars.append(dummy_vars[dummy_dim] if dummy_dim < len(dummy_vars) else '')
+            new_exprs.append(dummy_exprs[dummy_dim] if dummy_dim < len(dummy_exprs) else "")
+            new_vars.append(dummy_vars[dummy_dim] if dummy_dim < len(dummy_vars) else "")
         else:
             new_exprs.append(slot)
-            new_vars.append('')
-    spliced = SimpleNamespace(
+            new_vars.append("")
+    spliced = SyntheticAccess(
         array_name=src,
-        is_read=getattr(access, 'is_read', False),
-        is_write=getattr(access, 'is_write', False),
+        is_read=access.is_read,
+        is_write=access.is_write,
         index_exprs=new_exprs,
         index_vars=new_vars,
     )
-    return src, spliced
+    # A section of a section dummy (``CALL inner(f_in(:, 1:1))`` inside a callee whose ``f_in`` is itself a section)
+    # names another section_alias as its source: keep splicing until real storage.
+    if src != array_name:
+        return resolve_section_alias(builder, src, spliced)
+    return AliasResolution(src, spliced)
 
 
-def resolve_full_dim_markers(view_subset, src_shape):
+def resolve_full_dim_markers(view_subset: Sequence[str], src_shape: Sequence[Any]) -> list[str]:
     """Replace ``":"`` full-dimension markers in a section subset with an
     explicit ``"0:<extent>"`` drawn from the parent array's SDFG shape.
 
@@ -159,7 +178,7 @@ def resolve_full_dim_markers(view_subset, src_shape):
     return out
 
 
-def cc_alias_view_spec(builder, name: str):
+def cc_alias_view_spec(builder: SDFGBuilder, name: str) -> ComplexAliasSpec:
     """Synthesize a COMPLEX view spec for a complex-as-2-reals component alias
     (e.g. QE ``qvan2``'s ``REAL(8) :: qg(2, ngy)`` sequence-associated to a
     ``COMPLEX`` element): the bridge surfaces this as an inexpressible
@@ -182,16 +201,18 @@ def cc_alias_view_spec(builder, name: str):
             slab.append(f"({base[j]}):({base[j]}) + ({elem_ext[j]})")
         else:
             slab.append(base[j])
-    return SimpleNamespace(role='view_alias',
-                           view_source=v.view_source,
-                           view_subset=slab,
-                           fortran_name=name,
-                           shape=elem_ext,
-                           dtype=(src_v.dtype if src_v is not None else v.dtype),
-                           lower_bounds=list(v.lower_bounds)[1:])
+    return ComplexAliasSpec(
+        role="view_alias",
+        view_source=v.view_source,
+        view_subset=slab,
+        fortran_name=name,
+        shape=elem_ext,
+        dtype=(src_v.dtype if src_v is not None else v.dtype),
+        lower_bounds=list(v.lower_bounds)[1:],
+    )
 
 
-def acc(builder, state, name: str):
+def acc(builder: SDFGBuilder, state: SDFGState, name: str) -> AccessNode:
     """Single access node for ``name`` in ``state``, reused across reads /
     writes.  Without this, every tasklet in the same state would fabricate
     its own disconnected access node, so a later read could not see the
@@ -209,7 +230,7 @@ def acc(builder, state, name: str):
     # with indices spliced via ``view_dim_map``.  Redirect the access-
     # node lookup to the source.
     v_alias = builder.arrays.get(name)
-    if v_alias is not None and getattr(v_alias, 'role', '') == 'section_alias':
+    if v_alias is not None and v_alias.role == "section_alias":
         return acc(builder, state, v_alias.view_source)
     # Whole-object rebind member: route the access node onto the real flattened
     # descriptor of the aliased object (``params_oce_a_veloc_v`` has no
@@ -217,10 +238,10 @@ def acc(builder, state, name: str):
     obj_real = resolve_object_member(builder, name)
     if obj_real is not None:
         return acc(builder, state, obj_real)
-    cache = getattr(state, '_hlfir_access', None)
+    cache = builder.access_caches.get(state)
     if cache is None:
         cache = {}
-        state._hlfir_access = cache
+        builder.access_caches[state] = cache
     node = cache.get(name)
     if node is None:
         node = state.add_access(name)
@@ -230,16 +251,19 @@ def acc(builder, state, name: str):
         # float-of-complex ``view_alias`` as a SAME-dtype COMPLEX view of the
         # spanned source slab, then fall through to the shared view-link code
         # (mirrors the ``bounds_remap_view`` synthesis below).
-        if name in getattr(builder, 'complex_component_aliases', {}):
+        if name in builder.complex_component_aliases:
             v = cc_alias_view_spec(builder, name)
         # ``bounds_remap_view`` (multi-D POINTER remap of a 1D target,
         # e.g. ``p(1:M, 1:K) => arr1d``) needs the same source ->
         # view linking edge the rank-reinterpret ``view_alias`` path
         # uses.  Synthesise an equivalent VarInfo on the spot so the
         # shared code below handles both shapes uniformly.
-        if v is not None and getattr(v, 'bounds_remap_view', False) \
-                and v.bounds_remap_source \
-                and v.bounds_remap_source in state.parent.arrays:
+        if (
+            v is not None
+            and v.bounds_remap_view
+            and v.bounds_remap_source
+            and v.bounds_remap_source in state.parent.arrays
+        ):
             # Prefer the surfaced source-SECTION subset (carries the
             # column offset, e.g. ``a[0:nrows, (c0)-1:c1]``) so the
             # original -> view linking memlet covers exactly the aliased
@@ -248,13 +272,15 @@ def acc(builder, state, name: str):
             # the view's own strides encode the reshape and there is no
             # source section to carry.
             src_subset = list(v.bounds_remap_source_subset) or [""]
-            v = SimpleNamespace(role='view_alias',
-                                view_source=v.bounds_remap_source,
-                                view_subset=src_subset,
-                                fortran_name=v.fortran_name)
-        if v is not None and getattr(v, 'role', '') == 'view_alias' \
-                and v.view_source and v.view_source in state.parent.arrays:
+            v = SyntheticVar(
+                role="view_alias",
+                view_source=v.bounds_remap_source,
+                view_subset=src_subset,
+                fortran_name=v.fortran_name,
+            )
+        if v is not None and v.role == "view_alias" and v.view_source and v.view_source in state.parent.arrays:
             from dace import Memlet
+
             src = v.view_source
             src_node = cache.get(src) or state.add_access(src)
             cache.setdefault(src, src_node)
@@ -275,38 +301,38 @@ def acc(builder, state, name: str):
                 # (5445 == 5*33*33) so DaCe's dimensionality
                 # check is satisfied even with the rank difference.
                 src_dims = [str(d) for d in state.parent.arrays[src].shape]
-                src_subset = ", ".join(f"0:{d}" for d in src_dims)
+                src_slab = ", ".join(f"0:{d}" for d in src_dims)
                 view_dims = [str(d) for d in state.parent.arrays[name].shape]
-                view_subset = ", ".join(f"0:{d}" for d in view_dims)
-                state.add_edge(src_node, None, node, 'views',
-                               Memlet(data=src, subset=src_subset, other_subset=view_subset))
+                view_slab = ", ".join(f"0:{d}" for d in view_dims)
+                state.add_edge(src_node, None, node, "views", Memlet(data=src, subset=src_slab, other_subset=view_slab))
             else:
                 # Section-reshape view: source-side subset
                 # describes which slab of ``src`` the view covers;
                 # view-side subset spans the view's own shape.
                 src_shape = [str(d) for d in state.parent.arrays[src].shape]
-                src_subset = ", ".join(resolve_full_dim_markers(v.view_subset, src_shape))
+                src_slab = ", ".join(resolve_full_dim_markers(v.view_subset, src_shape))
                 view_dims = [str(d) for d in state.parent.arrays[name].shape]
-                view_subset = ", ".join(f"0:{d}" for d in view_dims)
-                state.add_edge(src_node, None, node, 'views',
-                               Memlet(data=src, subset=src_subset, other_subset=view_subset))
-        elif v is not None and getattr(v, 'role', '') == 'view_alias':
+                view_slab = ", ".join(f"0:{d}" for d in view_dims)
+                state.add_edge(src_node, None, node, "views", Memlet(data=src, subset=src_slab, other_subset=view_slab))
+        elif v is not None and v.role == "view_alias":
             # A view with no resolvable source would be emitted as a bare
             # AccessNode and only fail much later, at SDFG validation, as an
             # opaque "Ambiguous or invalid edge to/from a View access node"
             # (exchange_data_r3d's ``send_ptr`` did exactly this when the
             # rebind trace stopped at the inlined ``recv`` dummy's declare).
             # Fail here, at the emission point, with the actual names.
-            raise ValueError(f"view_alias '{name}' has no usable view source: "
-                             f"view_source={v.view_source!r} is "
-                             f"{'unset' if not v.view_source else 'not a registered array'} "
-                             f"(state '{state.label}'). The bridge's rebind trace must resolve "
-                             f"the view to a registered descriptor -- see extract_vars.cpp's "
-                             f"pointer-view source walk.")
+            raise ValueError(
+                f"view_alias '{name}' has no usable view source: "
+                f"view_source={v.view_source!r} is "
+                f"{'unset' if not v.view_source else 'not a registered array'} "
+                f"(state '{state.label}'). The bridge's rebind trace must resolve "
+                f"the view to a registered descriptor -- see extract_vars.cpp's "
+                f"pointer-view source walk."
+            )
     return node
 
 
-def get_access(accesses: list, array_name: str, is_read: bool):
+def get_access(accesses: Sequence[AccessLike], array_name: str, is_read: bool) -> AccessLike | None:
     """Return the matching ``AccessInfo`` (exact read/write match preferred)."""
     for ac in accesses:
         if ac.array_name == array_name:
@@ -320,19 +346,20 @@ def get_access(accesses: list, array_name: str, is_read: bool):
     return None
 
 
-def _reserved_rewrite(name):
+def _reserved_rewrite(name: str) -> str:
     """Map a single identifier to its ``program_<name>`` form when it
     collides with a sympy attribute (``im`` -> ``sympy.im`` is a
     ``FunctionClass``; arithmetic against a ``Symbol`` then fails).
-    See ``builder.__init__._RESERVED_DACE_NAMES`` for the full set.
+    See ``builder.__init__.RESERVED_DACE_NAMES`` for the full set.
     Imported lazily to avoid a circular import at module load."""
-    from dace_fortran.builder import _RESERVED_DACE_NAMES, _DACE_NAME_PREFIX
-    if name in _RESERVED_DACE_NAMES:
-        return _DACE_NAME_PREFIX + name
+    from dace_fortran.builder import DACE_NAME_PREFIX, RESERVED_DACE_NAMES
+
+    if name in RESERVED_DACE_NAMES:
+        return DACE_NAME_PREFIX + name
     return name
 
 
-def rename_iters(expr, iter_map):
+def rename_iters(expr: str, iter_map: dict[str, str]) -> str:
     """Whole-word substitution of Fortran iter names with their
     uniquified DaCe counterparts.  Word boundaries protect against
     partial matches inside identifiers (``i`` shouldn't rewrite
@@ -353,7 +380,7 @@ def rename_iters(expr, iter_map):
     return re.sub(r"\b([A-Za-z_]\w*)\b", lambda m: iter_map.get(m.group(1), m.group(1)), expr)
 
 
-def apply_reserved(expr):
+def apply_reserved(expr: str) -> str:
     """Whole-word rewrite of sympy-reserved Fortran identifiers
     (``im`` -> ``program_im`` etc.) inside a memlet-subset string.
     The SDFG-wide ``_rename_reserved_collisions`` only sees
@@ -365,7 +392,7 @@ def apply_reserved(expr):
     return re.sub(r"\b([A-Za-z_]\w*)\b", lambda m: _reserved_rewrite(m.group(1)), expr)
 
 
-def _remap_token(token, iter_map):
+def _remap_token(token: str, iter_map: dict[str, str]) -> str:
     """Rewrite a single subscript token through ``iter_map``.  Three
     forms collapse to one helper: integer literals pass through;
     arithmetic / parenthesised expressions go through whole-word
@@ -375,7 +402,7 @@ def _remap_token(token, iter_map):
     stays on plain Symbols.  This helper is ONLY used by memlet-subset
     paths -- the tasklet-body rewrite calls bare ``rename_iters``."""
     token = token.strip()
-    if token.lstrip('-').isdigit():
+    if token.lstrip("-").isdigit():
         return token
     if any(op in token for op in "+-*/") or token.startswith("("):
         return apply_reserved(rename_iters(token, iter_map))
@@ -383,14 +410,14 @@ def _remap_token(token, iter_map):
     return _reserved_rewrite(mapped)
 
 
-def _format_offset_subset(arr, parts):
+def _format_offset_subset(arr: str, parts: Sequence[str]) -> str:
     """Wrap a per-dim expression list in the uniform offset-symbol
     form: ``arr[(p0) - offset_arr_d0, (p1) - offset_arr_d1, ...]``."""
     items = ", ".join(f"({p}) - {_offset_token(arr, d)}" for d, p in enumerate(parts))
     return f"{arr}[{items}]"
 
 
-def sdfg_is_len1_array(sdfg, name: str) -> bool:
+def sdfg_is_len1_array(sdfg: SDFG, name: str) -> bool:
     """True when ``name`` is registered on the SDFG as a length-1 ``Array``
     rather than a ``Scalar``.  The bridge keeps some logical SCALARS as
     ``(1,)``-Arrays (``descriptors.py``): an ``intent(out)`` / ``inout``
@@ -404,18 +431,19 @@ def sdfg_is_len1_array(sdfg, name: str) -> bool:
     explicit subscript.  Keyed off the real descriptor (``dtype is array``)
     rather than the intent classification, so any length-1 Array is caught."""
     import dace
+
     s = sdfg
     while s is not None:
         d = s.arrays.get(name)
         if d is not None:
-            return isinstance(d, dace.data.Array) and tuple(d.shape) == (1, )
+            return isinstance(d, dace.data.Array) and tuple(d.shape) == (1,)
         # A nested-SDFG code block can reference a parent-scope length-1 Array
         # (a module global like ``kunit`` lives on the top SDFG); walk up.
-        s = getattr(s, 'parent_sdfg', None)
+        s = s.parent_sdfg
     return False
 
 
-def deref_len1_array_scalars(sdfg, expr: str) -> str:
+def deref_len1_array_scalars(sdfg: SDFG, expr: str) -> str:
     """Token-walk a code-block expression STRING and rewrite every bare
     reference to a length-1 Array scalar (see :func:`sdfg_is_len1_array`) as
     ``name[0]``.  Used to repair interstate-edge assignment values /
@@ -431,13 +459,13 @@ def deref_len1_array_scalars(sdfg, expr: str) -> str:
     i = 0
     while i < len(expr):
         ch = expr[i]
-        if ch.isalpha() or ch == '_':
+        if ch.isalpha() or ch == "_":
             j = i
-            while j < len(expr) and (expr[j].isalnum() or expr[j] == '_'):
+            while j < len(expr) and (expr[j].isalnum() or expr[j] == "_"):
                 j += 1
             tok = expr[i:j]
-            already_subscripted = j < len(expr) and expr[j] == '['
-            attr_access = i > 0 and expr[i - 1] == '.'
+            already_subscripted = j < len(expr) and expr[j] == "["
+            attr_access = i > 0 and expr[i - 1] == "."
             if not already_subscripted and not attr_access and sdfg_is_len1_array(sdfg, tok):
                 out.append(f"{tok}[0]")
             else:
@@ -449,7 +477,16 @@ def deref_len1_array_scalars(sdfg, expr: str) -> str:
     return "".join(out)
 
 
-def find_array_subscripts(expr, names, resolver=None):
+class ArraySubscript(NamedTuple):
+    start: int
+    end: int
+    array: str
+    parts: list[str]
+
+
+def find_array_subscripts(
+    expr: str, names: Container[str], resolver: Callable[[str], str | None] | None = None
+) -> Iterator[ArraySubscript]:
     """Generator yielding ``(start, end, arr_name, parts)`` for each
     top-level ``<arr>[...]`` substring in ``expr`` whose ``<arr>`` is in
     ``names`` or resolves (via ``resolver``) to an array.  Walks
@@ -460,7 +497,7 @@ def find_array_subscripts(expr, names, resolver=None):
     n = len(expr)
     i = 0
     while i < n:
-        m = re.match(r'([A-Za-z_]\w*)\[', expr[i:])
+        m = re.match(r"([A-Za-z_]\w*)\[", expr[i:])
         if not m:
             i += 1
             continue
@@ -479,9 +516,9 @@ def find_array_subscripts(expr, names, resolver=None):
         j = inner_start
         while j < n and depth > 0:
             ch = expr[j]
-            if ch in '([{':
+            if ch in "([{":
                 depth += 1
-            elif ch in ')]}':
+            elif ch in ")]}":
                 depth -= 1
                 if depth == 0:
                     break
@@ -492,28 +529,33 @@ def find_array_subscripts(expr, names, resolver=None):
         # Split top-level commas only.
         parts, d, sp = [], 0, 0
         for k, ch in enumerate(inner):
-            if ch in '([{':
+            if ch in "([{":
                 d += 1
-            elif ch in ')]}':
+            elif ch in ")]}":
                 d -= 1
-            elif ch == ',' and d == 0:
+            elif ch == "," and d == 0:
                 parts.append(inner[sp:k].strip())
                 sp = k + 1
         parts.append(inner[sp:].strip())
-        yield (start, j + 1, resolved, parts)
+        yield ArraySubscript(start, j + 1, resolved, parts)
         i = j + 1
 
 
-def indirect_host(expr):
+def indirect_host(expr: str) -> str:
     """Given ``edge_idx[jc,1]`` return ``edge_idx``; empty for non-indirect.
     Robust to nested brackets via the bracket-balanced walker."""
-    if not isinstance(expr, str) or '[' not in expr:
+    if not isinstance(expr, str) or "[" not in expr:
         return ""
-    m = re.match(r'^([A-Za-z_]\w*)\[', expr)
-    return m.group(1) if m and expr.endswith(']') else ""
+    m = re.match(r"^([A-Za-z_]\w*)\[", expr)
+    return m.group(1) if m and expr.endswith("]") else ""
 
 
-def indirect_exprs(builder, a) -> list:
+class IndirectExpr(NamedTuple):
+    subscript: str
+    array: str
+
+
+def indirect_exprs(builder: SDFGBuilder, a: NodeLike) -> list[IndirectExpr]:
     """The *inline* indirect index expressions assign ``a`` reads, as
     ``(expression, source array)`` pairs, innermost-first and deduplicated.
 
@@ -521,17 +563,20 @@ def indirect_exprs(builder, a) -> list:
     indirection level.  Innermost-first is what lets a caller materialise the
     levels in order without forward references.
     """
-    out: list[tuple[str, str]] = []
+    out: list[IndirectExpr] = []
     seen: set[str] = set()
 
-    def _visit(expr: str):
+    def _visit(expr: str) -> None:
         """Visit ``expr`` and collect any ``<arr>[...]`` substring with ``<arr>``
         in ``builder.arrays``.  ``idx1[idx2[i]]`` produces two entries: first
         ``idx2[i]`` (the inner load), then ``idx1[idx2[i]]`` (the outer load).
         """
-        if not isinstance(expr, str) or '[' not in expr:
+        if not isinstance(expr, str) or "[" not in expr:
             return
-        resolver = lambda n: resolve_object_member(builder, n)
+
+        def resolver(n):
+            return resolve_object_member(builder, n)
+
         for start, end, arr, parts in find_array_subscripts(expr, builder.arrays, resolver):
             # Recurse into each part FIRST so inner indirections come ahead of
             # the enclosing one.
@@ -540,16 +585,16 @@ def indirect_exprs(builder, a) -> list:
             sub = expr[start:end]
             if sub not in seen:
                 seen.add(sub)
-                out.append((sub, arr))
+                out.append(IndirectExpr(sub, arr))
 
     for ac in a.accesses:
-        for expr in getattr(ac, 'index_exprs', None) or []:
+        for expr in ac.index_exprs or []:
             _visit(expr)
 
     return out
 
 
-def collect_indirect(builder, assigns: list) -> dict:
+def collect_indirect(builder: SDFGBuilder, assigns: list) -> dict:
     """Mint a fresh SDFG symbol for each distinct inline indirect index
     expression across ``assigns`` (see :func:`indirect_exprs`).  Returns a map
     from the Fortran-style expression (``edge_idx[jc,1]``) to the symbol name.
@@ -567,11 +612,11 @@ def collect_indirect(builder, assigns: list) -> dict:
     for a in assigns:
         for sub, arr in indirect_exprs(builder, a):
             if sub not in out:
-                out[sub] = f"{arr}_at{_next_indirection_gid()}"
+                out[sub] = f"{arr}_at{next(_INDIRECTION_GIDS)}"
     return out
 
 
-def materialize_indirect_view_sources(builder, state, indirect_syms: dict) -> None:
+def materialize_indirect_view_sources(builder: SDFGBuilder, state: SDFGState, indirect_syms: dict) -> None:
     """Install the ``source -> view`` linking memlet for every ``view_alias``
     array that an INTERSTATE-edge indirection assignment reads.
 
@@ -598,11 +643,14 @@ def materialize_indirect_view_sources(builder, state, indirect_syms: dict) -> No
     placeholders and walks states topologically, so the real node is the FIRST
     recorded instance and ``get_view_edge`` resolves against it.
     """
-    resolver = lambda n: resolve_object_member(builder, n)
+
+    def resolver(n):
+        return resolve_object_member(builder, n)
+
     for expr in indirect_syms:
         for _start, _end, arr, _parts in find_array_subscripts(expr, builder.arrays, resolver):
             v = builder.arrays.get(arr)
-            if v is not None and getattr(v, 'role', '') == 'view_alias':
+            if v is not None and v.role == "view_alias":
                 acc(builder, state, arr)
 
 
@@ -611,7 +659,9 @@ def _offset_token(arr: str, dim: int) -> str:
     return f"offset_{arr}_d{dim}"
 
 
-def array_read_to_dace_expr(builder, assign_node, iter_map: dict, sdfg=None) -> str:
+def array_read_to_dace_expr(
+    builder: SDFGBuilder, assign_node: NodeLike, iter_map: dict[str, str], sdfg: SDFG | None = None
+) -> str:
     """Render a scalar-target assign's RHS as a DaCe interstate-edge
     expression, lifting EVERY array read to the uniform offset-symbol
     subscript form (``arr[(idx) - offset_arr_d<i>, ...]``).  Used to lift
@@ -641,15 +691,15 @@ def array_read_to_dace_expr(builder, assign_node, iter_map: dict, sdfg=None) -> 
     i = 0
     while i < len(expr):
         ch = expr[i]
-        if ch.isalpha() or ch == '_':
+        if ch.isalpha() or ch == "_":
             j = i
-            while j < len(expr) and (expr[j].isalnum() or expr[j] == '_'):
+            while j < len(expr) and (expr[j].isalnum() or expr[j] == "_"):
                 j += 1
             tok = expr[i:j]
             # A name already followed by ``[`` is subscripted -- leave it;
             # only a bare array-name occurrence maps to a read access (in
             # the order the bridge lists them).
-            already_subscripted = j < len(expr) and expr[j] == '['
+            already_subscripted = j < len(expr) and expr[j] == "["
             if not already_subscripted and ri < len(reads) and tok == reads[ri].array_name:
                 ac = reads[ri]
                 ri += 1
@@ -664,7 +714,7 @@ def array_read_to_dace_expr(builder, assign_node, iter_map: dict, sdfg=None) -> 
                 eff_name, eff_ac = resolve_section_alias(builder, ac.array_name, ac)
                 parts = [_remap_token(raw, iter_map) for raw in (eff_ac.index_exprs or [])]
                 out.append(_format_offset_subset(eff_name, parts))
-            elif not already_subscripted and sdfg_is_len1_array(sdfg, tok):
+            elif not already_subscripted and sdfg is not None and sdfg_is_len1_array(sdfg, tok):
                 # A logical scalar kept as a length-1 Array (inout/out module
                 # global like ``kunit`` / ``npool``, or a complex intent(in)):
                 # it is a pointer in C, so the code-block expression must read
@@ -687,13 +737,12 @@ def _rewrite_inner_indirects(part: str, indirect_syms: dict) -> str:
     minted symbol covers it (innermost first, then the outer).
     Returns ``part`` unchanged if no nested indirect appears.
     """
-    if not isinstance(part, str) or '[' not in part:
+    if not isinstance(part, str) or "[" not in part:
         return part
     # Walk inside-out: keep replacing the first match whose substring is
     # in ``indirect_syms`` until no more replacements are possible.  We
     # don't reuse ``find_array_subscripts`` since we need indexes into
     # ``part`` (not into a parent expression) for slicing.
-    arr_names = set(indirect_syms.keys())
     # Sort longest-first so a ``a[b[i]]`` form picks the outer first only
     # after the inner ``b[i]`` has been substituted.  But since we scan
     # innermost-first via the bracket walker each pass, longest doesn't
@@ -705,36 +754,36 @@ def _rewrite_inner_indirects(part: str, indirect_syms: dict) -> str:
         # Iterate through every <arr>[...] substring in out, replace the
         # first whose exact substring is interned.
         for st in range(len(out)):
-            if out[st] not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_':
+            if out[st] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_":
                 continue
             # Try to match an array name starting at st.
             j = st
-            while j < len(out) and (out[j].isalnum() or out[j] == '_'):
+            while j < len(out) and (out[j].isalnum() or out[j] == "_"):
                 j += 1
-            if j >= len(out) or out[j] != '[':
+            if j >= len(out) or out[j] != "[":
                 continue
             # Walk balanced brackets to find end.
             depth = 1
             k = j + 1
             while k < len(out) and depth > 0:
-                if out[k] == '[':
+                if out[k] == "[":
                     depth += 1
-                elif out[k] == ']':
+                elif out[k] == "]":
                     depth -= 1
                     if depth == 0:
                         break
                 k += 1
             if depth != 0:
                 break
-            sub = out[st:k + 1]
+            sub = out[st : k + 1]
             if sub in indirect_syms:
-                out = out[:st] + indirect_syms[sub] + out[k + 1:]
+                out = out[:st] + indirect_syms[sub] + out[k + 1 :]
                 changed = True
                 break  # restart the scan from the beginning
     return out
 
 
-def indirect_to_dace(builder, expr: str, iter_map: dict, indirect_syms: dict | None = None) -> str:
+def indirect_to_dace(builder: SDFGBuilder, expr: str, iter_map: dict, indirect_syms: dict | None = None) -> str:
     """Convert ``arr[i,j]`` (Fortran 1-based) into the uniform offset-
     symbol DaCe subscript form.  Robust to nested brackets via the
     bracket-balanced walker.
@@ -747,9 +796,12 @@ def indirect_to_dace(builder, expr: str, iter_map: dict, indirect_syms: dict | N
     falls back to a function-call shape that the C++ codegen can't
     compile).
     """
-    if not isinstance(expr, str) or '[' not in expr:
+    if not isinstance(expr, str) or "[" not in expr:
         return expr
-    resolver = lambda n: resolve_object_member(builder, n)
+
+    def resolver(n):
+        return resolve_object_member(builder, n)
+
     matches = list(find_array_subscripts(expr, builder.arrays, resolver))
     # Single full-string match -- the typical inline-indirection shape.
     if len(matches) == 1:
@@ -761,15 +813,22 @@ def indirect_to_dace(builder, expr: str, iter_map: dict, indirect_syms: dict | N
             # source array + spliced dim_map (same gap as
             # ``array_read_to_dace_expr`` -- the alias has no offset symbols).
             v = builder.arrays.get(arr)
-            if v is not None and getattr(v, 'role', '') == 'section_alias':
-                _src, _sp = resolve_section_alias(builder, arr,
-                                                  SimpleNamespace(index_exprs=parts, index_vars=[''] * len(parts)))
+            if v is not None and v.role == "section_alias":
+                _src, _sp = resolve_section_alias(
+                    builder, arr, SyntheticAccess(index_exprs=parts, index_vars=[""] * len(parts))
+                )
                 arr, parts = _src, list(_sp.index_exprs)
             return _format_offset_subset(arr, [_remap_token(p, iter_map) for p in parts])
     return expr
 
 
-def build_memlet_index(builder, array_name: str, access, iter_map: dict, indirect_syms: dict = None) -> str:
+def build_memlet_index(
+    builder: SDFGBuilder,
+    array_name: str,
+    access: AccessLike,
+    iter_map: dict[str, str],
+    indirect_syms: dict[str, str] | None = None,
+) -> str:
     """Build a memlet subset using the uniform offset-symbol form.
 
     For every dim of ``array_name``, the resulting subset token is
@@ -810,8 +869,11 @@ def build_memlet_index(builder, array_name: str, access, iter_map: dict, indirec
         # doesn't leak the nested-bracket commas into the memlet subset.  The
         # exact-match early-return below still catches the pure-indirect case
         # (``ikidx[...]`` with no surrounding arithmetic).
-        if '[' in expr and indirect_syms:
-            resolver = lambda n: resolve_object_member(builder, n)
+        if "[" in expr and indirect_syms:
+
+            def resolver(n):
+                return resolve_object_member(builder, n)
+
             while True:
                 replaced = False
                 for sub_start, sub_end, _arr, _parts in find_array_subscripts(expr, builder.arrays, resolver):
@@ -825,7 +887,7 @@ def build_memlet_index(builder, array_name: str, access, iter_map: dict, indirec
 
         # Indirect: substitute the minted symbol that holds the
         # Fortran 1-based runtime value, then offset uniformly.
-        if '[' in expr and expr in indirect_syms:
+        if "[" in expr and expr in indirect_syms:
             tok = indirect_syms[expr]
             parts.append(f"({tok}) - {offset_sym}")
             continue
@@ -838,7 +900,7 @@ def build_memlet_index(builder, array_name: str, access, iter_map: dict, indirec
 
         # Constant literal: keep as-is, offset symbolically (sympy
         # folds it to the right value after specialise).
-        if expr.lstrip('-').isdigit():
+        if expr.lstrip("-").isdigit():
             parts.append(f"{expr} - {offset_sym}")
             continue
 

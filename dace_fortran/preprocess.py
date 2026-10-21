@@ -28,9 +28,16 @@ SED-style text rewrites, not a Fortran parser -- deliberately narrow
 by construction.  Comment/string safety shared via ``_scan_line``.
 """
 
+from __future__ import annotations
+
 import re
+from collections.abc import Iterable, Iterator, Sequence
+from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from dace_fortran.external_functions import ExternalFunction
 
 # Whole-number REAL exponent only (``**2.0``, ``**2.0_JPRB``) -- backends are
 # free to round ``pow(x, 2.0)`` differently from gfortran's ``x*x``.
@@ -47,11 +54,13 @@ _CALL_IN_BASE = re.compile(r"[A-Za-z_]\w*\s*\(")
 # REAL literal: needs a frac point or exponent so a bare integer never
 # matches; captures are mantissa/exponent/kind.  Lookbehind/ahead keep off
 # identifiers (``R2ES``) and kind selectors.
-_REAL_LIT_RE = re.compile(r"(?<![\w.])"
-                          r"(\d+\.\d*|\.\d+|\d+)"  # mantissa
-                          r"([eEdD][+-]?\d+)?"  # optional exponent
-                          r"(_[A-Za-z]\w*|_\d+)?"  # optional kind suffix
-                          r"(?![\w.])")
+_REAL_LIT_RE = re.compile(
+    r"(?<![\w.])"
+    r"(\d+\.\d*|\.\d+|\d+)"  # mantissa
+    r"([eEdD][+-]?\d+)?"  # optional exponent
+    r"(_[A-Za-z]\w*|_\d+)?"  # optional kind suffix
+    r"(?![\w.])"
+)
 # Kind suffixes already double precision -- left alone.
 _DOUBLE_KINDS = {"jprb", "jprd", "dp", "8", "16", "r8", "qp"}
 
@@ -62,13 +71,31 @@ _INTEGER_DECL_RE = re.compile(
 _BARE_IF_RE = re.compile(r"\b(IF\s*\(\s*)([A-Za-z_]\w*)(\s*\))", re.IGNORECASE)
 
 
-def _scan_line(body: str):
+class StringSpan(NamedTuple):
+    start: int
+    end: int
+
+
+class ScannedLine(NamedTuple):
+    comment: int
+    strings: list[StringSpan]
+
+
+class MergeEngine(Enum):
+    """How ``merge_used_modules`` splices the ``USE``-d modules into one TU."""
+
+    REGEX = "regex"
+    FPARSER = "fparser"
+
+
+def _scan_line(body: str) -> ScannedLine:
     """Comment start + character-string spans of one line; shared so a ``!``
     or ``**`` inside a literal is never treated as code.  Returns
     ``(comment_index, [(start, end), ...])``; doubled quotes (``''``) stay
     inside one span.
     """
-    spans, i, n = [], 0, len(body)
+    spans: list[StringSpan] = []
+    i, n = 0, len(body)
     while i < n:
         c = body[i]
         if c in "'\"":
@@ -80,13 +107,13 @@ def _scan_line(body: str):
                         continue
                     break
                 j += 1
-            spans.append((i, min(j + 1, n)))
+            spans.append(StringSpan(i, min(j + 1, n)))
             i = j + 1
         elif c == "!":
-            return i, spans
+            return ScannedLine(i, spans)
         else:
             i += 1
-    return n, spans
+    return ScannedLine(n, spans)
 
 
 def _collect_integer_scalar_names(source: str) -> set[str]:
@@ -95,19 +122,24 @@ def _collect_integer_scalar_names(source: str) -> set[str]:
     """
     names: set[str] = set()
     for m in _INTEGER_DECL_RE.finditer(source):
-        decl = m.group(1).split('!', 1)[0]
-        for tok in decl.split(','):
-            head = tok.strip().split('=', 1)[0].strip()
+        decl = m.group(1).split("!", 1)[0]
+        for tok in decl.split(","):
+            head = tok.strip().split("=", 1)[0].strip()
             # Skip array forms (``name(...)``) -- can't be the bare argument of IF.
-            if '(' in head:
+            if "(" in head:
                 continue
-            name = head.split()[0] if head else ''
-            if name and name.replace('_', '').isalnum() and not name[0].isdigit():
+            name = head.split()[0] if head else ""
+            if name and name.replace("_", "").isalnum() and not name[0].isdigit():
                 names.add(name.lower())
     return names
 
 
-def _extract_power_base(code: str, star: int):
+class PowerBase(NamedTuple):
+    begin: int
+    end: int
+
+
+def _extract_power_base(code: str, star: int) -> PowerBase | None:
     """Base (left primary) of a ``**`` operator: scans leftward over a
     parenthesised group, identifier, array/function reference
     (``name(...)``), or ``%`` component chain (``a%b(i)%c``).  Returns
@@ -143,10 +175,10 @@ def _extract_power_base(code: str, star: int):
             i -= 1  # designator chain -- keep walking the components
             continue
         break
-    return None if i == end else (i, end)
+    return None if i == end else PowerBase(i, end)
 
 
-def _real_exp_int_value(tok: str):
+def _real_exp_int_value(tok: str) -> int | None:
     """Integer value of a REAL-literal exponent token (``2.0`` -> 2), or
     ``None`` when it isn't a whole number >= 1 (``2.5``, ``0.0``).
     """
@@ -172,11 +204,11 @@ def rewrite_integer_powers(source: str) -> str:
     """
     out = []
     for line in source.splitlines(keepends=True):
-        nl = line[len(line.rstrip("\r\n")):]
-        body = line[:len(line) - len(nl)]
+        nl = line[len(line.rstrip("\r\n")) :]
+        body = line[: len(line) - len(nl)]
         cut, strings = _scan_line(body)  # string-aware, shared
         code, tail = body[:cut], body[cut:]
-        edits = []
+        edits: list[tuple[int, int, str]] = []
         for m in _INT_POW_RE.finditer(code):
             if any(s <= m.start() < e for s, e in strings):
                 continue  # ``**`` inside a character literal
@@ -203,7 +235,7 @@ def rewrite_integer_powers(source: str) -> str:
     return "".join(out)
 
 
-def _promote_one(m: re.Match):
+def _promote_one(m: re.Match[str]) -> str:
     """Rewrite one ``_REAL_LIT_RE`` match to double precision; returns the
     match unchanged when it's an integer or already double.
     """
@@ -227,8 +259,8 @@ def promote_real_literals_to_double(source: str) -> str:
     """
     out = []
     for line in source.splitlines(keepends=True):
-        nl = line[len(line.rstrip("\r\n")):]
-        body = line[:len(line) - len(nl)]
+        nl = line[len(line.rstrip("\r\n")) :]
+        body = line[: len(line) - len(nl)]
         cut, strings = _scan_line(body)
         code, tail = body[:cut], body[cut:]
 
@@ -268,12 +300,12 @@ _OMP_ACC_MACROS = frozenset({"_OPENMP", "_OPENACC"})
 
 #: ``#if[n]def MACRO`` and the ``#if [!]defined(MACRO)`` aliases -- the
 #: directive openers we elide when ``MACRO`` is in :data:`_OMP_ACC_MACROS`.
-_CPP_IFDEF_RE = re.compile(r'^\s*#\s*(ifn?def)\s+(\w+)', re.IGNORECASE)
-_CPP_IFDEFINED_RE = re.compile(r'^\s*#\s*if\s+(!)?\s*defined\s*\(\s*(\w+)\s*\)\s*$', re.IGNORECASE)
-_CPP_IF_RE = re.compile(r'^\s*#\s*if\b', re.IGNORECASE)
-_CPP_ELSE_RE = re.compile(r'^\s*#\s*else\b', re.IGNORECASE)
-_CPP_ELIF_RE = re.compile(r'^\s*#\s*elif\b', re.IGNORECASE)
-_CPP_ENDIF_RE = re.compile(r'^\s*#\s*endif\b', re.IGNORECASE)
+_CPP_IFDEF_RE = re.compile(r"^\s*#\s*(ifn?def)\s+(\w+)", re.IGNORECASE)
+_CPP_IFDEFINED_RE = re.compile(r"^\s*#\s*if\s+(!)?\s*defined\s*\(\s*(\w+)\s*\)\s*$", re.IGNORECASE)
+_CPP_IF_RE = re.compile(r"^\s*#\s*if\b", re.IGNORECASE)
+_CPP_ELSE_RE = re.compile(r"^\s*#\s*else\b", re.IGNORECASE)
+_CPP_ELIF_RE = re.compile(r"^\s*#\s*elif\b", re.IGNORECASE)
+_CPP_ENDIF_RE = re.compile(r"^\s*#\s*endif\b", re.IGNORECASE)
 
 
 def strip_openmp_directives(source: str) -> str:
@@ -388,7 +420,7 @@ def _local_kind_bindings(source: str) -> dict:
     return out
 
 
-def normalize_kind_parameters(source: str, *, kind_map: dict = None, passthrough: bool = False) -> str:
+def normalize_kind_parameters(source: str, *, kind_map: dict | None = None, passthrough: bool = False) -> str:
     """Substitute symbolic precision kind aliases (``wp``, ``JPRB``, ...) with
     literal kind ints (default fp64 ``8``) at every use site
     (``REAL(KIND=wp)``, ``1.0_wp``).
@@ -417,17 +449,17 @@ def normalize_kind_parameters(source: str, *, kind_map: dict = None, passthrough
     if not aliases:
         return source
 
-    def _resolve_kind_eq(m):
+    def _resolve_kind_eq(m: re.Match[str]) -> str | None:
         sym = m.group(2).lower()
         return f"{m.group(1)}{aliases[sym]}" if sym in aliases else None
 
-    def _resolve_type_paren(m):
+    def _resolve_type_paren(m: re.Match[str]) -> str | None:
         sym = m.group(3).lower()
         if sym not in aliases:
             return None
         return f"{m.group(1)}{m.group(2)}{aliases[sym]}{m.group(4)}"
 
-    def _resolve_literal(m):
+    def _resolve_literal(m: re.Match[str]) -> str | None:
         sym = m.group(2).lower()
         return f"{m.group(1)}_{aliases[sym]}" if sym in aliases else None
 
@@ -439,11 +471,11 @@ def normalize_kind_parameters(source: str, *, kind_map: dict = None, passthrough
 
     out = []
     for line in source.splitlines(keepends=True):
-        nl = line[len(line.rstrip("\r\n")):]
-        body = line[:len(line) - len(nl)]
+        nl = line[len(line.rstrip("\r\n")) :]
+        body = line[: len(line) - len(nl)]
         cut, strings = _scan_line(body)
         code, tail = body[:cut], body[cut:]
-        edits = []
+        edits: list[tuple[int, int, str]] = []
         for pat, fn in rules:
             for m in pat.finditer(code):
                 if any(s <= m.start() < e for s, e in strings):
@@ -480,18 +512,20 @@ def preprocess_fortran(source: str) -> str:
 
 # Intrinsic/compiler-provided modules -- flang supplies them, so a ``USE``
 # of one is left untouched.
-_INTRINSIC_MODULES = frozenset({
-    "iso_c_binding",
-    "iso_fortran_env",
-    "ieee_arithmetic",
-    "ieee_exceptions",
-    "ieee_features",
-    "omp_lib",
-    "omp_lib_kinds",
-    "openacc",
-    "mpi",
-    "mpi_f08",
-})
+_INTRINSIC_MODULES = frozenset(
+    {
+        "iso_c_binding",
+        "iso_fortran_env",
+        "ieee_arithmetic",
+        "ieee_exceptions",
+        "ieee_features",
+        "omp_lib",
+        "omp_lib_kinds",
+        "openacc",
+        "mpi",
+        "mpi_f08",
+    }
+)
 
 # ``use [, intrinsic] [::] <name>`` -- code part only (comments/strings
 # stripped by ``_scan_line``).
@@ -545,16 +579,20 @@ def _balance_cpp(block: str) -> str:
                 open_idx.pop()
             else:
                 drop.add(i)  # orphan #endif
-        elif _CPP_MID_RE.match(ln):
-            if not open_idx:
-                drop.add(i)  # orphan #else / #elif
+        elif _CPP_MID_RE.match(ln) and not open_idx:
+            drop.add(i)  # orphan #else / #elif
     drop.update(open_idx)  # unmatched #if openers
     if not drop:
         return block
     return "".join(ln for i, ln in enumerate(lines) if i not in drop)
 
 
-def _module_blocks(text: str):
+class ModuleBlock(NamedTuple):
+    name: str
+    text: str
+
+
+def _module_blocks(text: str) -> Iterator[ModuleBlock]:
     """Yield ``(name_lower, block_text)`` per top-level ``module`` in
     ``text`` (``submodule``/``module procedure`` excluded; modules don't
     nest).
@@ -583,7 +621,7 @@ def _module_blocks(text: str):
             i += 1
         end = min(i, n - 1)
         # Balance cpp conditionals split across the block boundary (see _balance_cpp).
-        yield name, _balance_cpp("".join(lines[start:end + 1]))
+        yield ModuleBlock(name, _balance_cpp("".join(lines[start : end + 1])))
         last_end = end + 1
         i = end + 1
 
@@ -594,10 +632,7 @@ def _used_modules(text: str, resolve: frozenset = frozenset()) -> list:
 
     ``resolve`` exists because a project can legitimately VENDOR a module whose name is also an
     intrinsic one -- MFC ships a hand-written ``mpi`` stub carrying the MPI constants its sources
-    use, and the compiler has no ``mpi.mod`` to fall back on.  ``_INTRINSIC_MODULES`` is a heuristic
-    ("let the compiler supply this"), and a caller that knows better needs a way to say so; without
-    it the ``USE`` is left dangling and flang fails with ``Cannot parse module file for module
-    'mpi': Source file 'mpi.mod' was not found``.
+    use, and the compiler has no ``mpi.mod`` to fall back on.
     """
     seen, out = set(), []
     for raw in text.splitlines():
@@ -652,14 +687,14 @@ _SPEC_LINE_RE = re.compile(
 )
 
 
-def _stub_procedure_bodies(text: str, names) -> str:
+def _stub_procedure_bodies(text: str, names: Iterable[str]) -> str:
     """Empty the executable body of every procedure matching ``names`` --
     exactly, or as the generic an ICON interface dispatches over
     (``sync_patch_array`` -> ``sync_patch_array_3d_dp``) -- keeping its
     opener, spec part, and matching ``END``.
 
     Regex-merge analogue of the fparser inliner's ``make_noop``
-    (:func:`dace_fortran.fparser_inliner._keep_external_noop_specs`): dummy
+    (:func:`dace_fortran.fparser_inliner._external_noop_specs`): dummy
     args stay declared (in-TU call site stays legal) but internals
     (halo/MPI/I/O) never enter the TU.  Nesting-aware ``END`` scan handles
     internal ``CONTAINS`` subprograms.  Case-insensitive; names come from the
@@ -727,8 +762,14 @@ def _stub_procedure_bodies(text: str, names) -> str:
     return "".join(out)
 
 
-def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do_not_emit=(),
-                       resolve_intrinsic=()) -> str:
+def merge_used_modules(
+    source: str,
+    *,
+    search_dirs: Sequence[str | Path] = (),
+    external_functions: Iterable[ExternalFunction] = (),
+    do_not_emit: Iterable[str] = (),
+    resolve_intrinsic: Iterable[str] = (),
+) -> str:
     """Inline every ``USE``-d module's real source into ``source`` -- one
     self-contained TU, fparser-free (transitive ``USE``-graph resolve +
     dependency-ordered splice, de-duplicated).
@@ -741,15 +782,11 @@ def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do
     analogue of the fparser inliner's ``make_noop``) so halo/MPI/I/O
     internals never enter the TU.  ``external_functions`` gets an EMITted
     external call, ``do_not_emit`` gets the call DROPped.
-
-    ``resolve_intrinsic`` names modules to resolve from ``search_dirs`` EVEN
-    THOUGH they are in :data:`_INTRINSIC_MODULES` -- for a project that vendors
-    a module whose name is also an intrinsic one (MFC's hand-written ``mpi``
-    stub).  Default empty: the intrinsic set is left to the compiler.
     """
     from pathlib import Path
 
     from dace_fortran.external_functions import dont_inline_names, validate
+
     validate(external_functions, do_not_emit)
     dont_inline = dont_inline_names(external_functions, do_not_emit)
     resolve = frozenset(n.lower() for n in resolve_intrinsic)
@@ -758,9 +795,9 @@ def merge_used_modules(source: str, *, search_dirs=(), external_functions=(), do
     index: dict = {}
     for d in search_dirs:
         d = Path(d)
-        files = [
-            d
-        ] if d.is_file() else sorted(list(d.rglob("*.f90")) + list(d.rglob("*.F90")) + list(d.rglob("*.incf")))
+        files = (
+            [d] if d.is_file() else sorted(list(d.rglob("*.f90")) + list(d.rglob("*.F90")) + list(d.rglob("*.incf")))
+        )
         for f in files:
             try:
                 txt = f.read_text()
@@ -824,13 +861,14 @@ _SCOPE_OPEN_RE = re.compile(
 )
 
 
-def _index_procedures_in_modules(search_dirs) -> dict:
+def _index_procedures_in_modules(search_dirs: Sequence[str | Path]) -> dict[str, str]:
     """Index every ``SUBROUTINE``/``FUNCTION`` declared inside a ``MODULE``
     block across ``search_dirs``, as ``{procedure_name_lower:
     module_name_lower}``.  Sibling of :func:`merge_used_modules`'s scan;
     feeds :func:`replace_external_with_modules`.
     """
     from pathlib import Path
+
     index: dict = {}
     proc_open = _PROC_OPEN_RE
     for d in search_dirs:
@@ -865,7 +903,7 @@ _FUNC_RESULT_TYPE_DECL_RE = re.compile(
 )
 
 
-def _scope_already_uses(scope_lines, mod_name: str) -> bool:
+def _scope_already_uses(scope_lines: Iterable[str], mod_name: str) -> bool:
     """``True`` when ``scope_lines`` already has a ``USE <mod_name>`` (any
     casing) -- avoids a redundant synthesised ``USE ..., ONLY:`` import.
     """
@@ -877,7 +915,7 @@ def _scope_already_uses(scope_lines, mod_name: str) -> bool:
     return False
 
 
-def replace_external_with_modules(source: str, *, search_dirs=()) -> str:
+def replace_external_with_modules(source: str, *, search_dirs: Sequence[str | Path] = ()) -> str:
     """Replace ``EXTERNAL <name>, ...`` declarations with the equivalent
     ``USE <module>, ONLY: <name>, ...`` when the procedure is defined in a
     module visible via ``search_dirs``.
@@ -954,8 +992,9 @@ def replace_external_with_modules(source: str, *, search_dirs=()) -> str:
             if _EXTERNAL_DECL_RE.match(code):
                 continue
             if re.search(
-                    r"(?i)\b(intent|parameter|dimension|allocatable|pointer|target|save|optional|public|private|value)\b",
-                    code):
+                r"(?i)\b(intent|parameter|dimension|allocatable|pointer|target|save|optional|public|private|value)\b",
+                code,
+            ):
                 continue
             m = _FUNC_RESULT_TYPE_DECL_RE.match(code)
             if not m:
@@ -970,7 +1009,8 @@ def replace_external_with_modules(source: str, *, search_dirs=()) -> str:
             if _scope_already_uses(scope_lines, mod):
                 continue  # EXTERNAL becomes a no-op delete
             # Indent = opener's leading whitespace + 2 spaces (conventional continuation).
-            opener_indent = re.match(r"^(\s*)", lines[opener_idx]).group(1)
+            indent_match = re.match(r"^(\s*)", lines[opener_idx])  # matches the empty string at worst
+            opener_indent = indent_match.group(1) if indent_match else ""
             body_indent = opener_indent + "  "
             synth_use_lines.append(f"{body_indent}USE {mod}, ONLY: {', '.join(names)}\n")
         if synth_use_lines:
@@ -1032,7 +1072,7 @@ def _scan_string_enum_uses(scope_body: str, var: str) -> dict:
         re.IGNORECASE,
     )
 
-    def _record(lit: str):
+    def _record(lit: str) -> None:
         key = lit.lower()
         if key in mapping:
             return
@@ -1174,16 +1214,16 @@ def rewrite_string_enum_to_integer(source: str) -> tuple:
                         lit_key = cm.group(2).lower()
                         if lit_key in mapping:
                             # Rebuild, preserving any trailing comment past the match end.
-                            new_line = (cm.group(1) + str(mapping[lit_key]) + cm.group(3) + raw[len(cm.group(0)):])
+                            new_line = cm.group(1) + str(mapping[lit_key]) + cm.group(3) + raw[len(cm.group(0)) :]
 
                 # ``<var> == 'lit'`` / ``<var> .EQ. 'lit'``
-                def _replace_var_eq(m):
+                def _replace_var_eq(m: re.Match[str]) -> str:
                     lit_key = m.group(2).lower()
                     if lit_key not in mapping:
                         return m.group(0)
                     return f"{m.group(1)}{mapping[lit_key]}"
 
-                def _replace_eq_var(m):
+                def _replace_eq_var(m: re.Match[str]) -> str:
                     lit_key = m.group(1).lower()
                     if lit_key not in mapping:
                         return m.group(0)
@@ -1200,18 +1240,20 @@ def rewrite_string_enum_to_integer(source: str) -> tuple:
 
     out = []
     for i, raw in enumerate(lines):
-        out.append(delete_idx[i] if i in delete_idx else raw)
+        out.append(delete_idx.get(i, raw))
     return "".join(out), enum_maps
 
 
-def _fparser_merge(source: str,
-                   *,
-                   search_dirs=(),
-                   entry: Optional[str] = None,
-                   external_names: Iterable[str] = (),
-                   keep_acc_directives: bool = False) -> str:
+def fparser_merge(
+    source: str,
+    *,
+    search_dirs: Sequence[str | Path] = (),
+    entry: str | None = None,
+    external_names: Iterable[str] = (),
+    keep_acc_directives: bool = False,
+) -> str:
     """Single-TU merge via the fparser inliner engine (opt-in via
-    ``merge_engine="fparser"``; the regex splicer stays default).
+    ``merge_engine=MergeEngine.FPARSER``; the regex splicer stays default).
 
     Sibling of :func:`merge_used_modules`: parses ``source`` + every file
     under ``search_dirs`` into one fparser AST, resolves ``USE``, inlines,
@@ -1220,14 +1262,19 @@ def _fparser_merge(source: str,
     ``external_names`` are stubbed empty (inliner's ``make_noop``) so their
     internals never enter the TU.
     """
-    from dace_fortran.fparser_inliner import (decode_acc_directives, encode_acc_directives, inline_to_ast,
-                                              strip_builtin_stub_modules)
+    from dace_fortran.fparser_inliner import (
+        decode_acc_directives,
+        encode_acc_directives,
+        inline_to_ast,
+        strip_builtin_stub_modules,
+    )
 
-    src_map = {}
+    src_map: dict[str, str] = {}
     for d in search_dirs:
         d = Path(d)
-        files = ([d]
-                 if d.is_file() else sorted(list(d.rglob("*.f90")) + list(d.rglob("*.F90")) + list(d.rglob("*.incf"))))
+        files = (
+            [d] if d.is_file() else sorted(list(d.rglob("*.f90")) + list(d.rglob("*.F90")) + list(d.rglob("*.incf")))
+        )
         for f in files:
             try:
                 src_map.setdefault(str(f), f.read_text())
@@ -1258,25 +1305,27 @@ def _fparser_merge(source: str,
     return text
 
 
-def preprocess_fortran_source(source: str,
-                              *,
-                              search_dirs=(),
-                              merge: bool = True,
-                              merge_engine: str = "regex",
-                              merge_entry: Optional[str] = None,
-                              external_names: Iterable[str] = (),
-                              resolve_intrinsic: Iterable[str] = (),
-                              if_intvar: bool = False,
-                              kind_map: dict = None,
-                              kind_passthrough: bool = False,
-                              keep_acc_directives: bool = False) -> str:
+def preprocess_fortran_source(
+    source: str,
+    *,
+    search_dirs: Sequence[str | Path] = (),
+    merge: bool = True,
+    merge_engine: MergeEngine = MergeEngine.REGEX,
+    merge_entry: str | None = None,
+    resolve_intrinsic: Iterable[str] = (),
+    external_names: Iterable[str] = (),
+    if_intvar: bool = False,
+    kind_map: dict | None = None,
+    kind_passthrough: bool = False,
+    keep_acc_directives: bool = False,
+) -> str:
     """Single entrypoint for all Fortran-source preprocessing before flang.
 
     Order matters -- composes:
 
     1. ``merge_used_modules`` (if ``merge``) -- inline ``USE``-d modules into
-       one TU.  ``merge_engine="fparser"`` routes through
-       :func:`_fparser_merge` instead (also desugars/prunes; ``merge_entry``
+       one TU.  ``merge_engine=MergeEngine.FPARSER`` routes through
+       :func:`fparser_merge` instead (also desugars/prunes; ``merge_entry``
        scopes its pruning, ignored by the regex engine).
     2. ``strip_openmp_directives`` -- drop OpenMP/OpenACC sentinels + the
        ICON include (bridge runs no cpp, no ``-fopenmp``).
@@ -1295,18 +1344,28 @@ def preprocess_fortran_source(source: str,
     flang-bound text, so this passthrough serves bindings-side readers of the
     MERGED text; the SDFG path is unchanged.
     """
+    if isinstance(merge_engine, str):
+        # WRF's recipe files pass the engine as a string; keep the enum for typed callers.
+        try:
+            merge_engine = MergeEngine(merge_engine.lower())
+        except ValueError:
+            raise ValueError(f"merge_engine must be a MergeEngine, got {merge_engine!r}") from None
     if merge:
-        if merge_engine == "fparser":
-            source = _fparser_merge(source,
-                                    search_dirs=search_dirs,
-                                    entry=merge_entry,
-                                    external_names=external_names,
-                                    keep_acc_directives=keep_acc_directives)
-        elif merge_engine == "regex":
-            source = merge_used_modules(source, search_dirs=search_dirs, do_not_emit=external_names,
-                                    resolve_intrinsic=resolve_intrinsic)
+        if merge_engine is MergeEngine.FPARSER:
+            source = fparser_merge(
+                source,
+                search_dirs=search_dirs,
+                entry=merge_entry,
+                external_names=external_names,
+                keep_acc_directives=keep_acc_directives,
+            )
+        elif merge_engine is MergeEngine.REGEX:
+            source = merge_used_modules(source,
+                                        search_dirs=search_dirs,
+                                        do_not_emit=external_names,
+                                        resolve_intrinsic=resolve_intrinsic)
         else:
-            raise ValueError(f"merge_engine must be 'regex' or 'fparser', got {merge_engine!r}")
+            raise ValueError(f"merge_engine must be a MergeEngine, got {merge_engine!r}")
     source = strip_openmp_directives(source)
     source = normalize_kind_parameters(source, kind_map=kind_map, passthrough=kind_passthrough)
     source = rewrite_integer_powers(source)

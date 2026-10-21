@@ -5,18 +5,14 @@ merge. Seeds random inputs and compares the SDFG against a plain-gfortran refere
 through the generated Fortran binding (both sides called with the SAME ``ppmcoeffs``
 derived-type struct, nine POINTER(:,:) members).
 """
+
 import ctypes
-import shutil
 from pathlib import Path
 
 import numpy as np
-import pytest
-
-from _util import build_sdfg, have_flang
 
 from dace_fortran.bindings.build_fortran_library import build_fortran_library
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = Path(__file__).parent / "ppm_vflux_single_tu.f90"
 _ENTRY = "mo_ocean_tracer_transport_vert::upwind_vflux_ppm_onblock"
@@ -52,8 +48,9 @@ def _drivers() -> str:
     """Two bind(c) drivers (binding wrapper vs original subroutine), each rebuilding
     ppmcoeffs from the same flat member arrays m1..m9 so both see identical contents."""
     decl_m = "\n".join(f"  real(c_double) :: m{i}(np, nz)" for i in range(1, 10))
-    build_struct = "\n".join(f"  allocate(ppmcoeffs % {name}(np, nz)); ppmcoeffs % {name} = m{i}"
-                             for i, name in enumerate(_MEMBERS, start=1))
+    build_struct = "\n".join(
+        f"  allocate(ppmcoeffs % {name}(np, nz)); ppmcoeffs % {name} = m{i}" for i, name in enumerate(_MEMBERS, start=1)
+    )
     margs = ", ".join(f"m{i}" for i in range(1, 10))
     common = f"""
   integer(c_int), value :: np, nz, vlt, si, ei
@@ -75,8 +72,9 @@ subroutine run_ppm_binding(np, nz, tracer, w, dtime, vlt, ct, cih, {margs}, flux
   use upwind_vflux_ppm_dace_bindings, only: upwind_vflux_ppm_dace, upwind_vflux_ppm_dace_finalize
   implicit none
 {common}
-  call upwind_vflux_ppm_dace(tracer, w, dtime, vlt, ct, cih, ppmcoeffs, flux, si, ei, nlev, &
-                             logical(.false., c_bool))
+  ! The generated binding's LOGICAL scalars are ``bool`` in the SDFG, which the interface spells
+  ! ``logical(c_bool)``; a default-kind ``.false.`` is a LOGICAL(4) and Fortran rejects the call.
+  call upwind_vflux_ppm_dace(tracer, w, dtime, vlt, ct, cih, ppmcoeffs, flux, si, ei, nlev, .false._c_bool)
   call upwind_vflux_ppm_dace_finalize()
 end subroutine run_ppm_binding
 
@@ -94,7 +92,6 @@ end subroutine run_ppm_ref
 """
 
 
-@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH")
 def test_ppm_vflux_numerical_e2e_via_binding(tmp_path):
     """Random inputs through the generated binding (``ppmcoeffs`` struct) must match a
     plain-gfortran reference calling the original kernel with the same struct."""
@@ -120,18 +117,17 @@ def test_ppm_vflux_numerical_e2e_via_binding(tmp_path):
     src_f90.write_text(_SRC.read_text())
     drv_f90 = tmp_path / "ppm_drivers.f90"
     drv_f90.write_text(_drivers())
-    lib = build_fortran_library(sdfg,
-                                None,
-                                None,
-                                str(tmp_path / "lib"),
-                                name=_NAME,
-                                prelude_sources=[src_f90],
-                                extra_sources=[drv_f90])
+    lib = build_fortran_library(
+        sdfg, None, None, str(tmp_path / "lib"), name=_NAME, prelude_sources=[src_f90], extra_sources=[drv_f90]
+    )
     dl = lib.load()
 
     def _call(symbol):
         flux = np.zeros((nproma, n_zlev), dtype=np.float64, order="F")
-        cd = lambda a: a.ctypes.data_as(ctypes.c_void_p)
+
+        def cd(a):
+            return a.ctypes.data_as(ctypes.c_void_p)
+
         args = [
             ctypes.c_int(nproma),
             ctypes.c_int(n_zlev),
@@ -140,7 +136,7 @@ def test_ppm_vflux_numerical_e2e_via_binding(tmp_path):
             ctypes.c_double(dtime),
             ctypes.c_int(vlt),
             cd(ct),
-            cd(cih)
+            cd(cih),
         ]
         args += [cd(m) for m in members]
         args += [cd(flux), ctypes.c_int(si), ctypes.c_int(ei), cd(nlev)]
@@ -153,3 +149,9 @@ def test_ppm_vflux_numerical_e2e_via_binding(tmp_path):
     flux_ref = _call("run_ppm_ref")
     assert np.all(np.isfinite(flux_ref)), "reference produced non-finite values"
     np.testing.assert_allclose(flux_binding, flux_ref, rtol=1e-10, atol=1e-12)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

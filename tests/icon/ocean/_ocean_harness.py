@@ -11,31 +11,20 @@ Ocean is NOT compiled out (atmosphere's ``__NO_ICON_OCEAN__`` intentionally
 dropped) and slow (~137k-line closure), so gated on flang + icon-model and run
 in a memory-capped subprocess.
 """
+
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 from dace_fortran.external_functions import ExternalFunction
-from dace_fortran.flang_codebase import find_openmpi_include
-from dace_fortran.llvm_toolchain import find_flang
-
-from icon._halo_modes import halo_config
+from tests.icon._halo_modes import halo_config
 
 _HERE = Path(__file__).resolve().parent
 #: ``tests/icon/full/icon-model`` holds the pinned ICON checkout (shared with
 #: the atmosphere velocity test).  ``ICON_SRC`` overrides it.
 _ICON_SRC = Path(os.environ.get("ICON_SRC", str(_HERE.parent / "full" / "icon-model")))
 SRC = _ICON_SRC / "src"
-
-HAVE_FLANG = find_flang() is not None
-HAVE_OPENMPI = find_openmpi_include() is not None
-
-
-def have_icon_ocean() -> bool:
-    """True when EVERY ocean kernel source in :data:`KERNELS` is checked out (a partial
-    checkout must skip, not fail, the missing kernel's extraction)."""
-    return all((SRC / source).is_file() for _, source, *_ in KERNELS)
 
 
 def ocean_search_dirs() -> list:
@@ -131,18 +120,30 @@ def ocean_config(halo_mode: str) -> dict:
 #: The ICON-O kernels currently extracted.  Each entry is
 #: ``(key, source-relative-to-src, module::procedure, body-line-count)``.
 KERNELS = [
-    ("ppm_vflux", "ocean/tracer_transport/mo_ocean_tracer_transport_vert.f90",
-     "mo_ocean_tracer_transport_vert::upwind_vflux_ppm_onBlock", 339),
+    (
+        "ppm_vflux",
+        "ocean/tracer_transport/mo_ocean_tracer_transport_vert.f90",
+        "mo_ocean_tracer_transport_vert::upwind_vflux_ppm_onBlock",
+        339,
+    ),
     ("coriolis_pv", "ocean/math/mo_scalar_product.f90", "mo_scalar_product::nonlinear_coriolis_3d_fast_scalar", 273),
     # Ocean horizontal velocity advection (distinct from ICON atmosphere's
     # velocity_tendencies).  Rotational form: vorticity flux + kinetic-energy grad.
-    ("ocean_veloc_adv", "ocean/dynamics/mo_ocean_velocity_advection.f90",
-     "mo_ocean_velocity_advection::veloc_adv_horz_mimetic_rot", 102),
+    (
+        "ocean_veloc_adv",
+        "ocean/dynamics/mo_ocean_velocity_advection.f90",
+        "mo_ocean_velocity_advection::veloc_adv_horz_mimetic_rot",
+        102,
+    ),
     # The free-surface surface-pressure solver driver: dynamical-core keystone.
     # Its ~137k-line closure exercises the full external policy (MPI halo, comm-pattern
     # INIT, terminal IO/timers, restart queries) and inlines everything else.
-    ("solve_free_sfc", "ocean/dynamics/mo_ocean_ab_timestepping_mimetic.f90",
-     "mo_ocean_ab_timestepping_mimetic::solve_free_sfc_ab_mimetic", 191),
+    (
+        "solve_free_sfc",
+        "ocean/dynamics/mo_ocean_ab_timestepping_mimetic.f90",
+        "mo_ocean_ab_timestepping_mimetic::solve_free_sfc_ab_mimetic",
+        191,
+    ),
 ]
 
 #: Checked-in single-TU artifacts: ``(key, halo_mode, filename, module::procedure)``.
@@ -152,22 +153,32 @@ KERNELS = [
 SINGLE_TU_ARTIFACTS = [
     ("ppm_vflux", "external", "ppm_vflux_single_tu.f90", "mo_ocean_tracer_transport_vert::upwind_vflux_ppm_onBlock"),
     ("coriolis_pv", "external", "coriolis_pv_single_tu.f90", "mo_scalar_product::nonlinear_coriolis_3d_fast_scalar"),
-    ("ocean_veloc_adv", "external", "ocean_veloc_adv_single_tu.f90",
-     "mo_ocean_velocity_advection::veloc_adv_horz_mimetic_rot"),
-    ("solve_free_sfc", "external", "solve_free_sfc_single_tu.f90",
-     "mo_ocean_ab_timestepping_mimetic::solve_free_sfc_ab_mimetic"),
-    ("solve_free_sfc", "inlined", "solve_free_sfc_inlined_single_tu.f90",
-     "mo_ocean_ab_timestepping_mimetic::solve_free_sfc_ab_mimetic"),
+    (
+        "ocean_veloc_adv",
+        "external",
+        "ocean_veloc_adv_single_tu.f90",
+        "mo_ocean_velocity_advection::veloc_adv_horz_mimetic_rot",
+    ),
+    (
+        "solve_free_sfc",
+        "external",
+        "solve_free_sfc_single_tu.f90",
+        "mo_ocean_ab_timestepping_mimetic::solve_free_sfc_ab_mimetic",
+    ),
+    (
+        "solve_free_sfc",
+        "inlined",
+        "solve_free_sfc_inlined_single_tu.f90",
+        "mo_ocean_ab_timestepping_mimetic::solve_free_sfc_ab_mimetic",
+    ),
 ]
 
 _EXTRACT_SCRIPT = _HERE / "_extract_single_tu.py"
 
 
-def extract_single_tu(source_relpath: str,
-                      entry: str,
-                      out_dir: Path,
-                      halo_mode: str = "external",
-                      mem_gb: float = 10.0) -> dict:
+def extract_single_tu(
+    source_relpath: str, entry: str, out_dir: Path, halo_mode: str = "external", mem_gb: float = 10.0
+) -> dict:
     """Extract one ocean kernel into a single, gfortran-compiling ``.f90`` in a
     memory-capped subprocess (fparser parse peaks near 9 GB).  Returns a dict with
     ``passed``/``tu_path``/``tu_lines``/``output``.
@@ -176,23 +187,19 @@ def extract_single_tu(source_relpath: str,
     RAM-backed ``/tmp`` tmpfs)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    tests_root = str(_HERE.parent.parent)
-    prev_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = os.pathsep.join([tests_root, prev_pp]) if prev_pp else tests_root
     env["TMPDIR"] = str(out_dir)
     env.setdefault("UCX_VFS_ENABLE", "n")
     # Pin the hash seed for byte-reproducible regeneration -- the drift guard compares
     # against the committed TU, and set/dict-iteration order leaking into names would flake it.
     env["PYTHONHASHSEED"] = "0"
     proc = subprocess.run(
-        [sys.executable,
-         str(_EXTRACT_SCRIPT), source_relpath, entry,
-         str(out_dir),
-         str(mem_gb), halo_mode],
+        [sys.executable, str(_EXTRACT_SCRIPT), source_relpath, entry, str(out_dir), str(mem_gb), halo_mode],
+        check=False,
         capture_output=True,
         text=True,
         env=env,
-        cwd=str(out_dir))
+        cwd=str(out_dir),
+    )
     out = proc.stdout + "\n" + proc.stderr
     tu_path, tu_lines = None, None
     for line in proc.stdout.splitlines():

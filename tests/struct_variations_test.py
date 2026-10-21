@@ -33,12 +33,8 @@ Still pending (xfail / TODO):
     component access through the nested chain needs additional
     designate-chain rewriting.
 """
-import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # ---------------------------------------------------------------
 # Module-level: scalar struct of struct of scalars
@@ -66,8 +62,9 @@ contains
 end module
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="f", entry="m::f").build()
-    assert "g_inner_x" in sdfg.arrays or "g_inner_x" in sdfg.scalars, \
+    assert "g_inner_x" in sdfg.arrays or "g_inner_x" in sdfg.scalars, (
         f"expected g_inner_x: arrays={sorted(sdfg.arrays.keys())}"
+    )
 
 
 def test_module_struct_of_struct_of_arrays(tmp_path):
@@ -273,3 +270,9 @@ end module
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="f", entry="m::f").build()
     assert "g_idx" in sdfg.symbols or "g_idx" in sdfg.arrays
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

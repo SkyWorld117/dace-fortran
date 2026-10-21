@@ -13,14 +13,12 @@ copy, scattering the ``n1``-element buffer across all ``n1*nb`` cells of ``arr``
 ``prog_h`` halo transpose). An AUTOMATIC ``sbuf(SIZE(arr,1))`` in the same role is a direct declare and
 never hit the bug, so the two buffer kinds are the discriminator.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # ``h`` is a POINTER member so the section is passed by copy-in/out and the dummy is assumed-shape;
 # the buffer is ALLOCATABLE so its RHS box is a ``fir.load``, the shape the fix keys on.
@@ -66,3 +64,9 @@ def test_allocatable_buffer_column_unpack(tmp_path: Path):
     expected[:, 0] = np.arange(1, n1 + 1, dtype=np.float64) * 10.0
     expected[:, 1] = expected[:, 0]  # arr(:, 2) = arr(:, 1) via the buffer
     np.testing.assert_array_equal(h, expected)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

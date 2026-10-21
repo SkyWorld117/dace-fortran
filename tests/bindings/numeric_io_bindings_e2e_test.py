@@ -29,28 +29,23 @@ the LOGICAL suites don't touch:
 """
 
 import ctypes
-import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from _util import build_sdfg, gfortran_compile_so, have_flang
 from dace_fortran.bindings import (
     FlattenPlan,
     OriginalArg,
     OriginalInterface,
     emit_bindings,
 )
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from tests._util import build_sdfg, gfortran_compile_so
 
 
-def _build_binding_lib(tmp_path: Path, *, kernel_src: str, name: str, entry: str, iface: OriginalInterface,
-                       driver_src: str):
+def _build_binding_lib(
+    tmp_path: Path, *, kernel_src: str, name: str, entry: str, iface: OriginalInterface, driver_src: str
+):
     """Build the SDFG, emit its binding, gfortran-link binding + driver
     against the SDFG ``.so``.
 
@@ -143,18 +138,20 @@ def test_e2e_real8_arith_inout(tmp_path: Path):
     iface = OriginalInterface(
         entry="daxpy_lite",
         args=(
-            OriginalArg(name="x", fortran_type="real(8)", rank=1, shape=("n", ), intent="in"),
-            OriginalArg(name="y", fortran_type="real(8)", rank=1, shape=("n", ), intent="in"),
-            OriginalArg(name="z", fortran_type="real(8)", rank=1, shape=("n", ), intent="inout"),
+            OriginalArg(name="x", fortran_type="real(8)", rank=1, shape=("n",), intent="in"),
+            OriginalArg(name="y", fortran_type="real(8)", rank=1, shape=("n",), intent="in"),
+            OriginalArg(name="z", fortran_type="real(8)", rank=1, shape=("n",), intent="inout"),
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         ),
     )
-    lib, sdfg = _build_binding_lib(tmp_path,
-                                   kernel_src=_DAXPY_KERNEL,
-                                   name="daxpy_lite",
-                                   entry="daxpy_lite_mod::daxpy_lite",
-                                   iface=iface,
-                                   driver_src=_DAXPY_SDFG_DRIVER)
+    lib, sdfg = _build_binding_lib(
+        tmp_path,
+        kernel_src=_DAXPY_KERNEL,
+        name="daxpy_lite",
+        entry="daxpy_lite_mod::daxpy_lite",
+        iface=iface,
+        driver_src=_DAXPY_SDFG_DRIVER,
+    )
     ref = _build_ref_lib(tmp_path, kernel_src=_DAXPY_KERNEL, ref_driver_src=_DAXPY_REF_DRIVER, name="daxpy_lite")
 
     n = 16
@@ -237,17 +234,19 @@ def test_e2e_scalar_real_intent_out(tmp_path: Path):
     iface = OriginalInterface(
         entry="sum_reduce",
         args=(
-            OriginalArg(name="a", fortran_type="real(8)", rank=1, shape=("n", ), intent="in"),
+            OriginalArg(name="a", fortran_type="real(8)", rank=1, shape=("n",), intent="in"),
             OriginalArg(name="s", fortran_type="real(8)", rank=0, intent="out"),
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         ),
     )
-    lib, sdfg = _build_binding_lib(tmp_path,
-                                   kernel_src=_SUM_KERNEL,
-                                   name="sum_reduce",
-                                   entry="sum_reduce_mod::sum_reduce",
-                                   iface=iface,
-                                   driver_src=_SUM_SDFG_DRIVER)
+    lib, sdfg = _build_binding_lib(
+        tmp_path,
+        kernel_src=_SUM_KERNEL,
+        name="sum_reduce",
+        entry="sum_reduce_mod::sum_reduce",
+        iface=iface,
+        driver_src=_SUM_SDFG_DRIVER,
+    )
     ref = _build_ref_lib(tmp_path, kernel_src=_SUM_KERNEL, ref_driver_src=_SUM_REF_DRIVER, name="sum_reduce")
 
     n = 20
@@ -293,7 +292,7 @@ end subroutine madd_k{kind}
 """
 
 
-def _intk_sdfg_driver(kind: int, cty_name: str) -> str:
+def _intk_sdfg_driver(kind: int) -> str:
     return f"""
 subroutine run_madd_k{kind}(a, b, c, n) bind(c, name='run_madd_k{kind}')
   use iso_c_binding
@@ -340,18 +339,15 @@ def test_e2e_integer_kind_arith(tmp_path: Path, kind: int, npty, cty):
     iface = OriginalInterface(
         entry=name,
         args=(
-            OriginalArg(name="a", fortran_type=f"integer(kind={kind})", rank=1, shape=("n", ), intent="in"),
-            OriginalArg(name="b", fortran_type=f"integer(kind={kind})", rank=1, shape=("n", ), intent="in"),
-            OriginalArg(name="c", fortran_type=f"integer(kind={kind})", rank=1, shape=("n", ), intent="out"),
+            OriginalArg(name="a", fortran_type=f"integer(kind={kind})", rank=1, shape=("n",), intent="in"),
+            OriginalArg(name="b", fortran_type=f"integer(kind={kind})", rank=1, shape=("n",), intent="in"),
+            OriginalArg(name="c", fortran_type=f"integer(kind={kind})", rank=1, shape=("n",), intent="out"),
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         ),
     )
-    lib, sdfg = _build_binding_lib(tmp_path,
-                                   kernel_src=kernel,
-                                   name=name,
-                                   entry=f"_QP{name}",
-                                   iface=iface,
-                                   driver_src=_intk_sdfg_driver(kind, cty.__name__))
+    lib, sdfg = _build_binding_lib(
+        tmp_path, kernel_src=kernel, name=name, entry=name, iface=iface, driver_src=_intk_sdfg_driver(kind)
+    )
     ref = _build_ref_lib(tmp_path, kernel_src=kernel, ref_driver_src=_intk_ref_driver(kind), name=name)
 
     n = 6
@@ -438,19 +434,21 @@ def test_e2e_minmax_intrinsic(tmp_path: Path):
     iface = OriginalInterface(
         entry="clamp_kernel",
         args=(
-            OriginalArg(name="a", fortran_type="real(8)", rank=1, shape=("n", ), intent="in"),
+            OriginalArg(name="a", fortran_type="real(8)", rank=1, shape=("n",), intent="in"),
             OriginalArg(name="lo", fortran_type="real(8)", rank=0, intent="in"),
             OriginalArg(name="hi", fortran_type="real(8)", rank=0, intent="in"),
-            OriginalArg(name="out", fortran_type="real(8)", rank=1, shape=("n", ), intent="out"),
+            OriginalArg(name="out", fortran_type="real(8)", rank=1, shape=("n",), intent="out"),
             OriginalArg(name="n", fortran_type="integer(c_int)", rank=0, intent="in"),
         ),
     )
-    lib, sdfg = _build_binding_lib(tmp_path,
-                                   kernel_src=_MINMAX_KERNEL,
-                                   name="clamp_kernel",
-                                   entry="clamp_kernel_mod::clamp_kernel",
-                                   iface=iface,
-                                   driver_src=_MINMAX_SDFG_DRIVER)
+    lib, sdfg = _build_binding_lib(
+        tmp_path,
+        kernel_src=_MINMAX_KERNEL,
+        name="clamp_kernel",
+        entry="clamp_kernel_mod::clamp_kernel",
+        iface=iface,
+        driver_src=_MINMAX_SDFG_DRIVER,
+    )
     ref = _build_ref_lib(tmp_path, kernel_src=_MINMAX_KERNEL, ref_driver_src=_MINMAX_REF_DRIVER, name="clamp_kernel")
 
     n = 12
@@ -475,3 +473,7 @@ def test_e2e_minmax_intrinsic(tmp_path: Path):
     out_d = np.zeros(n, dtype=np.float64)
     sdfg(a=np.ascontiguousarray(a), lo=lo, hi=hi, out=out_d, n=n)
     np.testing.assert_allclose(out_d, out_ref, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -1,5 +1,5 @@
 """Milestone-1 ABI-alignment contract for the ICON velocity-callback shape: an OUTER kernel
-calling an INNER kernel via ``keep_external(c_abi='per_member_soa')`` must produce a
+calling an INNER kernel via ``keep_external(c_abi=PER_MEMBER_SOA)`` must produce a
 marshalled per-member-SoA leaf sequence that EQUALS the INNER's ``bind_c_shim`` slot
 sequence, member-for-member, when both compile against the SAME union struct type. Both
 sides walk the struct in Fortran declaration order, so the sequences coincide iff every
@@ -7,16 +7,13 @@ member CLASS is handled the same way on both sides -- pinned here for: scalar-sy
 (by-value forward), box-of-scalar-array pass-through (both directions), value-record-array
 (one leaf per field), and pointer-to-record handle (skipped on both sides, no leaf).
 Build-only, no gfortran link/run."""
+
 import re
 
-import pytest
-
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings.bind_c_shim import emit_bind_c_shim
 from dace_fortran.bindings.fortran_interface import build_auto_interface
-from dace_fortran.external import Arg, ExternalCall, clear_external_registry, keep_external
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from dace_fortran.external import Arg, ArgKind, CAbi, ExternalCall, Intent, clear_external_registry, keep_external
+from tests._util import build_sdfg
 
 # The shared UNION type text, identical on both sides.  ``t_patch`` carries one
 # member of every class the real ICON type mixes.
@@ -97,12 +94,16 @@ def _outer_patch_leaf_order(tmp_path):
     ``p_<leaf>``; a by-value symbol member appears as ``(int)(p_<leaf>)``. Mapped back to
     bare leaf names, first-appearance order, restricted to ``p_`` leaves."""
     clear_external_registry()
-    keep_external("velo",
-                  args=(Arg(kind="aos", intent="in",
-                            c_abi="per_member_soa"), Arg(kind="scalar", dtype="int32",
-                                                         intent="in"), Arg(kind="scalar", dtype="int32", intent="in"),
-                        Arg(kind="array", dtype="float64", intent="inout")),
-                  dynamic_extents_abi=True)
+    keep_external(
+        "velo",
+        args=(
+            Arg(kind=ArgKind.AOS, intent=Intent.IN, c_abi=CAbi.PER_MEMBER_SOA),
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+            Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+            Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+        ),
+        dynamic_extents_abi=True,
+    )
     try:
         sdfg = build_sdfg(_OUTER_SRC, tmp_path / "outer", name="driver", entry="m_align_outer::driver").build()
         sdfg.validate()
@@ -125,7 +126,7 @@ def _outer_patch_leaf_order(tmp_path):
             # -- strip the extent suffix so it maps to its owning leaf (not a distinct leaf).
             if not name.startswith("p_"):
                 return
-            leaf = re.sub(r"_d\d+$", "", name[len("p_"):])
+            leaf = re.sub(r"_d\d+$", "", name[len("p_") :])
             if leaf and leaf not in seen:
                 seen.add(leaf)
                 order.append(leaf)
@@ -157,14 +158,14 @@ def _inner_patch_slot_order(tmp_path):
         sdfg.validate()
         iface = build_auto_interface(sdfg._fortran_interface_raw, "velo")
         text = emit_bind_c_shim(iface, str(tmp_path / "velo_c.f90")).read_text()
-        sig = re.search(r"subroutine\s+velo_c\(([^)]*)\)", text, re.S)
+        sig = re.search(r"subroutine\s+velo_c\(([^)]*)\)", text, re.DOTALL)
         args = [a.strip() for a in sig.group(1).replace("&", " ").split(",") if a.strip()]
         order = []
         seen = set()
         for a in args:
             if not a.startswith("p_"):
                 continue
-            leaf = a[len("p_"):]
+            leaf = a[len("p_") :]
             # A dynamic member rides a lower-bound + extent scalar per dim ahead of its
             # pointer (<flat>_lb<i> / <flat>_d<i>); both collapse to the owning leaf (the
             # OUTER's matching offset_<flat>_d<i> token is filtered out above).
@@ -185,25 +186,26 @@ def test_outer_marshal_leaf_order_equals_inner_shim_slot_order(tmp_path):
     (both directions), value-record-array (per field), skipped pointer-to-record handle."""
     outer = _outer_patch_leaf_order(tmp_path)
     inner = _inner_patch_slot_order(tmp_path)
-    assert outer == _EXPECTED_PATCH_LEAVES, \
+    assert outer == _EXPECTED_PATCH_LEAVES, (
         f"OUTER p_patch leaf order drifted:\n  got      {outer}\n  expected {_EXPECTED_PATCH_LEAVES}"
-    assert inner == _EXPECTED_PATCH_LEAVES, \
+    )
+    assert inner == _EXPECTED_PATCH_LEAVES, (
         f"INNER shim slot order drifted:\n  got      {inner}\n  expected {_EXPECTED_PATCH_LEAVES}"
+    )
     assert outer == inner, f"outer/inner ABI desync:\n  outer {outer}\n  inner {inner}"
     # The pointer-to-record handle is absent from BOTH (skipped on both sides).
-    assert not any("comm_pat" in leaf for leaf in outer + inner), \
-        "pointer-to-record handle leaked into a leaf sequence"
+    assert not any("comm_pat" in leaf for leaf in outer + inner), "pointer-to-record handle leaked into a leaf sequence"
 
 
 # ---------------------------------------------------------------------------
-# Regression: concrete-NEGATIVE folded _lb slot for a callback member
-# (commit 9bf289a -- ICON end_block(-10) refinement-control pattern).
+# Regression: the _lb slot of a callback member read at a literal negative index
+# (ICON end_block(-10) refinement-control pattern).
 # ---------------------------------------------------------------------------
-# A deferred-shape ALLOCATABLE member accessed at a literal negative index has its lower
-# bound STATICALLY INFERRED to that literal (inferLowerBoundsFromLiteralAccesses), folding
-# offset_<member>_d0 to -10. The inner shim still mints one <flat>_lb<i> slot per dim
-# regardless, so the marshal MUST forward the folded literal -- else the outer emits one
-# fewer slot than the inner reads (925 vs 921 desync). Build + string-inspect, no run.
+# A deferred-shape ALLOCATABLE member accessed at a literal negative index keeps a FREE lower
+# bound (the literal is only a floor the caller's allocation must respect; the bridge records it
+# as the direct-call default of offset_<member>_d0). The inner shim mints one <flat>_lb<i> slot
+# per dim, so the marshal MUST forward the free offset -- else the outer emits one fewer slot
+# than the inner reads (925 vs 921 desync). Build + string-inspect, no run.
 
 _NEG_LB_TYPES = """
   type :: t_edges
@@ -248,8 +250,8 @@ contains
         real(c_double), intent(out) :: o(*)
       end subroutine
     end interface
-    ! The OUTER's own literal-negative access folds end_block's dim-1 lower
-    ! bound to -10 in the outer builder, so the marshal sees offset<1.
+    ! The OUTER's own literal-negative access leaves end_block's dim-1 lower
+    ! bound free in the outer builder (floor -10), so the marshal sees a free offset.
     acc(1) = real(p % edges % end_block(-10, jb), c_double) + real(p % nblks_e, c_double)
     call velo(p, je, jb, acc)
   end subroutine
@@ -257,10 +259,10 @@ end module
 """
 
 _NEG_LB_CALLBACK_ARGS = (
-    Arg(kind="aos", intent="in", c_abi="per_member_soa"),  # p
-    Arg(kind="scalar", dtype="int32", intent="in"),  # je
-    Arg(kind="scalar", dtype="int32", intent="in"),  # jb
-    Arg(kind="array", dtype="float64", intent="inout"),  # out / acc
+    Arg(kind=ArgKind.AOS, intent=Intent.IN, c_abi=CAbi.PER_MEMBER_SOA),  # p
+    Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # je
+    Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),  # jb
+    Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),  # out / acc
 )
 
 
@@ -272,7 +274,7 @@ def _neg_lb_inner_shim_slots(tmp_path):
         builder.build()
         iface = build_auto_interface(builder._fortran_interface_raw, "velo")
         shim = emit_bind_c_shim(iface, str(tmp_path / "velo_c.f90")).read_text()
-        hdr = re.search(r"subroutine\s+velo_c\s*\(([^)]*)\)", shim, re.S)
+        hdr = re.search(r"subroutine\s+velo_c\s*\(([^)]*)\)", shim, re.DOTALL)
         return [a.strip() for a in hdr.group(1).replace("&", " ").split(",") if a.strip()]
     finally:
         clear_external_registry()
@@ -294,24 +296,32 @@ def _neg_lb_outer_marshal_args(tmp_path):
         clear_external_registry()
 
 
-def test_neg_lbound_member_lb_slot_marshalled_with_folded_literal(tmp_path):
-    """A neg-folded member lower bound is marshalled as its ``_lb`` slot. ``end_block(-10,
-    jb)`` folds ``offset_p_edges_end_block_d0`` to literal ``-10`` (commit 9bf289a). Two
-    facets: LITERAL -- the marshal forwards the folded lb as ``(int)(-10)`` (pre-fix skipped
-    non-free offsets); COUNT PARITY -- with it forwarded, outer arg count == inner slot
-    count (a dropped ``_lb`` reproduces the capstone's 925-vs-921 desync at toy scale)."""
+def test_neg_lbound_member_lb_slot_marshalled_as_free_offset(tmp_path):
+    """A member read at a literal negative index keeps a free lower bound that is marshalled as its ``_lb``
+    slot. ``end_block(-10, jb)`` leaves ``offset_p_edges_end_block_d0`` free with floor -10. Two facets: SYMBOL --
+    the marshal forwards the free offset (a literal -10 would be wrong for an allocation ``(-12:)``); COUNT PARITY
+    -- with it forwarded, outer arg count == inner slot count (a dropped ``_lb`` reproduces the capstone's
+    925-vs-921 desync at toy scale)."""
     inner_slots = _neg_lb_inner_shim_slots(tmp_path)
     outer_args = _neg_lb_outer_marshal_args(tmp_path)
 
     # Precondition: inner shim mints a dim-0 _lb slot for the dynamic end_block member.
-    assert "p_edges_end_block_lb0" in inner_slots, \
-        f"inner shim did not mint end_block dim-0 lb slot:\n{inner_slots}"
+    assert "p_edges_end_block_lb0" in inner_slots, f"inner shim did not mint end_block dim-0 lb slot:\n{inner_slots}"
 
-    # LITERAL: the folded -10 lower bound rides as the member's dim-0 _lb slot.
-    assert "(int)(-10)" in outer_args, \
-        f"neg-folded end_block lower bound not marshalled as an _lb slot:\n{outer_args}"
+    # SYMBOL: the free lower bound rides as the member's dim-0 _lb slot, not a literal guessed from the access.
+    assert any("offset_p_edges_end_block_d0" in a for a in outer_args), (
+        f"end_block's free lower bound not marshalled as an _lb slot:\n{outer_args}"
+    )
+    assert "(int)(-10)" not in outer_args, f"a literal subscript was taken for the lower bound:\n{outer_args}"
 
     # COUNT PARITY: outer marshal lines up slot-for-slot with the inner shim.
     assert len(outer_args) == len(inner_slots), (
         f"neg-lbound _lb slot desync: inner shim {len(inner_slots)} slots vs "
-        f"outer marshal {len(outer_args)} args\n  inner={inner_slots}\n  outer={outer_args}")
+        f"outer marshal {len(outer_args)} args\n  inner={inner_slots}\n  outer={outer_args}"
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

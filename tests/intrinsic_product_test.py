@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/intrinsic_product_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_product_array(tmp_path):
@@ -20,7 +17,7 @@ res(3) = PRODUCT(d(2:5))
 
 END SUBROUTINE intrinsic_product_array_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_product_array_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_product_array_function").build()
 
     size = 7
     d = np.full([size], 0, order="F", dtype=np.float64)
@@ -48,10 +45,10 @@ res(1) = PRODUCT(d, 1)
 
 END SUBROUTINE intrinsic_product_array_dim_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_product_array_dim_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_product_array_dim_function").build()
 
-    d = np.array([1, 2, 3, 4, 5], dtype=np.int32, order='F')
-    res = np.zeros(2, dtype=np.int32, order='F')
+    d = np.array([1, 2, 3, 4, 5], dtype=np.int32, order="F")
+    res = np.zeros(2, dtype=np.int32, order="F")
     sdfg(d=d, res=res)
     assert int(res[0]) == 120
 
@@ -69,7 +66,7 @@ res(4) = PRODUCT(d(2:4, 2:3))
 
 END SUBROUTINE intrinsic_product_2d_test_function
 """
-    sdfg = build_sdfg(src, tmp_path, name='intrinsic_product_2d_test_function').build()
+    sdfg = build_sdfg(src, tmp_path, name="intrinsic_product_2d_test_function").build()
 
     sizes = [5, 3]
     d = np.full(sizes, 42, order="F", dtype=np.float64)
@@ -84,3 +81,9 @@ END SUBROUTINE intrinsic_product_2d_test_function
     assert res[1] == np.prod(d)
     assert res[2] == np.prod(d[1:4, 1])
     assert res[3] == np.prod(d[1:4, 1:3])
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

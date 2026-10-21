@@ -7,24 +7,26 @@ materialises the reduction into a boolean scalar BEFORE the branch
 inlined into the condition tasklet (which produced a malformed multi-dim
 memlet for QE's ``IF (ALL(odg(:)))``).
 """
+
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def _libnode_names(sdfg):
     return {type(n).__name__ for st in sdfg.all_states() for n in st.nodes()}
 
 
-@pytest.mark.parametrize("op,x,expected", [
-    ("ALL", [1.0, 2.0, 3.0], True),
-    ("ALL", [1.0, -1.0, 3.0], False),
-    ("ANY", [-1.0, -2.0, -3.0], False),
-    ("ANY", [-1.0, 2.0, -3.0], True),
-])
+@pytest.mark.parametrize(
+    "op,x,expected",
+    [
+        ("ALL", [1.0, 2.0, 3.0], True),
+        ("ALL", [1.0, -1.0, 3.0], False),
+        ("ANY", [-1.0, -2.0, -3.0], False),
+        ("ANY", [-1.0, 2.0, -3.0], True),
+    ],
+)
 def test_allany_assignment_emits_libnode(tmp_path, op, x, expected):
     """``res = ALL/ANY(mask)`` lowers to the AllNode/AnyNode and returns a boolean."""
     src = f"""
@@ -47,18 +49,21 @@ END MODULE s_mod
 """
     sdfg = build_sdfg(src, tmp_path / "sdfg", name="s", entry="s_mod::s").build()
     assert {"AllNode", "AnyNode"} & _libnode_names(sdfg)
-    res = np.zeros(1, dtype=np.bool_)
+    res = np.zeros(1, dtype=np.uint32)
     a = np.asarray(x, dtype=np.float64, order="F")
     sdfg(a=a, res=res, n=np.int32(len(x)))
     assert bool(res[0]) == expected
 
 
-@pytest.mark.parametrize("op,x,expected", [
-    ("ALL", [1.0, 2.0, 3.0], 1),
-    ("ALL", [1.0, -1.0, 3.0], 0),
-    ("ANY", [-1.0, -2.0, -3.0], 0),
-    ("ANY", [-1.0, 2.0, -3.0], 1),
-])
+@pytest.mark.parametrize(
+    "op,x,expected",
+    [
+        ("ALL", [1.0, 2.0, 3.0], 1),
+        ("ALL", [1.0, -1.0, 3.0], 0),
+        ("ANY", [-1.0, -2.0, -3.0], 0),
+        ("ANY", [-1.0, 2.0, -3.0], 1),
+    ],
+)
 def test_allany_in_if_condition(tmp_path, op, x, expected):
     """``IF (ALL/ANY(mask))`` materialises a boolean scalar via the libnode and branches on it."""
     src = f"""
@@ -87,3 +92,7 @@ END MODULE s_mod
     a = np.asarray(x, dtype=np.float64, order="F")
     sdfg(a=a, res=res)
     assert int(res[0]) == expected
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

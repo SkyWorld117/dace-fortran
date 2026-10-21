@@ -17,20 +17,14 @@ first-arm-baked contract.
 
 Companion doc: bug2_char_flatten_sibling_checks.md
 """
-import shutil
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
 from dace_fortran.bindings import FlattenPlan, emit_bindings
 from dace_fortran.bindings.fortran_interface import build_auto_interface
-
-pytestmark = [
-    pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH"),
-    pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran not on PATH"),
-]
+from tests._util import build_sdfg
 
 # Minimal QE ``addusxx_g`` shape: character dispatch computed into logicals,
 # one COMBINED input-validation IF across all arms (guarded by ``errore``,
@@ -108,9 +102,11 @@ def _call_kwargs(sdfg, n, y, a_c, a_r, *, a_c_present, a_r_present):
         kw["a_r_present"] = a_r_present
     if "flag" in args:
         import dace
+
         desc = sdfg.arrays["flag"]
-        kw["flag"] = (desc.dtype.type(ord("c")) if isinstance(desc, dace.data.Scalar) else np.array([ord("c")],
-                                                                                                    dtype=np.int8))
+        kw["flag"] = (
+            desc.dtype.type(ord("c")) if isinstance(desc, dace.data.Scalar) else np.array([ord("c")], dtype=np.int8)
+        )
     return kw
 
 
@@ -130,10 +126,12 @@ def test_first_arm_baked_and_computes(tmp_path: Path):
 def _flag_stores(sdfg) -> dict:
     """``set_<flag>`` tasklet bodies, one per logical the char dispatch computes."""
     import dace
+
     return {
-        nd.label[len("set_"):]: nd.code.as_string.strip()
+        nd.label[len("set_") :]: nd.code.as_string.strip()
         for st in sdfg.all_states()
-        for nd in st.nodes() if isinstance(nd, dace.nodes.Tasklet) and nd.label.startswith("set_add_")
+        for nd in st.nodes()
+        if isinstance(nd, dace.nodes.Tasklet) and nd.label.startswith("set_add_")
     }
 
 
@@ -145,8 +143,10 @@ def test_char_compare_folds_per_literal(tmp_path: Path):
     live."""
     stores = _flag_stores(_build(tmp_path))
     assert set(stores) == {"add_c", "add_r"}, f"dispatch flags not found: {stores}"
-    assert stores["add_c"].endswith("= (- 1)"), f"baked 'c' arm not folded TRUE: {stores['add_c']}"
-    assert stores["add_r"].endswith("= 0"), f"dead 'r' arm not folded FALSE: {stores['add_r']}"
+    # A LOGICAL store writes flang's .TRUE. (1) / .FALSE. (0).
+    stored = {flag: code.split("=", 1)[1].strip() for flag, code in stores.items()}
+    assert stored["add_c"] in ("True", "1"), f"baked 'c' arm not folded TRUE: {stores['add_c']}"
+    assert stored["add_r"] in ("False", "0"), f"dead 'r' arm not folded FALSE: {stores['add_r']}"
 
 
 def test_dead_arm_validation_cannot_gate_the_live_arm(tmp_path: Path):
@@ -174,9 +174,9 @@ def test_dead_arm_validation_cannot_gate_the_live_arm(tmp_path: Path):
         "dead-arm optional still gates the kernel: 'a_r_present' is a free "
         f"symbol of the SDFG (free symbols: {sorted(free)}), its arm did not fold "
         "FALSE, and the emitted wrapper hardwires the flag instead of forwarding "
-        "present(a_r)")
-    assert "a_r_present = 0  !" not in text, \
-        "wrapper still hardwires the dead arm's optional to absent"
+        "present(a_r)"
+    )
+    assert "a_r_present = 0  !" not in text, "wrapper still hardwires the dead arm's optional to absent"
 
 
 def test_wrapper_call_omitting_the_dead_arm_computes(tmp_path: Path):
@@ -186,7 +186,7 @@ def test_wrapper_call_omitting_the_dead_arm_computes(tmp_path: Path):
     'c' arm must still compute.  At 6c99810 this call returned ``y`` unchanged."""
     import ctypes
 
-    from _util import gfortran_compile_so
+    from tests._util import gfortran_compile_so
 
     sdfg = _build(tmp_path)
     compiled = sdfg.compile()
@@ -199,11 +199,9 @@ def test_wrapper_call_omitting_the_dead_arm_computes(tmp_path: Path):
     build_dir = tmp_path / "bind_build"
     build_dir.mkdir(parents=True, exist_ok=True)
     drv_so = build_dir / "disp_drv.so"
-    gfortran_compile_so(drv_so,
-                        bindings_path,
-                        driver_path,
-                        mod_dir=build_dir,
-                        link_so=Path(compiled._lib._library_filename))
+    gfortran_compile_so(
+        drv_so, bindings_path, driver_path, mod_dir=build_dir, link_so=Path(compiled._lib._library_filename)
+    )
 
     lib = ctypes.CDLL(str(drv_so))
     dp = ctypes.POINTER(ctypes.c_double)
@@ -226,7 +224,10 @@ def test_dead_arm_absent_still_computes(tmp_path: Path):
     a_c = np.array([1.0, 2.0, 3.0, 4.0])
     a_r = np.zeros(n)  # dead-arm dummy; zero-filled, never legitimately read
     sdfg(**_call_kwargs(sdfg, n, y, a_c, a_r, a_c_present=1, a_r_present=0))
-    np.testing.assert_allclose(y,
-                               a_c,
-                               err_msg="kernel skipped the baked arm when the dead arm's "
-                               "optional was absent")
+    np.testing.assert_allclose(y, a_c, err_msg="kernel skipped the baked arm when the dead arm's optional was absent")
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/array_attributes_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_array_attribute_no_offset(tmp_path):
@@ -18,7 +15,7 @@ subroutine main(d)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     a = np.full([5], 42, order="F", dtype=np.float64)
     sdfg(d=a, i=0)
@@ -37,7 +34,7 @@ subroutine main(d, arrsize)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     size = 10
     a = np.full([size], 42, order="F", dtype=np.float64)
@@ -56,7 +53,7 @@ subroutine main(d)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     a = np.full([60], 42, order="F", dtype=np.float64)
     sdfg(d=a, i=0)
@@ -74,7 +71,7 @@ subroutine main(d, arrsize)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     arrsize = 50
     a = np.full([arrsize + 10], 42, order="F", dtype=np.float64)
@@ -95,7 +92,7 @@ subroutine main(d, arrsize, arrsize2)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     arrsize = 50
     arrsize2 = 54
@@ -115,7 +112,7 @@ subroutine main(d)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     a = np.full([60], 42, order="F", dtype=np.float64)
     sdfg(d=a, i=0)
@@ -134,7 +131,7 @@ subroutine main(d, arrsize, arrsize2)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     arrsize = 50
     arrsize2 = 54
@@ -155,7 +152,7 @@ subroutine main(d, arrsize, arrsize2)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     arrsize = 5
     arrsize2 = 10
@@ -176,7 +173,7 @@ subroutine main(d, arrsize, arrsize2)
   end do
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main").build()
 
     arrsize = 5
     arrsize2 = 10
@@ -204,7 +201,7 @@ contains
   end subroutine other
 end module lib
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
 
     arrsize = 5
     arrsize2 = 10
@@ -218,3 +215,9 @@ end module lib
     assert a[0, 1] == arrsize2
     assert a[0, 2] == arrsize3
     assert a[0, 3] == arrsize4
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -54,23 +54,62 @@ Scalar dummies are exempt from all of it.  They reach the SDFG by value
 to get wrong -- and ICON's own directives rarely name them, which is why
 the extractor reports ``velocity_tendencies``' six scalars as
 ``unclassified``.  Array/pointer dummies get no such pass.
+
+The third lane is a caller that keeps everything the kernel touches on the
+device -- dummies, the module arrays the kernel reads, the members of its
+arrays of records -- and an SDFG whose arrays are GPU storage
+(:func:`plan_device_resident_caller`).  Nothing is staged through the host:
+a dummy is handed over inside ``HOST_DATA USE_DEVICE``; a module array is
+passed as the device address of the caller's own copy (``acc_deviceptr``, which
+unlike ``c_loc`` needs no ``TARGET`` attribute on the module variable); the
+packed companion of an array of records is packed on the device.
 """
+
+from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence, Tuple
+from typing import TYPE_CHECKING
 
 import dace
+
+from dace_fortran.bindings.frozen_signature import FrozenArgKind
+
+if TYPE_CHECKING:
+    from dace_fortran.bindings.frozen_signature import FrozenSignature
 
 _GPU_STORAGE = (
     dace.dtypes.StorageType.GPU_Global,
     dace.dtypes.StorageType.GPU_Shared,
 )
 
-DEVICE = "device"
-HOST = "host"
+
+class Residency(Enum):
+    """Where a buffer lives: ICON's side (from the sidecar) or the SDFG's (from its storage)."""
+
+    DEVICE = "device"
+    HOST = "host"
+
+
+DEVICE = Residency.DEVICE
+HOST = Residency.HOST
+
+
+class Directive(Enum):
+    """The directive language a transfer plan is rendered in.
+
+    ``OPENACC`` is what nvfortran (and ICON) speak.  ``OPENMP`` renders the same plan as OpenMP offload
+    (``target enter/exit data``, ``target update``, ``use_device_addr``) for compilers without OpenACC offload, e.g.
+    ROCm amdflang on MI300.  The caller picks one; nothing is inferred from the compiler.
+    """
+
+    OPENACC = auto()
+    OPENMP = auto()
+
 
 # ICON launches its dycore kernels on ASYNC(1); putting our copies on the
 # same queue orders them after ICON's in-flight work with no extra fence.
@@ -81,7 +120,7 @@ class AccResidencyError(Exception):
     """A sidecar/SDFG residency crossing with no defined emission."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AccResidency:
     """Parsed ``<routine>.acc_residency.json`` sidecar.
 
@@ -92,25 +131,29 @@ class AccResidency:
 
     routine: str
     source: str
-    args: Mapping[str, str]
-    unclassified: Tuple[str, ...] = ()
-    refs: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+    args: Mapping[str, Residency]
+    unclassified: tuple[str, ...] = ()
+    refs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def has_device_args(self) -> bool:
         """True iff at least one argument was classified device-resident."""
-        return any(r == DEVICE for r in self.args.values())
+        return any(r is DEVICE for r in self.args.values())
 
     @classmethod
-    def from_dict(cls, raw: Mapping) -> "AccResidency":
+    def from_dict(cls, raw: Mapping) -> AccResidency:
         """Build from the sidecar mapping, rejecting unknown residencies."""
         args = {}
         refs = {}
         for name, entry in (raw.get("args") or {}).items():
-            residency = (entry or {}).get("residency")
-            if residency not in (DEVICE, HOST):
-                raise AccResidencyError(f"acc residency sidecar: argument {name!r} has residency "
-                                        f"{residency!r}; expected {DEVICE!r} or {HOST!r}")
+            raw_residency = (entry or {}).get("residency")
+            try:
+                residency = Residency(raw_residency)
+            except ValueError:
+                raise AccResidencyError(
+                    f"acc residency sidecar: argument {name!r} has residency "
+                    f"{raw_residency!r}; expected {DEVICE.value!r} or {HOST.value!r}"
+                ) from None
             args[str(name)] = residency
             entry_refs = (entry or {}).get("refs") or ([(entry or {}).get("ref")] if (entry or {}).get("ref") else [])
             if entry_refs:
@@ -124,7 +167,7 @@ class AccResidency:
         )
 
     @classmethod
-    def from_file(cls, path) -> "AccResidency":
+    def from_file(cls, path: str | Path) -> AccResidency:
         """Read and parse the sidecar at ``path``."""
         path = Path(path)
         try:
@@ -136,7 +179,7 @@ class AccResidency:
         return cls.from_dict(raw)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AccTransferPlan:
     """The emission slots of the wrapper, in wrapper-argument order.
 
@@ -146,27 +189,36 @@ class AccTransferPlan:
     A given build uses one pair or the other, never both.
     """
 
-    update_host: Tuple[str, ...] = ()
-    update_device: Tuple[str, ...] = ()
-    use_device: Tuple[str, ...] = ()
-    storage: Mapping[str, str] = field(default_factory=dict)
-    copyin: Tuple[str, ...] = ()
-    copyout: Tuple[str, ...] = ()
-    copy: Tuple[str, ...] = ()
+    update_host: tuple[str, ...] = ()
+    update_device: tuple[str, ...] = ()
+    use_device: tuple[str, ...] = ()
+    storage: Mapping[str, Residency] = field(default_factory=dict)
+    copyin: tuple[str, ...] = ()
+    copyout: tuple[str, ...] = ()
+    copy: tuple[str, ...] = ()
+    #: Module-origin arrays the SDFG takes from the caller's device copy: the actual argument is the device address
+    #: ``acc_deviceptr`` reports for the module variable, and the wrapper neither copies the array in nor back.
+    deviceptr: tuple[str, ...] = ()
+    #: Packed companions of arrays of records (``aos_alloc`` recipes) that are packed and unpacked on the device,
+    #: between the caller's device-resident members and a device copy of the companion.  Also in ``use_device``.
+    device_pack: tuple[str, ...] = ()
+    #: Wrapper locals that need a device copy only for their address: the one-element scratch an absent member's
+    #: alias is bound to, which ``USE_DEVICE`` then looks up although the SDFG never reads it.
+    create: tuple[str, ...] = ()
 
     @property
     def active(self) -> bool:
         """True iff the wrapper needs any OpenACC directive at all."""
-        return bool(self.update_host or self.update_device or self.use_device or self.data_region)
+        return bool(self.update_host or self.update_device or self.use_device or self.data_region or self.deviceptr)
 
     @property
-    def data_region(self) -> Tuple[Tuple[str, str], ...]:
+    def data_region(self) -> tuple[tuple[str, str], ...]:
         """``(clause, name)`` pairs for the ``!$ACC DATA`` region, in emission order."""
-        return tuple(
-            (clause, name) for clause in ('COPYIN', 'COPY', 'COPYOUT') for name in getattr(self, clause.lower()))
+        groups = (("COPYIN", self.copyin), ("COPY", self.copy), ("COPYOUT", self.copyout), ("CREATE", self.create))
+        return tuple((clause, name) for clause, names in groups for name in names)
 
 
-def sdfg_containers_for_arg(sdfg: dace.SDFG, arg: str) -> Tuple[str, ...]:
+def sdfg_containers_for_arg(sdfg: dace.SDFG, arg: str) -> tuple[str, ...]:
     """Non-transient SDFG data containers backing wrapper argument ``arg``.
 
     ``hlfir-flatten-structs`` unpacks a derived-type dummy into one flat
@@ -176,7 +228,8 @@ def sdfg_containers_for_arg(sdfg: dace.SDFG, arg: str) -> Tuple[str, ...]:
     """
     prefix = arg + "_"
     return tuple(
-        sorted(n for n, desc in sdfg.arrays.items() if not desc.transient and (n == arg or n.startswith(prefix))))
+        sorted(n for n, desc in sdfg.arrays.items() if not desc.transient and (n == arg or n.startswith(prefix)))
+    )
 
 
 def is_scalar_arg(sdfg: dace.SDFG, arg: str, containers: Sequence[str]) -> bool:
@@ -190,19 +243,23 @@ def is_scalar_arg(sdfg: dace.SDFG, arg: str, containers: Sequence[str]) -> bool:
     return all(isinstance(sdfg.arrays[n], dace.data.Scalar) for n in containers)
 
 
-def _arg_storage(sdfg: dace.SDFG, arg: str, containers: Sequence[str]) -> str:
+def _arg_storage(sdfg: dace.SDFG, arg: str, containers: Sequence[str]) -> Residency:
     """Classify ``arg`` as ``host`` or ``device`` storage from the SDFG."""
     if not containers:
-        raise AccResidencyError(f"argument {arg!r} has no SDFG data container and is not an SDFG "
-                                f"symbol; its storage side cannot be determined")
+        raise AccResidencyError(
+            f"argument {arg!r} has no SDFG data container and is not an SDFG "
+            f"symbol; its storage side cannot be determined"
+        )
     sides = {(DEVICE if sdfg.arrays[n].storage in _GPU_STORAGE else HOST) for n in containers}
     if len(sides) > 1:
-        raise AccResidencyError(f"argument {arg!r} maps to SDFG containers with mixed host/GPU storage: " +
-                                ", ".join(f"{n}={sdfg.arrays[n].storage.name}" for n in containers))
+        raise AccResidencyError(
+            f"argument {arg!r} maps to SDFG containers with mixed host/GPU storage: "
+            + ", ".join(f"{n}={sdfg.arrays[n].storage.name}" for n in containers)
+        )
     return sides.pop()
 
 
-def _written_args(sdfg: dace.SDFG, containers: Mapping[str, Tuple[str, ...]]) -> frozenset:
+def _written_args(sdfg: dace.SDFG, containers: Mapping[str, tuple[str, ...]]) -> frozenset:
     """Wrapper arguments the SDFG writes, via ``SDFG.read_and_write_sets``."""
     _, write_set = sdfg.read_and_write_sets()
     return frozenset(arg for arg, names in containers.items() if write_set & set(names))
@@ -239,28 +296,34 @@ def validate_acc_mappability(sdfg: dace.SDFG, residency: AccResidency, arg_order
     """
     problems = []
     for arg in arg_order:
-        if residency.args.get(arg) != DEVICE:
+        if residency.args.get(arg) is not DEVICE:
             continue
         containers = sdfg_containers_for_arg(sdfg, arg)
         if is_scalar_arg(sdfg, arg, containers):
             continue
         if not containers:
-            problems.append(f"{arg!r} is device-resident but has no flat binding argument in the "
-                            f"SDFG (pointer on GPU must be mappable)")
+            problems.append(
+                f"{arg!r} is device-resident but has no flat binding argument in the "
+                f"SDFG (pointer on GPU must be mappable)"
+            )
             continue
-        for ref in residency.refs.get(arg) or (arg, ):
+        for ref in residency.refs.get(arg) or (arg,):
             flat = _ref_to_flat_name(ref)
             exact = [n for n in containers if n == flat]
             prefixed = [n for n in containers if n.startswith(flat + "_")]
             if exact:
                 continue
             if len(prefixed) == 0:
-                problems.append(f"device-resident entity {ref!r} of argument {arg!r} does not resolve "
-                                f"to any flat binding argument (candidates: "
-                                f"{', '.join(containers)}); pointer on GPU must be mappable")
+                problems.append(
+                    f"device-resident entity {ref!r} of argument {arg!r} does not resolve "
+                    f"to any flat binding argument (candidates: "
+                    f"{', '.join(containers)}); pointer on GPU must be mappable"
+                )
     if problems:
-        raise AccResidencyError(f"acc residency sidecar for {residency.routine or '<unknown>'} fails the "
-                                f"mappability invariant -- " + "; ".join(problems))
+        raise AccResidencyError(
+            f"acc residency sidecar for {residency.routine or '<unknown>'} fails the "
+            f"mappability invariant -- " + "; ".join(problems)
+        )
 
 
 def plan_acc_transfers(sdfg: dace.SDFG, residency: AccResidency, arg_order: Iterable[str]) -> AccTransferPlan:
@@ -285,11 +348,14 @@ def plan_acc_transfers(sdfg: dace.SDFG, residency: AccResidency, arg_order: Iter
     if residency.has_device_args:
         stuck = [a for a in buffers if a in unclassified]
         if stuck:
-            offenders.append("left unclassified by the extractor while the routine has device-resident "
-                             "arguments: " + ", ".join(stuck))
+            offenders.append(
+                "left unclassified by the extractor while the routine has device-resident "
+                "arguments: " + ", ".join(stuck)
+            )
     if offenders:
-        raise AccResidencyError(f"acc residency sidecar for {residency.routine or '<unknown>'} cannot be "
-                                f"applied -- " + "; ".join(offenders))
+        raise AccResidencyError(
+            f"acc residency sidecar for {residency.routine or '<unknown>'} cannot be applied -- " + "; ".join(offenders)
+        )
 
     validate_acc_mappability(sdfg, residency, arg_order)
 
@@ -299,17 +365,19 @@ def plan_acc_transfers(sdfg: dace.SDFG, residency: AccResidency, arg_order: Iter
     update_host, update_device, use_device, bad = [], [], [], []
     for arg in buffers:
         side = residency.args.get(arg, HOST)
-        if side == DEVICE and storage[arg] == HOST:
+        if side is DEVICE and storage[arg] is HOST:
             update_host.append(arg)
             if arg in written:
                 update_device.append(arg)
-        elif side == DEVICE and storage[arg] == DEVICE:
+        elif side is DEVICE and storage[arg] is DEVICE:
             use_device.append(arg)
-        elif side == HOST and storage[arg] == DEVICE:
+        elif side is HOST and storage[arg] is DEVICE:
             bad.append(f"{arg} (host-resident in ICON, GPU storage in the SDFG)")
     if bad:
-        raise AccResidencyError(f"acc residency sidecar for {residency.routine or '<unknown>'} cannot be "
-                                f"applied -- no transfer is defined for: " + "; ".join(bad))
+        raise AccResidencyError(
+            f"acc residency sidecar for {residency.routine or '<unknown>'} cannot be "
+            f"applied -- no transfer is defined for: " + "; ".join(bad)
+        )
 
     return AccTransferPlan(
         update_host=tuple(update_host),
@@ -319,7 +387,7 @@ def plan_acc_transfers(sdfg: dace.SDFG, residency: AccResidency, arg_order: Iter
     )
 
 
-def plan_frozen_transfers(frozen) -> AccTransferPlan:
+def plan_frozen_transfers(frozen: FrozenSignature) -> AccTransferPlan:
     """Plan the standalone direction: host caller, offloaded SDFG.
 
     No ICON sidecar is involved -- the caller is ordinary Fortran, so every buffer
@@ -333,7 +401,7 @@ def plan_frozen_transfers(frozen) -> AccTransferPlan:
     must hand the SDFG the DEVICE address, which is what ``HOST_DATA USE_DEVICE`` makes
     ``c_loc`` return.  Argument order follows the snapshot, so the emission is stable.
     """
-    by_clause: Dict[str, list] = {'copyin': [], 'copyout': [], 'copy': []}
+    by_clause: dict[str, list] = {"copyin": [], "copyout": [], "copy": []}
     for arg in frozen.args:
         clause = arg.acc_data_clause
         if clause:
@@ -341,15 +409,114 @@ def plan_frozen_transfers(frozen) -> AccTransferPlan:
     moved = tuple(a.sdfg_name for a in frozen.args if a.acc_data_clause)
     return AccTransferPlan(
         use_device=moved,
-        copyin=tuple(by_clause['copyin']),
-        copyout=tuple(by_clause['copyout']),
-        copy=tuple(by_clause['copy']),
-        storage={a.sdfg_name: DEVICE if a.acc_data_clause else HOST
-                 for a in frozen.args if a.kind == 'array'})
+        copyin=tuple(by_clause["copyin"]),
+        copyout=tuple(by_clause["copyout"]),
+        copy=tuple(by_clause["copy"]),
+        storage={
+            a.sdfg_name: DEVICE if a.acc_data_clause else HOST for a in frozen.args if a.kind is FrozenArgKind.ARRAY
+        },
+    )
 
 
-def render_data_open(plan: AccTransferPlan, indent: str = "  ") -> list:
-    """``!$ACC DATA`` opener staging the host caller's buffers onto the device.
+def _host_buffer_clause(arg) -> str:
+    """Data-region clause for a wrapper-side host buffer a GPU-storage SDFG reads or writes: the direction follows the
+    argument's intent, as :attr:`FrozenArg.acc_data_clause` does for an offloaded dummy."""
+    intent = arg.intent.lower()
+    if intent == "in" and not arg.is_written:
+        return "copyin"
+    if intent == "out":
+        return "copyout"
+    return "copy"
+
+
+def plan_device_resident_caller(sdfg: dace.SDFG, frozen: FrozenSignature, iface, plan) -> AccTransferPlan:
+    """Plan the device-resident direction: the caller keeps its arrays on the device, the SDFG's are GPU storage.
+
+    Every array argument whose SDFG storage is on the device is handed over without a host copy:
+
+    * a dummy, or the alias of a record member: its device address, through ``HOST_DATA USE_DEVICE``;
+    * a module-origin array: the device address of the caller's module variable, through ``acc_deviceptr``
+      (``deviceptr``);
+    * the packed companion of an array of records, or the image of a deferred-shape member of a module record or
+      a module array of records: packed on the device (``device_pack``);
+    * a buffer the wrapper itself fills on the host (a deep copy of a record member, the image of a module
+      array of records, a lifted member read): staged through a ``DATA`` region, by intent;
+    * the alias of a member that may be absent: as any alias, plus a device copy of the scratch the absent
+      member's alias is bound to (``create``).
+
+    Arrays left in host storage (the length-1 images of module scalars) are copied as on the CPU.  ``iface`` and
+    ``plan`` are the binding's :class:`OriginalInterface` and :class:`FlattenPlan`, which say which SDFG argument
+    is which of the above.
+    """
+    from dace_fortran.bindings.block_builders import (
+        _aos_lead,
+        _aos_member_is_static,
+        _aos_module_args,
+        _orphan_module_args,
+        _presence_scratch_name,
+        _recipe_presence_guard,
+        live_entries,
+    )
+
+    # A lifted member read (``entity%member`` of a module record, or ``entity(:)%member`` of a module array of
+    # records) is a wrapper-side copy of a component, not a module array the caller holds on the device.
+    synthetic = {s.sdfg_name for s in plan.synthetic_globals}
+    orphan = {a.sdfg_name for a, _mod, _member in _orphan_module_args(frozen, iface, plan)} - synthetic
+    aos_image = {a.sdfg_name for a in _aos_module_args(frozen)} | synthetic
+    # The image of a deferred-shape member of a module record or a module array of records: the members are the
+    # caller's device data, so the image is packed on the device.  A fixed-shape value member stays host data,
+    # staged as a buffer.
+    aos_device_image = {
+        a.sdfg_name
+        for a in _aos_module_args(frozen)
+        if a.rank > _aos_lead(a) and not _aos_member_is_static(a) and not a.global_alloc_inside
+    }
+    recipes = {flat: entry.recipe for entry in live_entries(frozen, plan) for flat in entry.recipe.flat_names}
+    use_device, deviceptr, device_pack, create = [], [], [], []
+    by_clause = {"copyin": [], "copyout": [], "copy": []}
+    storage = {}
+    for arg in frozen.args:
+        if arg.kind is not FrozenArgKind.ARRAY:
+            continue
+        name = arg.sdfg_name
+        desc = sdfg.arrays.get(name)  # a frozen array arg is one SDFG container, under its own name
+        if desc is None or desc.storage not in _GPU_STORAGE:
+            storage[name] = HOST
+            continue
+        storage[name] = DEVICE
+        recipe = recipes.get(name)
+        if name in orphan:
+            deviceptr.append(name)
+            continue
+        if (recipe is not None and recipe.aos_alloc) or name in aos_device_image:
+            device_pack.append(name)
+        elif name in aos_image or (recipe is not None and not recipe.aliasable):
+            by_clause[_host_buffer_clause(arg)].append(name)
+        elif recipe is not None and _recipe_presence_guard(iface, recipe):
+            scratch = _presence_scratch_name(recipe.scratch_dtype)
+            if scratch not in create:
+                create.append(scratch)
+        use_device.append(name)
+    return AccTransferPlan(
+        use_device=tuple(use_device),
+        deviceptr=tuple(deviceptr),
+        device_pack=tuple(device_pack),
+        copyin=tuple(by_clause["copyin"]),
+        copyout=tuple(by_clause["copyout"]),
+        copy=tuple(by_clause["copy"]),
+        create=tuple(create),
+        storage=storage,
+    )
+
+
+#: OpenMP ``target enter data`` / ``target exit data`` map types per data-region clause.
+_OMP_ENTER_MAP = {"COPYIN": "to", "COPY": "to", "COPYOUT": "alloc", "CREATE": "alloc"}
+_OMP_EXIT_MAP = {"COPYIN": "release", "COPY": "from", "COPYOUT": "from", "CREATE": "release"}
+
+
+def render_data_open(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:
+    """Opener staging the host caller's buffers onto the device: an ``!$ACC DATA`` region, or one
+    ``!$omp target enter data`` per buffer.
 
     One clause per line: the velocity wrapper moves ~100 buffers, and a single
     directive line naming them all would blow past any free-form line limit.
@@ -357,15 +524,22 @@ def render_data_open(plan: AccTransferPlan, indent: str = "  ") -> list:
     pairs = plan.data_region
     if not pairs:
         return []
+    if directive is Directive.OPENMP:
+        return [f"{indent}!$omp target enter data map({_OMP_ENTER_MAP[clause]}: {name})" for clause, name in pairs]
     lines = [f"{indent}!$ACC DATA &"]
     lines += [f"{indent}!$ACC   {clause}({name}) &" for clause, name in pairs[:-1]]
     clause, name = pairs[-1]
-    return lines + [f"{indent}!$ACC   {clause}({name})"]
+    return [*lines, f"{indent}!$ACC   {clause}({name})"]
 
 
-def render_data_close(plan: AccTransferPlan, indent: str = "  ") -> list:
-    """Closer matching :func:`render_data_open`."""
-    return [f"{indent}!$ACC END DATA"] if plan.data_region else []
+def render_data_close(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:
+    """Closer matching :func:`render_data_open`; OpenMP copies the written buffers back and releases the rest."""
+    pairs = plan.data_region
+    if not pairs:
+        return []
+    if directive is Directive.OPENMP:
+        return [f"{indent}!$omp target exit data map({_OMP_EXIT_MAP[clause]}: {name})" for clause, name in pairs]
+    return [f"{indent}!$ACC END DATA"]
 
 
 def _directive(keyword: str, names: Sequence[str], indent: str) -> list:
@@ -373,31 +547,45 @@ def _directive(keyword: str, names: Sequence[str], indent: str) -> list:
     return [f"{indent}!$ACC {keyword}({name}) ASYNC({ACC_QUEUE})" for name in names]
 
 
-def render_pre_call(plan: AccTransferPlan, indent: str = "  ") -> list:
+def render_pre_call(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:
     """Directive lines between the entry timer read and the SDFG call."""
+    if directive is Directive.OPENMP:
+        return [f"{indent}!$omp target update from({name})" for name in plan.update_host]
     return _directive("UPDATE HOST", plan.update_host, indent)
 
 
-def render_post_call(plan: AccTransferPlan, indent: str = "  ") -> list:
+def render_post_call(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:
     """Directive lines between the SDFG call and the exit sync."""
+    if directive is Directive.OPENMP:
+        return [f"{indent}!$omp target update to({name})" for name in plan.update_device]
     return _directive("UPDATE DEVICE", plan.update_device, indent)
 
 
-def render_host_data_open(plan: AccTransferPlan, indent: str = "  ") -> list:
-    """``HOST_DATA USE_DEVICE`` opener for the drift-rule arguments."""
+def render_host_data_open(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:
+    """Opener of the region handing the SDFG the device addresses: ``HOST_DATA USE_DEVICE``, or
+    ``target data use_device_addr`` with one name per line."""
     if not plan.use_device:
         return []
+    if directive is Directive.OPENMP:
+        names = plan.use_device
+        if len(names) == 1:
+            return [f"{indent}!$omp target data use_device_addr({names[0]})"]
+        lines = [f"{indent}!$omp target data use_device_addr({names[0]}, &"]
+        lines += [f"{indent}!$omp&   {name}, &" for name in names[1:-1]]
+        return [*lines, f"{indent}!$omp&   {names[-1]})"]
     return [f"{indent}!$ACC HOST_DATA USE_DEVICE({', '.join(plan.use_device)})"]
 
 
-def render_host_data_close(plan: AccTransferPlan, indent: str = "  ") -> list:
+def render_host_data_close(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:
     """Closer matching :func:`render_host_data_open`."""
     if not plan.use_device:
         return []
+    if directive is Directive.OPENMP:
+        return [f"{indent}!$omp end target data"]
     return [f"{indent}!$ACC END HOST_DATA"]
 
 
-def render_sync(plan: AccTransferPlan, indent: str = "  ") -> list:
+def render_sync(plan: AccTransferPlan, indent: str = "  ", directive: Directive = Directive.OPENACC) -> list:
     """The sync line that must precede each ``SYSTEM_CLOCK`` read.
 
     ICON launches its kernels on ``ASYNC(1)`` and our copies join the
@@ -407,4 +595,6 @@ def render_sync(plan: AccTransferPlan, indent: str = "  ") -> list:
     landed.  Other queues never carry our traffic, so they are not
     drained.
     """
+    if directive is Directive.OPENMP:
+        return []  # OpenMP's target update is synchronous: nothing is left in flight
     return [f"{indent}!$ACC WAIT({ACC_QUEUE})"] if plan.active else []

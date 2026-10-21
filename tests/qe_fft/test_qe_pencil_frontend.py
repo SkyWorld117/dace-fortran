@@ -7,17 +7,13 @@ matching lib node: ``cft_1x``/``cft_1y``/``cft_1z`` -> :class:`FFT`; ``fft_scatt
 Recognition only -- the buffer-to-3-D-grid reinterpretation for a full parallel 3-D FFT SDFG
 is a separate gap (``axis`` tag carried on the ASTNode for ``emit_fft`` to consume later).
 """
+
 from pathlib import Path
 
-import pytest
-
 import dace_fortran
-from _util import have_flang
 
 _HERE = Path(__file__).resolve().parent
 _SRC = _HERE / "qe_pencil_probe.f90"
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
 
 
 def _build_and_assert(entry: str, expected_node: str, tmp_path):
@@ -26,8 +22,7 @@ def _build_and_assert(entry: str, expected_node: str, tmp_path):
     sdfg = dace_fortran.build_sdfg(src, out_dir=str(tmp_path / name), entry=entry, name=name)
     sdfg.validate()
     classes = {type(n).__name__ for s in sdfg.states() for n in s.nodes()}
-    assert expected_node in classes, \
-        f"{entry}: expected a {expected_node!r} lib node, got {sorted(classes)!r}"
+    assert expected_node in classes, f"{entry}: expected a {expected_node!r} lib node, got {sorted(classes)!r}"
 
 
 def test_cft_1z_recognised(tmp_path):
@@ -48,3 +43,9 @@ def test_fft_scatter_xy_recognised(tmp_path):
 
 def test_fft_scatter_yz_recognised(tmp_path):
     _build_and_assert("qe_pencil_probe::run_fft_scatter_yz", "Alltoall", tmp_path)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -9,14 +9,13 @@ resolves it and hoists the live branch, making the rebind straight-line (plain
 ``canonicalize`` can't fold ``fir.is_present`` behind ``hlfir.declare``).
 
 Both fold directions covered: optional omitted (else branch) and passed (then branch)."""
+
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 _SRC = """
 module mo_cr
@@ -73,5 +72,9 @@ def test_present_guarded_conditional_pointer_rebind(tmp_path: Path, entry: str):
     sdfg(out=out, n=np.int32(n), grid_in_domain_sblk=np.int32(sblk), grid_in_domain_eblk=np.int32(eblk), out_d0=n)
 
     expected = np.zeros(n)
-    expected[sblk - 1:eblk] = np.arange(sblk, eblk + 1, dtype=np.float64)
+    expected[sblk - 1 : eblk] = np.arange(sblk, eblk + 1, dtype=np.float64)
     np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

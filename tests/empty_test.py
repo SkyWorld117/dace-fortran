@@ -1,11 +1,8 @@
 """Verbatim port of f2dace/dev:tests/fortran/empty_test.py."""
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_empty(tmp_path):
@@ -34,9 +31,15 @@ subroutine main(d)
   end if
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     a = np.full([2, 3], 42, order="F", dtype=np.float64)
     sdfg(d=a)
-    assert (a[0, 0] == 0)
-    assert (a[0, 1] == 5)
-    assert (a[1, 2] == 0)
+    assert a[0, 0] == 0
+    assert a[0, 1] == 5
+    assert a[1, 2] == 0
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

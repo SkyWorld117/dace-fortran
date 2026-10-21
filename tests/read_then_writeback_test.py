@@ -15,11 +15,8 @@ regression surfaces independently of Phases F/A/B/G.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_read_then_writeback_no_cycle(tmp_path: Path):
@@ -38,10 +35,11 @@ end subroutine kernel
 """
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
 
     # For every state touching 'out': if it has both an in-edge and an out-edge on 'out', it must have >= 2 access nodes.
     from dace.sdfg import nodes as nd
+
     bad = []
     for state in sdfg.all_states():
         out_nodes = [n for n in state.nodes() if isinstance(n, nd.AccessNode) and n.data == "out"]
@@ -77,9 +75,10 @@ end subroutine kernel
 """
     sdfg_dir = tmp_path / "sdfg"
     sdfg_dir.mkdir(parents=True, exist_ok=True)
-    sdfg = build_sdfg(src, sdfg_dir, name='kernel').build()
+    sdfg = build_sdfg(src, sdfg_dir, name="kernel").build()
 
     from dace.sdfg import nodes as nd
+
     bad = []
     for s in sdfg.all_states():
         st_nodes = [n for n in s.nodes() if isinstance(n, nd.AccessNode) and n.data == "state"]
@@ -97,3 +96,9 @@ end subroutine kernel
     state = np.array([0.25], dtype=np.float64)
     sdfg(state=state, x=x, n=n)
     assert state[0] == max(0.25, x.max())
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -4,11 +4,8 @@ HLFIR handles offset normalisation uniformly via ``offset_<arr>_d<i>`` symbols (
 """
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 
 def test_fortran_frontend_arr2loop_without_offset(tmp_path):
@@ -29,11 +26,11 @@ def test_fortran_frontend_arr2loop_without_offset(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
-    assert len(sdfg.arrays['d'].shape) == 2
-    assert sdfg.arrays['d'].shape[0] == 5
-    assert sdfg.arrays['d'].shape[1] == 3
+    assert len(sdfg.arrays["d"].shape) == 2
+    assert sdfg.arrays["d"].shape[0] == 5
+    assert sdfg.arrays["d"].shape[1] == 3
 
     a = np.full([5, 3], 42, order="F", dtype=np.float64)
     sdfg(d=a)
@@ -57,10 +54,10 @@ def test_fortran_frontend_arr2loop_1d_offset(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
-    assert len(sdfg.arrays['d'].shape) == 1
-    assert sdfg.arrays['d'].shape[0] == 5
+    assert len(sdfg.arrays["d"].shape) == 1
+    assert sdfg.arrays["d"].shape[0] == 5
 
     a = np.full([5], 42, order="F", dtype=np.float64)
     sdfg(d=a)
@@ -86,16 +83,16 @@ def test_fortran_frontend_arr2loop_2d_offset(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
-    assert len(sdfg.arrays['d'].shape) == 2
-    assert sdfg.arrays['d'].shape[0] == 5
-    assert sdfg.arrays['d'].shape[1] == 3
+    assert len(sdfg.arrays["d"].shape) == 2
+    assert sdfg.arrays["d"].shape[0] == 5
+    assert sdfg.arrays["d"].shape[1] == 3
 
     a = np.full([5, 3], 42, order="F", dtype=np.float64)
     sdfg(d=a)
     for i in range(1, 6):
-        for j in range(0, 3):
+        for j in range(3):
             assert a[i - 1, j] == i * 2
 
 
@@ -114,12 +111,12 @@ def test_fortran_frontend_arr2loop_2d_offset2(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
     a = np.full([5, 3], 42, order="F", dtype=np.float64)
     sdfg(d=a)
-    for i in range(0, 5):
-        for j in range(0, 3):
+    for i in range(5):
+        for j in range(3):
             assert a[i, j] == 43
 
 
@@ -138,15 +135,15 @@ def test_fortran_frontend_arr2loop_2d_offset3(tmp_path):
 
                     END SUBROUTINE index_test_function
                     """
-    sdfg = build_sdfg(test_string, tmp_path, name='index_offset_test', entry='index_test_function').build()
+    sdfg = build_sdfg(test_string, tmp_path, name="index_offset_test", entry="index_test_function").build()
 
     a = np.full([5, 3], 42, order="F", dtype=np.float64)
     sdfg(d=a)
     for i in range(1, 4):
-        for j in range(0, 2):
+        for j in range(2):
             assert a[i, j] == 43
         for j in range(2, 3):
             assert a[i, j] == 42
     for i in [0, 4]:
-        for j in range(0, 3):
+        for j in range(3):
             assert a[i, j] == 42

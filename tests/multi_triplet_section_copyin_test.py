@@ -10,14 +10,12 @@ binding shim allocated and zero-filled: every write through it was dropped silen
 index list cannot be "scalar prefix then triplet" -- the fold has to walk source dims in order.
 A per-element pattern (``i + 100*j``) catches a dropped or transposed index.
 """
+
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # Parent is a POINTER member so contiguity is unknown at the call site and flang guards it with
 # copy_in/copy_out; a plain contiguous local would be passed by reference with no copy at all.
@@ -115,3 +113,9 @@ def test_two_triplet_middle_scalar_section(tmp_path: Path):
     b = np.arange(1, nb + 1, dtype=np.float64)[None, :]
     expected[:, 0, :] = i + 100.0 * b
     np.testing.assert_array_equal(v3, expected)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

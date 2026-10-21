@@ -5,6 +5,7 @@
 * Differential: DUT (SDFG) runs in place, REF (original body, renamed ``solve_nh_ref``) runs on a deep
   copy, and results are compared bit-for-bit per call.
 """
+
 import re
 from pathlib import Path
 
@@ -13,7 +14,6 @@ SOLVE_NH_WRAPPER_NAME = "solve_nh_dace_icon"
 
 #: USE statements inserted after the SUBROUTINE header, before IMPLICIT NONE.
 _DIFF_USE = [
-    "    USE iso_c_binding, ONLY: c_bool",
     "    USE iso_fortran_env, ONLY: error_unit",
     "    USE mo_solve_nh_diff, ONLY: clone_state_indep_prog, free_state_clone, &",
     "                                clone_prepadv_indep, free_prepadv_clone, &",
@@ -34,7 +34,7 @@ _DIFF_BLOCK = """\
                                     l_init, l_recompute, lsave_mflx, &
                                     lprep_adv, lclean_mflx, &
                                     idyn_timestep, jstep, dtime, lacc)
-        USE iso_c_binding,     ONLY: c_int, c_double, c_bool
+        USE iso_c_binding,     ONLY: c_int, c_double
         USE mo_model_domain,   ONLY: t_patch
         USE mo_intp_data_strc, ONLY: t_int_state
         USE mo_nonhydro_types, ONLY: t_nh_state
@@ -44,15 +44,15 @@ _DIFF_BLOCK = """\
         TYPE(t_patch),       TARGET, INTENT(INOUT) :: p_patch
         TYPE(t_prepare_adv), TARGET, INTENT(INOUT) :: prep_adv
         INTEGER(c_int),              INTENT(IN)    :: nnow, nnew
-        LOGICAL(c_bool),             INTENT(IN)    :: l_init
-        LOGICAL(c_bool),             INTENT(IN)    :: l_recompute
-        LOGICAL(c_bool),             INTENT(IN)    :: lsave_mflx
-        LOGICAL(c_bool),             INTENT(IN)    :: lprep_adv
-        LOGICAL(c_bool),             INTENT(IN)    :: lclean_mflx
+        LOGICAL,                     INTENT(IN)    :: l_init
+        LOGICAL,                     INTENT(IN)    :: l_recompute
+        LOGICAL,                     INTENT(IN)    :: lsave_mflx
+        LOGICAL,                     INTENT(IN)    :: lprep_adv
+        LOGICAL,                     INTENT(IN)    :: lclean_mflx
         INTEGER(c_int),              INTENT(IN)    :: idyn_timestep
         INTEGER(c_int),              INTENT(IN)    :: jstep
         REAL(c_double),              INTENT(IN)    :: dtime
-        LOGICAL(c_bool),             INTENT(IN)    :: lacc
+        LOGICAL,                     INTENT(IN)    :: lacc
       END SUBROUTINE solve_nh_dace_icon
     END INTERFACE
 
@@ -63,13 +63,13 @@ _DIFF_BLOCK = """\
     ! DUT: the SDFG dycore, in place on p_nh / prep_adv (what ICON keeps).
     CALL solve_nh_dace_icon(p_nh, p_patch, p_int, prep_adv, &
                             nnow, nnew, &
-                            LOGICAL(l_init, kind=1), &
-                            LOGICAL(l_recompute, kind=1), &
-                            LOGICAL(lsave_mflx, kind=1), &
-                            LOGICAL(lprep_adv, kind=1), &
-                            LOGICAL(lclean_mflx, kind=1), &
+                            l_init, &
+                            l_recompute, &
+                            lsave_mflx, &
+                            lprep_adv, &
+                            lclean_mflx, &
                             idyn_timestep, jstep, dtime, &
-                            LOGICAL(lacc, kind=1))
+                            lacc)
 
     ! REF: the stock Fortran dycore, on the independent clone.
     CALL solve_nh_ref(nh_ref__dace, p_patch, p_int, prep_ref__dace, &
@@ -110,7 +110,7 @@ _DACE_ONLY_BLOCK = """\
                                     l_init, l_recompute, lsave_mflx, &
                                     lprep_adv, lclean_mflx, &
                                     idyn_timestep, jstep, dtime, lacc)
-        USE iso_c_binding,     ONLY: c_int, c_double, c_bool
+        USE iso_c_binding,     ONLY: c_int, c_double
         USE mo_model_domain,   ONLY: t_patch
         USE mo_intp_data_strc, ONLY: t_int_state
         USE mo_nonhydro_types, ONLY: t_nh_state
@@ -120,27 +120,27 @@ _DACE_ONLY_BLOCK = """\
         TYPE(t_patch),       TARGET, INTENT(INOUT) :: p_patch
         TYPE(t_prepare_adv), TARGET, INTENT(INOUT) :: prep_adv
         INTEGER(c_int),              INTENT(IN)    :: nnow, nnew
-        LOGICAL(c_bool),             INTENT(IN)    :: l_init
-        LOGICAL(c_bool),             INTENT(IN)    :: l_recompute
-        LOGICAL(c_bool),             INTENT(IN)    :: lsave_mflx
-        LOGICAL(c_bool),             INTENT(IN)    :: lprep_adv
-        LOGICAL(c_bool),             INTENT(IN)    :: lclean_mflx
+        LOGICAL,                     INTENT(IN)    :: l_init
+        LOGICAL,                     INTENT(IN)    :: l_recompute
+        LOGICAL,                     INTENT(IN)    :: lsave_mflx
+        LOGICAL,                     INTENT(IN)    :: lprep_adv
+        LOGICAL,                     INTENT(IN)    :: lclean_mflx
         INTEGER(c_int),              INTENT(IN)    :: idyn_timestep
         INTEGER(c_int),              INTENT(IN)    :: jstep
         REAL(c_double),              INTENT(IN)    :: dtime
-        LOGICAL(c_bool),             INTENT(IN)    :: lacc
+        LOGICAL,                     INTENT(IN)    :: lacc
       END SUBROUTINE solve_nh_dace_icon
     END INTERFACE
 
     CALL solve_nh_dace_icon(p_nh, p_patch, p_int, prep_adv, &
                             nnow, nnew, &
-                            LOGICAL(l_init, kind=1), &
-                            LOGICAL(l_recompute, kind=1), &
-                            LOGICAL(lsave_mflx, kind=1), &
-                            LOGICAL(lprep_adv, kind=1), &
-                            LOGICAL(lclean_mflx, kind=1), &
+                            l_init, &
+                            l_recompute, &
+                            lsave_mflx, &
+                            lprep_adv, &
+                            lclean_mflx, &
                             idyn_timestep, jstep, dtime, &
-                            LOGICAL(lacc, kind=1))
+                            lacc)
   END SUBROUTINE solve_nh
 """
 
@@ -192,15 +192,19 @@ def apply_solve_nh_patch(pristine_source: str, dace_only: bool = False) -> str:
         body_block = _DIFF_BLOCK
 
     # (1) driver: original header + USE helpers (if any) + dummies + body.
-    driver = (lines[subr_start:header_end + 1] + use_block + lines[header_end + 1:last_intent + 1] +
-              body_block.splitlines())
+    driver = (
+        lines[subr_start : header_end + 1]
+        + use_block
+        + lines[header_end + 1 : last_intent + 1]
+        + body_block.splitlines()
+    )
 
     # (2) the original subroutine, verbatim, renamed to solve_nh_ref.
-    ref = list(lines[subr_start:end_subr + 1])
+    ref = list(lines[subr_start : end_subr + 1])
     ref[0] = re.sub(r"(SUBROUTINE\s+)solve_nh(\s*\()", r"\1solve_nh_ref\2", ref[0], count=1, flags=re.IGNORECASE)
     ref[-1] = re.sub(r"(END\s+SUBROUTINE\s+)solve_nh\b", r"\1solve_nh_ref", ref[-1], count=1, flags=re.IGNORECASE)
 
-    out = lines[:subr_start] + driver + [""] + ref + lines[end_subr + 1:]
+    out = lines[:subr_start] + driver + [""] + ref + lines[end_subr + 1 :]
     return "\n".join(out) + "\n"
 
 

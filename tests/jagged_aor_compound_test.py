@@ -9,12 +9,8 @@ companion). L_B same shape, runtime + const multi-record indexing. L_C jagged-Ao
 double-buffer-accessed AoR struct. L_D compound: jagged + AoR + double-buffer (ICON dycore
 prog struct shape).
 """
-import numpy as np
-import pytest
 
-from _util import build_sdfg, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg
 
 # -----------------------------------------------------------------
 # L_A -- jagged AoR (records with heterogeneous-extent members)
@@ -44,7 +40,7 @@ end module
     arrs = sdfg.arrays
     # Bridge must not emit the unflattened struct base arr -- only per-field companions.
     assert "arr" not in arrs, f"struct base leaked: {sorted(arrs.keys())}"
-    has_per_member = ("arr_a" in arrs and "arr_b" in arrs and "arr_c" in arrs)
+    has_per_member = "arr_a" in arrs and "arr_b" in arrs and "arr_c" in arrs
     assert has_per_member, f"expected per-member flatten: {sorted(arrs.keys())}"
 
 
@@ -192,3 +188,9 @@ end module
     arrs = sdfg.arrays
     has_buffer_split = any("nnow" in k for k in arrs) and any("nnew" in k for k in arrs)
     assert has_buffer_split, f"expected nnow/nnew companions: {sorted(arrs.keys())}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

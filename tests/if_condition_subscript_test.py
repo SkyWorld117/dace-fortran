@@ -19,11 +19,8 @@ guarding a per-iteration write. xfail captures the gap so it's noticed if extrac
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 _IF_OR_SRC = """
 SUBROUTINE if_logical_or_neighbour(mask, out, n)
@@ -55,8 +52,14 @@ def test_if_condition_with_array_subscripts(tmp_path: Path):
     out_ref = mod.if_logical_or_neighbour(mask, n=n)
     np.testing.assert_array_equal(out_ref, expected)
 
-    # SDFG: xfail expects this assertion to fail until extract_ast subscript-preservation is fixed.
+    # The SDFG works on the caller's LOGICAL(4) storage.
     sdfg = build_sdfg(_IF_OR_SRC, tmp_path, name="if_logical_or_neighbour").build()
     out = np.zeros(n, dtype=np.float64, order="F")
-    sdfg(mask=mask, out=out, n=n, i=0)
+    sdfg(mask=mask.astype(np.uint32), out=out, n=n, i=0)
     np.testing.assert_array_equal(out, expected)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__]))

@@ -11,12 +11,12 @@ Needs (Ubuntu): libopenmpi-dev openmpi-bin libnetcdff-dev libnetcdf-dev
 libhdf5-dev libeccodes-dev libfyaml-dev libxml2-dev liblapack-dev libblas-dev
 python3 perl.
 """
+
 import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
 
 # Module-level memo so a session that touches several ICON tests builds
 # at most once even before any external cache is warm.
@@ -45,11 +45,11 @@ def _missing_build_tools() -> list:
     return [t for t in need if shutil.which(t) is None]
 
 
-def ensure_icon_built(icon_src: Path, build_dir: Optional[Path] = None, jobs: Optional[int] = None) -> Optional[Path]:
+def ensure_icon_built(icon_src: Path, build_dir: Path | None = None, jobs: int | None = None) -> Path:
     """Configure + ``make`` ICON under ``build_dir`` (default ``<icon_src>/build/stock_cpu``).
-    Idempotent: no-ops if ``<build_dir>/mod`` already has .mod files. Returns None if
-    the ICON submodule isn't checked out; raises RuntimeError (not swallowed --
-    tests must FAIL loudly, not silently skip) if tools are missing or the build fails."""
+    Idempotent: no-ops if ``<build_dir>/mod`` already has .mod files. Raises RuntimeError (not swallowed --
+    tests must FAIL loudly, not silently skip) if the submodule is not checked out, tools are missing or the
+    build fails."""
     # absolute paths: configure/make run with cwd=build_dir, relative icon_src would break
     icon_src = Path(icon_src).resolve()
     if build_dir is None:
@@ -61,9 +61,11 @@ def ensure_icon_built(icon_src: Path, build_dir: Optional[Path] = None, jobs: Op
     if key in _BUILT:
         return _BUILT[key]
 
-    # Submodule not checked out -> nothing we can build.
     if not (icon_src / "configure").is_file():
-        return None
+        raise RuntimeError(
+            f"icon-model submodule not checked out at {icon_src} "
+            "(run `git submodule update --init tests/icon/full/icon-model`)"
+        )
 
     # Already built (developer tree or restored CI cache).
     if _have_mods(build_dir):
@@ -72,8 +74,11 @@ def ensure_icon_built(icon_src: Path, build_dir: Optional[Path] = None, jobs: Op
 
     missing = _missing_build_tools()
     if missing:
-        raise RuntimeError("ICON build needs these tools on PATH: " + ", ".join(missing) +
-                           ".  Install libopenmpi-dev openmpi-bin + perl + python3.")
+        raise RuntimeError(
+            "ICON build needs these tools on PATH: "
+            + ", ".join(missing)
+            + ".  Install libopenmpi-dev openmpi-bin + perl + python3."
+        )
 
     build_dir.mkdir(parents=True, exist_ok=True)
     jobs = jobs or (os.cpu_count() or 4)
@@ -81,6 +86,7 @@ def ensure_icon_built(icon_src: Path, build_dir: Optional[Path] = None, jobs: Op
     # xdist-safe: serialise configure+make behind a flock so only one worker builds;
     # flock is advisory, released on fd close/process exit, so a crashed builder doesn't deadlock
     import fcntl
+
     lock_path = build_dir.parent / ".icon_build.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock_fd:
@@ -97,14 +103,12 @@ def _configure_and_make(icon_src: Path, build_dir: Path, jobs: int, key: str) ->
 
     # --- configure (stock CPU recipe) --------------------------------
     common_cflags = "-O0 -g -fno-fast-math -ffp-contract=off -fPIC"
-    fcflags = (common_cflags + " -fbacktrace -ffree-line-length-none"
-               " -I/usr/include -I/usr/include/hdf5/serial")
+    fcflags = common_cflags + " -fbacktrace -ffree-line-length-none -I/usr/include -I/usr/include/hdf5/serial"
     cppflags = "-I/usr/include -I/usr/include/hdf5/serial -I/usr/include/libxml2"
     ldflags = "-L/usr/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu/hdf5/serial"
     # GRIB2/eccodes disabled: dycore tests only need .mod files (no GRIB I/O), and
     # libeccodes_f90 isn't shipped by stock Ubuntu libeccodes-dev -- non-portable otherwise.
-    libs = ("-lxml2 -lfyaml -llapack -lblas"
-            " -lnetcdff -lnetcdf -lhdf5_hl -lhdf5 -lstdc++")
+    libs = "-lxml2 -lfyaml -llapack -lblas -lnetcdff -lnetcdf -lhdf5_hl -lhdf5 -lstdc++"
     configure_cmd = [
         str(icon_src / "configure"),
         "CC=mpicc",
@@ -132,8 +136,10 @@ def _configure_and_make(icon_src: Path, build_dir: Path, jobs: int, key: str) ->
     subprocess.run(["make", f"-j{jobs}"], cwd=build_dir, check=True)
 
     if not _have_mods(build_dir):
-        raise RuntimeError(f"ICON make completed but no .mod files appeared under "
-                           f"{build_dir / 'mod'} -- the build recipe may need updating.")
+        raise RuntimeError(
+            f"ICON make completed but no .mod files appeared under "
+            f"{build_dir / 'mod'} -- the build recipe may need updating."
+        )
 
     _BUILT[key] = build_dir
     return build_dir

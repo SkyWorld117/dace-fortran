@@ -8,9 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from _util import build_sdfg, f2py_compile, have_flang
-
-pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+from tests._util import build_sdfg, f2py_compile
 
 
 def test_pointer_to_scalar_local(tmp_path: Path):
@@ -29,7 +27,7 @@ end subroutine main
 """
     mod = f2py_compile(src, tmp_path / "ref", "ptr_to_scalar_local")
     out_ref = mod.main()
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     out = np.zeros(1, dtype=np.int32)
     sdfg(out=out)
     assert int(out[0]) == int(out_ref) == 14
@@ -39,6 +37,7 @@ def test_scalar_rebind_lowers_as_length_one_view(tmp_path: Path):
     """``tmp => x`` lowers as a length-1-array View of ``x``: writes through ``tmp`` alias
     ``x``, and ``x`` is a length-1 ``Array`` (not ``Scalar``) so the view can write back."""
     import dace.data as dd
+
     src = """
 subroutine main(out)
   implicit none
@@ -53,12 +52,12 @@ end subroutine main
 """
     mod = f2py_compile(src, tmp_path / "ref", "scalar_view_alias")
     out_ref = int(mod.main())
-    b = build_sdfg(src, tmp_path, name='main', entry='main')
+    b = build_sdfg(src, tmp_path, name="main", entry="main")
     sdfg = b.build()
     # tmp is a View; x is a length-1 Array (not a Scalar).
     assert isinstance(sdfg.arrays["tmp"], dd.View)
     assert isinstance(sdfg.arrays["x"], dd.Array) and not isinstance(sdfg.arrays["x"], dd.View)
-    assert tuple(sdfg.arrays["x"].shape) == (1, )
+    assert tuple(sdfg.arrays["x"].shape) == (1,)
     out = np.zeros(1, dtype=np.int32)
     sdfg(out=out)
     # The write through tmp must reach x: out = x = 13, NOT the initial 7.
@@ -82,7 +81,7 @@ subroutine main(out)
   out = tmp
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     out = np.zeros(1, dtype=np.int32)
     sdfg(out=out)
     assert int(out[0]) == 2  # last rebind wins
@@ -106,7 +105,7 @@ subroutine main(out)
 end subroutine main
 """
     with pytest.raises(RuntimeError):
-        build_sdfg(src, tmp_path, name='main', entry='main').build()
+        build_sdfg(src, tmp_path, name="main", entry="main").build()
 
 
 def test_unsupported_interleaved_rebind_across_blocks_raises(tmp_path: Path):
@@ -131,7 +130,7 @@ subroutine main(out, cond)
 end subroutine main
 """
     with pytest.raises(RuntimeError):
-        build_sdfg(src, tmp_path, name='main', entry='main').build()
+        build_sdfg(src, tmp_path, name="main", entry="main").build()
 
 
 def test_bounds_remap_lb_rebase_lowers_as_view(tmp_path: Path):
@@ -157,7 +156,7 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "bounds_remap_lb0")
     ref = np.asarray(mod.main(), dtype=np.float64)
     out = np.zeros(3, dtype=np.float64)
-    build_sdfg(src, tmp_path, name='main', entry='main').build()(out=out)
+    build_sdfg(src, tmp_path, name="main", entry="main").build()(out=out)
     np.testing.assert_array_equal(out, ref)
     np.testing.assert_array_equal(out, [1.0, 6.0, 10.0])
 
@@ -183,7 +182,7 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "bounds_remap_lb5")
     ref = np.asarray(mod.main(), dtype=np.float64)
     out = np.zeros(2, dtype=np.float64)
-    build_sdfg(src, tmp_path, name='main', entry='main').build()(out=out)
+    build_sdfg(src, tmp_path, name="main", entry="main").build()(out=out)
     np.testing.assert_array_equal(out, ref)
     np.testing.assert_array_equal(out, [10.0, 100.0])
 
@@ -203,7 +202,7 @@ subroutine main(n, k, src, res)
 end subroutine main
 """
     with pytest.raises(RuntimeError):
-        build_sdfg(src, tmp_path, name='main', entry='main').build()
+        build_sdfg(src, tmp_path, name="main", entry="main").build()
 
 
 def test_pointer_rebind_to_array_slice(tmp_path: Path):
@@ -222,7 +221,7 @@ subroutine main(n, store, res)
   res = w(2) + w(4)
 end subroutine main
 """
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     n = 5
     store = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
     res = np.zeros(1, dtype=np.float32)
@@ -258,8 +257,51 @@ end subroutine main
     mod = f2py_compile(src, tmp_path / "ref", "ptr_to_struct_field")
     d_ref = np.zeros(2, order="F", dtype=np.float32)
     mod.main(d_ref)
-    sdfg = build_sdfg(src, tmp_path, name='main', entry='main').build()
+    sdfg = build_sdfg(src, tmp_path, name="main", entry="main").build()
     d = np.zeros(2, dtype=np.float32)
     sdfg(d=d)
     np.testing.assert_array_equal(d, d_ref)
     np.testing.assert_array_equal(d, [13.0, 13.0])
+
+
+def test_array_element_pointer_component_rebind_raises(tmp_path: Path):
+    """``new(i) % data => old(i) % data`` (QE buiol's regrowable linked list of pointer records) rebinds a
+    per-element descriptor the flattened companion array does not have: the build names the construct and points to
+    ``keep_external`` instead of lowering the store as a value copy."""
+    src = """
+module buf
+  implicit none
+  type rec
+    complex(kind=8), pointer :: data(:)
+  end type
+  type(rec), pointer :: index(:)
+  integer :: nrec = 0
+contains
+  subroutine grow(nrec_new)
+    integer, intent(in) :: nrec_new
+    integer :: i
+    type(rec), pointer :: new(:), old(:)
+    allocate(new(nrec_new))
+    old => index
+    do i = 1, nrec
+      new(i) % data => old(i) % data
+    end do
+    index => new
+    nrec = nrec_new
+  end subroutine
+end module
+
+subroutine main(n, out)
+  use buf
+  integer, intent(in) :: n
+  integer, intent(out) :: out
+  if (n > 100) call grow(n)
+  out = nrec
+end subroutine
+"""
+    with pytest.raises(NotImplementedError, match=r"component 'data' of an array element.*keep_external"):
+        build_sdfg(src, tmp_path, name="main", entry="main").build()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

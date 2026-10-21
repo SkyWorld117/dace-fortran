@@ -3,6 +3,7 @@
 ICON's real ``mo_velocity_advection.f90``, asserting the merged TU lowers to HLFIR
 cleanly under flang-21. Skipped if no ICON checkout, flang, or OpenMPI.
 """
+
 import os
 import subprocess
 import tempfile
@@ -11,16 +12,21 @@ from pathlib import Path
 import pytest
 
 import dace_fortran
-from _util import flang_binary, have_flang
 from dace_fortran.flang_codebase import (
     FLANG_BUG_PATCHES,
     LIBRARY_STUBS,
     extract_make_compile_args,
-    find_openmpi_include,
     mpi_stub_source,
+    openacc_stub_source,
     patch_mpi_sizeof,
     prepare_flang_translation_unit,
 )
+from tests._util import flang_binary
+from dace_fortran.flang_codebase import find_openmpi_include
+
+#: The MPI-stub tests need OpenMPI's include directory (``mpif-config.h``); a system without it must
+#: skip, not fail.
+_HAVE_OPENMPI = find_openmpi_include() is not None
 
 # ICON source: in-repo submodule by default, override with ICON_SRC. Build dir is owned
 # by the icon_build fixture (root conftest.py), built into TMP storage on demand.
@@ -33,8 +39,6 @@ _CACHE_DIR = Path(os.environ.get("DACE_FORTRAN_CACHE", str(Path(tempfile.gettemp
 # Prefer a pristine .bak if a developer left one; else the submodule's own source.
 _VELOCITY_REF = _VELOCITY_BAK if _VELOCITY_BAK.is_file() else _VELOCITY_SRC
 
-_HAVE_FLANG = have_flang()
-_HAVE_OPENMPI = find_openmpi_include() is not None
 # icon_build session fixture (root conftest.py) configures+builds ICON on demand;
 # no .mod tree required upfront here.
 
@@ -46,7 +50,7 @@ _HAVE_OPENMPI = find_openmpi_include() is not None
 def test_library_stubs_registry_keys():
     """Every built-in library stub name should resolve to a
     :class:`LibraryStub` with ``source`` and ``flags`` callables."""
-    assert set(LIBRARY_STUBS) >= {"mpi", "netcdf"}
+    assert set(LIBRARY_STUBS) >= {"mpi", "netcdf", "openacc"}
     for stub in LIBRARY_STUBS.values():
         assert callable(stub.source)
         assert callable(stub.flags)
@@ -69,11 +73,45 @@ def test_mpi_stub_source_and_flags():
     assert (Path(inc_flag[2:]) / "mpif-config.h").is_file()
 
 
+def test_openacc_stub_lets_flang_compile_openacc_api_calls(tmp_path: Path):
+    """Code built with an OpenACC compiler uses its ``openacc`` module, which flang does not ship; with the stub
+    prepended, a routine querying devices and presence compiles to HLFIR."""
+    entry = """
+module m
+  use openacc
+  implicit none
+contains
+  subroutine setup(rank, a)
+    integer, intent(in) :: rank
+    real(8), intent(inout) :: a(:)
+    integer(acc_device_kind) :: devtype
+    integer :: n
+    devtype = acc_get_device_type()
+    n = acc_get_num_devices(devtype)
+    if (n > 0) call acc_set_device_num(mod(rank, n), devtype)
+    if (.not. acc_is_present(a)) call acc_copyin(a)
+  end subroutine setup
+end module m
+"""
+    tu = prepare_flang_translation_unit(entry, library_stubs=["openacc"])
+    assert tu.flags == []
+    src = tmp_path / "tu.f90"
+    src.write_text(tu.source)
+    subprocess.run(
+        [flang_binary(), "-fc1", "-emit-hlfir", str(src), "-o", str(tmp_path / "tu.hlfir")],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "acc_get_num_devices" in (tmp_path / "tu.hlfir").read_text()
+    assert openacc_stub_source() in tu.source
+
+
 def test_patch_mpi_sizeof_substitutes_static_byte_count():
     """``CALL MPI_SIZEOF(x, sz, err)`` becomes a static assignment.
     Pure text transform -- no upstream dependencies."""
-    before = ("    CALL MPI_SIZEOF(rrg, p_real_byte, p_error)\n"
-              "    CALL MPI_SIZEOF(ii4, p_int_i4_byte, p_error)\n")
+    before = "    CALL MPI_SIZEOF(rrg, p_real_byte, p_error)\n    CALL MPI_SIZEOF(ii4, p_int_i4_byte, p_error)\n"
     after = patch_mpi_sizeof(before)
     assert "CALL MPI_SIZEOF" not in after
     # rrg -> double (8); ii4 -> single (4)
@@ -118,7 +156,6 @@ def test_extract_make_compile_args_for_icon_velocity(icon_build):
     assert src_include in args["include_dirs"]
 
 
-@pytest.mark.skipif(not (_HAVE_FLANG and _HAVE_OPENMPI), reason="needs an LLVM flang on PATH + OpenMPI")
 def test_prepare_translation_unit_flang_clean_on_icon_velocity(tmp_path: Path, icon_build):
     """Compose a TU for ICON's real mo_velocity_advection.f90 and verify flang-21 lowers it
     to HLFIR with zero errors -- pins the entire merge+stubs+patches+defines recipe as a gate."""
@@ -160,13 +197,13 @@ def test_prepare_translation_unit_flang_clean_on_icon_velocity(tmp_path: Path, i
             "-o",
             str(hlfir_path),
         ],
+        check=False,
         capture_output=True,
         text=True,
         cwd=str(tmp_path),
     )
     err_lines = [ln for ln in result.stderr.splitlines() if "error:" in ln]
-    assert not err_lines, (f"flang reported {len(err_lines)} error(s); "
-                           f"first 5:\n" + "\n".join(err_lines[:5]))
+    assert not err_lines, f"flang reported {len(err_lines)} error(s); first 5:\n" + "\n".join(err_lines[:5])
     assert hlfir_path.is_file()
     # 753 MB empirically; >100 MB just confirms the full closure lowered (no premature truncation).
     assert hlfir_path.stat().st_size > 100 * 1024 * 1024
@@ -179,5 +216,10 @@ def test_lazy_import_surface():
     assert callable(dace_fortran.extract_make_compile_args)
     assert callable(dace_fortran.vendor_netcdf_fortran)
     assert callable(dace_fortran.mpi_stub_source)
+    assert callable(dace_fortran.openacc_stub_source)
     assert "mpi" in dace_fortran.LIBRARY_STUBS
     assert "mpi_sizeof" in dace_fortran.FLANG_BUG_PATCHES
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
