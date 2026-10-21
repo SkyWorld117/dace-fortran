@@ -208,7 +208,7 @@ def emit_bindings(
         if record_only:
             # The members of elements of module arrays of records that are another array of the SDFG: the substitute
             # built from the record folds the two (its storage guard would decline them).
-            aliases = build_alias_record(frozen, iface, plan, record_symbols_to)
+            aliases = build_alias_record(frozen, iface, plan, record_symbols_to, per_rank=record_per_rank)
             if aliases:
                 record = [*aliases, "", *record]
                 blocks["helpers"] = STORAGE_GUARD_HELPERS

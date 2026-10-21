@@ -246,15 +246,18 @@ def build_storage_guard(
     return lines
 
 
-def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, path) -> list[str]:
+def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, path,
+                       per_rank: bool = False) -> list[str]:
     """Wrapper lines of a sizing run appending, to ``<path>.aliases``, a line ``alias <image> <element> <array>`` for
     every member of an element of a rank-1 module array of records (``<image>`` its SDFG image, ``<element>`` the
     0-based element) whose storage is exactly that of a module array or array dummy the SDFG takes in place
     (``<array>``), a line ``same <image> <element> <image> <element>`` for every two such members with the same
     storage, and an empty line that ends the call.  The substitute built from the record takes the two as one array
     (``fold_aliases``), which the storage guard would otherwise decline.  Empty when the SDFG takes no such
-    member."""
+    member. With ``per_rank``, write ``<path>.aliases.<rank>`` so concurrent
+    processes cannot interleave call boundaries or corrupt association names."""
     from pathlib import Path
+    from dace_fortran.bindings.specialization import record_open_lines
 
     _NAMES.clear()
     module_members = _module_record_members(frozen)
@@ -262,12 +265,14 @@ def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: 
     if not module_members:
         return []
     groups = module_members + dummy_members + in_records + _in_place_arrays(frozen, iface, plan)
+    declarations, opening = record_open_lines("dace_alias_unit", f"'{Path(path)}.aliases'", per_rank)
     sdfg_names = [n.replace("'", "''")[:_NAME_LEN] for _expr, n, _elem in _NAMES]
     lines = [
         f"{_INDENT}! ----- Alias record: members handed over apart that are another array of the SDFG -----",
         f"{_INDENT}block",
         f"{_INDENT}  integer(c_intptr_t), allocatable :: {_SPANS}(:, :)",
         f"{_INDENT}  integer :: {_COUNT}, dace_alias_unit",
+        *(f"{_INDENT}  {line}" for line in declarations),
         f"{_INDENT}  character(len={_NAME_LEN}), parameter :: dace_span_sdfg({len(sdfg_names)}) = "
         f"[character(len={_NAME_LEN}) :: &",
         *(f"{_INDENT}    '{n}'{',' if i + 1 < len(sdfg_names) else ''} &" for i, n in enumerate(sdfg_names)),
@@ -276,7 +281,7 @@ def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: 
     ]
     lines += [f"{_INDENT}  {ln}" for group in groups for ln in group]
     lines += [
-        f"{_INDENT}  open(newunit=dace_alias_unit, file='{Path(path)}.aliases', position='append', action='write')",
+        *(f"{_INDENT}  {line}" for line in opening),
         f"{_INDENT}  call dace_spans_aliases({_SPANS}, {_COUNT}, dace_alias_unit, dace_span_sdfg)",
         f"{_INDENT}  write(dace_alias_unit, '(a)') ''",
         f"{_INDENT}  close(dace_alias_unit)",

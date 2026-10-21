@@ -4,6 +4,8 @@ the caller runs its own code; with the member pointing elsewhere the SDFG runs. 
 compiled kernel's."""
 
 import ctypes
+import os
+import subprocess
 
 import numpy as np
 import pytest
@@ -288,6 +290,42 @@ def test_a_sizing_run_records_the_members_that_are_another_array(tmp_path):
     ).read_text()
     assert "dace_spans_aliases" in sizing and "subroutine dace_spans_aliases" in sizing
     assert "if (dace_spans_overlap(" not in sizing  # no guard in a sizing run
+
+
+def test_concurrent_ranks_write_separate_alias_records(tmp_path):
+    from dace_fortran.bindings.storage_guard import STORAGE_GUARD_HELPERS, build_alias_record
+
+    frozen, iface = _signature_with_member()
+    record = tmp_path / "record"
+    body = "\n".join(build_alias_record(frozen, iface, FlattenPlan(), record, per_rank=True))
+    source = tmp_path / "record.f90"
+    source.write_text("module alias_helpers\nuse iso_c_binding\ncontains\n" + STORAGE_GUARD_HELPERS + """
+end module
+program record_aliases
+use iso_c_binding
+use alias_helpers
+implicit none
+type field
+  real(c_double), pointer :: sf(:)
+end type
+type(field) :: g(1)
+real(c_double), allocatable, target :: t__mod(:)
+real(c_double), target :: x(4)
+integer :: aos_g_sf_i0, iteration
+allocate(t__mod(4))
+t__mod=1; x=2; g(1)%sf=>t__mod
+do iteration=1,200
+""" + body + "\nend do\nend program\n")
+    exe = tmp_path / "record_aliases"
+    subprocess.run(["gfortran", "-ffree-line-length-none", str(source), "-o", str(exe)], cwd=tmp_path, check=True)
+    processes = [subprocess.Popen([str(exe)], env={**os.environ, "OMPI_COMM_WORLD_RANK": str(rank)})
+                 for rank in (0, 1)]
+    assert [process.wait() for process in processes] == [0, 0]
+    assert not record.with_name("record.aliases").exists()
+    for rank in (0, 1):
+        text = record.with_name(f"record.aliases.{rank}").read_text()
+        assert text.count("\n\n") == 200
+        assert all(part == "alias g_sf 0 t" for part in text.split("\n\n")[:-1])
 
 
 def test_recorded_aliases_are_those_of_every_call(tmp_path):

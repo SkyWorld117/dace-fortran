@@ -1522,6 +1522,12 @@ def main() -> int:
         )
         if private_baked:
             print(f"substitute entry checks baked private variables through accessors: {private_baked}", flush=True)
+    alias_record = None
+    if args.record_only and args.record:
+        from dace_fortran.bindings.storage_guard import build_alias_record
+
+        if build_alias_record(get_frozen_signature(sdfg), iface, plan, args.record, per_rank=args.record_per_rank):
+            alias_record = f"{args.record.resolve()}.aliases"
     info = {
         "sdfg_so": str(sdfg_so),
         "bindings": str(bindings),
@@ -1533,6 +1539,8 @@ def main() -> int:
         "shim_symbol": f"dace_sub_{routine}_",
         "original_symbol": f"dace_original_{routine}_",
         "record": str(args.record.resolve()) if args.record else None,
+        "alias_record": alias_record,
+        "record_per_rank": args.record_per_rank,
         "specialized": values,
         # Module copies with accessors, to compile with the build's own command and link in place of the originals.
         "access": access_entries(access),
