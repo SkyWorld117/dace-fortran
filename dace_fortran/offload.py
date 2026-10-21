@@ -447,7 +447,7 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
 
 
 def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False,
-                            permissive_ltm=False, device_libnodes=False):
+                            permissive_ltm=False, device_libnodes=False, device_scalars=False):
     """Schedule + storage assignment for device-resident offload. In place.
 
     `device_libnodes` is OFF by default and turned on PER FRONTEND (WRF), because it changes the
@@ -470,6 +470,13 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     hand-written in the union form -- so turning it on cannot move them; it exists for the TUs the
     extractor emits from the source's own sibling form.  Turn it on per kernel, with that kernel's
     differential.
+
+    `device_scalars` is OFF by default and turned on PER KERNEL: it gives every scalar a top-level
+    map reads a device copy (the colleague's `substitute/device_scalars`).  MEASURED on
+    `kessler_prod` it copied 11 scalars that already travel as legal `const float` kernel
+    arguments and added an 11-entry cudaMalloc/cudaMemcpyAsync per call -- added staging, not
+    less.  Opt in only for a kernel whose nested body really takes a scalar through a memlet,
+    and pay for it with that kernel's differential.
 
     `permissive_ltm` is OFF by default and turned on PER KERNEL, for the same reason as the other two:
     the permissive `LoopToMap` escalation is a STRUCTURAL rewrite with no conservative soundness
@@ -719,20 +726,27 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
                                                                  dace.dtypes.StorageType.GPU_Shared):
                         desc.storage = dace.dtypes.StorageType.GPU_Global
 
-    # 2d. Device copies of host scalars the kernels read.
+    # 2d. Device copies of host scalars the kernels read.  OPT-IN, and OFF by default.
     #
-    # A kernel reads a host scalar (an argument, or a value a host tasklet computes) as a kernel
-    # argument from a tasklet, but a nested SDFG inside the kernel takes it through a memlet, and
-    # CUDA codegen refuses the host-to-device copy that would mean.  Give each such scalar a
-    # device copy made in the state where the map reads it, after any host write.  AFTER 2/2b/2c:
-    # those steps decide each container's final storage, and AFTER the host-mirror reroute, whose
-    # mirrors are length-1 ARRAYS (`__host_mirror_N`) and so cannot be picked up here (this pass
-    # only looks at `dace.data.Scalar`).  It is a no-op on a graph whose maps read no host scalar.
-    from dace_fortran.device_scalars import device_copies_of_kernel_read_scalars
-    _dev_scalars = device_copies_of_kernel_read_scalars(sdfg)
-    if _dev_scalars:
-        print(f"[dace_fortran.offload] device copy of {len(_dev_scalars)} kernel-read scalar(s): "
-              f"{_dev_scalars}")
+    # This is the colleague's `substitute/device_scalars` pass.  Its premise is that a kernel's
+    # nested body takes a scalar through a MEMLET (an illegal host-to-device copy inside the
+    # kernel).  It copies EVERY scalar a top-level map reads, which is broader: a scalar that a
+    # tasklet or a nested function takes BY VALUE is already a legal kernel parameter.
+    # MEASURED on `kessler_prod` with the live pipeline: 11 scalars (c1..c4, dt, ep2, f5,
+    # svp1..3, svpt0) that travel as `const float` kernel arguments became device pointers,
+    # with an 11-entry cudaMalloc + cudaMemcpyAsync per call -- pure added staging on the
+    # north-star metric, and an ABI change inside the SDFG.  So it stays opt-in per kernel,
+    # enabled only after a differential shows the memlet case is present and the copies pay.
+    #
+    # It runs AFTER 2/2b/2c (they decide each container's final storage) and AFTER the
+    # host-mirror reroute (whose mirrors are length-1 ARRAYS, so this pass -- scalars only --
+    # cannot pick them up).
+    if device_scalars:
+        from dace_fortran.device_scalars import device_copies_of_kernel_read_scalars
+        _dev_scalars = device_copies_of_kernel_read_scalars(sdfg)
+        if _dev_scalars:
+            print(f"[dace_fortran.offload] device copy of {len(_dev_scalars)} kernel-read scalar(s): "
+                  f"{_dev_scalars}")
 
     # 3. Scheduling validation: at least one GPU map, all GPU maps have device arrays.
     n_gpu = sum(1 for st in sdfg.all_states() for nd in st.nodes()
