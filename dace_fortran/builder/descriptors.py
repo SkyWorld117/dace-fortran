@@ -896,10 +896,11 @@ def add_descriptors(builder: SDFGBuilder, sdfg: SDFG) -> None:
             # ``fir.convert`` to flatten the section (rank reduction
             # beyond just scalar dims), so the per-surviving-section-
             # dim stride list has more entries than the view has dims.
-            # In those cases the section is contiguous in storage and
-            # ``[1, ...]`` is correct.
+            # In those cases the section is contiguous in storage: interpret
+            # it using the dummy's column-major shape. Unit strides in every
+            # dimension alias distinct elements of a multidimensional dummy.
             if len(view_strides) != len(dims):
-                view_strides = [1] * len(dims) if len(dims) > 0 else None
+                view_strides = _fortran_strides(dims) if len(dims) > 1 else [1] if dims else None
             sdfg.add_view(
                 v.fortran_name,
                 shape=dims,

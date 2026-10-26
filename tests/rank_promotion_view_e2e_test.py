@@ -258,3 +258,41 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_element_actual_to_multidimensional_dummy(tmp_path):
+    """Sequence association at a 4-D element must preserve 3-D Fortran strides."""
+    source = '''
+module element_view
+contains
+subroutine update(a, ni, nk, nj)
+  integer, intent(in) :: ni, nk, nj
+  real, intent(inout) :: a(ni,nk,nj,2)
+  integer :: species
+  do species=1,2
+    call inner(a(1,1,1,species), ni, nk, nj, species)
+  end do
+end subroutine
+subroutine inner(b, ni, nk, nj, species)
+  integer, intent(in) :: ni, nk, nj, species
+  real, intent(inout) :: b(ni,nk,nj)
+  integer :: i,k,j
+  do j=1,nj
+    do k=1,nk
+      do i=1,ni
+        b(i,k,j)=b(i,k,j)+real(i+10*k+100*j+1000*species)
+      end do
+    end do
+  end do
+end subroutine
+end module
+'''
+    sdfg = build_sdfg(source, tmp_path / 'sdfg', name='element_view',
+                      entry='element_view::update').build()
+    shape = (4, 5, 3, 2)
+    actual = np.arange(np.prod(shape), dtype=np.float32).reshape(shape, order='F').copy(order='F')
+    expected = actual.copy(order='F')
+    i, k, j, species = np.indices(shape)
+    expected += (i+1) + 10*(k+1) + 100*(j+1) + 1000*(species+1)
+    sdfg(a=actual, ni=shape[0], nk=shape[1], nj=shape[2])
+    np.testing.assert_array_equal(actual, expected)
