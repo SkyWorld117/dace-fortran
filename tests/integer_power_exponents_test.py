@@ -9,6 +9,8 @@ the case this pass exists to fix.
 """
 
 from pathlib import Path
+import ast
+import pytest
 
 import dace
 import numpy as np
@@ -41,6 +43,34 @@ def test_pass_retypes_integer_valued_float_exponents():
     assert "a ** 2.0" not in code and "a ** 2" in code
     assert "a ** -3" in code
     assert "a ** 0.5" in code  # genuine fractional left alone
+
+
+@pytest.mark.parametrize('exponent,expected', [
+    ('dace.float32(2.0)', 2), ('dace.float64(-3.0)', -3),
+    ('-dace.float64(3.0)', -3), ('dace.float32(2)', 2), ('dace.float16(4.0)', 4),
+])
+def test_typed_integer_power_exponents(exponent, expected):
+    """The frontend's explicit dtype cast must not hide an integral exponent."""
+    from dace_fortran.integer_power_exponents import IntegerizePowerExponents
+    sdfg = dace.SDFG('typed_ipow')
+    tasklet = sdfg.add_state().add_tasklet('power', {'a'}, {'b'}, f'b = a ** ({exponent})')
+    assert IntegerizePowerExponents().apply_pass(sdfg, {}) == 1
+    power = next(node for node in ast.walk(ast.parse(tasklet.code.as_string))
+                 if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow))
+    assert ast.literal_eval(power.right) == expected
+    assert isinstance(ast.literal_eval(power.right), int)
+
+
+def test_fractional_and_rounding_sensitive_casts_are_unchanged():
+    """Keep fractional, rounding-sensitive and runtime-out-of-range powers intact."""
+    from dace_fortran.integer_power_exponents import IntegerizePowerExponents
+    sdfg = dace.SDFG('unchanged_powers')
+    tasklet = sdfg.add_state().add_tasklet('power', {'a'}, {'b'},
+        'b = a ** dace.float32(0.5) + a ** dace.float32(16777217.0) '
+        '+ a ** dace.float64(4294967296.0) + a ** dace.float64(-4294967296.0)')
+    before = ast.dump(ast.parse(tasklet.code.as_string))
+    assert IntegerizePowerExponents().apply_pass(sdfg, {}) is None
+    assert ast.dump(ast.parse(tasklet.code.as_string)) == before
 
 
 _ARR_POW = """

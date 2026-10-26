@@ -24,19 +24,44 @@ class _ExponentIntegerizer(ast.NodeTransformer):
 
     @staticmethod
     def _as_int_constant(node: ast.expr) -> ast.expr | None:
-        """Int-valued replacement for a float ``**`` exponent (``2.0`` or
-        ``-2.0``), or ``None`` if not integer-valued. Sign folds into the int."""
-        if (
-            isinstance(node, ast.UnaryOp)
-            and isinstance(node.op, ast.USub)
-            and isinstance(node.operand, ast.Constant)
-            and isinstance(node.operand.value, float)
-            and node.operand.value.is_integer()
-        ):
-            return ast.copy_location(ast.Constant(value=-int(node.operand.value)), node)
-        if isinstance(node, ast.Constant) and isinstance(node.value, float) and node.value.is_integer():
-            return ast.copy_location(ast.Constant(value=int(node.value)), node)
-        return None
+        """Retype an integral float exponent, honoring explicit dtype rounding.
+
+        The builder wraps literals in ``dace.float32`` / ``float64`` calls.
+        Only unwrap a typed integer within the dtype's consecutive-integer
+        range, so e.g. ``float32(16777217.0)`` cannot lose its rounding step.
+        """
+        original = node
+        sign = 1
+        while isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            if isinstance(node.op, ast.USub):
+                sign = -sign
+            node = node.operand
+        limit = None
+        if isinstance(node, ast.Call):
+            func = node.func
+            limits = {'float16': 2**11, 'float32': 2**24, 'float64': 2**53}
+            if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                    and func.value.id == 'dace' and func.attr in limits
+                    and len(node.args) == 1 and not node.keywords):
+                return None
+            # dace::math::ipow takes an unsigned 32-bit magnitude.
+            limit = min(limits[func.attr], 2**32-1)
+            node = node.args[0]
+            while isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+                if isinstance(node.op, ast.USub):
+                    sign = -sign
+                node = node.operand
+        if not isinstance(node, ast.Constant) or isinstance(node.value, bool):
+            return None
+        value = node.value
+        if isinstance(value, float):
+            if not value.is_integer():
+                return None
+        elif not (limit is not None and isinstance(value, int)):
+            return None
+        if limit is not None and abs(value) > limit:
+            return None
+        return ast.copy_location(ast.Constant(value=sign * int(value)), original)
 
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
         """Retype an integer-valued float ``**`` exponent to ``int``."""
