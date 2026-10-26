@@ -26,7 +26,7 @@ class _ExponentIntegerizer(ast.NodeTransformer):
     def _as_int_constant(node: ast.expr) -> ast.expr | None:
         """Retype an integral float exponent, honoring explicit dtype rounding.
 
-        The builder wraps literals in ``dace.float32`` / ``float64`` calls.
+        The builder wraps literals in qualified or unqualified DaCe dtype calls.
         Only unwrap a typed integer within the dtype's consecutive-integer
         range, so e.g. ``float32(16777217.0)`` cannot lose its rounding step.
         """
@@ -40,12 +40,15 @@ class _ExponentIntegerizer(ast.NodeTransformer):
         if isinstance(node, ast.Call):
             func = node.func
             limits = {'float16': 2**11, 'float32': 2**24, 'float64': 2**53}
-            if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-                    and func.value.id == 'dace' and func.attr in limits
-                    and len(node.args) == 1 and not node.keywords):
+            # Tasklet dtype constructors also occur as bare float32(...).
+            # They are reserved DaCe tasklet globals, like the qualified form.
+            cast = func.id if isinstance(func, ast.Name) else (
+                func.attr if isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name) and func.value.id == 'dace' else None)
+            if cast not in limits or len(node.args) != 1 or node.keywords:
                 return None
             # dace::math::ipow takes an unsigned 32-bit magnitude.
-            limit = min(limits[func.attr], 2**32-1)
+            limit = min(limits[cast], 2**32-1)
             node = node.args[0]
             while isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
                 if isinstance(node.op, ast.USub):

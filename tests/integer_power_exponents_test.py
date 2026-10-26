@@ -46,6 +46,7 @@ def test_pass_retypes_integer_valued_float_exponents():
 
 
 @pytest.mark.parametrize('exponent,expected', [
+    ('float32(2.0)', 2), ('float64(-3.0)', -3), ('-float16(4.0)', -4),
     ('dace.float32(2.0)', 2), ('dace.float64(-3.0)', -3),
     ('-dace.float64(3.0)', -3), ('dace.float32(2)', 2), ('dace.float16(4.0)', 4),
 ])
@@ -67,7 +68,9 @@ def test_fractional_and_rounding_sensitive_casts_are_unchanged():
     sdfg = dace.SDFG('unchanged_powers')
     tasklet = sdfg.add_state().add_tasklet('power', {'a'}, {'b'},
         'b = a ** dace.float32(0.5) + a ** dace.float32(16777217.0) '
-        '+ a ** dace.float64(4294967296.0) + a ** dace.float64(-4294967296.0)')
+        '+ a ** dace.float64(4294967296.0) + a ** dace.float64(-4294967296.0) '
+        '+ a ** float32(0.5) + a ** float32(16777217.0) '
+        '+ a ** float64(4294967296.0) + a ** other.float32(2.0)')
     before = ast.dump(ast.parse(tasklet.code.as_string))
     assert IntegerizePowerExponents().apply_pass(sdfg, {}) is None
     assert ast.dump(ast.parse(tasklet.code.as_string)) == before
