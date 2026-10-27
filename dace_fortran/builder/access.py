@@ -541,6 +541,34 @@ def find_array_subscripts(
         i = j + 1
 
 
+def fortran_subscripts_to_dace(expr: str, builder: SDFGBuilder) -> str:
+    """Convert explicit Fortran array reads to descriptor-relative subscripts.
+
+    Bridge conditions, bounds and yielded boolean expressions retain Fortran
+    indices. Resolve section aliases before subtracting the real descriptor's
+    lower bounds, including nested indirect reads. Dataflow accesses use the
+    same offset convention in ``build_memlet_index``.
+    """
+    if not isinstance(expr, str):
+        return expr
+    expr = resolve_object_member_expr(builder, expr)
+    if "[" not in expr:
+        return expr
+    out, cursor = [], 0
+    for start, end, arr, parts in find_array_subscripts(
+        expr, builder.arrays, lambda name: resolve_object_member(builder, name)
+    ):
+        out.append(expr[cursor:start])
+        name, access = resolve_section_alias(
+            builder, arr, SyntheticAccess(array_name=arr, is_read=True, index_exprs=parts)
+        )
+        indices = [fortran_subscripts_to_dace(part, builder) for part in access.index_exprs]
+        out.append(_format_offset_subset(name, indices))
+        cursor = end
+    out.append(expr[cursor:])
+    return "".join(out)
+
+
 def indirect_host(expr: str) -> str:
     """Given ``edge_idx[jc,1]`` return ``edge_idx``; empty for non-indirect.
     Robust to nested brackets via the bracket-balanced walker."""
@@ -677,7 +705,7 @@ def array_read_to_dace_expr(
     dims(2)+1`` collapsed to ``dims(1)``), making a promoted index/size
     symbol wrong.  Falls back to ``expr`` when the RHS has no array read."""
     reads = [ac for ac in assign_node.accesses if ac.is_read and ac.array_name in builder.arrays]
-    expr = assign_node.expr
+    expr = fortran_subscripts_to_dace(assign_node.expr, builder)
     # Phantom object-alias scalar members (``p_pat_fn1_comm``) resolve to real
     # SDFG symbols.  Rewrite them so the interstate-edge expression references
     # a registered symbol instead of leaking as a free identifier.

@@ -1733,7 +1733,7 @@ std::string buildExpr(mlir::Value val, int d) {
     if (!n.empty()) {
       // CONDITION / interstate-edge context (``buildExprWithSubscripts``
       // sets ``kForceSubscripts`` for its generic fall-through): render the
-      // element's 0-based subscript inline instead of the bare name.  Mirrors
+      // element's Fortran subscript inline instead of the bare name.  Mirrors
       // ``buildExprWithSubscripts``'s own load-of-designate handler so that any
       // op it doesn't special-case still lands here with subscripts intact.
       if (kForceSubscripts) {
@@ -1753,9 +1753,10 @@ std::string buildExpr(mlir::Value val, int d) {
             if (!arr.empty() && !idxs.empty()) {
               std::string s = arr + "[";
               bool first = true;
+              unsigned dim = 0;
               for (auto idx : idxs) {
                 if (!first) s += ", ";
-                s += "(" + buildIndexExpr(idx, d + 1) + ") - 1";
+                s += buildDesignateIndexExpr(dg, dim++, idx, d + 1);
                 first = false;
               }
               return s + "]";

@@ -23,10 +23,9 @@ from dace_fortran.builder.access import (
     acc,
     array_read_to_dace_expr,
     collect_indirect,
-    find_array_subscripts,
+    fortran_subscripts_to_dace as _fortran_subs_to_dace,
     indirect_exprs,
     indirect_to_dace,
-    iter_view_dim_map,
     materialize_indirect_view_sources,
     resolve_object_member,
     resolve_object_member_expr,
@@ -95,7 +94,7 @@ def _anchor_views_referenced_in_expr(
 
     Section-alias dummies are excluded  --  they have no SDFG descriptor
     and ``expr`` should have already been rewritten through
-    ``_rewrite_section_aliases_in_expr`` before this runs.
+    ``_fortran_subs_to_dace`` before this runs.
 
     Returns the (possibly updated) ``pre`` state to chain off.
     """
@@ -111,54 +110,6 @@ def _anchor_views_referenced_in_expr(
     for nm in referenced:
         acc(builder, anchor, nm)
     return anchor
-
-
-def _rewrite_section_aliases_in_expr(builder: SDFGBuilder, expr: str) -> str:
-    """Rewrite ``dummy[i, j]`` to ``source[i, j, k_const]`` for every
-    section_alias dummy referenced in ``expr``.
-
-    Used by emit_cond / emit_loop when condition / bound expressions
-    get lifted onto interstate-edge assignments  --  the dummy itself has
-    no SDFG descriptor, so a bare ``dummy`` symbol in the edge's free
-    symbols would trip ``sdfg.arglist`` (KeyError) and DaCe's
-    allocation-lifetime tracker.
-
-    The input subscripts are 0-based DaCe-form (built by
-    ``buildExprWithSubscripts`` as ``(idx) - 1``); ``view_dim_map``'s
-    scalar slots are 1-based Fortran-form, so we subtract 1 when
-    splicing them in.
-    """
-    if not isinstance(expr, str):
-        return expr
-    # Phantom object-alias scalar members may appear in condition/bound
-    # expressions; rewrite them to real SDFG symbols before section-alias
-    # handling so the downstream interstate edge references a registered name.
-    expr = resolve_object_member_expr(builder, expr)
-    if "[" not in expr:
-        return expr
-    section_dummies = {nm for nm, v in builder.arrays.items() if v.role == "section_alias"}
-    if not section_dummies:
-        return expr
-
-    def resolver(n):
-        return resolve_object_member(builder, n)
-
-    matches = list(find_array_subscripts(expr, builder.arrays, resolver))
-    if not matches:
-        return expr
-    out = expr
-    for start, end, arr, parts in reversed(matches):
-        if arr not in section_dummies:
-            continue
-        v = builder.arrays[arr]
-        new_parts = []
-        for _src_dim, slot, dummy_dim in iter_view_dim_map(v.view_dim_map):
-            if dummy_dim is not None:
-                new_parts.append(parts[dummy_dim] if dummy_dim < len(parts) else "0")
-            else:
-                new_parts.append(f"({slot}) - 1")
-        out = out[:start] + f"{v.view_source}[{', '.join(new_parts)}]" + out[end:]
-    return out
 
 
 def emit_assign(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
@@ -357,41 +308,6 @@ def emit_symbol_init(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: Contro
         read_expr = f"{arr}[{', '.join(str(i - 1) for i in idxs)}]"
     region.add_edge(ctx.cur, dst, InterstateEdge(assignments={sym: read_expr}))
     ctx.cur = dst
-
-
-def _fortran_subs_to_dace(expr: str, builder: SDFGBuilder) -> str:
-    """Rewrite every ``<arr>[<idx>, ...]`` substring in ``expr`` to
-    DaCe 0-based form ``<arr>[(<idx>) - offset_<arr>_d<i>, ...]`` for
-    each known array.  Used by ``emit_loop`` to convert Fortran-form
-    bound expressions (e.g. ``row_ptr[(i_0+1)]``) into valid DaCe
-    subscripts before they land in a LoopRegion's init / cond.
-    Non-array names (or untracked synthesised arrays) are left
-    unchanged.  Walks brackets balanced via ``find_array_subscripts``
-    so nested subscripts are handled correctly."""
-    if not isinstance(expr, str):
-        return expr
-    # Phantom object-alias scalar members (loop bounds, steps, ...) resolve to
-    # real SDFG symbols; rewrite them before the array-subscript pass so the
-    # LoopRegion's init/cond/update expressions reference registered names.
-    expr = resolve_object_member_expr(builder, expr)
-    if "[" not in expr:
-        return expr
-
-    def resolver(n):
-        return resolve_object_member(builder, n)
-
-    matches = list(find_array_subscripts(expr, builder.arrays, resolver))
-    if not matches:
-        return expr
-    out = []
-    cursor = 0
-    for start, end, arr, parts in matches:
-        out.append(expr[cursor:start])
-        new_inner = ", ".join(f"({p}) - offset_{arr}_d{d}" for d, p in enumerate(parts))
-        out.append(f"{arr}[{new_inner}]")
-        cursor = end
-    out.append(expr[cursor:])
-    return "".join(out)
 
 
 def _is_trivial_bound(expr: str, builder: SDFGBuilder | None = None) -> bool:
@@ -1139,7 +1055,7 @@ def emit_while(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowR
     # fixed for ``IF``.  Today the bridge folds break-on-false into
     # ``break`` nodes and sends ``True`` here -- but the day a real
     # condition lands, every gap below was an emit_cond fix:
-    cond = _rewrite_section_aliases_in_expr(builder, cond)
+    cond = _fortran_subs_to_dace(cond, builder)
 
     # When the condition references arrays, lift it through a
     # tasklet-into-scalar-transient (same per-occurrence connector
@@ -1206,7 +1122,7 @@ def _prepare_cond_expr(
     array-reading conditions, and caching of never-written conditions.
     """
     cond = n.condition if n.condition and n.condition != "?" else "True"
-    cond = _rewrite_section_aliases_in_expr(builder, cond)
+    cond = _fortran_subs_to_dace(cond, builder)
 
     accesses = n.accesses
     will_lift = bool(accesses) and any(ac.is_read and ac.array_name in builder.arrays for ac in accesses)

@@ -137,8 +137,8 @@ std::string buildExpr(mlir::Value val, int d);
 /// MAX/MIN (incl. cmp+select lowering), constant-indexed reads (via internPosSymbol), else "?". See assigns.cpp.
 std::string buildIndexExpr(mlir::Value v, int d);
 
-/// Like buildExpr but renders array reads with full arr[idx, ...] subscripts; used by buildBoolExpr for interstate-edge
-/// condition contexts. See control_flow.cpp.
+/// Like buildExpr but renders array reads with full Fortran arr[idx, ...] subscripts; the Python builder subtracts
+/// descriptor lower bounds once when emitting interstate expressions. See control_flow.cpp.
 std::string buildExprWithSubscripts(mlir::Value val, int d);
 
 /// Render an i1 SSA value as a Python boolean expression (cmpf/cmpi predicates, andi/ori/xori chains, fir.is_present

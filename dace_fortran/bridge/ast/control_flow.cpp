@@ -438,7 +438,7 @@ std::string cmpfPredStr(mlir::arith::CmpFPredicate p) {
   }
 }
 
-/// Like buildExpr but keeps explicit subscripts (a[(i)-1]) for a fir.load of an hlfir.designate; used by buildBoolExpr
+/// Like buildExpr but keeps Fortran subscripts (a[i]) for a fir.load of an hlfir.designate; used by buildBoolExpr
 /// since interstate-edge conditions evaluate in the caller's frame and can't rely on memlet-wired connectors.
 std::string buildExprWithSubscripts(mlir::Value val, int d) {
   if (d > limits::kBuildExprDepth || !val) return "?";
@@ -523,7 +523,7 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
           }
         }
         if (!yielded) return "?";
-        // Enumerate index combinations as literal Fortran-1-based integer strings; buildExprWithSubscripts converts to
+        // Enumerate index combinations as literal Fortran index strings; the Python builder converts to
         // 0-based at the access sites.
         std::vector<int64_t> cur(extents.size(), 1);
         auto incCur = [&]() -> bool {
@@ -656,9 +656,9 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
         for (size_t i = 0; i < dims.size(); ++i) {
           if (!first) s += ", ";
           if (dims[i].isTriplet)
-            s += std::to_string(dims[i].values[cur[i]] - 1);
+            s += std::to_string(dims[i].values[cur[i]]);
           else
-            s += "(" + dims[i].scalarExpr + ") - 1";
+            s += dims[i].scalarExpr;
           first = false;
         }
         s += "]";
@@ -690,7 +690,7 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
     }
   }
 
-  // fir.load of hlfir.designate: emit 0-based subscripts, peeling any fir.convert between load and designate -- without
+  // fir.load of hlfir.designate: keep Fortran subscripts, peeling any fir.convert between load and designate -- without
   // this a chain like `fir.convert %designate; fir.load` falls out of the designate branch, bottoms out to buildExpr,
   // and strips the subscript (cloudsc line 2140's `(1.0 - ZA(JL,JK)) < ZEPSEC` hits this via arith.subf -> load ->
   // convert -> designate).
@@ -716,9 +716,10 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
         if (indices.empty()) return arr;
         std::string s = arr + "[";
         bool first = true;
+        unsigned dim = 0;
         for (auto idx : indices) {
           if (!first) s += ", ";
-          s += "(" + buildIndexExpr(idx, d + 1) + ") - 1";
+          s += buildDesignateIndexExpr(dg, dim++, idx, d + 1);
           first = false;
         }
         s += "]";
