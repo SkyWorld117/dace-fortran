@@ -67,6 +67,7 @@ static ASTNode buildScfIfAsConditional(mlir::scf::IfOp ifOp) {
           a.kind = "assign";
           a.target = target;
           a.expr = expr;
+          collectReadAccesses(yieldOp.getOperand(i), a.accesses, 0);
           a.target_is_array = false;
           arm.push_back(std::move(a));
         }
@@ -228,6 +229,7 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
           a.kind = "assign";
           a.target = scfSynthName(whileOp.getResult(i));
           a.expr = yieldedExpr(args[i]);
+          collectReadAccesses(args[i], a.accesses, 0);
           a.target_is_array = false;
           out.push_back(std::move(a));
         }
@@ -2574,6 +2576,7 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
         a.target = synth[i];
         a.target_is_array = false;
         a.expr = (i == 0) ? buildBoolExpr(iterOps[0], 0) : buildExpr(iterOps[i], 0);
+        collectReadAccesses(iterOps[i], a.accesses, 0);
         nodes.push_back(std::move(a));
         kScfValueMap[body.getArgument(i + 1)] = synth[i];
       }
@@ -2627,6 +2630,7 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
         a.target = synth[i];
         a.target_is_array = false;
         a.expr = (i == 0) ? buildBoolExpr(term->getOperand(0), 0) : buildExpr(term->getOperand(i), 0);
+        collectReadAccesses(term->getOperand(i), a.accesses, 0);
         n.children.push_back(std::move(a));
       }
       indexStack().pop_back();
@@ -3631,6 +3635,7 @@ static std::vector<ASTNode> buildIndexSwitchNodes(mlir::scf::IndexSwitchOp sw) {
       a.kind = "assign";
       a.target = scfSynthName(sw.getResult(i));
       a.expr = yieldedExpr(yieldOp.getOperand(i));
+      collectReadAccesses(yieldOp.getOperand(i), a.accesses, 0);
       a.target_is_array = false;
       body.push_back(std::move(a));
     }

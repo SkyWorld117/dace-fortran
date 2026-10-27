@@ -144,3 +144,36 @@ def test_nonunit_condition_read_matches_writes_for_parallel_mapping(tmp_path):
          its=2, ite=4, jts=2, jte=4)
     np.testing.assert_array_equal(mask, expected_mask)
     np.testing.assert_array_equal(out, expected)
+
+
+def test_named_search_exit_preserves_array_read_bounds(tmp_path):
+    src = """
+subroutine first_match(lo, hi, lj, uj, a, threshold, out)
+  integer, value :: lo, hi, lj, uj
+  real(8), intent(in) :: a(lo:hi,1:8,lj:uj), threshold(lo:hi,lj:uj)
+  integer, intent(inout) :: out(lo:hi,lj:uj)
+  integer :: i, j, k
+  do j = 2, 4
+    do i = 2, 4
+      search: do k = 1, 5
+        if (a(i,k,j) >= threshold(i,j)) then
+          out(i,j) = k
+          exit search
+        endif
+      enddo search
+    enddo
+  enddo
+end subroutine
+"""
+    lo, hi, lj, uj = -3, 7, -2, 8
+    ii, jj = np.indices((11, 11))
+    threshold = np.asfortranarray(((ii + 2 * jj) % 4).astype(np.float64) + 1.5)
+    a = np.broadcast_to(np.arange(1., 9.)[None, :, None], (11, 8, 11)).copy(order="F")
+    out = np.full((11, 11), -9, dtype=np.int32, order="F")
+    expected = out.copy(order="F")
+    for j in range(2, 5):
+        for i in range(2, 5):
+            expected[i - lo, j - lj] = int(np.ceil(threshold[i - lo, j - lj]))
+    sdfg = build_sdfg(src, tmp_path, name="first_match").build()
+    sdfg(a=a, threshold=threshold, out=out, lo=lo, hi=hi, lj=lj, uj=uj)
+    np.testing.assert_array_equal(out, expected)
