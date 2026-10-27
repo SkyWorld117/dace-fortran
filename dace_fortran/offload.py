@@ -19,6 +19,7 @@ CPU-scheduled, so a device kernel needs the schedule/storage assignment below on
 sound (applied library-wide it made a real kernel produce NaN), so it is enabled per kernel and
 paid for by that kernel's differential gate.
 """
+import copy
 import re
 
 import dace
@@ -446,8 +447,65 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
     return n
 
 
+def _device_array_tasklets(sdfg, block_size=None):
+    """Place residual array-only host tasklets in singleton GPU maps.
+
+    Only unscoped tasklets with direct AccessNode operands qualify. Outputs
+    must all be GPU arrays; input scalars may cross by value. Host arrays,
+    scalar/control outputs, side-effect tasklets and tasklet chains stay with
+    the existing offload logic. The one-iteration map preserves serial order.
+    """
+    changed = 0
+    for state in sdfg.all_states():
+        scope = state.scope_dict()
+        for tasklet in list(state.nodes()):
+            if not isinstance(tasklet, nodes.Tasklet) or scope.get(tasklet) is not None:
+                continue
+            if tasklet.has_side_effects(sdfg) or tasklet.has_ordered_side_effects(sdfg):
+                continue
+            if tasklet.code.language != dace.Language.Python and tasklet.side_effects is not False:
+                continue
+            incoming = list(state.in_edges(tasklet))
+            outgoing = list(state.out_edges(tasklet))
+            if not outgoing:
+                continue
+            if any(not isinstance(edge.src, nodes.AccessNode) for edge in incoming):
+                continue
+            if any(not isinstance(edge.dst, nodes.AccessNode) for edge in outgoing):
+                continue
+            if any(edge.data.is_empty() for edge in incoming + outgoing):
+                continue
+            outputs = [sdfg.arrays[edge.data.data] for edge in outgoing]
+            if any(not isinstance(desc, dace.data.Array) or desc.storage != dace.StorageType.GPU_Global
+                   for desc in outputs):
+                continue
+            inputs = [sdfg.arrays[edge.data.data] for edge in incoming]
+            if any(not isinstance(desc, dace.data.Scalar) and desc.storage != dace.StorageType.GPU_Global
+                   for desc in inputs):
+                continue
+            parameter = f"__device_element_{changed}"
+            while parameter in sdfg.symbols or parameter in sdfg.arrays:
+                parameter += "_"  # Do not shadow a genuine caller/loop symbol.
+            entry, map_exit = state.add_map(
+                f"device_element_{changed}", {parameter: "0:1"}, schedule=dace.ScheduleType.GPU_Device)
+            if block_size:
+                entry.gpu_block_size = tuple(block_size)
+            for edge in incoming:
+                state.remove_edge(edge)
+                state.add_memlet_path(edge.src, entry, tasklet, src_conn=edge.src_conn,
+                                      dst_conn=edge.dst_conn, memlet=copy.deepcopy(edge.data))
+            if not incoming:
+                state.add_edge(entry, None, tasklet, None, dace.Memlet())
+            for edge in outgoing:
+                state.remove_edge(edge)
+                state.add_memlet_path(tasklet, map_exit, edge.dst, src_conn=edge.src_conn,
+                                      dst_conn=edge.dst_conn, memlet=copy.deepcopy(edge.data))
+            changed += 1
+    return changed
+
+
 def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False,
-                            permissive_ltm=False, device_libnodes=False, device_scalars=False):
+                            permissive_ltm=False, device_libnodes=False, device_scalars=False, device_tasklets=False):
     """Schedule + storage assignment for device-resident offload. In place.
 
     `device_libnodes` is OFF by default and turned on PER FRONTEND (WRF), because it changes the
@@ -470,6 +528,10 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     hand-written in the union form -- so turning it on cannot move them; it exists for the TUs the
     extractor emits from the source's own sibling form.  Turn it on per kernel, with that kernel's
     differential.
+
+    `device_tasklets` is OFF by default. It wraps residual, side-effect-free
+    array-output tasklets in singleton GPU maps before the host-mirror fallback;
+    scalar/control outputs and host array operands are excluded.
 
     `device_scalars` is OFF by default and turned on PER KERNEL: it gives every scalar a top-level
     map reads a device copy (the colleague's `substitute/device_scalars`).  MEASURED on
@@ -626,6 +688,12 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
             arr.storage = dace.dtypes.StorageType.GPU_Global
             promoted.append(name)
             n_dev += 1
+
+    # Before the host-mirror fallback: a scalar array update need not return
+    # to the CPU merely because short-loop unrolling removed its enclosing map.
+    if device_tasklets:
+        count=_device_array_tasklets(sdfg,block_size)
+        if count: print(f'[dace_fortran.offload] device-scheduled {count} residual array tasklet(s)')
 
     from dace.sdfg.validation import InvalidSDFGEdgeError, InvalidSDFGInterstateEdgeError
     demoted = []
