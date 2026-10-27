@@ -27,7 +27,7 @@ from dace.sdfg import nodes
 from dace.sdfg.state import SDFGState
 
 
-def _mapify(sdfg, permissive_ltm=False):
+def _mapify(sdfg, permissive_ltm=False, loop_map_patterns=None):
     """LoopToMap + MapCollapse at this level, then recurse into nested SDFGs.
 
     dp.optimize's LoopToMap runs on the top-level SDFG only: for the pack
@@ -55,8 +55,11 @@ def _mapify(sdfg, permissive_ltm=False):
     those loops as control flow and, if it then has no map to schedule, ``offload_device_resident``
     FAILS LOUDLY (see the ``n_gpu == 0`` guard) -- loud failure beats a silently restructured, wrong
     kernel.  A caller that has a differential for one kernel opts in with ``permissive_ltm=True``."""
-    from dace.transformation.interstate.loop_to_map import LoopToMap
     from dace.transformation.dataflow import MapCollapse
+
+    from dace_fortran.loop_mapping import loop_to_map_type
+
+    LoopToMap = loop_to_map_type(loop_map_patterns)
 
     def _apply_ltm(sdfg):
         """LoopToMap, escalating to permissive only when the caller opted in.
@@ -83,7 +86,7 @@ def _mapify(sdfg, permissive_ltm=False):
     for state in sdfg.all_states():
         for node in list(state.nodes()):
             if isinstance(node, nodes.NestedSDFG):
-                _mapify(node.sdfg, permissive_ltm=permissive_ltm)
+                _mapify(node.sdfg, permissive_ltm=permissive_ltm, loop_map_patterns=loop_map_patterns)
     sdfg.apply_transformations_repeated(MapCollapse, validate=False)
 
 
@@ -505,7 +508,7 @@ def _device_array_tasklets(sdfg, block_size=None):
 
 
 def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False,
-                            permissive_ltm=False, device_libnodes=False, device_scalars=False, device_tasklets=False):
+                            permissive_ltm=False, device_libnodes=False, device_scalars=False, device_tasklets=False, loop_map_patterns=None):
     """Schedule + storage assignment for device-resident offload. In place.
 
     `device_libnodes` is OFF by default and turned on PER FRONTEND (WRF), because it changes the
@@ -553,7 +556,7 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     #     frontend introduces: MapCollapse cannot fuse across the nested-SDFG
     #     boundary, and without fusion the GPU map would cover only the outer
     #     loop (sys_size/nvar threads) with the N^3 loops serial per thread.
-    _mapify(sdfg, permissive_ltm=permissive_ltm)
+    _mapify(sdfg, permissive_ltm=permissive_ltm, loop_map_patterns=loop_map_patterns)
     from dace.sdfg import utils as sutils
     sutils.inline_sdfgs(sdfg, permissive=True)
     if force_inline:

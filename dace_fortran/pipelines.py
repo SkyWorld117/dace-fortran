@@ -32,7 +32,6 @@ from dace import SDFG
 from dace.sdfg import nodes
 from dace.sdfg.utils import specialize_scalars, specialize_symbols
 from dace.transformation.dataflow.map_collapse import MapCollapse
-from dace.transformation.interstate.loop_to_map import LoopToMap
 from dace.transformation.interstate.state_fusion_with_happens_before import StateFusionExtended
 from dace.transformation.pass_pipeline import Pipeline
 from dace.transformation.passes.full_map_fusion import FullMapFusion
@@ -203,6 +202,7 @@ def optimize(
     device_libnodes: bool = False,
     device_tasklets: bool = False,
     allow_abi_scalar_fission: bool = False,
+    loop_map_patterns: list[str] | None = None,
 ) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
 
@@ -222,6 +222,8 @@ def optimize(
     :param permissive_ltm: allow the PERMISSIVE ``LoopToMap`` escalation when the conservative
                 per-iteration affine-write check refuses every loop.  NOT generally sound and the
                 failure is SILENT; enabled per kernel, paid for by that kernel's differential.
+    :param loop_map_patterns: optionally restrict LoopToMap candidates by full loop-label
+        regex matches, retaining conservative dependence checks; None leaves selection unchanged.
     :param device_tasklets: wrap residual array-output tasklets in singleton GPU maps,
         avoiding host mirrors for scalar array updates. Off by default.
     :param device_libnodes: schedule a top-level compute library node whose inputs are all
@@ -260,7 +262,8 @@ def optimize(
     _fissioned = fission_loop_local_scalars(sdfg, allow_abi_staged=allow_abi_scalar_fission)
     if _fissioned:
         print(f"[dace_fortran.optimize] loop-local scalar fission: {len(_fissioned)} container(s)")
-    sdfg.apply_transformations_repeated(LoopToMap, validate=validate)
+    from dace_fortran.loop_mapping import loop_to_map_type
+    sdfg.apply_transformations_repeated(loop_to_map_type(loop_map_patterns), validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)
     # FullMapFusion: MapFusionVertical + MapFusionHorizontal run together to a fixed point, not just
     # vertical -- horizontal fuses maps that only share an input, no producer/consumer edge.
@@ -285,7 +288,8 @@ def optimize(
                                                      split_siblings=split_siblings,
                                                      permissive_ltm=permissive_ltm,
                                                      device_libnodes=device_libnodes,
-                                                     device_tasklets=device_tasklets)
+                                                     device_tasklets=device_tasklets,
+                                                     loop_map_patterns=loop_map_patterns)
         print(f"[dace_fortran.optimize] gpu offload: {n_gpu} device map(s), {n_dev} device array(s)")
 
     if validate:
