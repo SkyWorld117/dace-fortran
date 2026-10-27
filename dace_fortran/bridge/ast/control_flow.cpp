@@ -887,8 +887,14 @@ std::string yieldedExpr(mlir::Value v) {
   // subscripts via buildBoolExpr, not through NoSubscriptGuard's bare-name path -- else `rsdnm < tolrsd` renders as a
   // POINTER comparison in C++ (both double* params), silently breaking early-return semantics (NPB LU ssor istep bug;
   // see tests/lu_two_call_convergence_repro_test.py).
-  auto b = buildBoolExpr(v, 0);
-  if (b != "?") return b;
+  // The structurizer also yields integer exit-reason codes (e.g. 1 for
+  // a matching EXIT, 2 for normal exhaustion). Boolean rendering would
+  // collapse every nonzero code to True and execute the wrong successor.
+  if (v.getType().isInteger(1) || mlir::isa<fir::LogicalType>(v.getType())) {
+    auto b = buildBoolExpr(v, 0);
+    if (b != "?") return b;
+  }
+  ForceSubscriptsGuard const subscriptGuard;
   return buildExpr(v, 0);
 }
 

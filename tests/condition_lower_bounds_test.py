@@ -177,3 +177,30 @@ end subroutine
     sdfg = build_sdfg(src, tmp_path, name="first_match").build()
     sdfg(a=a, threshold=threshold, out=out, lo=lo, hi=hi, lj=lj, uj=uj)
     np.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("threshold,expected", [(1.5, 2), (7.5, 1)])
+def test_bounded_search_distinguishes_exhaustion_from_exit(tmp_path, threshold, expected):
+    src = """
+subroutine bounded_search(a, threshold, out)
+  real(8), intent(in) :: a(5), threshold
+  integer, intent(inout) :: out(2)
+  integer :: k
+  out(1) = 1
+  find: do k = 1, 5
+    if (k >= out(1)) then
+      if (threshold <= a(k)) then
+        out(1) = k
+        exit find
+      else
+        cycle find
+      endif
+    endif
+  enddo find
+end subroutine
+"""
+    a = np.arange(1., 6.)
+    out = np.zeros(2, dtype=np.int32)
+    sdfg = build_sdfg(src, tmp_path, name="bounded_search").build()
+    sdfg(a=a, threshold=threshold, out=out)
+    assert out[0] == expected
