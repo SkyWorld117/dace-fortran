@@ -180,7 +180,8 @@ end subroutine
 
 
 @pytest.mark.parametrize("threshold,expected", [(1.5, 2), (7.5, 1)])
-def test_bounded_search_distinguishes_exhaustion_from_exit(tmp_path, threshold, expected):
+@pytest.mark.parametrize("extent", [1, 2])
+def test_bounded_search_distinguishes_exhaustion_from_exit(tmp_path, threshold, expected, extent):
     src = """
 subroutine bounded_search(a, threshold, out)
   real(8), intent(in) :: a(5), threshold
@@ -199,8 +200,9 @@ subroutine bounded_search(a, threshold, out)
   enddo find
 end subroutine
 """
+    src = src.replace("out(2)", f"out({extent})")
     a = np.arange(1., 6.)
-    out = np.zeros(2, dtype=np.int32)
+    out = np.zeros(extent, dtype=np.int32)
     sdfg = build_sdfg(src, tmp_path, name="bounded_search").build()
     sdfg(a=a, threshold=threshold, out=out)
     assert out[0] == expected
