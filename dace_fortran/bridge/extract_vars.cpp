@@ -1821,8 +1821,10 @@ void buildCollisionSet(mlir::ModuleOp module, const std::string& entryScope) {
 void prepareExtractionState(mlir::ModuleOp module, const std::string& entry_symbol) {
   // Latent #1 + D1: clear thread-locals FIRST.  ``buildAllocatedReaderNames``
   // and similar pre-walk helpers must not see stale per-thread state
-  // from a previous extract (e.g. a prior module's collision set).
+  // from a previous extract (e.g. a prior module's collision set, or its
+  // re-allocation aliases, which ``traceToDecl`` reads here before the AST walk).
   clearManglingOverrides();
+  clearAllocAliases();
 
   // Latent #8: reject user variable names that collide with bridge-
   // rendered intrinsics; auto-rename user variable names that collide

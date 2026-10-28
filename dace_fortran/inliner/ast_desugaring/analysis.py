@@ -448,14 +448,46 @@ def _eval_selected_int_kind(p: Union[int, np.integer]) -> int:
     return 8
 
 
-def _eval_selected_real_kind(p: int, r: int) -> int:
-    """Calculates the real kind value from a given precision and range."""
-    # Copied logic from `replace_real_kind()` elsewhere in the project.
-    if p >= 9 or r > 126:
-        return 8
-    if p >= 3 or r > 14:
+def _eval_selected_real_kind(p: int | None, r: int | None, radix: int | None = None) -> int | None:
+    """Fold an unambiguous IEEE binary32/binary64 request supported by the frontend.
+
+    PRECISION/RANGE count decimal digits, not bits or bytes. Requests that might
+    select a smaller processor-specific kind, a wider format, or another radix
+    stay as intrinsics for the Fortran compiler; guessing a kind changes types.
+    """
+    if radix not in (None, 2) or p is None or p < 4:
+        return None
+    required_range = 0 if r is None else r
+    if p <= 6 and required_range <= 37:
         return 4
-    return 2
+    if p <= 15 and required_range <= 307:
+        return 8
+    return None
+
+
+def _selected_real_kind_args(args: list[Base], alias_map: types.SPEC_TABLE) -> tuple[int | None, int | None, int | None] | None:
+    """Resolve positional, keyword and mixed P/R/RADIX arguments without guessing unknown values."""
+    names = ("P", "R", "RADIX")
+    values: dict[str, int] = {}
+    keyword_seen = False
+    for position, arg in enumerate(args):
+        if isinstance(arg, f03.Actual_Arg_Spec):
+            keyword, value = arg.children
+            name = keyword.string.upper()
+            keyword_seen = True
+        else:
+            if keyword_seen or position >= len(names):
+                return None
+            name, value = names[position], arg
+        if name not in names or name in values:
+            return None
+        constant = const_eval_basic_type(value, alias_map)
+        if constant is None or not types.is_numpy_int(constant):
+            return None
+        values[name] = int(constant)
+    if not values or not ("P" in values or "R" in values):
+        return None
+    return values.get("P"), values.get("R"), values.get("RADIX")
 
 
 def _cdiv(x: types.NUMPY_TYPES, y: types.NUMPY_TYPES) -> types.NUMPY_TYPES:
@@ -664,11 +696,9 @@ def const_eval_basic_type(expr: Base, alias_map: types.SPEC_TABLE) -> types.NUMP
             ):
                 return INTR_FNS[intr.string](*avals)
         elif intr.string == "SELECTED_REAL_KIND":
-            p, r = args
-            p, r = const_eval_basic_type(p, alias_map), const_eval_basic_type(r, alias_map)
-            if p is None or r is None:
-                return None
-            return np.int32(_eval_selected_real_kind(int(p), int(r)))
+            values = _selected_real_kind_args(args, alias_map)
+            kind = _eval_selected_real_kind(*values) if values is not None else None
+            return np.int32(kind) if kind is not None else None
         elif intr.string == "SELECTED_INT_KIND":
             (p,) = args
             p = const_eval_basic_type(p, alias_map)
@@ -1282,11 +1312,8 @@ def _const_eval_int(expr: Base, alias_map: types.SPEC_TABLE) -> int | None:
         if args:
             args = args.children
         if intr.string == "SELECTED_REAL_KIND":
-            assert len(args) == 2
-            p, r = args
-            p, r = _const_eval_int(p, alias_map), _const_eval_int(r, alias_map)
-            assert p is not None and r is not None
-            return _eval_selected_real_kind(p, r)
+            values = _selected_real_kind_args(list(args or ()), alias_map)
+            return _eval_selected_real_kind(*values) if values is not None else None
         if intr.string == "SELECTED_INT_KIND":
             assert len(args) == 1
             (p,) = args

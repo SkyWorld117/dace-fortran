@@ -10,6 +10,7 @@ offset inside ``scratch``, matching the f2py-compiled gfortran reference
 element-by-element (NPB LU's ``scratch``/``buf`` pattern).
 """
 
+import dace
 import numpy as np
 
 from tests._util import build_sdfg
@@ -296,3 +297,47 @@ end module
     expected += (i+1) + 10*(k+1) + 100*(j+1) + 1000*(species+1)
     sdfg(a=actual, ni=shape[0], nk=shape[1], nj=shape[2])
     np.testing.assert_array_equal(actual, expected)
+
+_SRC_ALIAS_AND_REINTERPRET = """\
+subroutine bump(buf, n)
+  integer, intent(in) :: n
+  double precision, intent(inout) :: buf(n)
+  integer :: i
+  do i = 1, n
+    buf(i) = buf(i) + real(i, kind=8)
+  end do
+end subroutine bump
+
+subroutine both(x, y)
+  double precision, intent(inout) :: x(12)
+  double precision, intent(out) :: y(12)
+  double precision, allocatable :: z(:, :)
+  integer :: i, j
+  allocate(z(3, 4))
+  z = 0.d0
+  call bump(x, 12)
+  call bump(z, 12)
+  do j = 1, 4
+    do i = 1, 3
+      y(i + 3*(j - 1)) = z(i, j)
+    end do
+  end do
+  deallocate(z)
+end subroutine both
+"""
+
+
+
+
+def test_a_dummy_reinterpreting_one_actual_leaves_the_aliased_one_an_array(tmp_path):
+    """``bump``'s ``buf(n)`` aliases ``x(12)`` at one call and reinterprets the rank of the allocatable ``z(3, 4)``
+    at the other: the second inlined copy is a view of ``z``, and ``x`` stays the argument it is."""
+    sdfg = build_sdfg(_SRC_ALIAS_AND_REINTERPRET, tmp_path / "sdfg", name="both", entry="both").build()
+    assert not isinstance(sdfg.arrays["x"], dace.data.View)
+
+    x = np.full(12, 10.0, dtype=np.float64)
+    y = np.zeros(12, dtype=np.float64)
+    sdfg(x=x, y=y)
+
+    np.testing.assert_array_equal(x, 10.0 + np.arange(1, 13))
+    np.testing.assert_array_equal(y, np.arange(1, 13, dtype=np.float64))

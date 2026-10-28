@@ -3471,7 +3471,6 @@ std::vector<ASTNode> extractAST(mlir::ModuleOp module, const std::string& entry_
   // Defensive: kBoolExprNoSubscripts should be false at module-walk start; a previous extractAST aborted mid-walk
   // (exception) could leave it set despite the RAII guard.
   kBoolExprNoSubscripts = false;
-  clearAllocAliases();
 
   // Reseeds per-thread extraction state; without this, calling extractAST standalone or on a different module than the
   // prior extractVariables would leak stale kEntryScope/kShortNameCollisions. Shares the same helper extractVariables

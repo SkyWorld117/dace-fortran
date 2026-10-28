@@ -64,6 +64,29 @@ def test_inlined_function_section_alias_reads_correct_column(tmp_path):
     np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12)
 
 
+_SRC_REALLOC = """
+SUBROUTINE realloc(out)
+  IMPLICIT NONE
+  REAL(8), INTENT(OUT) :: out
+  REAL(8), ALLOCATABLE :: a(:)
+  ALLOCATE(a(2))
+  a = 1.0D0
+  out = a(1)
+  DEALLOCATE(a)
+  ALLOCATE(a(3))
+  a = 2.0D0
+  out = out + a(3)
+  DEALLOCATE(a)
+END SUBROUTINE
+"""
+
+
+def test_section_alias_after_a_build_that_reallocates_the_same_name(tmp_path):
+    """A prior build in the same process re-allocating ``a`` (aliased ``a_alloc1``) must not rename this build's ``a``."""
+    assert "a_alloc1" in build_sdfg(_SRC_REALLOC, tmp_path / "realloc", name="realloc").build().arrays
+    test_inlined_function_section_alias_reads_correct_column(tmp_path / "section")
+
+
 # (b) -------------------------------------------------------------------
 _SRC_VALUE_INDEX = """
 MODULE m_idxb
@@ -106,6 +129,10 @@ def test_value_symbol_index_on_pointer_member_is_one_based(tmp_path):
 
 
 if __name__ == "__main__":
-    import pytest
+    import tempfile
+    from pathlib import Path
 
-    raise SystemExit(pytest.main([__file__]))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_inlined_function_section_alias_reads_correct_column(Path(tmp) / "a")
+        test_section_alias_after_a_build_that_reallocates_the_same_name(Path(tmp) / "b")
+        test_value_symbol_index_on_pointer_member_is_one_based(Path(tmp) / "c")
