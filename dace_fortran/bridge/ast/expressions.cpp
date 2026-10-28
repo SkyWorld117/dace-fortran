@@ -1477,7 +1477,7 @@ std::string buildExpr(mlir::Value val, int d) {
     if (inIsFloat && outIsFloat) {
       auto inW = mlir::cast<mlir::FloatType>(inT).getWidth();
       auto outW = mlir::cast<mlir::FloatType>(outT).getWidth();
-      if (inW < outW && !kSuppressFloatCast) {
+      if (inW < outW) {
         const char* cast = inW == 32 ? "float32" : "float64";
         return std::string(cast) + "(" + buildExpr(conv.getValue(), d + 1) + ")";
       }
@@ -1854,7 +1854,7 @@ std::string buildExpr(mlir::Value val, int d) {
       // ``5.5``.  Pairs with the ``fir.convert f32->f64`` wrap so
       // both the literal and the widening cast preserve the
       // intended precision.
-      if (isF32 && !kSuppressFloatCast) return "float32(" + lit + ")";
+      if (isF32) return "float32(" + lit + ")";
       return lit;
     }
     if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue())) {

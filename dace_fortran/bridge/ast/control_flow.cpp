@@ -442,10 +442,9 @@ std::string cmpfPredStr(mlir::arith::CmpFPredicate p) {
 /// since interstate-edge conditions evaluate in the caller's frame and can't rely on memlet-wired connectors.
 std::string buildExprWithSubscripts(mlir::Value val, int d) {
   if (d > limits::kBuildExprDepth || !val) return "?";
-  // Output lands in an interstate-edge/ConditionalBlock condition parsed by DaCe's symbolic engine, which can't handle
-  // the dace.float32(...) wrap (treats dace as a free symbol); suppress it for this walk since f32-vs-f64 doesn't
-  // change comparison outcomes.
-  SuppressFloatCastGuard const floatCastGuard;
+  // Bare numeric casts are supported by DaCe's symbolic/codegen layer. Keep
+  // literal kinds: widening a short f32 decimal directly to f64 changes range
+  // boundary tests, and untyped constants change arithmetic before comparison.
   auto* def = val.getDefiningOp();
   if (!def) return "?";
   // A reduction op materialised into a scalar by materialiseCondReductions (Reduce lib-node before the branch) renders

@@ -110,19 +110,6 @@ struct ForceSubscriptsGuard {
   ~ForceSubscriptsGuard() { kForceSubscripts = prev; }
 };
 
-/// When true, suppress the dace.float32(...) wrap around f32 constants/converts. Set inside
-/// buildBoolExpr/buildExprWithSubscripts, whose output lands in an interstate-edge/ConditionalBlock condition parsed by
-/// DaCe's symbolic engine -- which treats dace.float32 as a free symbol and raises KeyError: 'dace'. Harmless inside
-/// tasklet bodies; the f32-vs-f64 difference doesn't change comparison outcomes anyway.
-inline thread_local bool kSuppressFloatCast = false;
-
-/// RAII guard scoping ``kSuppressFloatCast = true``.
-struct SuppressFloatCastGuard {
-  bool prev;
-  SuppressFloatCastGuard() : prev(kSuppressFloatCast) { kSuppressFloatCast = true; }
-  ~SuppressFloatCastGuard() { kSuppressFloatCast = prev; }
-};
-
 // ============================================================================
 // Cross-file API
 // ============================================================================
