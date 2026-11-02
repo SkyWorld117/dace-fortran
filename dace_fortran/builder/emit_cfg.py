@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Container, Sequence
+from itertools import pairwise
 from typing import TYPE_CHECKING, NamedTuple
 
 import dace
@@ -818,7 +819,8 @@ def emit_loop(
                 ctx.sdfg.add_symbol(sym, dace.int64)
         symbol_assign_pairs: list[tuple[str, str]] = []
         for a in symbol_assigns:
-            symbol_assign_pairs.append((a.target, array_read_to_dace_expr(builder, a, iter_map, ctx.sdfg)))
+            rhs = array_read_to_dace_expr(builder, a, iter_map, ctx.sdfg, indirect_syms)
+            symbol_assign_pairs.append((a.target, rhs))
 
         def _emit_one(st: SDFGState, a: NodeLike, i: int) -> None:
             # A complex-as-2-reals component-alias write (``qg(c,i)=...``) is a
@@ -848,7 +850,9 @@ def emit_loop(
         symbol_targets = [t for t, _ in symbol_assign_pairs] + [t for t, _ in per_sym_assigns]
         repeated_symbol_write = len(symbol_targets) != len(set(symbol_targets))
 
-        if hazardous or repeated_symbol_write:
+        if hazardous or repeated_symbol_write or any(
+            a.target not in builder.symbols and b.target in builder.symbols for a, b in pairwise(child_assigns)
+        ):
             # At least one hoisted assignment reads a value something it skips past defines, or
             # overwrites a value something it skips past reads, so the hoist would rotate it by an
             # iteration (see ``_hoist_hazard_targets`` / ``_overwritten_after_read``).  Emit the batch
@@ -890,6 +894,7 @@ def emit_loop(
                         loop.add_edge(cur, nxt, edge)
                         cur, edge = nxt, InterstateEdge()
                     edge.assignments[tgt] = rhs
+                    emitted_syms -= {sym for expr, sym in indirect_syms.items() if tgt in _rhs_free_symbols(expr)}
                     continue
                 # A pending symbol edge -- or a sibling array/scalar hazard -- closes the state
                 # first; the first compute always opens one so nothing lands in ``pre``.
@@ -899,6 +904,7 @@ def emit_loop(
                     cur, edge = nxt, InterstateEdge()
                 _emit_one(cur, a, compute_i)
                 compute_i += 1
+                emitted_syms -= {sym for expr, sym in indirect_syms.items() if a.target in _rhs_free_symbols(expr)}
             if edge.assignments:  # trailing symbol assignments still need a state to land on
                 loop.add_edge(cur, loop.add_state(f"body_{builder.nid()}"), edge)
             return
