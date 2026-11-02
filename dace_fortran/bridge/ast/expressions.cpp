@@ -1706,8 +1706,24 @@ std::string buildExpr(mlir::Value val, int d) {
   }
   if ((nm == "arith.shli" || nm == "arith.shrui") && def->getNumOperands() == 2) {
     const char* fn = (nm == "arith.shli") ? "logical_left_shift" : "logical_right_shift";
-    return std::string(fn) + "(" + buildExpr(def->getOperand(0), d + 1) + ", " + buildExpr(def->getOperand(1), d + 1) +
-           ")";
+    // The operand's own C++ type is not the Fortran kind: an integer convert is transparent, so the cast restores the
+    // width the unsigned shift runs in. Only int32 and int64 are casts in every expression context, interstate
+    // included.
+    auto resT = def->getResult(0).getType();
+    // A narrow logical right shift needs an int8/int16 cast symbolic expressions lack. BTEST masks bit 0 of the result,
+    // which the promoted int gets right.
+    auto masksBitZero = [](mlir::OpOperand& use) {
+      auto mask = mlir::dyn_cast<mlir::arith::AndIOp>(use.getOwner());
+      if (!mask) return false;
+      auto bit = traceConstInt(mask.getOperand(1 - use.getOperandNumber()));
+      return bit && *bit == 1;
+    };
+    if (nm == "arith.shrui" && (resT.isInteger(8) || resT.isInteger(16)) &&
+        !llvm::all_of(def->getResult(0).getUses(), masksBitZero))
+      throw std::runtime_error("ISHFT / IBITS on integer(1) or integer(2) is not lowered");
+    std::string operand = buildExpr(def->getOperand(0), d + 1);
+    if (resT.isInteger(32) || resT.isInteger(64)) operand = (resT.isInteger(32) ? "int32(" : "int64(") + operand + ")";
+    return std::string(fn) + "(" + operand + ", " + buildExpr(def->getOperand(1), d + 1) + ")";
   }
 
   // Integer Fortran MOD lowers to ``arith.remsi`` / ``arith.remui``: the SDFG's truncated ``FtnMod``.
