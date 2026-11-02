@@ -631,7 +631,9 @@ std::string buildIndexExpr(mlir::Value v, int d) {
           auto c = traceConstInt(x);
           return c && *c == want;
         };
-        bool const condIsZeroExtent = isConst(cmp.getRhs(), 0) || isConst(cmp.getLhs(), 0);
+        // Extents compare as ``index``; a Fortran integer never does, so ``merge(1, j, k == 0)`` stays out.
+        bool const condIsZeroExtent =
+            cmp.getLhs().getType().isIndex() && (isConst(cmp.getRhs(), 0) || isConst(cmp.getLhs(), 0));
         mlir::Value const t = sel.getTrueValue();
         mlir::Value const f = sel.getFalseValue();
         if (condIsZeroExtent && pred == P::eq && isConst(t, 1))
@@ -788,40 +790,7 @@ ASTNode buildAssignNode(hlfir::AssignOp assign) {
       }
       return;
     }
-    // Scalar min/max idiom: ``arith.select(arith.cmpf|cmpi, t, f)``
-    // where buildExpr emits ``min(t, f)`` / ``max(t, f)``.  The cmp
-    // and the select reference the SAME ``t`` and ``f`` loads, so
-    // recursing into both branches would record 4 AccessInfos for
-    // the 2 textual operands ``min/max`` emits.  Skip the cmp's
-    // operands here so the AccessInfo count matches the textual
-    // occurrences emit_tasklet's regex sees.  Falls back to the
-    // generic operand walk for any select that doesn't match the
-    // idiom (in particular when t != cmp.lhs or f != cmp.rhs, which
-    // is the actual conditional-select shape).
-    if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(op)) {
-      auto* cdef = sel.getCondition().getDefiningOp();
-      bool isMinMax = false;
-      if (auto cmp = mlir::dyn_cast_or_null<mlir::arith::CmpFOp>(cdef)) {
-        using P = mlir::arith::CmpFPredicate;
-        auto pred = cmp.getPredicate();
-        bool const ok_pred = (pred == P::OLT || pred == P::ULT || pred == P::OGT || pred == P::UGT);
-        if (ok_pred && cmp.getLhs() == sel.getTrueValue() && cmp.getRhs() == sel.getFalseValue()) isMinMax = true;
-      }
-      if (!isMinMax) {
-        if (auto cmp = mlir::dyn_cast_or_null<mlir::arith::CmpIOp>(cdef)) {
-          using P = mlir::arith::CmpIPredicate;
-          auto pred = cmp.getPredicate();
-          bool const ok_pred = (pred == P::slt || pred == P::ult || pred == P::sgt || pred == P::ugt);
-          if (ok_pred && cmp.getLhs() == sel.getTrueValue() && cmp.getRhs() == sel.getFalseValue()) isMinMax = true;
-        }
-      }
-      if (isMinMax) {
-        collectReads(sel.getTrueValue(), depth + 1);
-        collectReads(sel.getFalseValue(), depth + 1);
-        return;
-      }
-    }
-    for (auto operand : op->getOperands()) collectReads(operand, depth + 1);
+    for (auto operand : printedOperands(op)) collectReads(operand, depth + 1);
   };
   collectReads(src, 0);
 
@@ -1152,7 +1121,7 @@ std::vector<ASTNode> buildSectionScalarAssign(hlfir::AssignOp assign, hlfir::Des
       inner.accesses.push_back(std::move(ra));
       return;
     }
-    for (auto operand : op->getOperands()) collectScalarRhsReads(operand, depth + 1);
+    for (auto operand : printedOperands(op)) collectScalarRhsReads(operand, depth + 1);
   };
   collectScalarRhsReads(assign.getOperand(0), 0);
 
@@ -1171,6 +1140,8 @@ std::vector<ASTNode> buildSectionScalarAssign(hlfir::AssignOp assign, hlfir::Des
       wrap.loop_iter = iter_names[tDim];
       wrap.loop_lower_expr = it->lo;
       wrap.loop_bound = it->hi;
+      wrap.loop_step = it->strideConst;
+      wrap.loop_step_expr = it->strideExpr;
       wrap.children.push_back(current);
       current = wrap;
     }
@@ -1548,18 +1519,6 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
   unsigned const rank = extents.empty() ? (seq ? seq.getDimension() : 0) : extents.size();
   if (rank == 0) return {};
 
-  auto extentString = [](mlir::Value ext) -> std::string {
-    // Inline ``resolveExtent``-equivalent: prefer a traced declare,
-    // then a literal constant, otherwise a buildIndexExpr fallback.
-    if (!ext) return {};
-    auto n = traceToDecl(ext);
-    if (!n.empty()) return n;
-    if (auto c = traceConstInt(ext)) return std::to_string(*c);
-    auto idx = buildIndexExpr(ext, 0);
-    if (!idx.empty() && idx != "?") return "(" + idx + ")";
-    return {};
-  };
-
   std::vector<std::string> bounds;
   bounds.reserve(rank);
   std::string const boxName = extents.empty() ? traceToDecl(dst) : std::string{};
@@ -1798,13 +1757,14 @@ ASTNode buildLibCallNode(hlfir::AssignOp assign, mlir::Operation* srcOp, std::st
       n.call_arg_subsets.push_back(sub);
     };
     auto pushDim = [&](mlir::Value dim_val) {
-      if (auto c = traceConstInt(dim_val)) n.reduce_axes.push_back(*c - 1);
+      auto c = traceConstInt(dim_val);
+      if (!c) throw std::runtime_error("MINLOC/MAXLOC: a non-constant DIM is not lowered");
+      n.reduce_axes.push_back(*c - 1);
     };
     auto pushBack = [&](mlir::Value back_val) {
-      if (auto c = traceConstInt(back_val))
-        n.options["back"] = (*c != 0) ? "true" : "false";
-      else
-        n.options["back"] = "true";  // dynamic; safe default
+      auto c = traceConstInt(back_val);
+      if (!c) throw std::runtime_error("MINLOC/MAXLOC: a non-constant BACK is not lowered");
+      n.options["back"] = (*c != 0) ? "true" : "false";
     };
     if (auto minOp = mlir::dyn_cast<hlfir::MinlocOp>(srcOp)) {
       auto [nm, sub] = resolveDesignateSliceSubset(minOp.getArray(), callee, 0);
@@ -2030,6 +1990,10 @@ std::vector<ASTNode> buildSectionReduceAssign(hlfir::AssignOp assign, hlfir::Des
     wrap.loop_iter = iterNames[revIdx];
     wrap.loop_lower_expr = buildIndexExpr(it->lo, 0);
     wrap.loop_bound = buildIndexExpr(it->hi, 0);
+    if (auto step = traceConstInt(it->stride))
+      wrap.loop_step = *step;
+    else
+      wrap.loop_step_expr = buildIndexExpr(it->stride, 0);
     wrap.children.push_back(current);
     current = wrap;
   }

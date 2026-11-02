@@ -365,18 +365,51 @@ std::vector<ASTNode> buildElementalAssign(hlfir::AssignOp assign, hlfir::Element
 
   // Wrap the inner assign in one ASTNode kind="loop" per rank; the outermost loop is the result, deeper loops live as
   // its sole child.
-  ASTNode current;
-  current.kind = "assign";
-  current = inner;
-  for (int i = rank - 1; i >= 0; --i) {
-    ASTNode wrap;
-    wrap.kind = "loop";
-    wrap.loop_iter = iter_names[i];
-    wrap.loop_lower = 1;
-    wrap.loop_bound = resolveExtent(shape, i);
-    wrap.children.push_back(current);
-    current = wrap;
+  auto nest = [&](ASTNode current) {
+    for (int i = rank - 1; i >= 0; --i) {
+      ASTNode wrap;
+      wrap.kind = "loop";
+      wrap.loop_iter = iter_names[i];
+      wrap.loop_lower = 1;
+      wrap.loop_bound = resolveExtent(shape, i);
+      wrap.children.push_back(current);
+      current = wrap;
+    }
+    return current;
+  };
+  // Fortran evaluates the RHS first: a read of the target at another element goes through a buffer.
+  AccessInfo const write = inner.accesses[0];
+  bool const overlaps = std::any_of(inner.accesses.begin() + 1, inner.accesses.end(), [&](const AccessInfo& a) {
+    return a.array_name == inner.target && a.index_exprs != write.index_exprs;
+  });
+  ASTNode current = inner;
+  if (overlaps) {
+    std::string const buffer = "_rhs_buffer_" + std::to_string(kSynthTransientCounter++);
+    AccessInfo extent;
+    extent.array_name = buffer;
+    AccessInfo element;
+    element.array_name = buffer;
+    element.index_vars = iter_names;
+    element.index_exprs = iter_names;
+    for (unsigned i = 0; i < rank; ++i) extent.index_exprs.push_back(resolveExtent(shape, i));
+    ASTNode decl;
+    decl.kind = "declare_transient";
+    decl.target = buffer;
+    decl.expr = exprDtypeString(elem.getType());
+    decl.accesses.push_back(std::move(extent));
+    preNodes.push_back(std::move(decl));
+
+    ASTNode fill = inner;
+    fill.target = buffer;
+    fill.accesses[0] = element;
+    fill.accesses[0].is_write = true;
+    preNodes.push_back(nest(std::move(fill)));
+
+    current.expr = buffer;
+    current.accesses = {write, element};
+    current.accesses[1].is_read = true;
   }
+  current = nest(std::move(current));
   // Prepend any libcall-result materialisations so the transient is declared and populated before the elemental body
   // reads it.
   for (auto& n :
@@ -454,7 +487,7 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
   if (auto conv = mlir::dyn_cast<fir::ConvertOp>(def)) {
     if (mlir::isa<fir::LogicalType>(conv.getValue().getType()) && conv.getValue().getType() != conv.getType())
       return logicalTruth(conv.getValue(), d + 1, &buildExprWithSubscripts);
-    return buildExprWithSubscripts(conv.getValue(), d + 1);
+    return castForConvert(conv.getValue().getType(), conv.getType(), buildExprWithSubscripts(conv.getValue(), d + 1));
   }
   // hlfir.no_reassoc is Flang's reassociation-blocker wrapper around order-preserved expressions (e.g. `(1.0 -
   // ZA(JL,JK))`); pure structural metadata, so peel through to keep the inner chain subscript-aware -- without this it
@@ -710,7 +743,6 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
         // threshold`); traceToDecl(dg.getMemref()) would bypass it and leak the struct base `g` as a free symbol for
         // `if (x > g % threshold)`.
         auto arr = traceToDecl(dg.getResult());
-        auto indices = dg.getIndices();
         if (arr.empty()) return "?";
         if (indices.empty()) return arr;
         std::string s = arr + "[";
@@ -760,8 +792,7 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
   // Exponentiation a**b (math.fpowi/powf/powi/ipowi): recurse through the subscript-aware builder so a squared
   // per-element term keeps its subscript -- else it falls to buildExpr below and strips it, and QE's `IF (SUM((i -
   // i_real) ** 2) > eps6)` emits whole-array operands that C++ codegen rejects as `int* - double*`.
-  if ((nm == "math.fpowi" || nm == "math.powf" || nm == "math.powi" || nm == "math.ipowi") &&
-      def->getNumOperands() == 2) {
+  if ((nm == "math.fpowi" || nm == "math.powf" || nm == "math.powi") && def->getNumOperands() == 2) {
     return "(" + buildExprWithSubscripts(def->getOperand(0), d + 1) + " ** " +
            buildExprWithSubscripts(def->getOperand(1), d + 1) + ")";
   }

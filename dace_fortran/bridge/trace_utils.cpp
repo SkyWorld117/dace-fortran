@@ -550,6 +550,47 @@ std::string traceToDecl(mlir::Value val, int max) {
   return "";
 }
 
+mlir::Value globalInitValue(fir::GlobalOp gop) {
+  if (!gop || gop.getRegion().empty()) return {};
+  for (auto& op : gop.getRegion().front())
+    if (auto hv = mlir::dyn_cast<fir::HasValueOp>(op)) return hv.getResval();
+  return {};
+}
+
+mlir::Value componentInitValue(fir::GlobalOp gop, llvm::ArrayRef<std::string> path) {
+  mlir::Value agg = globalInitValue(gop);
+  while (agg && !path.empty()) {
+    auto ins = mlir::dyn_cast_or_null<fir::InsertValueOp>(agg.getDefiningOp());
+    if (!ins) return {};
+    auto coor = ins.getCoor();
+    auto name = coor.empty() ? mlir::StringAttr() : mlir::dyn_cast<mlir::StringAttr>(coor[0]);
+    if (name && name.getValue() == path.front()) {
+      agg = ins.getVal();
+      path = path.drop_front();
+    } else {
+      agg = ins.getAdt();
+    }
+  }
+  return agg;
+}
+
+std::optional<double> scalarConstantValue(mlir::Value v) {
+  auto* def = v.getDefiningOp();
+  while (auto cv = mlir::dyn_cast_or_null<fir::ConvertOp>(def)) def = cv.getValue().getDefiningOp();
+  auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantOp>(def);
+  if (!cst) return std::nullopt;
+  auto attr = cst.getValue();
+  if (auto fa = mlir::dyn_cast<mlir::FloatAttr>(attr)) return fa.getValueAsDouble();
+  if (auto ba = mlir::dyn_cast<mlir::BoolAttr>(attr)) return ba.getValue() ? 1.0 : 0.0;
+  if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(attr)) return static_cast<double>(ia.getInt());
+  return std::nullopt;
+}
+
+bool isExtentClamp(mlir::arith::SelectOp sel) {
+  auto cmp = sel.getCondition().getDefiningOp<mlir::arith::CmpIOp>();
+  return cmp && cmp.getLhs().getType().isIndex();
+}
+
 std::optional<int64_t> traceConstInt(mlir::Value v) {
   for (int i = 0; i < limits::kTraceConstIntMax; ++i) {
     auto* d = v.getDefiningOp();

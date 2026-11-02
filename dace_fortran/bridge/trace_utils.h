@@ -120,6 +120,8 @@ void clearAllocAliases();
 /// Trace an SSA value to a compile-time integer constant through any number of fir.convert wrappings; nullopt if not
 /// constant-foldable.
 std::optional<int64_t> traceConstInt(mlir::Value v);
+/// True for Flang's clamp of an extent to zero: its compare runs in ``index``, which a Fortran MERGE or MAX never does.
+bool isExtentClamp(mlir::arith::SelectOp sel);
 
 /// Recognise Flang's ASSOCIATED(ptr)/ALLOCATED(arr) lowering (arith.cmpi ne, fir.convert*(fir.box_addr(fir.load?
 /// %boxref)), 0) and return %boxref, to which callers append "_allocated"; null if cmp isn't that shape. Shared by
