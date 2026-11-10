@@ -188,3 +188,36 @@ def test_abi_staged_scalar_split_when_opted_in():
     assert made, "the opt-in arm must split the scalar so the nest can map"
     assert "x" in sdfg.arrays, "the base container must be KEPT for the staging state"
     sdfg.validate()
+
+
+def test_scalar_value_read_on_parent_edge_is_not_fissioned():
+    """The final loop value feeds an edge condition (MYNN's carried-out __sc_N)."""
+    sdfg = _base()
+    start = sdfg.add_state('start', is_start_block=True)
+    loop = LoopRegion('L', 'i < 8', 'i', 'i = 0', 'i = i + 1')
+    sdfg.add_node(loop)
+    body = loop.add_state('body')
+    node = _write(body, 'x', 'src', 'i')
+    _read(body, 'x', 'dst', 'i', node=node)
+    end = sdfg.add_state('end')
+    sdfg.add_edge(start, loop, InterstateEdge())
+    sdfg.add_edge(loop, end, InterstateEdge('x > 0'))
+    sdfg.validate()
+    assert not fission_loop_local_scalars(sdfg)
+    assert 'x' in sdfg.arrays
+    sdfg.validate()
+
+
+def test_scalar_read_on_edge_before_write_is_not_fissioned():
+    """An iteration's incoming value can be read by a branch edge before its write."""
+    sdfg = _base()
+    start = sdfg.add_state('start', is_start_block=True)
+    loop = LoopRegion('L', 'i < 8', 'i', 'i = 0', 'i = i + 1')
+    sdfg.add_node(loop)
+    before, body = loop.add_state('before'), loop.add_state('body')
+    node = _write(body, 'x', 'src', 'i')
+    _read(body, 'x', 'dst', 'i', node=node)
+    loop.add_edge(before, body, InterstateEdge('x > 0'))
+    sdfg.add_edge(start, loop, InterstateEdge())
+    assert not fission_loop_local_scalars(sdfg)
+    sdfg.validate()

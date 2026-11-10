@@ -187,7 +187,7 @@ def _scan_uncached(region: ControlFlowRegion, name: str, sdfg: SDFG,
     # An interstate edge that READS the scalar needs it defined where the edge leaves.  Nothing
     # else in this pass looks at edge accesses, and `if (radflux) then` is one.
     for e in region.edges():
-        if e.data is None or name not in {m.data for m in e.data.get_read_memlets(sdfg.arrays)}:
+        if e.data is None or name not in {m.data for m in e.data.get_read_memlets(sdfg.arrays, include_scalars=True)}:
             continue
         if e.src in out and not out[e.src]:
             ok = False
@@ -235,7 +235,7 @@ def _touched_edges(sdfg: SDFG, name: str) -> List[ControlFlowRegion]:
         for e in region.edges():
             if e.data is None:
                 continue
-            if name in {m.data for m in e.data.get_read_memlets(sdfg.arrays)}:
+            if name in {m.data for m in e.data.get_read_memlets(sdfg.arrays, include_scalars=True)}:
                 hit.append(region)
                 break
     return hit

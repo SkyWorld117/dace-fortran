@@ -688,7 +688,8 @@ def _offset_token(arr: str, dim: int) -> str:
 
 
 def array_read_to_dace_expr(
-    builder: SDFGBuilder, assign_node: NodeLike, iter_map: dict[str, str], sdfg: SDFG | None = None
+    builder: SDFGBuilder, assign_node: NodeLike, iter_map: dict[str, str], sdfg: SDFG | None = None,
+    indirect_syms: dict[str, str] | None = None,
 ) -> str:
     """Render a scalar-target assign's RHS as a DaCe interstate-edge
     expression, lifting EVERY array read to the uniform offset-symbol
@@ -728,9 +729,10 @@ def array_read_to_dace_expr(
             # only a bare array-name occurrence maps to a read access (in
             # the order the bridge lists them).
             already_subscripted = j < len(expr) and expr[j] == "["
-            if not already_subscripted and ri < len(reads) and tok == reads[ri].array_name:
-                ac = reads[ri]
-                ri += 1
+            k = next((k for k in range(ri, len(reads)) if reads[k].array_name == tok), None)
+            if not already_subscripted and k is not None:
+                ac = reads[k]
+                ri = k + 1
                 # Section-alias dummy (``igkp`` <- ``igk_exx(:, current_k)``):
                 # resolve to the SOURCE array + spliced index list so the
                 # interstate-edge read references real storage.  The alias has
@@ -740,7 +742,8 @@ def array_read_to_dace_expr(
                 # free symbols.  QE ``init_us_2``'s ``iv = igk_(ig)``
                 # value-symbol read, reached after ``add_nlxx_pot`` inlines it.
                 eff_name, eff_ac = resolve_section_alias(builder, ac.array_name, ac)
-                parts = [_remap_token(raw, iter_map) for raw in (eff_ac.index_exprs or [])]
+                parts = [_remap_token(_rewrite_inner_indirects(raw, indirect_syms or {}), iter_map)
+                         for raw in (eff_ac.index_exprs or [])]
                 out.append(_format_offset_subset(eff_name, parts))
             elif not already_subscripted and sdfg is not None and sdfg_is_len1_array(sdfg, tok):
                 # A logical scalar kept as a length-1 Array (inout/out module

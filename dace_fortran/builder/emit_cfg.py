@@ -298,15 +298,14 @@ def emit_symbol_init(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: Contro
     #     as data.
     #   * ``arr`` is a Scalar on the SDFG (the bridge folds length-1
     #     transients to Scalar) -- a Scalar has no subscript.
-    # Otherwise emit the (multi-dim) 0-based subscript; these source
-    # arrays use the default lower bound 1.
+    # Otherwise emit the (multi-dim) 0-based subscript.
     from dace.data import Scalar
 
     src_desc = ctx.sdfg.arrays.get(arr)
     if arr in ctx.sdfg.symbols or isinstance(src_desc, Scalar):
         read_expr = arr
     else:
-        read_expr = f"{arr}[{', '.join(str(i - 1) for i in idxs)}]"
+        read_expr = f"{arr}[{', '.join(f'{i} - offset_{arr}_d{d}' for d, i in enumerate(idxs))}]"
     region.add_edge(ctx.cur, dst, InterstateEdge(assignments={sym: read_expr}))
     ctx.cur = dst
 

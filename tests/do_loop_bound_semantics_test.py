@@ -14,13 +14,13 @@ def _loops(sdfg):
 
 def test_nested_subscript_in_a_bound_is_zero_based_at_every_level(tmp_path):
     src = """
-subroutine bound(n, cnt, map, b)
+subroutine bound(n, cnt, idxmap, b)
   integer, intent(in) :: n
-  integer, intent(in) :: cnt(n), map(n)
+  integer, intent(in) :: cnt(n), idxmap(n)
   real(8), intent(inout) :: b(n)
   integer :: i, j
   do i = 1, n
-    do j = 1, cnt(map(i))
+    do j = 1, cnt(idxmap(i))
       b(i) = b(i) + 1.0d0
     end do
   end do
@@ -33,9 +33,9 @@ end subroutine
         for name, value in edge.data.assignments.items()
         if name.startswith("loopend") and "cnt" in value
     )
-    assert "map[_loop_it_0 - 1]" in hoist, f"inner subscript still 1-based: {hoist}"
+    assert "idxmap[_loop_it_0 - 1]" in hoist, f"inner subscript still 1-based: {hoist}"
     cnt, indirect, b = np.array([1, 2, 3, 4], dtype=np.int32), np.array([4, 1, 3, 2], dtype=np.int32), np.zeros(4)
-    sdfg(n=np.int32(4), cnt=cnt, map=indirect, b=b)
+    sdfg(n=np.int32(4), cnt=cnt, idxmap=indirect, b=b)
     np.testing.assert_array_equal(b, [4.0, 1.0, 3.0, 2.0])
 
 
