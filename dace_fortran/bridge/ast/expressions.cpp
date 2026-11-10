@@ -314,7 +314,8 @@ std::string subscriptedElement(hlfir::DesignateOp dg, const std::string& arr) {
   std::string s = arr + "[";
   for (unsigned i = 0; i < dims.size(); ++i) {
     if (i > 0) s += ", ";
-    s += "(" + dims[i].expr + ") - " + rootLowerBound(dg.getMemref(), arr, i);
+    // The Python builder applies the declared lower bound once, uniformly across expressions.
+    s += dims[i].expr;
   }
   return s + "]";
 }
@@ -1567,46 +1568,7 @@ std::string buildExpr(mlir::Value val, int d) {
       NoSubscriptGuard const _g;
       return logicalTruth(conv.getValue(), d + 1, &buildExpr);
     }
-    bool const inIsInt = inT.isInteger(8) || inT.isInteger(16) || inT.isInteger(32) || inT.isInteger(64);
-    bool const outIsInt = outT.isInteger(8) || outT.isInteger(16) || outT.isInteger(32) || outT.isInteger(64);
-    bool const inIsFloat = mlir::isa<mlir::FloatType>(inT);
-    bool const outIsFloat = mlir::isa<mlir::FloatType>(outT);
-    // Float -> integer: explicit truncating cast.  Use ``dace.intN``
-    // so the C++ codegen lowers via ``static_cast<int{32,64}>``.
-    if (inIsFloat && outIsInt) {
-      const char* cast = outT.isInteger(64) ? "int64" : "int32";
-      return std::string(cast) + "(" + buildExpr(conv.getValue(), d + 1) + ")";
-    }
-    // Integer -> float: same shape  --  codegen will widen at the
-    // arithmetic site.  Tag with ``float64`` / ``float32`` so the
-    // intent is explicit when the surrounding op is integer too.
-    if (inIsInt && outIsFloat) {
-      const char* cast = mlir::cast<mlir::FloatType>(outT).getWidth() == 32 ? "float32" : "float64";
-      return std::string(cast) + "(" + buildExpr(conv.getValue(), d + 1) + ")";
-    }
-    // Float -> wider float (f32 -> f64): wrap in an explicit
-    // ``dace.float32(...)`` BEFORE the widening so the inner
-    // expression's f32 arithmetic rounds at f32 precision.  In
-    // C++ codegen, ``static_cast<float>(double_val)`` rounds to
-    // the nearest f32, which matches Fortran's ``real(4)``
-    // semantics  --  ``5.5 + epsilon(1.0)`` evaluates to ``5.5``
-    // exactly because the epsilon is below f32's ulp at 5.5.
-    // Without this wrap the C++ promotes both operands to double
-    // and gives ``5.5 + 1.19e-7 = 5.5000001192...``.  Same-width
-    // converts (f64 -> f64) stay transparent.
-    if (inIsFloat && outIsFloat) {
-      auto inW = mlir::cast<mlir::FloatType>(inT).getWidth();
-      auto outW = mlir::cast<mlir::FloatType>(outT).getWidth();
-      if (inW < outW) {
-        const char* cast = inW == 32 ? "float32" : "float64";
-        return std::string(cast) + "(" + buildExpr(conv.getValue(), d + 1) + ")";
-      }
-      if (inW < outW) return buildExpr(conv.getValue(), d + 1);
-    }
-    // Same width or float -> narrower float (truncating cast)  --
-    // transparent (the underlying expression already has the
-    // narrower type, or the narrowing is desired).
-    return buildExpr(conv.getValue(), d + 1);
+    return castForConvert(inT, outT, buildExpr(conv.getValue(), d + 1));
   }
 
   // MLIR bool/int casts used by lift-cf-to-scf when threading keep-going

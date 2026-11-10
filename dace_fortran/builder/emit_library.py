@@ -1625,9 +1625,9 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     :class:`dace_fortran.external.ExternalCall` library node.
 
     The callee is matched against
-    ``dace_fortran.external.lookup_external``.  Unregistered callees
-    are a **no-op** (preserves prior behaviour -- ``kind="call"`` had
-    no emitter), so unrelated kernels are unaffected.
+    ``dace_fortran.external.lookup_external``. Unregistered side-effecting calls
+    are refused; result-producing calls marked as expression-owned are rendered
+    by the expression emitter. Deliberate stubs require an explicit registration.
 
     For a registered callee the signature drives the library node's
     connectors and call body: array args are pointer connectors
@@ -1667,7 +1667,9 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     if sig is None and callee != callee_raw:
         sig = lookup_external(callee_raw)
     if sig is None:
-        return  # not registered -> unchanged (kind="call" had no emitter)
+        if (n.options or {}).get("renders_inline") == "true":
+            return  # The expression emitter owns this result-producing call.
+        raise NotImplementedError(f"unregistered external call {callee_raw!r}; register or explicitly stub it")
     if sig.stub:
         return  # stubbed external -> body already stripped; drop the call
 
@@ -2260,6 +2262,10 @@ def _emit_reduce(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlo
     state = ctx.flush_and_ensure(builder, region)
 
     src_name = n.reduce_src
+    opts = dict(n.options) if n.options else {}
+    if src_name not in ctx.sdfg.arrays and src_name in builder.arrays:
+        src_name, slab = whole_array_subset(builder, ctx, src_name)
+        opts.setdefault("src_subset", slab)
     src_desc = ctx.sdfg.arrays.get(src_name)
     if src_desc is None:
         raise RuntimeError(f"reduction source {src_name!r} not registered as SDFG data")
@@ -2319,7 +2325,8 @@ def _emit_reduce(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlo
         dim = (n.reduce_axes[0] + 1) if n.reduce_axes else -1
         node = cls(f"{_logical_op}_{n.target}_{builder.nid()}", dim=dim)
         state.add_node(pin_sequential(node))
-        state.add_edge(src_access, None, node, input_connector(cls), Memlet.from_array(src_name, src_desc))
+        state.add_edge(src_access, None, node, input_connector(cls), (Memlet(data=src_name, subset=opts["src_subset"])
+                        if opts.get("src_subset") else Memlet.from_array(src_name, src_desc)))
         state.add_edge(node, output_connector(cls), tgt_access, None, out_memlet)
         return
 
@@ -2329,7 +2336,6 @@ def _emit_reduce(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlo
     # whose shape = the ranged dims' extents and whose strides = the PARENT's
     # strides for those dims (so a row keeps its column-major stride, a column
     # stays contiguous), link ``parent[subset] -> view``, and reduce the view.
-    opts = dict(n.options) if n.options else {}
     src_subset = opts.get("src_subset", "")
     if src_subset:
         import dace

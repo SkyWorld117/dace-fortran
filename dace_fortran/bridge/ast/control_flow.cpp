@@ -744,17 +744,7 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
         // `if (x > g % threshold)`.
         auto arr = traceToDecl(dg.getResult());
         if (arr.empty()) return "?";
-        if (indices.empty()) return arr;
-        std::string s = arr + "[";
-        bool first = true;
-        unsigned dim = 0;
-        for (auto idx : indices) {
-          if (!first) s += ", ";
-          s += buildDesignateIndexExpr(dg, dim++, idx, d + 1);
-          first = false;
-        }
-        s += "]";
-        return s;
+        return dg.getIndices().empty() ? arr : subscriptedElement(dg, arr);
       }
   }
 

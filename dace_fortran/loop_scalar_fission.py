@@ -204,7 +204,8 @@ def _regions(sdfg: SDFG) -> List[ControlFlowRegion]:
 
 def _outermost_loop(node, sdfg: SDFG) -> Optional[LoopRegion]:
     """The outermost LoopRegion containing a state or a region, or None if there is none."""
-    found = None
+    # Edge sites are their containing region; an edge in a loop belongs to that loop itself.
+    found = node if isinstance(node, LoopRegion) else None
     parent = node.parent_graph
     while parent is not None and parent is not sdfg:
         if isinstance(parent, LoopRegion):

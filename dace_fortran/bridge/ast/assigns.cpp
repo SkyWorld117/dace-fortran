@@ -1519,6 +1519,18 @@ std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
   unsigned const rank = extents.empty() ? (seq ? seq.getDimension() : 0) : extents.size();
   if (rank == 0) return {};
 
+  auto extentString = [](mlir::Value ext) -> std::string {
+    // Inline ``resolveExtent``-equivalent: prefer a traced declare,
+    // then a literal constant, otherwise a buildIndexExpr fallback.
+    if (!ext) return {};
+    auto n = traceToDecl(ext);
+    if (!n.empty()) return n;
+    if (auto c = traceConstInt(ext)) return std::to_string(*c);
+    auto idx = buildIndexExpr(ext, 0);
+    if (!idx.empty() && idx != "?") return "(" + idx + ")";
+    return {};
+  };
+
   std::vector<std::string> bounds;
   bounds.reserve(rank);
   std::string const boxName = extents.empty() ? traceToDecl(dst) : std::string{};

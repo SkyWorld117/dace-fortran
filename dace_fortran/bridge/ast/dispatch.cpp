@@ -265,6 +265,7 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block, const YieldSnapshot
         a.kind = "assign";
         a.target = scfSynthName(result);
         a.expr = yieldedExpr(yielded);
+        collectReadAccesses(yielded, a.accesses, 0);
         a.target_is_array = false;
         out.push_back(std::move(a));
       }
@@ -1850,8 +1851,20 @@ static std::string tryMaterialiseAllAnyCond(mlir::Value condVal, std::vector<AST
   std::string maskName = traceToDecl(maskVal);
   // A section mask reduces a view of its parent, not the whole array.
   std::string maskSubset;
-  if (auto dg = maskVal.getDefiningOp<hlfir::DesignateOp>())
-    if (auto parts = renderDesignateSubsetStrings(dg); !parts.empty()) maskSubset = llvm::join(parts, ", ");
+  if (auto dg = maskVal.getDefiningOp<hlfir::DesignateOp>()) {
+    unsigned cursor = 0;
+    auto indices = dg.getIndices();
+    for (bool triplet : dg.getIsTriplet()) {
+      if (triplet) {
+        auto step = cursor + 2 < indices.size() ? traceConstInt(indices[cursor + 2]) : std::nullopt;
+        if (!step || *step != 1) throw std::runtime_error("strided section mask in ALL/ANY");
+      }
+      cursor += triplet ? 3 : 1;
+    }
+    auto parts = renderDesignateSubsetStrings(dg);
+    if (parts.empty()) throw std::runtime_error("strided section or unrenderable section mask in ALL/ANY");
+    maskSubset = llvm::join(parts, ", ");
+  }
   // An INLINE elemental mask (e.g. ``IF (ANY(sectionA /= sectionB))``) has no declared name, so traceToDecl
   // returns "". Materialise it into a transient array via the same path materialiseCondReductions already uses
   // for SUM/MINVAL/MAXVAL/PRODUCT elemental sources, then reduce that transient.
@@ -2727,43 +2740,7 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
       // Bound resolution: traceToDecl is a shortcut for the scalar case (DO i = 1, n) but wrong for array-element loads
       // (DO j = row_ptr(i), ...) since the load chain bottoms out at the array's declare -- detect that and route
       // through buildIndexExpr for the proper subscripted form.
-      auto isArrayElementLoad = [](mlir::Value v) -> bool {
-        for (int i = 0; i < 32 && v; ++i) {
-          auto* d = v.getDefiningOp();
-          if (!d) break;
-          if (mlir::isa<hlfir::DesignateOp>(d)) return true;
-          if (auto cv = mlir::dyn_cast<fir::ConvertOp>(d)) {
-            v = cv.getValue();
-            continue;
-          }
-          if (auto ld = mlir::dyn_cast<fir::LoadOp>(d)) {
-            v = ld.getMemref();
-            continue;
-          }
-          break;
-        }
-        return false;
-      };
-      if (auto c = traceConstInt(doLoop.getUpperBound())) {
-        n.loop_bound = std::to_string(*c);
-      } else if (!isArrayElementLoad(doLoop.getUpperBound())) {
-        n.loop_bound = traceToDecl(doLoop.getUpperBound());
-      }
-      if (n.loop_bound.empty()) n.loop_bound = buildIndexExpr(doLoop.getUpperBound(), 0);
-      // buildIndexExpr suppresses fir.box_dims on a local allocatable (keeps the whole-array-section copy fallback for
-      // arr(:) reads); a loop bound is a scalar, not a subset, so fall back to buildExpr like a scalar sz = size(a)
-      // assignment would.
-      if (n.loop_bound == "?") n.loop_bound = buildExpr(doLoop.getUpperBound(), 0);
-      n.loop_lower = traceLB(doLoop.getLowerBound());
-      if (n.loop_lower < 0) {
-        // Non-constant lower bound: capture the symbolic form so emit_loop can thread it through instead of silently
-        // defaulting to 1.
-        if (!isArrayElementLoad(doLoop.getLowerBound())) {
-          auto sym = traceToDecl(doLoop.getLowerBound());
-          if (!sym.empty()) n.loop_lower_expr = sym;
-        }
-        if (n.loop_lower_expr.empty()) n.loop_lower_expr = buildIndexExpr(doLoop.getLowerBound(), 0);
-      }
+      setDoLoopBounds(n, doLoop);
       // Step: reverse-direction DO i = N, 1, -1 carries step -1 (needed to flip init/cond/update in emit_loop).
       // Constant steps only -- a symbolic step would silently default to 1 and iterate the wrong direction if actually
       // negative, so throw when non-constant and non-trivial (not the default %c1).

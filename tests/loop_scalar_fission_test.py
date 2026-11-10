@@ -221,3 +221,20 @@ def test_scalar_read_on_edge_before_write_is_not_fissioned():
     sdfg.add_edge(start, loop, InterstateEdge())
     assert not fission_loop_local_scalars(sdfg)
     sdfg.validate()
+
+
+def test_scalar_read_on_an_internal_loop_edge_is_local():
+    """Reading a freshly written scalar on a loop-body edge does not carry it out of the loop."""
+    sdfg = _base()
+    start = sdfg.add_state('start', is_start_block=True)
+    loop = LoopRegion('L', 'i < 8', 'i', 'i = 0', 'i = i + 1')
+    sdfg.add_node(loop)
+    body = loop.add_state('body')
+    node = _write(body, 'x', 'src', 'i')
+    _read(body, 'x', 'dst', 'i', node=node)
+    end = loop.add_state('end')
+    loop.add_edge(body, end, InterstateEdge('x >= 0'))
+    sdfg.add_edge(start, loop, InterstateEdge())
+    assert fission_loop_local_scalars(sdfg)
+    assert 'x' not in sdfg.arrays
+    sdfg.validate()

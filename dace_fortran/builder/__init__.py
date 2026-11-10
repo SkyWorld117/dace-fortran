@@ -2138,9 +2138,7 @@ class SDFGBuilder:
             fn = self._EMIT_DISPATCH.get(n.kind)
             if fn is not None:
                 fn(self, ctx, n, region)
-            # ``kind="call"`` dispatches to ``emit_call``: a no-op for
-            # an unregistered callee, a CPP tasklet for one registered
-            # via ``dace_fortran.external``.
+            # Calls need an explicit external binding or stub; expression-owned results are emitted there.
 
     # Scalar-assign is called from Ctx.flush; keep it as a method on the
     # builder for that caller's convenience.
