@@ -1694,8 +1694,8 @@ class SDFGBuilder:
         RemoveScalarFortranShapeSymbols(recursive=True).apply_pass(sdfg, {})
 
         # Retype integer-valued float ``**`` exponents to ``int`` so
-        # codegen uses repeated-multiply ``ipow`` (bit-matching the
-        # Fortran reference) rather than libm ``pow``.
+        # codegen uses integer-multiply ``ipow`` rather than libm ``pow``.
+        # The runtime uses repeated squaring for powers such as x**4.
         IntegerizePowerExponents().apply_pass(sdfg, {})
 
         # Code-block length-1 Array deref.  A logical scalar the bridge keeps
