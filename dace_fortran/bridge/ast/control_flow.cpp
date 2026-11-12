@@ -903,6 +903,14 @@ static bool isScfIfResult(mlir::Value v) {
 /// Convert a yielded value to a string for writing into a synthetic scalar; reuses buildExpr, which traces through
 /// arith ops and cast chains.
 std::string yieldedExpr(mlir::Value v) {
+  // The CFG structurizer pads inactive integer result slots with ub.poison.
+  // Zero is a legal refinement of poison; it gives the transported slot a
+  // representation without inventing a value for an ordinary source read.
+  // Keep generic expression lowering strict: this applies only to yielded
+  // control-flow results, and real/complex poison remains unsupported.
+  if (auto* def = v.getDefiningOp(); def && def->getName().getStringRef() == "ub.poison" &&
+                                      (mlir::isa<mlir::IntegerType>(v.getType()) || v.getType().isIndex()))
+    return "0";
   // The yielded value (e.g. arith.andi of i1 cmps for a multi-element AND convergence check) must render WITH
   // subscripts via buildBoolExpr, not through NoSubscriptGuard's bare-name path -- else `rsdnm < tolrsd` renders as a
   // POINTER comparison in C++ (both double* params), silently breaking early-return semantics (NPB LU ssor istep bug;

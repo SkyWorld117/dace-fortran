@@ -100,3 +100,68 @@ def test_non_python_code_requires_an_explicit_purity_declaration():
     tasklet.side_effects=False
     assert _device_array_tasklets(sdfg)==1
     sdfg.validate()
+
+
+@pytest.mark.parametrize('expression', [
+    'A[N[0] - 1, k] <= B[k]',
+    'A[N[0] - 1, k] + B[M[0], k]',
+    'A[(N[0] + M[1]) * 2, k] > 0',
+])
+def test_host_mirror_rewrites_the_whole_nested_subscript(expression):
+    import ast
+    from dace_fortran.offload import _rewrite_scalar_subscript
+    replaced, count = _rewrite_scalar_subscript(expression, 'A', 'mirror[0]')
+    assert count == 1
+    ast.parse(replaced, mode='eval')
+    assert 'A[' not in replaced
+    values = dict(A={(2, 0): 7, (6, 0): 7}, B={(2, 0): 3, 0: 3},
+                  N=[3], M=[2, 0], k=0, mirror=[7])
+    assert eval(expression, {}, values) == eval(replaced, {}, values)
+
+
+def test_host_mirror_does_not_replace_a_different_container():
+    from dace_fortran.offload import _rewrite_scalar_subscript
+    expression = 'A[N[0], 1] + BA[0]'
+    assert _rewrite_scalar_subscript(expression, 'B', 'mirror[0]') == (expression, 0)
+
+
+def nested_index_graph():
+    from dace_fortran.offload import _reroute_host_scalar_accesses
+    graph = dace.SDFG('nested_host_mirror_index')
+    graph.add_symbol('index', dace.int32)
+    graph.add_array('A', [8], dace.int32, transient=True, storage=dace.StorageType.GPU_Global)
+    graph.add_array('N', [1], dace.int32, transient=True, storage=dace.StorageType.GPU_Global)
+    graph.add_array('result', [1], dace.int32)
+    start = graph.add_state('compute')
+    start.add_mapped_tasklet('values', {'i': '0:8'}, {}, 'a = 2*i + 5',
+                            {'a': dace.Memlet('A[i]')}, external_edges=True,
+                            schedule=dace.ScheduleType.GPU_Device)
+    start.add_mapped_tasklet('selector', {'one': '0:1'}, {}, 'n = index',
+                            {'n': dace.Memlet('N[0]')}, external_edges=True,
+                            schedule=dace.ScheduleType.GPU_Device)
+    for label, value, condition in [('match', 1, 'A[N[0]] == 11'),
+                                     ('other', 0, 'A[N[0]] != 11')]:
+        target = graph.add_state(label)
+        tasklet = target.add_tasklet(label, {}, {'y'}, f'y = {value}')
+        target.add_edge(tasklet, 'y', target.add_write('result'), None, dace.Memlet('result[0]'))
+        graph.add_edge(start, target, dace.InterstateEdge(condition))
+    assert _reroute_host_scalar_accesses(graph, 'N') == 2
+    assert _reroute_host_scalar_accesses(graph, 'A') == 2
+    graph.validate()
+    return graph
+
+
+def test_nested_host_mirror_index_validates_and_generates_code():
+    code = '\n'.join(part.code for part in nested_index_graph().generate_code())
+    assert '__host_mirror' in code
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+def test_nested_host_mirror_index_changes_between_gpu_calls():
+    import numpy as np
+    graph = nested_index_graph()
+    compiled = graph.compile()
+    for index in (3, 5, 3, 2, 7, 3):
+        result = np.full(1, -1, dtype=np.int32)
+        compiled(result=result, index=np.int32(index))
+        np.testing.assert_array_equal(result, [int(index == 3)])

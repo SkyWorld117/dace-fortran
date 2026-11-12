@@ -304,6 +304,28 @@ def _transient_needs_device_global(sdfg, name) -> bool:
     return False
 
 
+def _rewrite_scalar_subscript(expression, container, replacement=None):
+    """Count/replace complete scalar reads, including nested index expressions.
+
+    A closing-bracket regex truncates A[index[0], k] at the inner bracket.
+    Rewriting the parsed subscript preserves the whole read and its neighbours.
+    """
+    import ast
+    tree = ast.parse(expression, mode='eval')
+    matches = [node for node in ast.walk(tree) if isinstance(node, ast.Subscript)
+               and isinstance(node.value, ast.Name) and node.value.id == container]
+    if replacement is None or not matches:
+        return expression, len(matches)
+
+    class Replace(ast.NodeTransformer):
+        def visit_Subscript(self, node):
+            if isinstance(node.value, ast.Name) and node.value.id == container:
+                return ast.copy_location(ast.parse(replacement, mode='eval').body, node)
+            return self.generic_visit(node)
+
+    return ast.unparse(ast.fix_missing_locations(Replace().visit(tree))), len(matches)
+
+
 def _reroute_host_scalar_accesses(sdfg, culprit):
     """Give every host-side scalar access of a device-resident container a host mirror.
 
@@ -327,7 +349,6 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
     from dace.sdfg.scope import is_devicelevel_gpu
     from dace.subsets import Range
     from dace.properties import CodeBlock
-    import re as _re
 
     # Only a container that is BOTH device- and host-accessed is worth re-routing: demotion
     # strands its device tasklets, which is the defect.  For a host-only container demotion is
@@ -405,12 +426,14 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
 
     # Host reads in a loop/branch CONDITION (a LoopRegion or interstate-edge condition) are not
     # tasklet edges, so the loop above cannot reach them.  Re-route them the same way: mirror the
-    # read element with a copy placed in the condition edge's SOURCE state (which runs immediately
-    # before the condition is evaluated), and rewrite the condition/assignments to read the mirror.
+    # read element in a new state after the condition edge's source, and rewrite
+    # the condition/assignments to read the mirror. A later reroute can index a
+    # device array using an earlier host mirror; separate copy states preserve
+    # that dependency instead of issuing both copies in one unordered state.
     # Still keyed on the read memlets and their shape, never on a container's name.  Only a single
     # unambiguous read on the edge is re-routed; anything else is left to the demotion fallback.
-    pat = _re.compile(r'\b%s\s*\[[^\]]*\]' % _re.escape(culprit))
     for region in list(sdfg.all_control_flow_regions()):
+        copy_states = {}
         for e in list(region.edges()):
             d = getattr(e, 'data', None)
             if d is None or not isinstance(e.src, SDFGState):
@@ -426,26 +449,39 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
                 continue
             cond = getattr(d, 'condition', None)
             assignments = getattr(d, 'assignments', None) or {}
-            occ = sum(len(pat.findall(v)) for v in assignments.values())
-            occ += len(pat.findall(cond.as_string)) if cond is not None else 0
+            try:
+                occ = sum(_rewrite_scalar_subscript(v, culprit)[1] for v in assignments.values())
+                occ += _rewrite_scalar_subscript(cond.as_string, culprit)[1] if cond is not None else 0
+            except SyntaxError:
+                continue
             if occ != 1:
                 continue
             sub = deepcopy(reads[0].subset)
             mname = _new_mirror()
-            src_node = next((nd for nd in e.src.nodes()
-                             if isinstance(nd, nodes.AccessNode) and nd.data == culprit), None)
-            if src_node is None:
-                src_node = e.src.add_access(culprit)
-            mnode = e.src.add_access(mname)
-            e.src.add_edge(src_node, None, mnode, None,
-                           Memlet(data=culprit, subset=sub, other_subset=_one()))
+            copy_state = copy_states.get(e.src)
+            if copy_state is None:
+                copy_state = region.add_state_after(e.src, f'{e.src.label}_host_read')
+                copy_states[e.src] = copy_state
+            src_node = copy_state.add_read(culprit)
+            # Array names inside a subset are not free symbols in DaCe.
+            # Explicit reads keep index mirrors alive across the copy states.
+            import ast
+            index_arrays = {node.id for node in ast.walk(ast.parse(str(sub), mode='eval'))
+                            if isinstance(node, ast.Name) and node.id in sdfg.arrays}
+            for name in sorted(index_arrays - {culprit}):
+                copy_state.add_edge(copy_state.add_read(name), None, src_node, None, Memlet())
+            mnode = copy_state.add_write(mname)
+            copy_state.add_edge(src_node, None, mnode, None,
+                                Memlet(data=culprit, subset=sub, other_subset=_one()))
             repl = f'{mname}[0]'
             if assignments:
-                d.assignments = {k: pat.sub(repl, v) for k, v in assignments.items()}
+                d.assignments = {k: _rewrite_scalar_subscript(v, culprit, repl)[0]
+                                 for k, v in assignments.items()}
             # Re-set the condition even when unchanged: the assignment rewrite above must
             # invalidate the edge's cached condition symbols.
             if cond is not None:
-                d.condition = CodeBlock(pat.sub(repl, cond.as_string), language=cond.language)
+                d.condition = CodeBlock(_rewrite_scalar_subscript(cond.as_string, culprit, repl)[0],
+                                        language=cond.language)
             n += 1
     return n
 
