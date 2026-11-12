@@ -304,7 +304,7 @@ def _transient_needs_device_global(sdfg, name) -> bool:
     return False
 
 
-def _rewrite_scalar_subscript(expression, container, replacement=None, scalar=False):
+def _rewrite_scalar_subscript(expression, container, replacement=None, scalar=False, access=None):
     """Count/replace complete scalar reads, including nested index expressions.
 
     A closing-bracket regex truncates A[index[0], k] at the inner bracket.
@@ -312,24 +312,31 @@ def _rewrite_scalar_subscript(expression, container, replacement=None, scalar=Fa
     """
     import ast
     tree = ast.parse(expression, mode='eval')
+    target = ast.dump(ast.parse(access, mode='eval').body) if access is not None else None
+    def selected(node):
+        return target is None or ast.dump(node) == target
     matches = [node for node in ast.walk(tree) if isinstance(node, ast.Subscript)
-               and isinstance(node.value, ast.Name) and node.value.id == container]
-    indexed_names = {node.value for node in matches}
+               and isinstance(node.value, ast.Name) and node.value.id == container and selected(node)]
+    indexed_names = {node.value for node in ast.walk(tree) if isinstance(node, ast.Subscript)
+                     and isinstance(node.value, ast.Name) and node.value.id == container}
     if scalar:
         matches += [node for node in ast.walk(tree) if isinstance(node, ast.Name)
-                    and node.id == container and node not in indexed_names]
+                    and node.id == container and node not in indexed_names and selected(node)]
     if replacement is None or not matches:
         return expression, len(matches)
 
     class Replace(ast.NodeTransformer):
         def visit_Name(self, node):
-            if scalar and node.id == container:
+            if scalar and node.id == container and selected(node):
                 return ast.copy_location(ast.parse(replacement, mode='eval').body, node)
             return node
 
         def visit_Subscript(self, node):
             if isinstance(node.value, ast.Name) and node.value.id == container:
-                return ast.copy_location(ast.parse(replacement, mode='eval').body, node)
+                if selected(node):
+                    return ast.copy_location(ast.parse(replacement, mode='eval').body, node)
+                node.slice = self.visit(node.slice)
+                return node
             return self.generic_visit(node)
 
     return ast.unparse(ast.fix_missing_locations(Replace().visit(tree))), len(matches)
@@ -446,72 +453,83 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
     # the condition/assignments to read the mirror. A later reroute can index a
     # device array using an earlier host mirror; separate copy states preserve
     # that dependency instead of issuing both copies in one unordered state.
-    # Still keyed on the read memlets and their shape, never on a container's name.  Only a single
-    # distinct element per edge is re-routed (repeated reads share a mirror);
-    # different elements are left to the demotion fallback.
+    # Each distinct scalar expression gets its own mirror; repeated identical
+    # reads share that mirror. Bulk/slice reads retain the demotion fallback.
     for region in list(sdfg.all_control_flow_regions()):
         copy_states = {}
         for e in list(region.edges()):
             d = getattr(e, 'data', None)
             if d is None:
                 continue
-            try:
-                reads = [
-                    m for m in d.get_read_memlets(sdfg.arrays, include_scalars=True)
-                    if m.data == culprit and m.subset is not None and m.subset.num_elements() == 1
-                ]
-            except Exception:
-                continue
-            if not reads or any(m.subset != reads[0].subset for m in reads[1:]):
-                continue
             cond = getattr(d, 'condition', None)
             assignments = getattr(d, 'assignments', None) or {}
+            import ast
             try:
-                occ = sum(_rewrite_scalar_subscript(v, culprit, scalar=scalar)[1] for v in assignments.values())
-                occ += _rewrite_scalar_subscript(cond.as_string, culprit, scalar=scalar)[1] if cond is not None else 0
+                expressions = list(assignments.values()) + ([cond.as_string] if cond is not None else [])
+                accesses = set()
+                for expression in expressions:
+                    tree = ast.parse(expression, mode='eval')
+                    for node in ast.walk(tree):
+                        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                                and node.value.id == culprit):
+                            accesses.add(ast.unparse(node))
+                        elif scalar and isinstance(node, ast.Name) and node.id == culprit:
+                            # Scalar descriptors use bare names; indexed forms
+                            # are already handled by the subscript case.
+                            if not any(isinstance(parent, ast.Subscript) and parent.value is node
+                                       for parent in ast.walk(tree)):
+                                accesses.add(ast.unparse(node))
             except SyntaxError:
                 continue
-            if occ < 1:
-                continue
-            sub = deepcopy(reads[0].subset)
-            import ast
-            index_arrays = {node.id for node in ast.walk(ast.parse(str(sub), mode='eval'))
-                            if isinstance(node, ast.Name) and node.id in sdfg.arrays}
-            for name in sorted(index_arrays):
-                if sdfg.arrays[name].storage != dace.StorageType.GPU_Global:
+            for access in sorted(accesses):
+                try:
+                    reads = [m for m in dace.InterstateEdge(access).get_read_memlets(
+                        sdfg.arrays, include_scalars=True) if m.data == culprit]
+                except (ValueError, TypeError, SyntaxError, KeyError, NotImplementedError):
                     continue
-                # The validator may report A before its device index N in
-                # A[N[0]]. Mirror N first, then re-read the changed edges and
-                # subsets. Otherwise codegen dereferences a GPU pointer on host.
-                if not _reroute_host_scalar_accesses(sdfg, name, active):
-                    raise NotImplementedError('cannot mirror device index ' + name + ' for ' + culprit)
-                return n + _reroute_host_scalar_accesses(sdfg, culprit, _parents)
-            mname = _new_mirror()
-            copy_state = copy_states.get(e.src)
-            if copy_state is None:
-                copy_state = region.add_state_after(e.src, f'{e.src.label}_host_read')
-                copy_states[e.src] = copy_state
-            src_node = copy_state.add_read(culprit)
-            # Array names inside a subset are not free symbols in DaCe.
-            # Explicit reads keep index mirrors alive across the copy states.
-            import ast
-            index_arrays = {node.id for node in ast.walk(ast.parse(str(sub), mode='eval'))
-                            if isinstance(node, ast.Name) and node.id in sdfg.arrays}
-            for name in sorted(index_arrays - {culprit}):
-                copy_state.add_edge(copy_state.add_read(name), None, src_node, None, Memlet())
-            mnode = copy_state.add_write(mname)
-            copy_state.add_edge(src_node, None, mnode, None,
-                                Memlet(data=culprit, subset=sub, other_subset=_one()))
-            repl = f'{mname}[0]'
-            if assignments:
-                d.assignments = {k: _rewrite_scalar_subscript(v, culprit, repl, scalar=scalar)[0]
-                                 for k, v in assignments.items()}
-            # Re-set the condition even when unchanged: the assignment rewrite above must
-            # invalidate the edge's cached condition symbols.
-            if cond is not None:
-                d.condition = CodeBlock(_rewrite_scalar_subscript(cond.as_string, culprit, repl, scalar=scalar)[0],
-                                        language=cond.language)
-            n += 1
+                if len(reads) != 1 or reads[0].subset is None or reads[0].subset.num_elements() != 1:
+                    continue
+                sub = deepcopy(reads[0].subset)
+                import ast
+                index_arrays = {node.id for node in ast.walk(ast.parse(str(sub), mode='eval'))
+                                if isinstance(node, ast.Name) and node.id in sdfg.arrays}
+                for name in sorted(index_arrays):
+                    if sdfg.arrays[name].storage != dace.StorageType.GPU_Global:
+                        continue
+                    # The validator may report A before its device index N in
+                    # A[N[0]]. Mirror N first, then re-read the changed edges and
+                    # subsets. Otherwise codegen dereferences a GPU pointer on host.
+                    if not _reroute_host_scalar_accesses(sdfg, name, active):
+                        raise NotImplementedError('cannot mirror device index ' + name + ' for ' + culprit)
+                    return n + _reroute_host_scalar_accesses(sdfg, culprit, _parents)
+                mname = _new_mirror()
+                copy_state = copy_states.get(e.src)
+                if copy_state is None:
+                    copy_state = region.add_state_after(e.src, f'{e.src.label}_host_read')
+                    copy_states[e.src] = copy_state
+                src_node = copy_state.add_read(culprit)
+                # Array names inside a subset are not free symbols in DaCe.
+                # Explicit reads keep index mirrors alive across the copy states.
+                import ast
+                index_arrays = {node.id for node in ast.walk(ast.parse(str(sub), mode='eval'))
+                                if isinstance(node, ast.Name) and node.id in sdfg.arrays}
+                for name in sorted(index_arrays - {culprit}):
+                    copy_state.add_edge(copy_state.add_read(name), None, src_node, None, Memlet())
+                mnode = copy_state.add_write(mname)
+                copy_state.add_edge(src_node, None, mnode, None,
+                                    Memlet(data=culprit, subset=sub, other_subset=_one()))
+                repl = f'{mname}[0]'
+                assignments = getattr(d, 'assignments', None) or {}
+                cond = getattr(d, 'condition', None)
+                if assignments:
+                    d.assignments = {k: _rewrite_scalar_subscript(v, culprit, repl, scalar=scalar, access=access)[0]
+                                     for k, v in assignments.items()}
+                # Re-set the condition even when unchanged: the assignment rewrite above must
+                # invalidate the edge's cached condition symbols.
+                if cond is not None:
+                    d.condition = CodeBlock(_rewrite_scalar_subscript(cond.as_string, culprit, repl, scalar=scalar, access=access)[0],
+                                            language=cond.language)
+                n += 1
     return n
 
 

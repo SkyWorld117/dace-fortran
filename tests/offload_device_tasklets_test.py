@@ -263,17 +263,42 @@ def test_mirror_after_compound_block_repeated_indices_change_on_gpu():
         np.testing.assert_array_equal(result, [int(index == 3)])
 
 
-def test_distinct_elements_are_not_replaced_with_one_mirror():
+def distinct_control_graph():
     from dace_fortran.offload import _reroute_host_scalar_accesses
     graph = dace.SDFG('different_control_elements')
+    graph.add_symbol('offset', dace.int32)
     graph.add_array('A', [8], dace.int32, transient=True, storage=dace.StorageType.GPU_Global)
+    graph.add_array('result', [1], dace.int32)
     start = graph.add_state('compute')
-    start.add_mapped_tasklet('values', {'i': '0:8'}, {}, 'a = i',
+    start.add_mapped_tasklet('values', {'i': '0:8'}, {}, 'a = i + offset',
                             {'a': dace.Memlet('A[i]')}, external_edges=True,
                             schedule=dace.ScheduleType.GPU_Device)
-    end = graph.add_state('end')
-    edge = dace.InterstateEdge('A[0] + A[1] == 1')
-    graph.add_edge(start, end, edge)
-    original = edge.condition.as_string
-    assert _reroute_host_scalar_accesses(graph, 'A') == 0
-    assert edge.condition.as_string == original
+    for label, value, condition in [('match', 1, 'A[0] + A[1] == 1'),
+                                     ('other', 0, 'A[0] + A[1] != 1')]:
+        end = graph.add_state(label)
+        tasklet = end.add_tasklet(label, {}, {'y'}, f'y = {value}')
+        end.add_edge(tasklet, 'y', end.add_write('result'), None, dace.Memlet('result[0]'))
+        graph.add_edge(start, end, dace.InterstateEdge(condition))
+    assert _reroute_host_scalar_accesses(graph, 'A') == 4
+    graph.validate()
+    return graph
+
+
+def test_distinct_elements_get_distinct_mirrors():
+    distinct_control_graph().generate_code()
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+def test_distinct_control_elements_repeat_on_gpu():
+    import numpy as np
+    compiled = distinct_control_graph().compile()
+    for offset in (0, 5, 0, -1):
+        result = np.full(1, -1, dtype=np.int32)
+        compiled(result=result, offset=np.int32(offset))
+        np.testing.assert_array_equal(result, [int(offset == 0)])
+
+
+def test_targeted_scalar_rewrite_preserves_other_indexed_reads():
+    from dace_fortran.offload import _rewrite_scalar_subscript
+    text, count = _rewrite_scalar_subscript('a + a[0]', 'a', 'mirror[0]', scalar=True, access='a')
+    assert text == 'mirror[0] + a[0]' and count == 1
