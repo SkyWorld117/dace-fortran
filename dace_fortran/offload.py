@@ -342,7 +342,7 @@ def _rewrite_scalar_subscript(expression, container, replacement=None, scalar=Fa
     return ast.unparse(ast.fix_missing_locations(Replace().visit(tree))), len(matches)
 
 
-def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
+def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset(), force=False):
     """Give every host-side scalar access of a device-resident container a host mirror.
 
     The demotion below exists because a container promoted to GPU_Global may also be touched by
@@ -380,8 +380,8 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
         return (isinstance(pn, (nodes.EntryNode, nodes.ExitNode)) and getattr(pn, 'map', None) is not None
                 and pn.map.schedule in dace.dtypes.GPU_SCHEDULES)
 
-    device_accessed = False
-    for st in sdfg.all_states():
+    device_accessed = force
+    for st in ([] if force else sdfg.all_states()):
         if not isinstance(st, SDFGState):
             continue
         for nd in st.nodes():
@@ -499,9 +499,9 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
                     # The validator may report A before its device index N in
                     # A[N[0]]. Mirror N first, then re-read the changed edges and
                     # subsets. Otherwise codegen dereferences a GPU pointer on host.
-                    if not _reroute_host_scalar_accesses(sdfg, name, active):
+                    if not _reroute_host_scalar_accesses(sdfg, name, active, force=force):
                         raise NotImplementedError('cannot mirror device index ' + name + ' for ' + culprit)
-                    return n + _reroute_host_scalar_accesses(sdfg, culprit, _parents)
+                    return n + _reroute_host_scalar_accesses(sdfg, culprit, _parents, force=force)
                 mname = _new_mirror()
                 copy_state = copy_states.get(e.src)
                 if copy_state is None:
@@ -579,6 +579,27 @@ def _batch_host_scalar_reroutes(sdfg):
             # oracle below; batching does not accept or demote it speculatively.
             continue
     return changed
+
+
+def _device_array_abi(sdfg):
+    """Keep every array argument on device; mirror scalar host accesses.
+
+    Opt-in for device-pointer callers, including length-one array arguments
+    and host-only coefficient tables. Scalar descriptors still pass by value.
+    Unsupported bulk host operations must still pass strict validation/codegen.
+    """
+    promoted = []
+    for name, desc in list(sdfg.arrays.items()):
+        if desc.transient or not isinstance(desc, dace.data.Array):
+            continue
+        if desc.storage == dace.StorageType.GPU_Global:
+            continue
+        desc.storage = dace.StorageType.GPU_Global
+        promoted.append(name)
+    for name in promoted:
+        _reroute_host_scalar_accesses(sdfg, name, force=True)
+    sdfg.validate()
+    return promoted
 
 
 def _device_library_nodes(sdfg):
@@ -693,7 +714,7 @@ def _device_array_tasklets(sdfg, block_size=None):
 
 
 def offload_device_resident(sdfg, block_size=None, force_inline=False, split_siblings=False,
-                            permissive_ltm=False, device_libnodes=False, device_scalars=False, device_tasklets=False, loop_map_patterns=None):
+                            permissive_ltm=False, device_libnodes=False, device_scalars=False, device_tasklets=False, loop_map_patterns=None, device_array_abi=False):
     """Schedule + storage assignment for device-resident offload. In place.
 
     `device_libnodes` is OFF by default and turned on PER FRONTEND (WRF), because it changes the
@@ -716,6 +737,11 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     hand-written in the union form -- so turning it on cannot move them; it exists for the TUs the
     extractor emits from the source's own sibling form.  Turn it on per kernel, with that kernel's
     differential.
+
+    `device_array_abi` is OFF by default. It keeps every public array argument
+    on device, including length-one arrays and host-only tables, with scalar
+    host mirrors for remaining control/arithmetic. It does not eliminate those
+    scalar transfers. Unsupported accesses retain strict validation/codegen.
 
     `device_tasklets` is OFF by default. It wraps residual, side-effect-free
     array-output tasklets in singleton GPU maps before the host-mirror fallback;
@@ -962,6 +988,14 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
         if _dev_scalars:
             print(f"[dace_fortran.offload] device copy of {len(_dev_scalars)} kernel-read scalar(s): "
                   f"{_dev_scalars}")
+
+    if device_array_abi:
+        # Resolve the public array ABI after ordinary scheduling/demotion.
+        # Keep the default path unchanged for callers supplying host arrays.
+        promoted_abi = _device_array_abi(sdfg)
+        print(f"[dace_fortran.offload] device array ABI: {len(promoted_abi)} promoted argument(s)")
+        n_dev = sum(not desc.transient and isinstance(desc, dace.data.Array)
+                    and desc.storage == dace.StorageType.GPU_Global for desc in sdfg.arrays.values())
 
     # 3. Scheduling validation: at least one GPU map, all GPU maps have device arrays.
     n_gpu = sum(1 for st in sdfg.all_states() for nd in st.nodes()

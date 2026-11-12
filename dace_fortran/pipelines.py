@@ -201,6 +201,7 @@ def optimize(
     permissive_ltm: bool = False,
     device_libnodes: bool = False,
     device_tasklets: bool = False,
+    device_array_abi: bool = False,
     allow_abi_scalar_fission: bool = False,
     loop_map_patterns: list[str] | None = None,
 ) -> SDFG:
@@ -226,6 +227,9 @@ def optimize(
         regex matches, retaining conservative dependence checks; None leaves selection unchanged.
     :param device_tasklets: wrap residual array-output tasklets in singleton GPU maps,
         avoiding host mirrors for scalar array updates. Off by default.
+    :param device_array_abi: require device pointers for all array arguments,
+        including length-one and host-only inputs; use scalar host mirrors for
+        residual host accesses. Off by default; scalar staging can remain.
     :param device_libnodes: schedule a top-level compute library node whose inputs are all
                 device-resident on the GPU.  Opt-in per frontend.
     :param allow_abi_scalar_fission: let ``fission_loop_local_scalars`` split a size-1 ABI-STAGED
@@ -289,6 +293,7 @@ def optimize(
                                                      permissive_ltm=permissive_ltm,
                                                      device_libnodes=device_libnodes,
                                                      device_tasklets=device_tasklets,
+                                                     device_array_abi=device_array_abi,
                                                      loop_map_patterns=loop_map_patterns)
         print(f"[dace_fortran.optimize] gpu offload: {n_gpu} device map(s), {n_dev} device array(s)")
 

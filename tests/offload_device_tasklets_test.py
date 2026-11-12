@@ -302,3 +302,65 @@ def test_targeted_scalar_rewrite_preserves_other_indexed_reads():
     from dace_fortran.offload import _rewrite_scalar_subscript
     text, count = _rewrite_scalar_subscript('a + a[0]', 'a', 'mirror[0]', scalar=True, access='a')
     assert text == 'mirror[0] + a[0]' and count == 1
+
+
+def array_abi_graph():
+    graph = dace.SDFG('host_scalar_reads_device_array_abi')
+    graph.add_symbol('index', dace.int32)
+    graph.add_array('table', [8], dace.int32)
+    graph.add_array('scale', [1], dace.int32)
+    graph.add_array('result', [1], dace.int32)
+    graph.add_array('bulk', [8], dace.int32, transient=True)
+    graph.add_scalar('value', dace.int32, transient=True)
+    start = graph.add_state('compute')
+    start.add_mapped_tasklet('bulk', {'i': '0:8'}, {}, 'a = i',
+                            {'a': dace.Memlet('bulk[i]')}, external_edges=True)
+    tasklet = start.add_tasklet('host_value', {'x', 'y'}, {'z'}, 'z = x + y')
+    start.add_edge(start.add_read('table'), None, tasklet, 'x', dace.Memlet('table[index]'))
+    start.add_edge(start.add_read('scale'), None, tasklet, 'y', dace.Memlet('scale[0]'))
+    start.add_edge(tasklet, 'z', start.add_write('value'), None, dace.Memlet('value[0]'))
+    for label, val, condition in [('positive', 1, 'value > 3'), ('other', 0, 'value <= 3')]:
+        end = graph.add_state(label)
+        tasklet = end.add_tasklet(label, {}, {'y'}, f'y = {val}')
+        end.add_edge(tasklet, 'y', end.add_write('result'), None, dace.Memlet('result[0]'))
+        graph.add_edge(start, end, dace.InterstateEdge(condition))
+    offload_device_resident(graph, device_array_abi=True)
+    for name in ('table', 'scale', 'result'):
+        assert graph.arrays[name].storage == dace.StorageType.GPU_Global
+    return graph
+
+
+def test_device_array_abi_includes_host_only_and_length_one_arguments():
+    array_abi_graph().generate_code()
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+def test_device_array_abi_scalar_reads_and_writes_repeat_on_gpu():
+    import ctypes as ct
+    import numpy as np
+    runtime = ct.CDLL('libcudart.so')
+    runtime.cudaMalloc.argtypes = [ct.POINTER(ct.c_void_p), ct.c_size_t]
+    runtime.cudaFree.argtypes = [ct.c_void_p]
+    runtime.cudaMemcpy.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_size_t, ct.c_int]
+    class DeviceArray:
+        def __init__(self, array):
+            self.pointer = ct.c_void_p()
+            assert runtime.cudaMalloc(ct.byref(self.pointer), array.nbytes) == 0
+            self.__cuda_array_interface__ = dict(shape=array.shape, strides=None,
+                typestr=array.dtype.str, data=(self.pointer.value, False), version=3)
+    arrays = [np.arange(8, dtype=np.int32), np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32)]
+    device = [DeviceArray(array) for array in arrays]
+    try:
+        compiled = array_abi_graph().compile()
+        for index, scale, offset in [(3, 1, 0), (5, -20, 0), (3, 1, 2), (2, 0, 0)]:
+            arrays[0][:] = np.arange(8) + offset
+            arrays[1][:] = scale
+            arrays[2][:] = -1
+            for host, gpu in zip(arrays, device):
+                assert runtime.cudaMemcpy(gpu.pointer, host.ctypes.data, host.nbytes, 1) == 0
+            compiled(table=device[0], scale=device[1], result=device[2], index=np.int32(index))
+            assert runtime.cudaMemcpy(arrays[2].ctypes.data, device[2].pointer, arrays[2].nbytes, 2) == 0
+            np.testing.assert_array_equal(arrays[2], [int(index + offset + scale > 3)])
+    finally:
+        for gpu in device:
+            assert runtime.cudaFree(gpu.pointer) == 0
