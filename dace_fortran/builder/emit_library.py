@@ -1620,6 +1620,48 @@ def _image_of_record_array(builder: SDFGBuilder, ctx: Ctx, name: str) -> str:
     return images[0]
 
 
+def emit_integer_stop(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
+    """Preserve Flang's integer STOP as ordered termination, including device error paths.
+
+    Host execution exits with the integer status. Device execution traps so the next
+    checked CUDA/HIP operation reports failure. This does not implement STOP text or
+    Fortran's optional diagnostic/IEEE reporting; unsupported runtime forms still fail.
+    """
+    import dace
+
+    if len(n.call_args) != 3:
+        raise NotImplementedError('integer STOP requires the three-argument Flang runtime ABI')
+    code = n.call_args[0]
+    inputs = {}
+    array = None
+    if re.fullmatch(r'[+-]?\d+', code):
+        expression = code
+    elif code in ctx.sdfg.symbols:
+        expression = code
+    elif code in ctx.sdfg.arrays:
+        array = ctx.sdfg.arrays[code]
+        if array.dtype not in (dace.int8, dace.int16, dace.int32, dace.int64) or array.total_size != 1:
+            raise NotImplementedError('STOP status must be a scalar integer')
+        inputs['_stop_status'] = array.dtype
+        expression = '_stop_status'
+    else:
+        raise NotImplementedError(f'unresolved integer STOP status {code!r}')
+    ctx.flush_and_ensure(builder, region)
+    state = ctx.new_state(builder, region)
+    ctx.sdfg.append_global_code('#include <cstdlib>\n')
+    tasklet = state.add_tasklet(f'fortran_stop_{builder.nid()}', inputs, {},
+        '#if defined(__CUDA_ARCH__)\n'
+        'asm volatile("trap;");\n'
+        '#elif defined(__HIP_DEVICE_COMPILE__)\n'
+        '__builtin_trap();\n'
+        '#else\n'
+        f'std::exit(static_cast<int>({expression}));\n'
+        '#endif\n', language=dace.Language.CPP, side_effects=True)
+    tasklet.ordered_side_effects = True
+    if array is not None:
+        state.add_edge(state.add_read(code), None, tasklet, '_stop_status', Memlet(f'{code}[0]'))
+
+
 def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
     """Lower a *registered* external ``bind(c)`` call to an
     :class:`dace_fortran.external.ExternalCall` library node.
@@ -1654,6 +1696,9 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     # untouched mangled form so a caller can still register module-
     # qualified if they want to disambiguate two same-named callees.
     callee_raw = n.callee.lstrip("@")
+    if callee_raw == '_FortranAStopStatement':
+        emit_integer_stop(builder, ctx, n, region)
+        return
     callee = callee_raw
     if callee.startswith("_QP"):
         callee = callee[3:]

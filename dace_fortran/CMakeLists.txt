@@ -379,6 +379,7 @@ add_library(hlfir_bridge_passes STATIC
     passes/VersionShapeScalars.cpp
     passes/InlineAll.cpp
     passes/LowerFirSelectCase.cpp
+    passes/NormalizeStopControlFlow.cpp
     passes/FlattenStructs.cpp
     passes/RaggedAos.cpp
     passes/FlattenGlobalScalarReads.cpp

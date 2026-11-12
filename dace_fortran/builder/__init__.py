@@ -145,6 +145,7 @@ DEFAULT_PIPELINE = (
     # blocks``).  Lifting cf -> scf first folds the early-return guard into a
     # single-block ``scf.if`` so every callee is single-block and inlines
     # cleanly; the trailing lift-cf-to-scf handles whatever inlining exposes.
+    "hlfir-normalize-stop-control-flow,"
     "lift-cf-to-scf,"
     # A DO with a CYCLE (or any branch out of structured control flow in its body) is lowered unstructured and
     # lifted to a trip-counted scf.while; restore the counted fir.do_loop so the loop and everything nested in it
@@ -358,6 +359,7 @@ DEFAULT_PIPELINE = (
     "hlfir-lift-reduction-operands,"
     "hlfir-default-intent,"
     # Lift cf.br / cf.cond_br loops into scf.while so extract_ast can walk them.
+    "hlfir-normalize-stop-control-flow,"
     "lift-cf-to-scf,"
     "hlfir-restore-counted-loops,"
     # Classify ``fir.global`` ops as INPUT vs MUTABLE based on whether
@@ -420,6 +422,7 @@ MULTI_FILE_PIPELINE = (
     # it see code the configuration never runs.  A no-op when nothing is specialised.
     "hlfir-specialize-globals,"
     "symbol-dce,"
+    "hlfir-normalize-stop-control-flow,"
     "lift-cf-to-scf,"
     "hlfir-restore-counted-loops,"
     "hlfir-inline-all,"

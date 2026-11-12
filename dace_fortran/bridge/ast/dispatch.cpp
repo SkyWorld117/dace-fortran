@@ -3509,6 +3509,8 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
       if (auto r = mlir::dyn_cast<hlfir::MaxvalOp>(red)) return r.getMask();
       return {};
     };
+    if (op.getName().getStringRef() == "cf.br" || op.getName().getStringRef() == "cf.cond_br")
+      throw std::runtime_error("buildAST: unstructured branch; structurize control flow before extraction");
     if (reductionMask(&op)) throw std::runtime_error("MASK= on SUM/PRODUCT/MINVAL/MAXVAL is not lowered");
     if (mlir::isa<hlfir::WhereOp, hlfir::ForallOp, hlfir::RegionAssignOp>(&op)) {
       std::string locStr;
@@ -3556,7 +3558,12 @@ std::vector<ASTNode> extractAST(mlir::ModuleOp module, const std::string& entry_
     // dispatch the callee survives as private -- walking its body would shadow the real entry's AST if it appears
     // earlier in module order.
     if (func.isPrivate()) return;
-    if (!func.getBody().empty()) result = buildAST(func.getBody().front());
+    if (!func.getBody().empty()) {
+      if (!func.getBody().hasOneBlock())
+        throw std::runtime_error("extractAST: unstructured multi-block entry; structurize control flow before "
+                                 "extraction (reading only the first block would drop branches/statements)");
+      result = buildAST(func.getBody().front());
+    }
   });
 
   // Prepends one symbol_init node per registered position symbol (interstate-edge load <symbol>=<array>[idx-1] ahead of
