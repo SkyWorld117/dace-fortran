@@ -389,7 +389,17 @@ def apply_reserved(expr: str) -> str:
     is the right place to catch them before sympify."""
     if not isinstance(expr, str):
         return expr
-    return re.sub(r"\b([A-Za-z_]\w*)\b", lambda m: _reserved_rewrite(m.group(1)), expr)
+    def rewrite(match):
+        name = match.group(1)
+        # The bridge renders intrinsic index expressions as calls. They are
+        # functions, whereas a reserved variable (including array[index])
+        # still needs the program_ prefix. DaCe's symbolic parser knows these
+        # builtins and converts them to SymPy Min/Max/Abs.
+        if (name.lower() in {"min", "max", "abs"}
+                and re.match(r"\s*\(", expr[match.end():])):
+            return name.lower()
+        return _reserved_rewrite(name)
+    return re.sub(r"\b([A-Za-z_]\w*)\b", rewrite, expr)
 
 
 def _remap_token(token: str, iter_map: dict[str, str]) -> str:
