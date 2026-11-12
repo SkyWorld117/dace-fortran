@@ -898,7 +898,10 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
             is_len1 = all(int(s) == 1 for s in arr.shape)
         except (TypeError, ValueError):  # symbolic extents -> real array
             is_len1 = False
-        if not is_len1:
+        # A boundary-crossing transient needs device storage even when it
+        # contains one element. It cannot be a host/register allocation outside
+        # the kernel that writes it. Private per-map arrays were excluded above.
+        if arr.transient or not is_len1:
             arr.storage = dace.dtypes.StorageType.GPU_Global
             promoted.append(name)
             n_dev += 1

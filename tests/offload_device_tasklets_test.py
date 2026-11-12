@@ -364,3 +364,54 @@ def test_device_array_abi_scalar_reads_and_writes_repeat_on_gpu():
     finally:
         for gpu in device:
             assert runtime.cudaFree(gpu.pointer) == 0
+
+
+def boundary_singleton_graph():
+    graph = dace.SDFG('boundary_singleton_transient')
+    graph.add_symbol('offset', dace.int32)
+    graph.add_array('temporary', [1], dace.int32, transient=True, storage=dace.StorageType.Register)
+    graph.add_array('result', [1], dace.int32)
+    start = graph.add_state('device_write')
+    start.add_mapped_tasklet('write', {'i': '0:1'}, {}, 'a = offset',
+                            {'a': dace.Memlet('temporary[i]')}, external_edges=True)
+    end = graph.add_state('host_read')
+    graph.add_edge(start, end, dace.InterstateEdge())
+    tasklet = end.add_tasklet('read', {'x'}, {'y'}, 'y = x + 1')
+    end.add_edge(end.add_read('temporary'), None, tasklet, 'x', dace.Memlet('temporary[0]'))
+    end.add_edge(tasklet, 'y', end.add_write('result'), None, dace.Memlet('result[0]'))
+    offload_device_resident(graph)
+    assert graph.arrays['temporary'].storage == dace.StorageType.GPU_Global
+    return graph
+
+
+def test_boundary_singleton_transient_gets_device_storage():
+    boundary_singleton_graph().generate_code()
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+def test_boundary_singleton_transient_repeats_on_gpu():
+    import numpy as np
+    compiled = boundary_singleton_graph().compile()
+    for value in (4, -3, 0, 4):
+        result = np.full(1, -1, dtype=np.int32)
+        compiled(result=result, offset=np.int32(value))
+        np.testing.assert_array_equal(result, [value + 1])
+
+
+def test_private_singleton_inside_one_map_stays_private():
+    graph = dace.SDFG('private_singleton')
+    graph.add_array('tmp', [1], dace.int32, transient=True, storage=dace.StorageType.Register)
+    graph.add_array('output', [8], dace.int32)
+    state = graph.add_state()
+    entry, exit = state.add_map('columns', {'i': '0:8'})
+    write = state.add_tasklet('write', {}, {'x'}, 'x = i')
+    read = state.add_tasklet('read', {'x'}, {'y'}, 'y = x + 1')
+    tmp = state.add_access('tmp')
+    state.add_edge(entry, None, write, None, dace.Memlet())
+    state.add_edge(write, 'x', tmp, None, dace.Memlet('tmp[0]'))
+    state.add_edge(tmp, None, read, 'x', dace.Memlet('tmp[0]'))
+    state.add_memlet_path(read, exit, state.add_write('output'),
+                          src_conn='y', memlet=dace.Memlet('output[i]'))
+    offload_device_resident(graph)
+    assert graph.arrays['tmp'].storage == dace.StorageType.Register
+    graph.generate_code()
