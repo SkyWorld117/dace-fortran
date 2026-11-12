@@ -447,12 +447,13 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
     # device array using an earlier host mirror; separate copy states preserve
     # that dependency instead of issuing both copies in one unordered state.
     # Still keyed on the read memlets and their shape, never on a container's name.  Only a single
-    # unambiguous read on the edge is re-routed; anything else is left to the demotion fallback.
+    # distinct element per edge is re-routed (repeated reads share a mirror);
+    # different elements are left to the demotion fallback.
     for region in list(sdfg.all_control_flow_regions()):
         copy_states = {}
         for e in list(region.edges()):
             d = getattr(e, 'data', None)
-            if d is None or not isinstance(e.src, SDFGState):
+            if d is None:
                 continue
             try:
                 reads = [
@@ -461,7 +462,7 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
                 ]
             except Exception:
                 continue
-            if len(reads) != 1:
+            if not reads or any(m.subset != reads[0].subset for m in reads[1:]):
                 continue
             cond = getattr(d, 'condition', None)
             assignments = getattr(d, 'assignments', None) or {}
@@ -470,7 +471,7 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
                 occ += _rewrite_scalar_subscript(cond.as_string, culprit, scalar=scalar)[1] if cond is not None else 0
             except SyntaxError:
                 continue
-            if occ != 1:
+            if occ < 1:
                 continue
             sub = deepcopy(reads[0].subset)
             import ast
@@ -541,7 +542,7 @@ def _batch_host_scalar_reroutes(sdfg):
                 candidates.add(name)
     for region in sdfg.all_control_flow_regions():
         for edge in region.edges():
-            if edge.data is None or not isinstance(edge.src, SDFGState):
+            if edge.data is None:
                 continue
             try:
                 reads = edge.data.get_read_memlets(sdfg.arrays, include_scalars=True)

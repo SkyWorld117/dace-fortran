@@ -219,3 +219,61 @@ def test_device_reduction_scalar_host_branch_repeats_on_gpu():
         result = np.full(1, -1, dtype=np.int32)
         compiled(result=result, offset=np.int32(offset))
         np.testing.assert_array_equal(result, [int(offset + 7 > 0)])
+
+
+def compound_control_graph():
+    from dace.sdfg.state import ControlFlowRegion
+    from dace_fortran.offload import _batch_host_scalar_reroutes
+    graph = dace.SDFG('compound_repeated_index_control')
+    graph.add_symbol('index', dace.int32)
+    graph.add_array('A', [8], dace.int32, transient=True, storage=dace.StorageType.GPU_Global)
+    graph.add_array('N', [1], dace.int32, transient=True, storage=dace.StorageType.GPU_Global)
+    graph.add_array('result', [1], dace.int32)
+    region = ControlFlowRegion('compound', sdfg=graph)
+    graph.add_node(region, is_start_block=True)
+    start = region.add_state('compute', is_start_block=True)
+    start.add_mapped_tasklet('values', {'i': '0:8'}, {}, 'a = 2*i + 5',
+                            {'a': dace.Memlet('A[i]')}, external_edges=True,
+                            schedule=dace.ScheduleType.GPU_Device)
+    start.add_mapped_tasklet('selector', {'one': '0:1'}, {}, 'n = index',
+                            {'n': dace.Memlet('N[0]')}, external_edges=True,
+                            schedule=dace.ScheduleType.GPU_Device)
+    for label, value, condition in [('match', 1, 'A[N[0]] + A[N[0]] == 22'),
+                                     ('other', 0, 'A[N[0]] + A[N[0]] != 22')]:
+        target = graph.add_state(label)
+        tasklet = target.add_tasklet(label, {}, {'y'}, f'y = {value}')
+        target.add_edge(tasklet, 'y', target.add_write('result'), None, dace.Memlet('result[0]'))
+        graph.add_edge(region, target, dace.InterstateEdge(condition))
+    assert _batch_host_scalar_reroutes(graph) > 0
+    graph.validate()
+    return graph
+
+
+def test_mirror_after_compound_block_reuses_repeated_array_element():
+    compound_control_graph().generate_code()
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+def test_mirror_after_compound_block_repeated_indices_change_on_gpu():
+    import numpy as np
+    compiled = compound_control_graph().compile()
+    for index in (3, 5, 3, 2):
+        result = np.full(1, -1, dtype=np.int32)
+        compiled(result=result, index=np.int32(index))
+        np.testing.assert_array_equal(result, [int(index == 3)])
+
+
+def test_distinct_elements_are_not_replaced_with_one_mirror():
+    from dace_fortran.offload import _reroute_host_scalar_accesses
+    graph = dace.SDFG('different_control_elements')
+    graph.add_array('A', [8], dace.int32, transient=True, storage=dace.StorageType.GPU_Global)
+    start = graph.add_state('compute')
+    start.add_mapped_tasklet('values', {'i': '0:8'}, {}, 'a = i',
+                            {'a': dace.Memlet('A[i]')}, external_edges=True,
+                            schedule=dace.ScheduleType.GPU_Device)
+    end = graph.add_state('end')
+    edge = dace.InterstateEdge('A[0] + A[1] == 1')
+    graph.add_edge(start, end, edge)
+    original = edge.condition.as_string
+    assert _reroute_host_scalar_accesses(graph, 'A') == 0
+    assert edge.condition.as_string == original
