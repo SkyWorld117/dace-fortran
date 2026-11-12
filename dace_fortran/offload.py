@@ -326,7 +326,7 @@ def _rewrite_scalar_subscript(expression, container, replacement=None):
     return ast.unparse(ast.fix_missing_locations(Replace().visit(tree))), len(matches)
 
 
-def _reroute_host_scalar_accesses(sdfg, culprit):
+def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
     """Give every host-side scalar access of a device-resident container a host mirror.
 
     The demotion below exists because a container promoted to GPU_Global may also be touched by
@@ -344,6 +344,10 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
     rewritten to read the mirror.  Anything else -- a dynamic map range, an ambiguous multi-read
     condition -- is left for the caller, which demotes as before.
     """
+    if culprit in _parents:
+        raise NotImplementedError('cyclic device-array index reads: ' + culprit)
+    active = _parents | {culprit}
+
     from copy import deepcopy
     from dace import Memlet
     from dace.sdfg.scope import is_devicelevel_gpu
@@ -457,6 +461,18 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
             if occ != 1:
                 continue
             sub = deepcopy(reads[0].subset)
+            import ast
+            index_arrays = {node.id for node in ast.walk(ast.parse(str(sub), mode='eval'))
+                            if isinstance(node, ast.Name) and node.id in sdfg.arrays}
+            for name in sorted(index_arrays):
+                if sdfg.arrays[name].storage != dace.StorageType.GPU_Global:
+                    continue
+                # The validator may report A before its device index N in
+                # A[N[0]]. Mirror N first, then re-read the changed edges and
+                # subsets. Otherwise codegen dereferences a GPU pointer on host.
+                if not _reroute_host_scalar_accesses(sdfg, name, active):
+                    raise NotImplementedError('cannot mirror device index ' + name + ' for ' + culprit)
+                return n + _reroute_host_scalar_accesses(sdfg, culprit, _parents)
             mname = _new_mirror()
             copy_state = copy_states.get(e.src)
             if copy_state is None:
@@ -484,6 +500,54 @@ def _reroute_host_scalar_accesses(sdfg, culprit):
                                         language=cond.language)
             n += 1
     return n
+
+
+def _batch_host_scalar_reroutes(sdfg):
+    """Repair independent scalar host reads before using validation as an oracle.
+
+    Large graphs can otherwise repeat a full recursive validation for each
+    array. Only accesses the validator classifies as scalar are candidates;
+    unsupported cases remain for the existing validation/demotion loop.
+    """
+    from dace.sdfg.scope import is_devicelevel_gpu
+    from dace.sdfg.validation import _is_scalar
+    if is_devicelevel_gpu(sdfg, None, None):
+        return 0
+    candidates = set()
+    for state in sdfg.all_states():
+        for edge in state.edges():
+            if edge.data is None or edge.data.data not in sdfg.arrays:
+                continue
+            name = edge.data.data
+            if sdfg.arrays[name].storage != dace.StorageType.GPU_Global:
+                continue
+            tasklet = edge.dst if isinstance(edge.dst, nodes.Tasklet) else edge.src
+            if not isinstance(tasklet, nodes.Tasklet) or tasklet.language != dace.Language.Python:
+                continue
+            path = state.memlet_path(edge)
+            if len(path) == 1 and _is_scalar(edge, path) and not is_devicelevel_gpu(sdfg, state, tasklet):
+                candidates.add(name)
+    for region in sdfg.all_control_flow_regions():
+        for edge in region.edges():
+            if edge.data is None or not isinstance(edge.src, SDFGState):
+                continue
+            try:
+                reads = edge.data.get_read_memlets(sdfg.arrays)
+            except (ValueError, TypeError, SyntaxError, KeyError, NotImplementedError):
+                continue
+            for read in reads:
+                if (read.data in sdfg.arrays and read.subset is not None and read.subset.num_elements() == 1
+                        and sdfg.arrays[read.data].storage == dace.StorageType.GPU_Global):
+                    candidates.add(read.data)
+    changed = 0
+    for name in sorted(candidates):
+        try:
+            changed += _reroute_host_scalar_accesses(sdfg, name)
+        except NotImplementedError:
+            # An unresolved device index or cycle still has to pass the strict
+            # oracle below; batching does not accept or demote it speculatively.
+            continue
+    return changed
 
 
 def _device_array_tasklets(sdfg, block_size=None):
@@ -733,6 +797,10 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     if device_tasklets:
         count=_device_array_tasklets(sdfg,block_size)
         if count: print(f'[dace_fortran.offload] device-scheduled {count} residual array tasklet(s)')
+
+    repaired = _batch_host_scalar_reroutes(sdfg)
+    if repaired:
+        print(f'[dace_fortran.offload] batched {repaired} host scalar mirror repairs')
 
     from dace.sdfg.validation import InvalidSDFGEdgeError, InvalidSDFGInterstateEdgeError
     demoted = []

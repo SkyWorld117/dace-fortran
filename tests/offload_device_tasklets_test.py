@@ -125,7 +125,7 @@ def test_host_mirror_does_not_replace_a_different_container():
     assert _rewrite_scalar_subscript(expression, 'B', 'mirror[0]') == (expression, 0)
 
 
-def nested_index_graph():
+def nested_index_graph(outer_first=False):
     from dace_fortran.offload import _reroute_host_scalar_accesses
     graph = dace.SDFG('nested_host_mirror_index')
     graph.add_symbol('index', dace.int32)
@@ -145,21 +145,30 @@ def nested_index_graph():
         tasklet = target.add_tasklet(label, {}, {'y'}, f'y = {value}')
         target.add_edge(tasklet, 'y', target.add_write('result'), None, dace.Memlet('result[0]'))
         graph.add_edge(start, target, dace.InterstateEdge(condition))
-    assert _reroute_host_scalar_accesses(graph, 'N') == 2
-    assert _reroute_host_scalar_accesses(graph, 'A') == 2
+    if outer_first == 'batch':
+        from dace_fortran.offload import _batch_host_scalar_reroutes
+        assert _batch_host_scalar_reroutes(graph) == 2
+    elif outer_first:
+        assert _reroute_host_scalar_accesses(graph, 'A') == 2
+        assert _reroute_host_scalar_accesses(graph, 'N') == 0
+    else:
+        assert _reroute_host_scalar_accesses(graph, 'N') == 2
+        assert _reroute_host_scalar_accesses(graph, 'A') == 2
     graph.validate()
     return graph
 
 
-def test_nested_host_mirror_index_validates_and_generates_code():
-    code = '\n'.join(part.code for part in nested_index_graph().generate_code())
+@pytest.mark.parametrize('outer_first', [False, True, 'batch'])
+def test_nested_host_mirror_index_validates_and_generates_code(outer_first):
+    code = '\n'.join(part.code for part in nested_index_graph(outer_first).generate_code())
     assert '__host_mirror' in code
 
 
 @pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
-def test_nested_host_mirror_index_changes_between_gpu_calls():
+@pytest.mark.parametrize('outer_first', [False, True, 'batch'])
+def test_nested_host_mirror_index_changes_between_gpu_calls(outer_first):
     import numpy as np
-    graph = nested_index_graph()
+    graph = nested_index_graph(outer_first)
     compiled = graph.compile()
     for index in (3, 5, 3, 2, 7, 3):
         result = np.full(1, -1, dtype=np.int32)
