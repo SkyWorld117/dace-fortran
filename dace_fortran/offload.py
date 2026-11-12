@@ -293,7 +293,17 @@ def _transient_needs_device_global(sdfg, name) -> bool:
         for nd in st.nodes():
             if not (isinstance(nd, nodes.AccessNode) and nd.data == name):
                 continue
-            if not is_devicelevel_gpu(sdfg, st, nd):
+            in_device = is_devicelevel_gpu(sdfg, st, nd)
+            desc = sdfg.arrays[name]
+            # Persistent heap arrays belong to the program, even when all
+            # access nodes sit inside maps. Their allocation cannot stay on
+            # the CPU when the mapped code runs on the GPU. Registers and
+            # scope-lifetime private temporaries retain their private storage.
+            if (in_device and desc.lifetime == dace.AllocationLifetime.Persistent
+                    and desc.storage in (dace.StorageType.Default, dace.StorageType.CPU_Heap,
+                                         dace.StorageType.CPU_ThreadLocal)):
+                return True
+            if not in_device:
                 outside_scope = True
             for e in st.all_edges(nd):
                 if any(_gpu_boundary_node(p.src) or _gpu_boundary_node(p.dst)

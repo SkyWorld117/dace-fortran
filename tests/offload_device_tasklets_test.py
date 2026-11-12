@@ -415,3 +415,23 @@ def test_private_singleton_inside_one_map_stays_private():
     offload_device_resident(graph)
     assert graph.arrays['tmp'].storage == dace.StorageType.Register
     graph.generate_code()
+
+
+def test_persistent_heap_inside_a_map_gets_device_allocation():
+    graph = dace.SDFG('persistent_heap_in_device_map')
+    graph.add_array('tmp', [8], dace.int32, transient=True,
+                    lifetime=dace.AllocationLifetime.Persistent)
+    graph.add_array('output', [8], dace.int32)
+    state = graph.add_state()
+    entry, exit = state.add_map('columns', {'i': '0:8'})
+    write = state.add_tasklet('write', {}, {'x'}, 'x = i')
+    read = state.add_tasklet('read', {'x'}, {'y'}, 'y = x + 1')
+    tmp = state.add_access('tmp')
+    state.add_edge(entry, None, write, None, dace.Memlet())
+    state.add_edge(write, 'x', tmp, None, dace.Memlet('tmp[i]'))
+    state.add_edge(tmp, None, read, 'x', dace.Memlet('tmp[i]'))
+    state.add_memlet_path(read, exit, state.add_write('output'),
+                          src_conn='y', memlet=dace.Memlet('output[i]'))
+    offload_device_resident(graph)
+    assert graph.arrays['tmp'].storage == dace.StorageType.GPU_Global
+    graph.generate_code()
