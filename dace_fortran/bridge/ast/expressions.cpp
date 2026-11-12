@@ -560,12 +560,24 @@ void captureElementDesignateWrite(mlir::Value dest, ASTNode& node) {
         AccessInfo wa;
         wa.array_name = node.target;
         wa.is_write = true;
-        unsigned di = 0;
-        for (auto idx : dg.getIndices()) {
-          auto resolved = resolveIndex(idx);
-          wa.index_vars.push_back(resolved.empty() ? "?" : resolved);
-          wa.index_exprs.push_back(buildDesignateIndexExpr(dg, di, idx, 0));
-          ++di;
+        auto indices = dg.getIndices();
+        auto triplets = dg.getIsTriplet();
+        unsigned cursor = 0;
+        for (unsigned di = 0; cursor < indices.size(); ++di) {
+          if (di < triplets.size() && triplets[di]) {
+            if (cursor + 2 >= indices.size()) throw std::runtime_error("incomplete destination triplet");
+            std::string range = buildDesignateIndexExpr(dg, di, indices[cursor], 0) + ":" +
+                                buildDesignateIndexExpr(dg, di, indices[cursor + 1], 0) + ":" +
+                                buildIndexExpr(indices[cursor + 2], 0);
+            wa.index_vars.emplace_back("?");
+            wa.index_exprs.push_back(std::move(range));
+            cursor += 3;
+          } else {
+            auto idx = indices[cursor++];
+            auto resolved = resolveIndex(idx);
+            wa.index_vars.push_back(resolved.empty() ? "?" : resolved);
+            wa.index_exprs.push_back(buildDesignateIndexExpr(dg, di, idx, 0));
+          }
         }
         node.accesses.push_back(std::move(wa));
       }

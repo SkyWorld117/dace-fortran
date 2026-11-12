@@ -926,6 +926,24 @@ def build_memlet_index(
                 if not replaced:
                     break
 
+        # Destination sections carry one Fortran triplet per dimension. Keep
+        # both endpoints relative to the declared lower bound, and convert
+        # the inclusive upper bound to DaCe's exclusive range endpoint.
+        if ":" in expr:
+            bounds = expr.split(":")
+            if len(bounds) != 3:
+                raise ValueError(f"unsupported destination triplet {expr!r}")
+            lo, hi, step = [apply_reserved(rename_iters(value, iter_map)) for value in bounds]
+            try:
+                stride = int(step)
+            except ValueError as error:
+                raise NotImplementedError('symbolic destination triplet stride') from error
+            if stride == 0:
+                raise ValueError('zero destination triplet stride')
+            endpoint = 1 if stride > 0 else -1
+            parts.append(f"({lo}) - {offset_sym}:({hi}) - {offset_sym} + ({endpoint}):{stride}")
+            continue
+
         # Indirect: substitute the minted symbol that holds the
         # Fortran 1-based runtime value, then offset uniformly.
         if "[" in expr and expr in indirect_syms:

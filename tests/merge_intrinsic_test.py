@@ -89,6 +89,30 @@ end subroutine main
     assert len(libnodes) == 1, f"expected exactly one MergeLibraryNode, got {len(libnodes)}"
 
 
+def test_merge_in_place_uses_the_previous_array_value(tmp_path: Path):
+    """An operand may also be the destination; subsequent reads use its new value."""
+    src = """
+subroutine update(a, b, mask, out, n)
+  integer, intent(in) :: n
+  real(8), intent(inout) :: a(n)
+  real(8), intent(in) :: b(n)
+  logical, intent(in) :: mask(n)
+  real(8), intent(out) :: out(n)
+  a = merge(b, a, mask)
+  out = a
+end subroutine
+"""
+    sdfg = build_sdfg(src, tmp_path, name="update").build()
+    a = np.arange(8, dtype=np.float64)
+    b = -a - 1
+    mask = np.array([0, 1, 1, 0, 1, 0, 0, 1], dtype=np.uint32)
+    expected = np.where(mask != 0, b, a)
+    out = np.zeros_like(a)
+    sdfg(a=a, b=b, mask=mask, out=out, n=8)
+    np.testing.assert_array_equal(a, expected)
+    np.testing.assert_array_equal(out, expected)
+
+
 if __name__ == "__main__":
     import pytest
 

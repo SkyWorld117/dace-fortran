@@ -448,7 +448,20 @@ def _emit_libcall(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFl
         out_memlet = Memlet(f"{n.target}[{ix}]")
     else:
         out_memlet = Memlet.from_array(n.target, tgt_desc)
-    state.add_edge(node, out_conn, acc(builder, state, n.target), None, out_memlet)
+    # Elementwise MERGE may update one of its own operands. Keep its read
+    # access separate from the new live value, as for tasklet self-updates.
+    # Other library operations can need a temporary for overlapping operands.
+    cache = builder.access_caches.get(state)
+    live = cache.get(n.target) if cache is not None else None
+    if spec.node_cls == "MergeLibraryNode" and live is not None and state.out_degree(live) > 0:
+        target = state.add_access(n.target)
+        cache[n.target] = target
+        from dace_fortran.builder.emit_tasklet import ensure_view_writeback_link
+
+        ensure_view_writeback_link(builder, state, target, n.target)
+    else:
+        target = acc(builder, state, n.target)
+    state.add_edge(node, out_conn, target, None, out_memlet)
 
 
 # Fortran MPI reduction-op handle name (``use mpi`` integer handle, lower-cased)

@@ -2130,6 +2130,12 @@ std::vector<ASTNode> buildReductionAssignNodes(hlfir::AssignOp assign, mlir::Ope
           if (auto elem_src = mlir::dyn_cast<hlfir::ElementalOp>(srcOp)) {
             auto built =
                 buildElementalAnyAllReduce(assign, elem_src, e.wcr.str(), identityForType(e, redElemTy), e.py_op.str());
+            if (!built.empty() && sd->getNumOperands() >= 2) {
+              auto dim = traceConstInt(sd->getOperand(1));
+              if (!dim || built.back().kind != "reduce")
+                throw std::runtime_error("elemental reduction DIM requires a constant axis and a reduction node");
+              built.back().reduce_axes.push_back(*dim - 1);
+            }
             if (!built.empty()) {
               for (auto& bn : built) nodes.push_back(std::move(bn));
               emitted = true;
