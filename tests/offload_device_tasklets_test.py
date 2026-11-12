@@ -174,3 +174,48 @@ def test_nested_host_mirror_index_changes_between_gpu_calls(outer_first):
         result = np.full(1, -1, dtype=np.int32)
         compiled(result=result, index=np.int32(index))
         np.testing.assert_array_equal(result, [int(index == 3)])
+
+
+def reduction_control_graph():
+    from dace.libraries.standard import Reduce
+    graph = dace.SDFG('gpu_reduction_scalar_control')
+    graph.add_symbol('offset', dace.int32)
+    graph.add_array('values', [8], dace.float32, transient=True)
+    graph.add_scalar('peak', dace.float32, transient=True)
+    graph.add_array('result', [1], dace.int32)
+    start = graph.add_state('compute')
+    start.add_mapped_tasklet('values', {'i': '0:8'}, {}, 'value = float32(i + offset)',
+                            {'value': dace.Memlet('values[i]')}, external_edges=True)
+    reduce = Reduce('max_value', wcr='lambda a, b: max(a, b)', axes=[0],
+                    identity='-3.4028234663852886e38', schedule=dace.ScheduleType.Sequential)
+    reduce.add_in_connector('_in')
+    reduce.add_out_connector('_out')
+    start.add_node(reduce)
+    written_values = next(node for node in start.nodes()
+                          if isinstance(node, dace.sdfg.nodes.AccessNode) and node.data == 'values')
+    start.add_edge(written_values, None, reduce, '_in', dace.Memlet('values[0:8]'))
+    start.add_edge(reduce, '_out', start.add_write('peak'), None, dace.Memlet('peak[0]'))
+    for label, value, condition in [('positive', 1, 'peak > 0'), ('other', 0, 'peak <= 0')]:
+        target = graph.add_state(label)
+        tasklet = target.add_tasklet(label, {}, {'y'}, f'y = {value}')
+        target.add_edge(tasklet, 'y', target.add_write('result'), None, dace.Memlet('result[0]'))
+        graph.add_edge(start, target, dace.InterstateEdge(condition))
+    offload_device_resident(graph, device_libnodes=True)
+    graph.validate()
+    assert graph.arrays['peak'].storage == dace.StorageType.GPU_Global
+    assert reduce.schedule == dace.ScheduleType.GPU_Device
+    return graph
+
+
+def test_device_reduction_scalar_can_control_a_host_branch():
+    reduction_control_graph().generate_code()
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+def test_device_reduction_scalar_host_branch_repeats_on_gpu():
+    import numpy as np
+    compiled = reduction_control_graph().compile()
+    for offset in (-20, 0, -7, 100):
+        result = np.full(1, -1, dtype=np.int32)
+        compiled(result=result, offset=np.int32(offset))
+        np.testing.assert_array_equal(result, [int(offset + 7 > 0)])

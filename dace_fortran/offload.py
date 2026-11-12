@@ -304,7 +304,7 @@ def _transient_needs_device_global(sdfg, name) -> bool:
     return False
 
 
-def _rewrite_scalar_subscript(expression, container, replacement=None):
+def _rewrite_scalar_subscript(expression, container, replacement=None, scalar=False):
     """Count/replace complete scalar reads, including nested index expressions.
 
     A closing-bracket regex truncates A[index[0], k] at the inner bracket.
@@ -314,10 +314,19 @@ def _rewrite_scalar_subscript(expression, container, replacement=None):
     tree = ast.parse(expression, mode='eval')
     matches = [node for node in ast.walk(tree) if isinstance(node, ast.Subscript)
                and isinstance(node.value, ast.Name) and node.value.id == container]
+    indexed_names = {node.value for node in matches}
+    if scalar:
+        matches += [node for node in ast.walk(tree) if isinstance(node, ast.Name)
+                    and node.id == container and node not in indexed_names]
     if replacement is None or not matches:
         return expression, len(matches)
 
     class Replace(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if scalar and node.id == container:
+                return ast.copy_location(ast.parse(replacement, mode='eval').body, node)
+            return node
+
         def visit_Subscript(self, node):
             if isinstance(node.value, ast.Name) and node.value.id == container:
                 return ast.copy_location(ast.parse(replacement, mode='eval').body, node)
@@ -359,6 +368,8 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
     # already sound, so leave it exactly as before -- this keeps every existing demotion (and
     # hence any other user of these trees, MFC included) byte-for-byte unchanged.
     def _gpu_boundary(pn):
+        if isinstance(pn, nodes.LibraryNode) and pn.schedule in dace.dtypes.GPU_SCHEDULES:
+            return True
         return (isinstance(pn, (nodes.EntryNode, nodes.ExitNode)) and getattr(pn, 'map', None) is not None
                 and pn.map.schedule in dace.dtypes.GPU_SCHEDULES)
 
@@ -380,6 +391,7 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
         return 0
 
     dtype = sdfg.arrays[culprit].dtype
+    scalar = isinstance(sdfg.arrays[culprit], dace.data.Scalar)
 
     def _new_mirror():
         # A 1-element host transient: its shape is a LITERAL, so it never drags an array's shape
@@ -444,7 +456,7 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
                 continue
             try:
                 reads = [
-                    m for m in d.get_read_memlets(sdfg.arrays)
+                    m for m in d.get_read_memlets(sdfg.arrays, include_scalars=True)
                     if m.data == culprit and m.subset is not None and m.subset.num_elements() == 1
                 ]
             except Exception:
@@ -454,8 +466,8 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
             cond = getattr(d, 'condition', None)
             assignments = getattr(d, 'assignments', None) or {}
             try:
-                occ = sum(_rewrite_scalar_subscript(v, culprit)[1] for v in assignments.values())
-                occ += _rewrite_scalar_subscript(cond.as_string, culprit)[1] if cond is not None else 0
+                occ = sum(_rewrite_scalar_subscript(v, culprit, scalar=scalar)[1] for v in assignments.values())
+                occ += _rewrite_scalar_subscript(cond.as_string, culprit, scalar=scalar)[1] if cond is not None else 0
             except SyntaxError:
                 continue
             if occ != 1:
@@ -491,12 +503,12 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset()):
                                 Memlet(data=culprit, subset=sub, other_subset=_one()))
             repl = f'{mname}[0]'
             if assignments:
-                d.assignments = {k: _rewrite_scalar_subscript(v, culprit, repl)[0]
+                d.assignments = {k: _rewrite_scalar_subscript(v, culprit, repl, scalar=scalar)[0]
                                  for k, v in assignments.items()}
             # Re-set the condition even when unchanged: the assignment rewrite above must
             # invalidate the edge's cached condition symbols.
             if cond is not None:
-                d.condition = CodeBlock(_rewrite_scalar_subscript(cond.as_string, culprit, repl)[0],
+                d.condition = CodeBlock(_rewrite_scalar_subscript(cond.as_string, culprit, repl, scalar=scalar)[0],
                                         language=cond.language)
             n += 1
     return n
@@ -532,7 +544,7 @@ def _batch_host_scalar_reroutes(sdfg):
             if edge.data is None or not isinstance(edge.src, SDFGState):
                 continue
             try:
-                reads = edge.data.get_read_memlets(sdfg.arrays)
+                reads = edge.data.get_read_memlets(sdfg.arrays, include_scalars=True)
             except (ValueError, TypeError, SyntaxError, KeyError, NotImplementedError):
                 continue
             for read in reads:
@@ -548,6 +560,60 @@ def _batch_host_scalar_reroutes(sdfg):
             # oracle below; batching does not accept or demote it speculatively.
             continue
     return changed
+
+
+def _device_library_nodes(sdfg):
+    """Schedule unscoped library nodes with device inputs and promote their outputs."""
+    all_states = list(sdfg.all_states())
+    lib_resched = []
+    for state in all_states:
+        scope = state.scope_dict()
+        for node in state.nodes():
+            if scope.get(node) is not None:  # nested inside a map -> per-thread, stays Sequential
+                continue
+            if getattr(node, 'schedule', None) in dace.dtypes.GPU_SCHEDULES:
+                continue
+            if not isinstance(node, nodes.LibraryNode):
+                continue
+            inputs = [e for e in state.in_edges(node)]
+            if not inputs:
+                continue
+            dev_inputs = 0
+            for e in inputs:
+                src = e.src
+                if isinstance(src, nodes.AccessNode) and src.data in sdfg.arrays:
+                    if sdfg.arrays[src.data].storage in (dace.dtypes.StorageType.GPU_Global,
+                                                          dace.dtypes.StorageType.GPU_Shared):
+                        dev_inputs += 1
+            if dev_inputs == len(inputs):
+                node.schedule = dace.dtypes.ScheduleType.GPU_Device
+                lib_resched.append(node.label if getattr(node, 'label', None) else type(node).__name__)
+    if lib_resched:
+        print(f"[dace_fortran.offload] device-scheduled {len(lib_resched)} top-level library node(s) "
+              f"reading device arrays: {lib_resched}")
+
+        # 2c. A GPU-scheduled library node's OUTPUT must be device-resident too.  Reduce's GPU
+        # expansion stages a host output through a device transient, and the edge out of that
+        # transient lowers to a device->host copy in the host .cpp -- a mid-program copy the
+        # residency contract forbids.  Promote the output containers of any GPU-scheduled library
+        # node, INCLUDING length-1 arrays (the step-2 `is_len1` skip otherwise leaves a reduced scalar
+        # host-resident).  Only for nodes step 2b scheduled as GPU, i.e. nodes whose inputs are all
+        # device-resident.
+        for state in all_states:
+            for node in state.nodes():
+                if not isinstance(node, nodes.LibraryNode):
+                    continue
+                if getattr(node, 'schedule', None) not in dace.dtypes.GPU_SCHEDULES:
+                    continue
+                for e in state.out_edges(node):
+                    if not isinstance(e.dst, nodes.AccessNode):
+                        continue
+                    desc = sdfg.arrays.get(e.dst.data)
+                    if desc is not None and desc.storage not in (dace.dtypes.StorageType.GPU_Global,
+                                                                 dace.dtypes.StorageType.GPU_Shared):
+                        desc.storage = dace.dtypes.StorageType.GPU_Global
+
+    return lib_resched
 
 
 def _device_array_tasklets(sdfg, block_size=None):
@@ -852,54 +918,9 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     # current handling, and no node that validated before can regress (a host-scheduled node reading a
     # device array never validated in the first place).  OPT-IN (see the `device_libnodes` doc), so the
     # default bake -- MFC included -- is byte-identical.
-    lib_resched = []
-    if device_libnodes:
-        for state in all_states:
-            scope = state.scope_dict()
-            for node in state.nodes():
-                if scope.get(node) is not None:  # nested inside a map -> per-thread, stays Sequential
-                    continue
-                if getattr(node, 'schedule', None) in dace.dtypes.GPU_SCHEDULES:
-                    continue
-                if not isinstance(node, nodes.LibraryNode):
-                    continue
-                inputs = [e for e in state.in_edges(node)]
-                if not inputs:
-                    continue
-                dev_inputs = 0
-                for e in inputs:
-                    src = e.src
-                    if isinstance(src, nodes.AccessNode) and src.data in sdfg.arrays:
-                        if sdfg.arrays[src.data].storage in (dace.dtypes.StorageType.GPU_Global,
-                                                              dace.dtypes.StorageType.GPU_Shared):
-                            dev_inputs += 1
-                if dev_inputs == len(inputs):
-                    node.schedule = dace.dtypes.ScheduleType.GPU_Device
-                    lib_resched.append(node.label if getattr(node, 'label', None) else type(node).__name__)
+    lib_resched = _device_library_nodes(sdfg) if device_libnodes else []
     if lib_resched:
-        print(f"[dace_fortran.offload] device-scheduled {len(lib_resched)} top-level library node(s) "
-              f"reading device arrays: {lib_resched}")
-
-        # 2c. A GPU-scheduled library node's OUTPUT must be device-resident too.  Reduce's GPU
-        # expansion stages a host output through a device transient, and the edge out of that
-        # transient lowers to a device->host copy in the host .cpp -- a mid-program copy the
-        # residency contract forbids.  Promote the output containers of any GPU-scheduled library
-        # node, INCLUDING length-1 arrays (the step-2 `is_len1` skip otherwise leaves a reduced scalar
-        # host-resident).  Only for nodes step 2b scheduled as GPU, i.e. nodes whose inputs are all
-        # device-resident.
-        for state in all_states:
-            for node in state.nodes():
-                if not isinstance(node, nodes.LibraryNode):
-                    continue
-                if getattr(node, 'schedule', None) not in dace.dtypes.GPU_SCHEDULES:
-                    continue
-                for e in state.out_edges(node):
-                    if not isinstance(e.dst, nodes.AccessNode):
-                        continue
-                    desc = sdfg.arrays.get(e.dst.data)
-                    if desc is not None and desc.storage not in (dace.dtypes.StorageType.GPU_Global,
-                                                                 dace.dtypes.StorageType.GPU_Shared):
-                        desc.storage = dace.dtypes.StorageType.GPU_Global
+        _batch_host_scalar_reroutes(sdfg)
 
     # 2d. Device copies of host scalars the kernels read.  OPT-IN, and OFF by default.
     #
