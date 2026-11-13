@@ -107,3 +107,38 @@ if __name__ == "__main__":
         test_mixed_kinds_and_eqv(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_if_count_any_all_on_foreign_true(Path(tmp))
+
+
+def test_local_negated_flags_survive_optimization(tmp_path: Path) -> None:
+    from dace_fortran.pipelines import optimize
+
+    src = """
+subroutine phases(temperature, phase, out, n)
+  implicit none
+  integer, intent(in) :: n, phase(n)
+  real(8), intent(in) :: temperature(n)
+  integer, intent(out) :: out(2,n)
+  logical :: water, ice
+  integer :: i
+  do i = 1, n
+    water = .not. (temperature(i) < 253.15d0 .and. phase(i) == 1)
+    ice = .true.
+    out(:,i) = 0
+    if (water) then
+      out(1,i) = 1
+      ice = .not. (temperature(i) >= 273.15d0 .or. phase(i) == 0)
+    end if
+    if (ice) out(2,i) = 1
+  end do
+end subroutine phases
+"""
+    sdfg = build_sdfg(src, tmp_path, name="negated_flags", entry="phases").build()
+    optimize(sdfg, unroll_limit=0)
+    temperature = np.array([240., 260., 290., 240., 260., 290.])
+    phase = np.array([1, 1, 1, 0, 0, 0], dtype=np.int32)
+    out = np.full((2, 6), -1, dtype=np.int32, order='F')
+    for values in (temperature, temperature[::-1].copy()):
+        sdfg(temperature=values, phase=phase, out=out, n=6)
+        water = ~((values < 253.15) & (phase == 1))
+        ice = ~water | ~((values >= 273.15) | (phase == 0))
+        np.testing.assert_array_equal(out, np.array([water, ice], dtype=np.int32))
