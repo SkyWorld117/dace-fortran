@@ -29,6 +29,12 @@ std::vector<ASTNode> buildMergeLibcall(hlfir::AssignOp assign, hlfir::ElementalO
   if (region.empty()) return {};
   auto& block = region.front();
 
+  // The library fast path wires entire declared arrays. A section destination
+  // needs the elemental path, which preserves scalar dimensions and triplets.
+  if (auto dest = assign.getOperand(1).getDefiningOp())
+    if (auto section = mlir::dyn_cast<hlfir::DesignateOp>(dest))
+      if (!section.getIndices().empty()) return {};
+
   // Find the yield_element and confirm its operand is an arith.select.
   mlir::Value yielded;
   for (auto& op : block)
@@ -58,7 +64,17 @@ std::vector<ASTNode> buildMergeLibcall(hlfir::AssignOp assign, hlfir::ElementalO
     if (!ld) return "";
     auto* md = ld.getMemref().getDefiningOp();
     if (!md) return "";
-    if (mlir::isa<hlfir::DesignateOp>(md) || mlir::isa<hlfir::DeclareOp>(md)) return traceToDecl(ld.getMemref());
+    if (auto element = mlir::dyn_cast<hlfir::DesignateOp>(md)) {
+      // The innermost designate selects the elemental iteration's scalar.
+      // A parent designate selects a section of the original declared array;
+      // dropping that parent would lose its offsets, strides or scalar dims.
+      auto base = element.getMemref();
+      while (auto cv = base.getDefiningOp<fir::ConvertOp>()) base = cv.getValue();
+      if (auto parent = base.getDefiningOp<hlfir::DesignateOp>())
+        if (!parent.getIndices().empty()) return "";
+      return traceToDecl(ld.getMemref());
+    }
+    if (mlir::isa<hlfir::DeclareOp>(md)) return traceToDecl(ld.getMemref());
     return "";
   };
 

@@ -113,6 +113,46 @@ end subroutine
     np.testing.assert_array_equal(out, expected)
 
 
+def test_merge_sections_of_different_parent_ranks_preserve_indices(tmp_path: Path):
+    """UW-style in-place vectors must retain the parents' scalar dimensions."""
+    src = """
+subroutine update(a, b, mask)
+  real(8), intent(inout) :: a(-1:2,3,2)
+  real(8), intent(in) :: b(0:3,3)
+  logical, intent(in) :: mask(4,3)
+  a(0:1,2,1) = merge(a(0:1,2,1), b(1:2,2), mask(2:3,2))
+end subroutine
+"""
+    sdfg = build_sdfg(src, tmp_path, name="update").build()
+    a = np.array(np.arange(24).reshape(4, 3, 2, order="F"), dtype=np.float64, order="F")
+    b = np.array(-np.arange(12).reshape(4, 3, order="F") - 1, dtype=np.float64, order="F")
+    mask = np.ones((4, 3), dtype=np.uint32, order="F")
+    mask[2, 1] = 0
+    expected = a.copy(order="F")
+    expected[1:3, 1, 0] = np.where(mask[1:3, 1], a[1:3, 1, 0], b[1:3, 1])
+    sdfg(a=a, b=b, mask=mask)
+    np.testing.assert_array_equal(a, expected)
+
+
+def test_merge_input_sections_do_not_read_the_entire_parent(tmp_path: Path):
+    src = """
+subroutine update(a, b, mask, out)
+  real(8), intent(in) :: a(4,3), b(4,3)
+  logical, intent(in) :: mask(4,3)
+  real(8), intent(out) :: out(2)
+  out = merge(a(1:3:2,2), b(1:3:2,2), mask(1:3:2,2))
+end subroutine
+"""
+    sdfg = build_sdfg(src, tmp_path, name="update").build()
+    a = np.array(np.arange(12).reshape(4, 3, order="F"), dtype=np.float64, order="F")
+    b = -a.copy(order="F") - 1
+    mask = np.ones((4, 3), dtype=np.uint32, order="F")
+    mask[2, 1] = 0
+    out = np.zeros(2)
+    sdfg(a=a, b=b, mask=mask, out=out)
+    np.testing.assert_array_equal(out, [a[0, 1], b[2, 1]])
+
+
 if __name__ == "__main__":
     import pytest
 
