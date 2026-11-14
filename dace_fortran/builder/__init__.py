@@ -1444,11 +1444,12 @@ class SDFGBuilder:
                 val = arr.reshape(())[()]
                 sdfg.add_constant(v.fortran_name, val if np.issubdtype(arr.dtype, np.floating) else val.item(), desc)
                 continue
-            # Array globals: reshape from row-major doubles transport
-            # to the descriptor's declared shape.
+            # Dense initializers arrive in Fortran storage order. Constants
+            # hold logical indices; descriptor-aware codegen packs those
+            # indices using the declared strides when emitting the buffer.
             shape = tuple(int(d) for d in desc.shape)
             if arr.size == int(np.prod(shape)):
-                arr = arr.reshape(shape, order="C")
+                arr = arr.reshape(shape, order="F")
             sdfg.add_constant(v.fortran_name, arr, desc)
 
     def _seed_written_inits(self, ctx: Ctx, sdfg: SDFG) -> None:
@@ -1502,10 +1503,9 @@ class SDFGBuilder:
             # element.  Reshape column-major (``order='F'``) so each logical
             # ``a[i, j]`` write picks the Fortran-storage value the kernel
             # later reads through the array's column-major strides -- the
-            # read-only ``_register_constants`` path instead stores the flat
-            # ``const_data`` verbatim and relies on the strides, so it uses
-            # ``order='C'``; a per-element write must map logical -> value
-            # itself.  (Identical for rank 1.)
+            # read-only ``_register_constants`` path uses the same logical
+            # index convention; codegen then packs its values by strides.
+            # (Identical for rank 1.)
             desc.transient = True
             arr = arr.reshape(shape, order="F")
             is_int = v.dtype.startswith(("int", "uint")) or v.dtype == "bool"

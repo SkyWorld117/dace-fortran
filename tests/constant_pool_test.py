@@ -222,3 +222,52 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_multidimensional_pool_and_parameter_keep_fortran_indices(tmp_path):
+    src = """
+subroutine main(out)
+  implicit none
+  real(8), intent(out) :: out(2,3)
+  real(8), parameter :: p(2,3) = reshape([1d0,2d0,3d0,4d0,5d0,6d0],[2,3])
+  real(8) :: x(2,3)
+  integer :: i,j
+  x = reshape([10d0,20d0,30d0,40d0,50d0,60d0],[2,3])
+  do j=1,3
+    do i=1,2
+      out(i,j) = x(i,j) + p(3-i,j)
+    enddo
+  enddo
+end subroutine
+"""
+    sdfg = _build(src, tmp_path)
+    out = np.zeros((2,3), dtype=np.float64, order="F")
+    sdfg(out=out)
+    np.testing.assert_array_equal(out, [[12,34,56],[21,43,65]])
+
+
+def test_rank_three_data_keeps_readonly_and_written_layouts_equal(tmp_path):
+    src = """
+subroutine main(out)
+  implicit none
+  real, intent(out) :: out(2,3,2)
+  real :: r(2,3,2), w(2,3,2)
+  integer :: i,j,k
+  data r /1,2,3,4,5,6,7,8,9,10,11,12/
+  data w /101,102,103,104,105,106,107,108,109,110,111,112/
+  w(1,1,1) = 999.
+  do k=1,2
+    do j=1,3
+      do i=1,2
+        out(i,j,k) = r(i,j,k) + w(i,j,k)
+      enddo
+    enddo
+  enddo
+end subroutine
+"""
+    sdfg = _build(src, tmp_path)
+    out = np.zeros((2,3,2), dtype=np.float32, order="F")
+    sdfg(out=out)
+    expected = (100 + 2*np.arange(1,13,dtype=np.float32)).reshape(2,3,2,order="F")
+    expected[0,0,0] = 1000
+    np.testing.assert_array_equal(out, expected)
