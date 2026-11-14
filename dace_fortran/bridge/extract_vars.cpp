@@ -1373,6 +1373,7 @@ const std::set<std::string>& kRejectedIntrinsicNames() {
       "minval",
       "maxval",
       // Math.* intrinsics emit as bare Python function call:
+      "pow",
       "sin",
       "cos",
       "tan",

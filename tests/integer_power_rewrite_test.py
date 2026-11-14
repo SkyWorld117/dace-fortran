@@ -1,7 +1,7 @@
 """Unit + e2e coverage for ``rewrite_integer_powers``.
 
-Expands an integer-valued REAL-literal power (``x**2.0``, ``x**3.0_JPRB``) to an explicit
-multiply so the bridge's g++ codegen and gfortran emit byte-identical arithmetic. Scope:
+Expands REAL-literal squares to a multiply. Cubes and higher REAL powers
+retain native library rounding. Scope:
 
 * bare-integer exponent (``x**2``) is left for flang's own lowering (already bit-identical);
 * fractional/symbolic powers (``**0.5``, ``**n``) stay ``pow()``;
@@ -27,8 +27,8 @@ def test_simple_identifier_square():
     assert rewrite_integer_powers("y = x**2.0") == "y = (x*x)"
 
 
-def test_simple_identifier_cube():
-    assert rewrite_integer_powers("y = x**3.0_JPRB") == "y = (x*x*x)"
+def test_simple_identifier_cube_retains_real_power():
+    assert rewrite_integer_powers("y = x**3.0_JPRB") == "y = x**3.0_JPRB"
 
 
 def test_parenthesised_base_keeps_its_parens():
@@ -48,7 +48,7 @@ def test_double_exponent_form():
 
 
 def test_multiple_on_one_line():
-    assert rewrite_integer_powers("r = a**2.0 + b**3.0") == "r = (a*a) + (b*b*b)"
+    assert rewrite_integer_powers("r = a**2.0 + b**3.0") == "r = (a*a) + b**3.0"
 
 
 # --- things the pass must NOT touch ---------------------------------

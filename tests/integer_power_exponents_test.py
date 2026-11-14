@@ -1,11 +1,7 @@
-"""Tests for ``IntegerizePowerExponents``: retypes integer-valued float ``**``
-exponents (``base**2.0``) to ``int`` so codegen takes the deterministic
-``dace::math::ipow`` path instead of libm ``pow`` -- bit-matching Fortran.
+"""Legacy untyped power normalization preserves explicit REAL constructors.
 
-Coverage: a direct pass unit test on a hand-built tasklet, and an e2e test using
-an array-reference base (``a(jl)**2.0``) -- the source preprocessor skips
-array/function bases, so the float exponent survives into a tasklet, exactly
-the case this pass exists to fix.
+Source-level REAL powers retain their library rounding. Compiled native kind
+comparisons live in real_integer_power_kind_test.py.
 """
 
 from pathlib import Path
@@ -45,21 +41,19 @@ def test_pass_retypes_integer_valued_float_exponents():
     assert "a ** 0.5" in code  # genuine fractional left alone
 
 
-@pytest.mark.parametrize('exponent,expected', [
-    ('float32(2.0)', 2), ('float64(-3.0)', -3), ('-float16(4.0)', -4),
-    ('dace.float32(2.0)', 2), ('dace.float64(-3.0)', -3),
-    ('-dace.float64(3.0)', -3), ('dace.float32(2)', 2), ('dace.float16(4.0)', 4),
+@pytest.mark.parametrize('exponent', [
+    'float32(2.0)', 'float64(-3.0)', '-float16(4.0)',
+    'dace.float32(2.0)', 'dace.float64(-3.0)',
+    '-dace.float64(3.0)', 'dace.float32(2)', 'dace.float16(4.0)',
 ])
-def test_typed_integer_power_exponents(exponent, expected):
-    """The frontend's explicit dtype cast must not hide an integral exponent."""
+def test_typed_real_power_exponents_keep_kind(exponent):
+    """An integral REAL value still uses real-power rather than integer-power semantics."""
     from dace_fortran.integer_power_exponents import IntegerizePowerExponents
-    sdfg = dace.SDFG('typed_ipow')
+    sdfg = dace.SDFG('typed_real_power')
     tasklet = sdfg.add_state().add_tasklet('power', {'a'}, {'b'}, f'b = a ** ({exponent})')
-    assert IntegerizePowerExponents().apply_pass(sdfg, {}) == 1
-    power = next(node for node in ast.walk(ast.parse(tasklet.code.as_string))
-                 if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow))
-    assert ast.literal_eval(power.right) == expected
-    assert isinstance(ast.literal_eval(power.right), int)
+    before = ast.dump(ast.parse(tasklet.code.as_string))
+    assert IntegerizePowerExponents().apply_pass(sdfg, {}) is None
+    assert ast.dump(ast.parse(tasklet.code.as_string)) == before
 
 
 def test_fractional_and_rounding_sensitive_casts_are_unchanged():
@@ -103,7 +97,7 @@ def test_array_base_float_power_matches_gfortran(tmp_path: Path):
     sdfg_dir.mkdir(parents=True, exist_ok=True)
     sdfg = build_sdfg(_ARR_POW, sdfg_dir, name="kern", entry="kern_mod::kern").build()
 
-    # No libm float pow of an integer-valued exponent should remain in any tasklet.
+    # Source REAL powers use calls, retaining their exponent kind.
     for node, _ in sdfg.all_nodes_recursive():
         if isinstance(node, dace.nodes.Tasklet):
             assert "** 2.0" not in node.code.as_string

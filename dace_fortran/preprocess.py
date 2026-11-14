@@ -191,13 +191,14 @@ def _real_exp_int_value(tok: str) -> int | None:
 
 
 def rewrite_integer_powers(source: str) -> str:
-    """Expand integer-valued REAL-literal powers to repeated multiply:
+    """Expand REAL-literal squares to a multiply, preserving other REAL powers:
     ``base**2.0`` -> ``(base*base)``.
 
     Adds a single outer paren pair -- ``_extract_power_base`` always returns
     a Fortran primary, so this preserves precedence in any context
     (``2.0*x**2.0`` -> ``2.0*(x*x)``, ``-x**2.0`` -> ``-(x*x)``).
-    Bare-integer ``x**2`` (flang already lowers it bit-identically to
+    Native Fortran may call powf/pow for REAL cubes and higher powers, so
+    those retain their library rounding. Bare-integer ``x**2`` (flang already lowers it bit-identically to
     gfortran) and fractional powers (``**0.5``) are never touched, nor is a
     base containing a function/array ref (duplicating it could call twice).
     Overlapping (stacked ``a**2.0**2.0``) matches are skipped.  Idempotent.
@@ -213,7 +214,7 @@ def rewrite_integer_powers(source: str) -> str:
             if any(s <= m.start() < e for s, e in strings):
                 continue  # ``**`` inside a character literal
             n = _real_exp_int_value(m.group(1) or m.group(2))
-            if n is None:
+            if n != 2:
                 continue
             span = _extract_power_base(code, m.start())
             if span is None:

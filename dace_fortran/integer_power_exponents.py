@@ -3,7 +3,8 @@
 """Retype integer-valued float ``**`` exponents to ``int`` so codegen emits
 ``ipow`` (integer multiplication) instead of libm ``pow``, which isn't bit-identical
 to Fortran/C's integer-power codegen and drifts across real(8) reduction chains.
-Only the exponent literal is rewritten; base and fractional exponents are untouched.
+Only legacy untyped literals are rewritten. Explicit REAL constructors and
+real-power calls preserve their kind and library rounding.
 """
 
 from __future__ import annotations
@@ -24,45 +25,26 @@ class _ExponentIntegerizer(ast.NodeTransformer):
 
     @staticmethod
     def _as_int_constant(node: ast.expr) -> ast.expr | None:
-        """Retype an integral float exponent, honoring explicit dtype rounding.
-
-        The builder wraps literals in qualified or unqualified DaCe dtype calls.
-        Only unwrap a typed integer within the dtype's consecutive-integer
-        range, so e.g. ``float32(16777217.0)`` cannot lose its rounding step.
-        """
+        """Normalize legacy untyped literals; preserve explicit REAL constructors."""
         original = node
         sign = 1
         while isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
             if isinstance(node.op, ast.USub):
                 sign = -sign
             node = node.operand
-        limit = None
+        # An explicit REAL kind carries source semantics: REAL exponents
+        # must keep their libm rounding even when numerically integral.
         if isinstance(node, ast.Call):
-            func = node.func
-            limits = {'float16': 2**11, 'float32': 2**24, 'float64': 2**53}
-            # Tasklet dtype constructors also occur as bare float32(...).
-            # They are reserved DaCe tasklet globals, like the qualified form.
-            cast = func.id if isinstance(func, ast.Name) else (
-                func.attr if isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name) and func.value.id == 'dace' else None)
-            if cast not in limits or len(node.args) != 1 or node.keywords:
-                return None
-            # dace::math::ipow takes an unsigned 32-bit magnitude.
-            limit = min(limits[cast], 2**32-1)
-            node = node.args[0]
-            while isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-                if isinstance(node.op, ast.USub):
-                    sign = -sign
-                node = node.operand
+            return None
         if not isinstance(node, ast.Constant) or isinstance(node.value, bool):
             return None
         value = node.value
         if isinstance(value, float):
             if not value.is_integer():
                 return None
-        elif not (limit is not None and isinstance(value, int)):
+        else:
             return None
-        if limit is not None and abs(value) > limit:
+        if abs(value) > 2**32-1:
             return None
         return ast.copy_location(ast.Constant(value=sign * int(value)), original)
 

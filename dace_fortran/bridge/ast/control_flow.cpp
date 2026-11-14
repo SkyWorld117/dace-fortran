@@ -798,7 +798,10 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
   // Exponentiation a**b (math.fpowi/powf/powi/ipowi): recurse through the subscript-aware builder so a squared
   // per-element term keeps its subscript -- else it falls to buildExpr below and strips it, and QE's `IF (SUM((i -
   // i_real) ** 2) > eps6)` emits whole-array operands that C++ codegen rejects as `int* - double*`.
-  if ((nm == "math.fpowi" || nm == "math.powf" || nm == "math.powi") && def->getNumOperands() == 2) {
+  if (nm == "math.powf" && def->getNumOperands() == 2)
+    return "pow(" + buildExprWithSubscripts(def->getOperand(0), d + 1) + ", " +
+           buildExprWithSubscripts(def->getOperand(1), d + 1) + ")";
+  if ((nm == "math.fpowi" || nm == "math.powi") && def->getNumOperands() == 2) {
     return "(" + buildExprWithSubscripts(def->getOperand(0), d + 1) + " ** " +
            buildExprWithSubscripts(def->getOperand(1), d + 1) + ")";
   }

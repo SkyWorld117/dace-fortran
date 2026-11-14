@@ -1298,16 +1298,16 @@ std::string buildExpr(mlir::Value val, int d) {
     return it->second + "(" + buildExpr(def->getOperand(0), d + 1) + ")";
   }
 
-  // Exponentiation ``a ** b``.  Flang's four variants
-  // (``math.fpowi`` float**int, ``math.powf`` float**float,
-  // ``math.powi`` / ``math.ipowi`` int**int) all surface as the
-  // Python ``**`` operator.  A downstream SDFG-level simplify pass
-  // recognises ``**`` and rewrites it based on the tasklet's
-  // input/output types  --  no variant marker needed at this layer.
+  // REAL exponents retain a libm call even when their value is integral.
+  // x**3.0 and x**3 can round differently in native Fortran. Do not send
+  // math.powf through Python **, where exponent normalization loses its kind.
+  if (nm == "math.powf" && def->getNumOperands() == 2)
+    return "pow(" + buildExpr(def->getOperand(0), d + 1) + ", " + buildExpr(def->getOperand(1), d + 1) + ")";
+
+  // INTEGER-exponent variants keep the multiplication-based ** lowering.
   static const std::set<llvm::StringRef> pow_ops = {
       "complex.powi",
       "math.fpowi",
-      "math.powf",
       "math.powi",
   };
   // ``**`` runs in double for an integer base: keep the integer quotient of a negative exponent with the cast, and go
