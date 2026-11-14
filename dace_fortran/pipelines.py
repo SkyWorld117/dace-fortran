@@ -9,7 +9,7 @@
       -> state-fusion-extended -> mapfusion -> map-collapse -> mapfusion -> make-transients-persistent
       -> bind-omp-thread-count
 
-``scalar_fission`` runs unconditionally, BEFORE simplify (it splits scalar-carried loop bodies so
+``scalar_fission`` runs by default, BEFORE simplify (it splits scalar-carried loop bodies so
 the loop can map downstream): LoopToMap needs it in general, not just CloudSC. ``specialize``
 runs FIRST and bakes the known compile-time constants (CloudSC: nclv, ncldqi, ...), so the
 short-loop unroll sees literal trip counts and the shape and branch folding downstream have
@@ -203,6 +203,7 @@ def optimize(
     device_tasklets: bool = False,
     device_array_abi: bool = False,
     allow_abi_scalar_fission: bool = False,
+    scalar_fission: bool = True,
     loop_map_patterns: list[str] | None = None,
 ) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
@@ -210,6 +211,9 @@ def optimize(
     :param sdfg: the SDFG to optimize (mutated in place).
     :param symbols: free symbols to bake to constants (batched, one recursive walk).
     :param scalars: scalar data containers to bake to constants (batched).
+    :param scalar_fission: split scalar write shadows before simplification. Disabling this
+        optional preparation avoids all-pairs shadow-scope analysis on large leaves,
+        while retaining conservative LoopToMap dependence checks.
     :param unroll_limit: fully unroll constant-trip loops at or below this many iterations.
     :param validate: validate the SDFG after each structural stage. STRUCTURAL only -- it says
                      nothing about whether the transformations preserved values.
@@ -252,7 +256,8 @@ def optimize(
     # default assign_loop_iterator_post_value=True keeps Fortran counted-DO exit-value semantics;
     # shared iterator names otherwise make LoopToMap refuse merged siblings.
     UniqueLoopIterators().apply_pass(sdfg, {})
-    fission_scalars(sdfg)
+    if scalar_fission:
+        fission_scalars(sdfg)
 
     sdfg.simplify(validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)

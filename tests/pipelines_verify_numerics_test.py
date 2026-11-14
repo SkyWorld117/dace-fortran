@@ -29,14 +29,15 @@ def scale_sdfg(name: str, factor: float = 2.0) -> dace.SDFG:
     return sdfg
 
 
-def test_optimize_verifies_numerics():
+@pytest.mark.parametrize("scalar_fission", [False, True])
+def test_optimize_verifies_numerics(scalar_fission):
     """A value-preserving pipeline run must pass the gate, and still parallelize."""
     sdfg = scale_sdfg("verify_ok")
     rng = np.random.default_rng(0)
     a = rng.random(16)
     inputs = {"A": a, "B": np.zeros(16)}
 
-    optimize(sdfg, verify_inputs=inputs)
+    optimize(sdfg, verify_inputs=inputs, scalar_fission=scalar_fission)
 
     # The caller's arrays are inputs to the check, never scratch for it.
     assert np.array_equal(inputs["B"], np.zeros(16)), "verify_numerics wrote through the caller arrays"
