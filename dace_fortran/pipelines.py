@@ -204,6 +204,7 @@ def optimize(
     device_array_abi: bool = False,
     allow_abi_scalar_fission: bool = False,
     scalar_fission: bool = True,
+    simplify_graph: bool = True,
     loop_map_patterns: list[str] | None = None,
 ) -> SDFG:
     """Run the parallelization pipeline in place and return ``sdfg``.
@@ -211,6 +212,9 @@ def optimize(
     :param sdfg: the SDFG to optimize (mutated in place).
     :param symbols: free symbols to bake to constants (batched, one recursive walk).
     :param scalars: scalar data containers to bake to constants (batched).
+    :param simplify_graph: run whole-graph simplification before state fusion. Large
+        explicit-control-flow leaves may defer this optional optimization; conservative
+        mapping checks and the numerical verification option remain enabled.
     :param scalar_fission: split scalar write shadows before simplification. Disabling this
         optional preparation avoids all-pairs shadow-scope analysis on large leaves,
         while retaining conservative LoopToMap dependence checks.
@@ -259,7 +263,8 @@ def optimize(
     if scalar_fission:
         fission_scalars(sdfg)
 
-    sdfg.simplify(validate=validate)
+    if simplify_graph:
+        sdfg.simplify(validate=validate)
     sdfg.apply_transformations_repeated(StateFusionExtended, validate=validate)
 
     privatize_loop_local_arrays(sdfg)
