@@ -216,9 +216,12 @@ std::string castForConvert(mlir::Type inT, mlir::Type outT, std::string inner) {
   auto outF = mlir::dyn_cast<mlir::FloatType>(outT);
   if (inF && outI) return (outI == 64 ? "int64(" : "int32(") + inner + ")";
   if (inI && outF) return (outF.getWidth() == 32 ? "float32(" : "float64(") + inner + ")";
-  // Between float kinds the value rounds in the narrower one, on either side of the convert.
-  if (inF && outF && inF.getWidth() != outF.getWidth())
-    return (std::min(inF.getWidth(), outF.getWidth()) == 32 ? "float32(" : "float64(") + inner + ")";
+  // Widen the TYPE as well as preserving the source value's rounding. Emitting only
+  // float32 for f32->f64 makes DBLE(a)*DBLE(b) multiply in f32 before a later store.
+  if (inF && outF && inF.getWidth() != outF.getWidth()) {
+    if (inF.getWidth() == 32 && outF.getWidth() == 64) return "float64(float32(" + inner + "))";
+    return (outF.getWidth() == 32 ? "float32(" : "float64(") + inner + ")";
+  }
   // ``int(a, 8) * int(b, 8)`` must not multiply in 32 bits.
   if (inI && outI >= 32 && outI > inI) return (outI == 64 ? "int64(" : "int32(") + inner + ")";
   return inner;
@@ -1563,14 +1566,8 @@ std::string buildExpr(mlir::Value val, int d) {
     }
   }
 
-  // fir.convert: same-family kind casts (i32->i64, f32->f64, i64->f64)
-  // are transparent  --  Fortran's KIND coercion semantics flow through
-  // the tasklet's operand types so the C++ codegen widens for free.
-  // Cross-family casts (float <-> int) are NOT transparent: Fortran's
-  // INT(x) / NINT(x) / DBLE(x) / REAL(x) carry semantic intent (cast
-  // truncates, NINT rounds, DBLE widens) that the bridge must
-  // surface as an explicit ``dace.<ty>(...)`` call so the codegen
-  // emits the right ``static_cast``.
+  // fir.convert: preserve numeric KIND conversions explicitly, including DBLE
+  // widening before arithmetic and REAL narrowing before a surrounding operation.
   if (auto conv = mlir::dyn_cast<fir::ConvertOp>(def)) {
     auto inT = conv.getValue().getType();
     auto outT = conv.getRes().getType();
