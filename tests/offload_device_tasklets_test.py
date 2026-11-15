@@ -435,3 +435,50 @@ def test_persistent_heap_inside_a_map_gets_device_allocation():
     offload_device_resident(graph)
     assert graph.arrays['tmp'].storage == dace.StorageType.GPU_Global
     graph.generate_code()
+
+
+def indirect_copy_graph(write=False, same_state=False):
+    from dace_fortran.offload import _mirror_host_copy_indices
+    graph = dace.SDFG('indirect_host_copy')
+    graph.add_symbol('index', dace.int32)
+    for name, shape in [('A', [8]), ('N', [2, 2]), ('M', [1])]:
+        graph.add_array(name, shape, dace.int32, transient=True,
+                        storage=dace.StorageType.GPU_Global,
+                        strides=[1, 2] if name == 'N' else None)
+    graph.add_array('result', [1], dace.int32)
+    compute = graph.add_state('compute')
+    values = compute.add_mapped_tasklet('values', {'i': '0:8'}, {}, 'a = 2*i + 5',
+        {'a': dace.Memlet('A[i]')}, external_edges=True, schedule=dace.ScheduleType.GPU_Device)
+    compute.add_mapped_tasklet('selector', {'i': '0:2', 'j': '0:2'}, {}, 'n = index + j',
+        {'n': dace.Memlet('N[i,j]')}, external_edges=True, schedule=dace.ScheduleType.GPU_Device)
+    compute.add_mapped_tasklet('indirect', {'i': '0:1'}, {}, 'n = 1',
+        {'n': dace.Memlet('M[0]')}, external_edges=True, schedule=dace.ScheduleType.GPU_Device)
+    copy = compute if same_state else graph.add_state_after(compute, 'copy')
+    a = next((nd for nd in copy.nodes() if isinstance(nd, dace.sdfg.nodes.AccessNode) and nd.data == 'A'), None)
+    a = a if a is not None else copy.add_access('A')
+    host = copy.add_access('result')
+    offset = dace.symbolic.pystr_to_symbolic('N[M[0],0]')
+    indirect = dace.subsets.Range([(offset, offset, 1)])
+    if write:
+        copy.add_edge(host, None, a, None, dace.Memlet(data='result', subset='0', other_subset=indirect))
+        publish = graph.add_state_after(copy, 'publish')
+        publish.add_edge(publish.add_read('A'), None, publish.add_write('result'), None,
+                         dace.Memlet(data='A', subset='index', other_subset='0'))
+    else:
+        copy.add_edge(a, None, host, None, dace.Memlet(data='A', subset=indirect, other_subset='0'))
+    assert _mirror_host_copy_indices(graph) == 2
+    assert _mirror_host_copy_indices(graph) == 0
+    graph.validate()
+    return graph
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+@pytest.mark.parametrize('write,same_state', [(False,False),(True,False),(False,True),(True,True)])
+def test_indirect_copy_indices_repeat_on_gpu(write, same_state):
+    import numpy as np
+    graph = indirect_copy_graph(write, same_state)
+    compiled = graph.compile()
+    for index in (3,5,2,7,0,3):
+        result = np.array([40 + index],dtype=np.int32)
+        compiled(result=result,index=np.int32(index))
+        np.testing.assert_array_equal(result, [40+index if write else 2*index+5])

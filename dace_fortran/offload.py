@@ -543,6 +543,89 @@ def _reroute_host_scalar_accesses(sdfg, culprit, _parents=frozenset(), force=Fal
     return n
 
 
+def _mirror_host_copy_indices(sdfg):
+    """Publish device-resident scalar indices before host-dispatched copies.
+
+    Copy memlets can contain indirect reads even without a tasklet or an
+    interstate condition. Order each index copy before the addressed copy,
+    including nested indices and indices produced in the same state.
+    """
+    import ast
+    from copy import deepcopy
+    import networkx as nx
+    from dace.sdfg.scope import is_devicelevel_gpu
+
+    changed = 0
+    for state in sdfg.all_states():
+        for edge in list(state.edges()):
+            if not (isinstance(edge.src, nodes.AccessNode) and isinstance(edge.dst, nodes.AccessNode)):
+                continue
+            if is_devicelevel_gpu(sdfg, state, edge.src) or is_devicelevel_gpu(sdfg, state, edge.dst):
+                continue
+            if not edge.data.data:
+                continue
+            published = {}
+
+            class Publish(ast.NodeTransformer):
+                def visit_Subscript(self, node):
+                    nonlocal changed
+                    node = self.generic_visit(node)
+                    if not isinstance(node.value, ast.Name):
+                        return node
+                    name = node.value.id
+                    if name not in sdfg.arrays or sdfg.arrays[name].storage != dace.StorageType.GPU_Global:
+                        return node
+                    expression = ast.unparse(node)
+                    if expression in published:
+                        return ast.copy_location(ast.parse(published[expression], mode='eval').body, node)
+                    reads = [read for read in dace.InterstateEdge(expression).get_read_memlets(
+                        sdfg.arrays, include_scalars=True) if read.data == name]
+                    if len(reads) != 1 or reads[0].subset is None or reads[0].subset.num_elements() != 1:
+                        raise NotImplementedError('non-scalar device copy index: ' + expression)
+                    accesses = [nd for nd in state.nodes() if isinstance(nd, nodes.AccessNode)
+                                and nd.data == name and not is_devicelevel_gpu(sdfg, state, nd)]
+                    producers = [nd for nd in accesses if state.in_degree(nd)]
+                    if len(producers) > 1:
+                        raise NotImplementedError('ambiguous device copy index producer: ' + name)
+                    source = producers[0] if producers else state.add_read(name)
+                    if source is edge.src or nx.has_path(state.nx, edge.src, source):
+                        raise NotImplementedError('cyclic device copy index: ' + name)
+                    mirror = sdfg._find_new_name('__host_index')
+                    sdfg.add_array(mirror, [1], sdfg.arrays[name].dtype, transient=True)
+                    target = state.add_access(mirror)
+                    state.add_edge(source, None, target, None, dace.Memlet(
+                        data=name, subset=deepcopy(reads[0].subset), other_subset=dace.subsets.Range([(0, 0, 1)])))
+                    # Reads in a subset do not create dataflow dependencies.
+                    # Retain the nested index mirror explicitly until this copy.
+                    for dependency in published.values():
+                        dependency_name = dependency.split('[', 1)[0]
+                        dependency_node = next(nd for nd in state.nodes()
+                                               if isinstance(nd, nodes.AccessNode) and nd.data == dependency_name)
+                        state.add_edge(dependency_node, None, source, None, dace.Memlet())
+                    state.add_edge(target, None, edge.src, None, dace.Memlet())
+                    published[expression] = mirror + '[0]'
+                    changed += 1
+                    return ast.copy_location(ast.parse(mirror + '[0]', mode='eval').body, node)
+
+            for attribute in ('subset', 'other_subset'):
+                subset = getattr(edge.data, attribute)
+                if subset is None or '[' not in str(subset):
+                    continue
+                fields = subset.ranges if isinstance(subset, dace.subsets.Range) else [(v,) for v in subset.indices]
+                rewritten = []
+                for dimension in fields:
+                    rewritten.append(tuple(dace.symbolic.pystr_to_symbolic(ast.unparse(
+                        ast.fix_missing_locations(Publish().visit(ast.parse(str(value), mode='eval')))))
+                        for value in dimension))
+                replacement = deepcopy(subset)
+                if isinstance(subset, dace.subsets.Range):
+                    replacement.ranges = rewritten
+                else:
+                    replacement.indices = [v[0] for v in rewritten]
+                setattr(edge.data, attribute, replacement)
+    return changed
+
+
 def _batch_host_scalar_reroutes(sdfg):
     """Repair independent scalar host reads before using validation as an oracle.
 
@@ -588,7 +671,7 @@ def _batch_host_scalar_reroutes(sdfg):
             # An unresolved device index or cycle still has to pass the strict
             # oracle below; batching does not accept or demote it speculatively.
             continue
-    return changed
+    return changed + _mirror_host_copy_indices(sdfg)
 
 
 def _device_array_abi(sdfg):
@@ -608,6 +691,7 @@ def _device_array_abi(sdfg):
         promoted.append(name)
     for name in promoted:
         _reroute_host_scalar_accesses(sdfg, name, force=True)
+    _mirror_host_copy_indices(sdfg)
     sdfg.validate()
     return promoted
 
