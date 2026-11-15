@@ -1122,3 +1122,73 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
                 "bit-exact differential")
         raise RuntimeError("offload_device_resident: no top-level map found to schedule" + hint)
     return sdfg, n_gpu, n_dev
+
+
+def offload_native_order(sdfg):
+    """Run an unmapped leaf in one device thread, preserving its control flow.
+
+    This opt-in bring-up schedule trades parallelism for native statement and
+    loop order. Public arrays use device pointers. Shape-safe private arrays
+    are allocated persistently by the host and passed to the device body;
+    scalar temporaries remain local. No host mirrors or copy states are added.
+    The input graph becomes the returned wrapper's callee and is mutated.
+    """
+    if len(list(sdfg.all_sdfgs_recursive())) != 1:
+        raise ValueError('native-order offload requires a leaf SDFG')
+    scalar_inputs = {name for name,desc in sdfg.arrays.items()
+                     if isinstance(desc,dace.data.Scalar) and not desc.transient}
+    scalar_writes = {node.data for state in sdfg.all_states() for node in state.data_nodes()
+                     if node.data in scalar_inputs and state.in_degree(node)}
+    scalar_writes |= {name for edge in sdfg.all_interstate_edges()
+                      for name in edge.data.assignments if name in scalar_inputs}
+    if scalar_writes:
+        raise ValueError('mutable scalar inputs require one-element arrays: ' +
+                         ', '.join(sorted(scalar_writes)))
+    root = dace.SDFG(sdfg.name)
+    sdfg.name += '_native_order'
+    root.constants_prop = copy.deepcopy(sdfg.constants_prop)
+    free = set(sdfg.free_symbols)
+    for name in free:
+        if name in sdfg.symbols:
+            root.add_symbol(name, sdfg.symbols[name])
+    for name, desc in list(sdfg.arrays.items()):
+        if name in sdfg.constants_prop or type(desc) is not dace.data.Array or not desc.transient:
+            continue
+        shape_names = {str(symbol) for symbol in desc.total_size.free_symbols}
+        if shape_names - free - set(sdfg.constants_prop):
+            raise ValueError('native-order workspace has a body-local extent: ' + name)
+        parent = copy.deepcopy(desc)
+        parent.storage = dace.StorageType.GPU_Global
+        parent.lifetime = dace.AllocationLifetime.Persistent
+        root.add_datadesc(name, parent)
+        desc.transient = False
+        desc.storage = dace.StorageType.GPU_Global
+    arguments = sdfg.arglist()
+    for name, desc in arguments.items():
+        if name not in sdfg.arrays:
+            continue
+        if name not in root.arrays:
+            parent = copy.deepcopy(desc)
+            if isinstance(parent, dace.data.Array):
+                parent.storage = dace.StorageType.GPU_Global
+            root.add_datadesc(name, parent)
+        if isinstance(desc, dace.data.Array):
+            desc.storage = dace.StorageType.GPU_Global
+    state = root.add_state('native_order')
+    entry, exit = state.add_map('whole_leaf', {'device_lane': '0:1'},
+                                schedule=dace.ScheduleType.GPU_Device)
+    inputs = {name for name in arguments if name in sdfg.arrays}
+    outputs = {name for name in inputs if isinstance(sdfg.arrays[name], dace.data.Array)}
+    call = state.add_nested_sdfg(sdfg, sorted(inputs), sorted(outputs),
+                symbol_mapping={name: name for name in free if name in sdfg.symbols})
+    for name in sorted(inputs):
+        state.add_memlet_path(state.add_read(name), entry, call, dst_conn=name,
+                              memlet=dace.Memlet.from_array(name, root.arrays[name]))
+    for name in sorted(outputs):
+        state.add_memlet_path(call, exit, state.add_write(name), src_conn=name,
+                              memlet=dace.Memlet.from_array(name, root.arrays[name]))
+    if not inputs:
+        state.add_edge(entry, None, call, None, dace.Memlet())
+    if not outputs:
+        state.add_edge(call, None, exit, None, dace.Memlet())
+    return root
