@@ -1170,7 +1170,16 @@ def emit_declare_transient(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: 
                 if 0 <= dim < len(desc.shape):
                     resolved.append(desc.shape[dim])
                     continue
-        resolved.append(entry)
+        # Runtime array reads belong on control-flow edges, not in an
+        # allocation descriptor. This also lets GPU offload publish the
+        # extent's index/value through ordered scalar mirrors.
+        from dace_fortran.builder.access import fortran_subscripts_to_dace
+        expression = fortran_subscripts_to_dace(str(entry), builder)
+        if any(re.search(r"\b" + re.escape(name) + r"\s*\[", expression) for name in builder.arrays):
+            from dace_fortran.builder.emit_cfg import _hoist_bound_to_symbol
+            ctx.flush(builder, region)
+            expression = _hoist_bound_to_symbol(ctx, region, builder, expression, "array_extent") or expression
+        resolved.append(expression)
     declare_synth_array(builder, n.target, resolved, n.expr or "int32", ctx)
 
 
