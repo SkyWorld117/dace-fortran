@@ -84,3 +84,44 @@ def test_fresh_fortran_stop_structurizes_without_losing_the_continuation(tmp_pat
     a = np.arange(4, dtype=np.float32)
     graph(n=np.int32(1), a=a)
     np.testing.assert_array_equal(a, (np.arange(4) + 1) * 2)
+
+
+@pytest.mark.parametrize('kind', [4, 8])
+def test_real_function_with_stop_inlines_without_losing_its_return(tmp_path, kind):
+    source = f"""
+module helpers
+contains
+real(kind={kind}) function positive(x)
+  real(kind={kind}),intent(in)::x
+  if(x<0.0_{kind})stop
+  positive=2.0_{kind}*x+1.0_{kind}
+end function
+end module
+subroutine apply_helper(a,b)
+  use helpers,only:positive
+  real(kind={kind}),intent(in)::a(4)
+  real(kind={kind}),intent(out)::b(4)
+  integer i
+  do i=1,4
+    b(i)=positive(a(i))
+  end do
+end subroutine
+"""
+    graph = build_sdfg(source, tmp_path/'graph', name='apply_helper', entry='apply_helper').build()
+    stops = [node for node, _ in graph.all_nodes_recursive()
+             if getattr(node, 'label', '').startswith('fortran_stop_')]
+    assert len(stops) == 1
+    dtype = np.float32 if kind == 4 else np.float64
+    inputs = np.array([1, 2, 3, 4], dtype=dtype)
+    output = np.zeros(4, dtype=dtype)
+    graph.build_folder = str(tmp_path/'build')
+    graph(a=inputs, b=output)
+    np.testing.assert_array_equal(output, 2*inputs+1)
+    path = tmp_path/'real_stop.sdfgz'
+    graph.save(str(path))
+    script = ('import dace,numpy as np; '
+              f'g=dace.SDFG.from_file({str(path)!r}); '
+              f'g(a=np.full(4,-1,dtype=np.float{kind*8}),b=np.zeros(4,dtype=np.float{kind*8})); '
+              'raise SystemExit(99)')
+    result = subprocess.run([sys.executable, '-c', script], capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
