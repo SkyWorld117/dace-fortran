@@ -609,14 +609,24 @@ def _mirror_host_copy_indices(sdfg):
 
             for attribute in ('subset', 'other_subset'):
                 subset = getattr(edge.data, attribute)
-                if subset is None or '[' not in str(subset):
+                if subset is None:
                     continue
                 fields = subset.ranges if isinstance(subset, dace.subsets.Range) else [(v,) for v in subset.indices]
-                rewritten = []
-                for dimension in fields:
-                    rewritten.append(tuple(dace.symbolic.pystr_to_symbolic(ast.unparse(
-                        ast.fix_missing_locations(Publish().visit(ast.parse(str(value), mode='eval')))))
-                        for value in dimension))
+                def rewrite(value):
+                    # SymPy's generic Add printer spells a nested indexed term
+                    # Subscript(A, i), bypassing Subscript.__str__. Use DaCe's
+                    # Python printer so compound offsets retain array syntax.
+                    if not dace.symbolic.arrays(value) and '[' not in str(value):
+                        return value
+                    expression = dace.symbolic.symstr(value)
+                    tree = ast.parse(expression, mode='eval')
+                    before = ast.unparse(tree)
+                    after = ast.unparse(ast.fix_missing_locations(Publish().visit(tree)))
+                    if before == after:
+                        return value
+                    symbols = {str(symbol):symbol for symbol in getattr(value,'free_symbols',())}
+                    return dace.symbolic.pystr_to_symbolic(after,symbol_map=symbols)
+                rewritten = [tuple(rewrite(value) for value in dimension) for dimension in fields]
                 replacement = deepcopy(subset)
                 if isinstance(subset, dace.subsets.Range):
                     replacement.ranges = rewritten

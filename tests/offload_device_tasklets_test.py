@@ -437,9 +437,11 @@ def test_persistent_heap_inside_a_map_gets_device_allocation():
     graph.generate_code()
 
 
-def indirect_copy_graph(write=False, same_state=False):
+def indirect_copy_graph(write=False, same_state=False, compound=False):
     from dace_fortran.offload import _mirror_host_copy_indices
     graph = dace.SDFG('indirect_host_copy')
+    if compound:
+        graph.add_symbol('bias',dace.int64)
     graph.add_symbol('index', dace.int32)
     for name, shape in [('A', [8]), ('N', [2, 2]), ('M', [1])]:
         graph.add_array(name, shape, dace.int32, transient=True,
@@ -457,7 +459,7 @@ def indirect_copy_graph(write=False, same_state=False):
     a = next((nd for nd in copy.nodes() if isinstance(nd, dace.sdfg.nodes.AccessNode) and nd.data == 'A'), None)
     a = a if a is not None else copy.add_access('A')
     host = copy.add_access('result')
-    offset = dace.symbolic.pystr_to_symbolic('N[M[0],0]')
+    offset = dace.symbolic.pystr_to_symbolic('N[M[0],0] - bias + 1' if compound else 'N[M[0],0]')
     indirect = dace.subsets.Range([(offset, offset, 1)])
     if write:
         copy.add_edge(host, None, a, None, dace.Memlet(data='result', subset='0', other_subset=indirect))
@@ -482,3 +484,15 @@ def test_indirect_copy_indices_repeat_on_gpu(write, same_state):
         result = np.array([40 + index],dtype=np.int32)
         compiled(result=result,index=np.int32(index))
         np.testing.assert_array_equal(result, [40+index if write else 2*index+5])
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+@pytest.mark.parametrize('write,same_state', [(False,False),(True,True)])
+def test_compound_indirect_copy_indices_repeat_on_gpu(write, same_state):
+    import numpy as np
+    graph = indirect_copy_graph(write,same_state,compound=True)
+    compiled = graph.compile()
+    for index in (3,5,2,7,0,3):
+        result=np.array([40+index],dtype=np.int32)
+        compiled(result=result,index=np.int32(index),bias=np.int64(1))
+        np.testing.assert_array_equal(result,[40+index if write else 2*index+5])
