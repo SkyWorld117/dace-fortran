@@ -307,6 +307,9 @@ def optimize(
                                                      loop_map_patterns=loop_map_patterns)
         print(f"[dace_fortran.optimize] gpu offload: {n_gpu} device map(s), {n_dev} device array(s)")
 
+    from dace_fortran.private_results import restore_private_result_storage
+    restore_private_result_storage(sdfg)
+
     if validate:
         sdfg.validate()
     if verify_inputs is not None and reference is not None:
