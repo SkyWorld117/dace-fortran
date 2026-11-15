@@ -7,14 +7,14 @@ import pytest
 from dace_fortran.offload import offload_native_order
 
 
-def prefix_graph():
+def prefix_graph(bounded=False):
     graph = dace.SDFG('native_prefix')
     graph.add_symbol('N',dace.int32)
     graph.add_symbol('offset',dace.int32)
     graph.add_symbol('i',dace.int32)
     graph.add_array('values',['N'],dace.int32)
     graph.add_array('result',['N'],dace.int32)
-    graph.add_array('scratch',['N'],dace.int32,transient=True)
+    graph.add_array('scratch',['local_extent' if bounded else 'N'],dace.int32,transient=True)
     start = graph.add_state('prepare')
     start.add_mapped_tasklet('prepare',{'k':'0:N'}, {},'value = offset + k',
         {'value':dace.Memlet('scratch[k]')},external_edges=True,schedule=dace.ScheduleType.Sequential)
@@ -23,6 +23,9 @@ def prefix_graph():
                       initialize_expr='i = 0',update_expr='i = i + 1')
     graph.add_node(loop)
     graph.add_edge(start,loop,dace.InterstateEdge())
+    if bounded:
+        allocation = graph.add_state_before(start,'allocation_extent')
+        graph.edges_between(allocation,start)[0].data.assignments = {'local_extent':'N'}
     body = loop.add_state('prefix')
     last = graph.add_state('finish')
     graph.add_edge(loop,last,dace.InterstateEdge())
@@ -31,7 +34,7 @@ def prefix_graph():
     for connector,expression in [('x','values[i]'),('s','scratch[i]'),('prev','result[Max(i-1,0)]')]:
         body.add_edge(body.add_read(expression.split('[')[0]),None,task,connector,dace.Memlet(expression))
     body.add_edge(task,'value',body.add_write('result'),None,dace.Memlet('result[i]'))
-    return offload_native_order(graph)
+    return offload_native_order(graph,{'scratch':'N+3'} if bounded else None)
 
 
 def test_native_order_retains_loop_and_device_workspace():
@@ -47,12 +50,13 @@ def test_native_order_retains_loop_and_device_workspace():
 
 
 @pytest.mark.skipif(os.environ.get('DACE_TEST_GPU') != '1',reason='requires GPU')
-def test_native_order_recurrence_repeated_on_gpu(tmp_path):
+@pytest.mark.parametrize('bounded',[False,True])
+def test_native_order_recurrence_repeated_on_gpu(tmp_path,bounded):
     runtime = ct.CDLL('libcudart.so')
     runtime.cudaMalloc.argtypes = [ct.POINTER(ct.c_void_p),ct.c_size_t]
     runtime.cudaFree.argtypes = [ct.c_void_p]
     runtime.cudaMemcpy.argtypes = [ct.c_void_p,ct.c_void_p,ct.c_size_t,ct.c_int]
-    graph = prefix_graph()
+    graph = prefix_graph(bounded)
     graph.build_folder = str(tmp_path/'native_prefix')
     compiled = graph.compile()
     class DeviceArray:

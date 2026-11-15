@@ -1124,13 +1124,15 @@ def offload_device_resident(sdfg, block_size=None, force_inline=False, split_sib
     return sdfg, n_gpu, n_dev
 
 
-def offload_native_order(sdfg):
+def offload_native_order(sdfg, workspace_bounds=None):
     """Run an unmapped leaf in one device thread, preserving its control flow.
 
     This opt-in bring-up schedule trades parallelism for native statement and
     loop order. Public arrays use device pointers. Shape-safe private arrays
     are allocated persistently by the host and passed to the device body;
     scalar temporaries remain local. No host mirrors or copy states are added.
+    workspace_bounds optionally supplies proven allocation upper bounds for
+    rank-one private arrays. Access ranges and executed copies stay unchanged.
     The input graph becomes the returned wrapper's callee and is mutated.
     """
     if len(list(sdfg.all_sdfgs_recursive())) != 1:
@@ -1144,6 +1146,13 @@ def offload_native_order(sdfg):
     if scalar_writes:
         raise ValueError('mutable scalar inputs require one-element arrays: ' +
                          ', '.join(sorted(scalar_writes)))
+    symbol_types = {name:dace.symbol(name,dtype=dtype) for name,dtype in sdfg.symbols.items()}
+    for name,bound in (workspace_bounds or {}).items():
+        desc = sdfg.arrays.get(name)
+        if type(desc) is not dace.data.Array or not desc.transient or len(desc.shape) != 1:
+            raise ValueError('workspace bound requires a rank-one private array: ' + name)
+        extent = dace.symbolic.pystr_to_symbolic(str(bound),symbol_map=symbol_types)
+        desc.set_shape((extent,))
     root = dace.SDFG(sdfg.name)
     sdfg.name += '_native_order'
     root.constants_prop = copy.deepcopy(sdfg.constants_prop)
@@ -1154,7 +1163,7 @@ def offload_native_order(sdfg):
     for name, desc in list(sdfg.arrays.items()):
         if name in sdfg.constants_prop or type(desc) is not dace.data.Array or not desc.transient:
             continue
-        shape_names = {str(symbol) for symbol in desc.total_size.free_symbols}
+        shape_names = {str(symbol) for symbol in getattr(desc.total_size, 'free_symbols', ())}
         if shape_names - free - set(sdfg.constants_prop):
             raise ValueError('native-order workspace has a body-local extent: ' + name)
         parent = copy.deepcopy(desc)
