@@ -498,29 +498,23 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
   if (!declOp) return raw;
   auto outer = asAssumedShapeAlias(declOp);
   if (!outer) return raw;
-  auto lbs = declareLowerBounds(outer);
-  if (dim >= lbs.size()) return raw;
-  auto const& lb = lbs[dim];
-  if (!lb) return raw;
-  int64_t adjust = *lb - 1;
-  if (mlir::Value const innerLb = declaredLowerBound(declOp, dim)) {
-    auto innerC = traceConstInt(innerLb);
-    if (!innerC) {
-      std::string const innerExpr = buildIndexExpr(innerLb, depth + 1);
-      // A symbolic inner bound we cannot render must NOT poison the whole expression with ``?`` -- that leaves
-      // an unresolved operand in a condition (e.g. a MAXVAL in a do-loop EXIT).  Fall back to the conservative
-      // constant default this code used before symbolic inner bounds were supported.
-      if (innerExpr.empty() || innerExpr == "?") {
-        adjust = *lb - 1;
-      } else {
-        return "(" + raw + " + " + std::to_string(*lb) + " - " + innerExpr + ")";
-      }
+  // Access naming resolves the whole alias chain to its root allocation.
+  // Apply the same root's lower bound here, including symbolic expressions
+  // such as kts-1. Dropping a nonconstant bound silently shifts every access
+  // when the callee uses the default lower bound of one.
+  while (auto next = asAssumedShapeAlias(outer)) outer = next;
+  auto boundExpr = [&](hlfir::DeclareOp decl) -> std::string {
+    if (mlir::Value const bound = declaredLowerBound(decl, dim)) {
+      if (auto value = traceConstInt(bound)) return std::to_string(*value);
+      return buildIndexExpr(bound, depth + 1);
     }
-    adjust = *lb - *innerC;
-  }
-  if (adjust == 0) return raw;
-  if (adjust > 0) return "(" + raw + " + " + std::to_string(adjust) + ")";
-  return "(" + raw + " - " + std::to_string(-adjust) + ")";
+    return "1";
+  };
+  std::string const outerExpr = boundExpr(outer);
+  std::string const innerExpr = boundExpr(declOp);
+  if (outerExpr.empty() || outerExpr == "?" || innerExpr.empty() || innerExpr == "?") return raw;
+  if (outerExpr == innerExpr) return raw;
+  return "(" + raw + " + (" + outerExpr + ") - (" + innerExpr + "))";
 }
 
 /// Capture the LHS of an ``hlfir.assign`` whose destination is either a
