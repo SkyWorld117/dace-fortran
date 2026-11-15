@@ -616,9 +616,12 @@ def _mirror_host_copy_indices(sdfg):
                     # SymPy's generic Add printer spells a nested indexed term
                     # Subscript(A, i), bypassing Subscript.__str__. Use DaCe's
                     # Python printer so compound offsets retain array syntax.
-                    if not dace.symbolic.arrays(value) and '[' not in str(value):
-                        return value
+                    # Checkpoints can restore Subscript as a generic SymPy
+                    # function. The Python printer also handles that spelling;
+                    # isinstance-based array discovery would silently skip it.
                     expression = dace.symbolic.symstr(value)
+                    if '[' not in expression:
+                        return value
                     tree = ast.parse(expression, mode='eval')
                     before = ast.unparse(tree)
                     after = ast.unparse(ast.fix_missing_locations(Publish().visit(tree)))

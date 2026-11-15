@@ -437,7 +437,7 @@ def test_persistent_heap_inside_a_map_gets_device_allocation():
     graph.generate_code()
 
 
-def indirect_copy_graph(write=False, same_state=False, compound=False):
+def indirect_copy_graph(write=False, same_state=False, compound=False, checkpoint=False):
     from dace_fortran.offload import _mirror_host_copy_indices
     graph = dace.SDFG('indirect_host_copy')
     if compound:
@@ -468,6 +468,9 @@ def indirect_copy_graph(write=False, same_state=False, compound=False):
                          dace.Memlet(data='A', subset='index', other_subset='0'))
     else:
         copy.add_edge(a, None, host, None, dace.Memlet(data='A', subset=indirect, other_subset='0'))
+    if checkpoint:
+        graph = dace.SDFG.from_json(graph.to_json())
+        graph.name += '_checkpoint'
     assert _mirror_host_copy_indices(graph) == 2
     assert _mirror_host_copy_indices(graph) == 0
     graph.validate()
@@ -494,5 +497,21 @@ def test_compound_indirect_copy_indices_repeat_on_gpu(write, same_state):
     compiled = graph.compile()
     for index in (3,5,2,7,0,3):
         result=np.array([40+index],dtype=np.int32)
+        compiled(result=result,index=np.int32(index),bias=np.int64(1))
+        np.testing.assert_array_equal(result,[40+index if write else 2*index+5])
+
+
+@pytest.mark.parametrize('write,same_state', [(False,False),(True,True)])
+def test_checkpoint_indirect_copy_indices(write, same_state):
+    indirect_copy_graph(write, same_state, compound=True, checkpoint=True)
+
+
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1', reason='requires GPU')
+@pytest.mark.parametrize('write,same_state', [(False,False),(True,True)])
+def test_checkpoint_indirect_copy_indices_repeat_on_gpu(write, same_state):
+    import numpy as np
+    compiled = indirect_copy_graph(write, same_state, compound=True, checkpoint=True).compile()
+    for index in (3,5,2,7,0,3):
+        result = np.array([40+index],dtype=np.int32)
         compiled(result=result,index=np.int32(index),bias=np.int64(1))
         np.testing.assert_array_equal(result,[40+index if write else 2*index+5])
