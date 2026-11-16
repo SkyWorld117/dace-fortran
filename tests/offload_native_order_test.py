@@ -43,6 +43,8 @@ def test_native_order_retains_loop_and_device_workspace():
     assert graph.arrays['scratch'].transient
     assert graph.arrays['scratch'].storage == dace.StorageType.GPU_Global
     assert graph.arrays['scratch'].lifetime == dace.AllocationLifetime.Persistent
+    nested = next(n for n, _ in graph.all_nodes_recursive() if isinstance(n, dace.nodes.NestedSDFG))
+    assert 'values' in nested.in_connectors and 'values' not in nested.out_connectors
     assert 'scratch' not in graph.arglist()
     assert {name for name in graph.arglist()} == {'values','result','N','offset'}
     assert sum(isinstance(n,dace.nodes.MapEntry) and n.schedule == dace.ScheduleType.GPU_Device

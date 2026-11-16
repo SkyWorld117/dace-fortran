@@ -801,6 +801,11 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
   if (nm == "math.powf" && def->getNumOperands() == 2)
     return "pow(" + buildExprWithSubscripts(def->getOperand(0), d + 1) + ", " +
            buildExprWithSubscripts(def->getOperand(1), d + 1) + ")";
+  if (nm == "math.fpowi" && def->getNumOperands() == 2 &&
+      !def->getOperand(1).getDefiningOp<mlir::arith::ConstantOp>()) {
+    return "FtnPowI(" + buildExprWithSubscripts(def->getOperand(0), d + 1) + ", " +
+           buildExprWithSubscripts(def->getOperand(1), d + 1) + ")";
+  }
   if ((nm == "math.fpowi" || nm == "math.powi") && def->getNumOperands() == 2) {
     return "(" + buildExprWithSubscripts(def->getOperand(0), d + 1) + " ** " +
            buildExprWithSubscripts(def->getOperand(1), d + 1) + ")";

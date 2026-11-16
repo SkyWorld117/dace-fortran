@@ -1298,6 +1298,15 @@ std::string buildExpr(mlir::Value val, int d) {
   if (nm == "math.powf" && def->getNumOperands() == 2)
     return "pow(" + buildExpr(def->getOperand(0), d + 1) + ", " + buildExpr(def->getOperand(1), d + 1) + ")";
 
+  // Runtime INTEGER exponents must retain REAL-kind products and a REAL-kind
+  // result. Generic C++ pow(float, int64_t) otherwise promotes the surrounding
+  // arithmetic to double. Literal exponents retain their specialized lowering.
+  if (nm == "math.fpowi" && def->getNumOperands() == 2 &&
+      !def->getOperand(1).getDefiningOp<mlir::arith::ConstantOp>()) {
+    return "FtnPowI(" + buildExpr(def->getOperand(0), d + 1) + ", " +
+           buildExpr(def->getOperand(1), d + 1) + ")";
+  }
+
   // INTEGER-exponent variants keep the multiplication-based ** lowering.
   static const std::set<llvm::StringRef> pow_ops = {
       "complex.powi",

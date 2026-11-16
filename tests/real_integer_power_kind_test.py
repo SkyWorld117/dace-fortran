@@ -44,3 +44,38 @@ end subroutine
     graph.build_folder=str(tmp_path/'build')
     graph(a=values,scale=dtype(scale),b=actual)
     assert actual.tobytes(order='F')==reference.tobytes(order='F')
+
+
+@pytest.mark.parametrize('kind', [4, 8])
+def test_runtime_integer_powers_keep_real_kind(tmp_path, kind):
+    """A variable integer power must round before its enclosing arithmetic."""
+    source = f"""
+subroutine variable_powers(x,n,y)
+  real({kind}),intent(in)::x(64)
+  integer,intent(in)::n(9)
+  real({kind}),intent(out)::y(64,9)
+  integer::i,j
+  do j=1,9
+    do i=1,64
+      y(i,j)=0.25_{kind}+x(i)**n(j)/0.7_{kind}
+    enddo
+  enddo
+end subroutine
+"""
+    path=tmp_path/'native.f90';path.write_text(source)
+    subprocess.run([os.environ.get('WRF_FC','gfortran'),'-shared','-fPIC','-O2',
+                    '-ffp-contract=off','-fno-tree-vectorize',str(path),
+                    '-o',str(tmp_path/'native.so')],check=True)
+    dtype=np.float32 if kind==4 else np.float64
+    values=np.random.default_rng(82).uniform(0.3,3,64).astype(dtype)
+    powers=np.array([-7,-3,-1,0,1,2,3,5,7],dtype='i4')
+    reference=np.zeros((64,9),dtype=dtype,order='F')
+    actual=np.zeros_like(reference,order='F')
+    native=ctypes.CDLL(str(tmp_path/'native.so')).variable_powers_
+    native.argtypes=[ctypes.c_void_p]*3
+    native.restype=None
+    native(values.ctypes.data,powers.ctypes.data,reference.ctypes.data)
+    graph=build_sdfg(source,tmp_path/'graph',name='variable_powers').build()
+    graph.build_folder=str(tmp_path/'build')
+    graph(x=values,n=powers,y=actual)
+    assert actual.tobytes(order='F')==reference.tobytes(order='F')

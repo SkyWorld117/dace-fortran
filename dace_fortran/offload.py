@@ -1187,7 +1187,8 @@ def offload_native_order(sdfg, workspace_bounds=None):
     entry, exit = state.add_map('whole_leaf', {'device_lane': '0:1'},
                                 schedule=dace.ScheduleType.GPU_Device)
     inputs = {name for name in arguments if name in sdfg.arrays}
-    outputs = {name for name in inputs if isinstance(sdfg.arrays[name], dace.data.Array)}
+    _, written = sdfg.read_and_write_sets()
+    outputs = {name for name in inputs if name in written and isinstance(sdfg.arrays[name], dace.data.Array)}
     call = state.add_nested_sdfg(sdfg, sorted(inputs), sorted(outputs),
                 symbol_mapping={name: name for name in free if name in sdfg.symbols})
     for name in sorted(inputs):
