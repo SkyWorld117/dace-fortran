@@ -701,11 +701,41 @@ struct FoldCopyInOutPass : public mlir::PassWrapper<FoldCopyInOutPass, mlir::Ope
     eraseCopyPair(cin);
   }
 
+  /// Declared lower bounds of the alias view ``useDg`` indexes, one per dim (the
+  /// ``fir.shape_shift`` / ``fir.shift`` origins of the ``hlfir.declare`` behind its
+  /// memref).  Empty when the view is 1-based by default (a plain ``fir.shape``) or
+  /// when the memref is not a declare.
+  ///
+  /// This is what makes a REBASED subscripts' frame explicit: the inlined callee's
+  /// dummy may declare ``XF(ims:ime, jms:jme, NF)`` (``ims``/``jms`` symbolic, e.g.
+  /// the nest gather's ``cims``/``cjms``), in which case ``XF(II, ...)`` is index
+  /// ``II - ims`` of the view, NOT ``II - 1``.
+  static llvm::SmallVector<mlir::Value, 4> aliasDeclaredLowerBounds(hlfir::DesignateOp useDg) {
+    llvm::SmallVector<mlir::Value, 4> lbs;
+    auto decl = useDg.getMemref().getDefiningOp<hlfir::DeclareOp>();
+    if (!decl) return lbs;
+    mlir::Value const shape = decl.getShape();
+    if (!shape) return lbs;
+    if (auto shapeShift = shape.getDefiningOp<fir::ShapeShiftOp>()) {
+      for (mlir::Value const o : shapeShift.getOrigins()) lbs.push_back(o);
+    } else if (auto shift = shape.getDefiningOp<fir::ShiftOp>()) {
+      for (mlir::Value const o : shift.getOrigins()) lbs.push_back(o);
+    }
+    return lbs;
+  }
+
   /// Rewrite a single ``hlfir.designate %alias (j_1, ..., j_K)`` use
   /// to the equivalent designate on ``parent`` with the section
   /// indices folded in.  Preserves triplets / shape on the alias-
   /// access side (so ``%alias(1:N:1)`` whole-array becomes
   /// ``%parent(scalars..., 1:N:1)``).
+  ///
+  /// The alias subscript frame is the view's OWN declared lower bound, which is 1 for
+  /// a default-bound section view but symbolic when the inlined callee declares
+  /// ``XF(ims:ime, ...)``: ``parent_idx = lo + (alias_idx - alias_lb)``.  Hardcoding
+  /// ``alias_idx + (lo - 1)`` shifted every access of such a callee by ``alias_lb - 1``
+  /// -- the nest gather/`icmask` sweep wrote ``(II-1)`` into a slab indexed ``(II-cims)``,
+  /// 12 elements past it at ``cims=13``.
   static void rewriteAccess(hlfir::DesignateOp useDg, hlfir::DesignateOp srcDg, const SectionShape& sec,
                             mlir::OpBuilder& b) {
     b.setInsertionPoint(useDg);
@@ -749,15 +779,25 @@ struct FoldCopyInOutPass : public mlir::PassWrapper<FoldCopyInOutPass, mlir::Ope
     }
     if (aliasDims.size() != sec.tripletCount) return;
 
-    // ``parent_idx = alias_idx + (lo - 1)`` for the dim's own lo.  Stride-1 only
-    // -- the caller filters strided triplets out before reaching here.
-    auto lowerShift = [&](mlir::Value lo) -> mlir::Value {
-      auto loConst = traceConstIndex(lo);
-      if (loConst && *loConst == 1) return {};  // ``arr(:)`` default lo = 1: no shift
-      mlir::Value l = lo;
-      if (!l.getType().isIndex()) l = b.create<fir::ConvertOp>(loc, b.getIndexType(), l);
-      mlir::Value const one = b.create<mlir::arith::ConstantOp>(loc, b.getIndexType(), b.getIndexAttr(1));
-      return b.create<mlir::arith::SubIOp>(loc, l, one);
+    // The alias view's own declared lower bound per dim, so the shift maps the
+    // alias' FORTRAN subscript (which may count from ``ims``, not 1) onto the
+    // parent: ``parent_idx = lo + (alias_idx - alias_lb)``.  Stride-1 only --
+    // the caller filters strided triplets out before reaching here.
+    auto const aliasLbs = aliasDeclaredLowerBounds(useDg);
+    auto lowerShift = [&](mlir::Value lo, mlir::Value lb) -> mlir::Value {
+      auto const loConst = traceConstIndex(lo);
+      auto const lbConst = traceConstIndex(lb);
+      if (loConst && lbConst) {
+        int64_t const adjust = *loConst - *lbConst;
+        if (adjust == 0) return {};
+        return b.create<mlir::arith::ConstantOp>(loc, b.getIndexType(), b.getIndexAttr(adjust));
+      }
+      auto toIndex = [&](mlir::Value v) -> mlir::Value {
+        return v.getType().isIndex() ? v : b.create<fir::ConvertOp>(loc, b.getIndexType(), v);
+      };
+      mlir::Value const l = toIndex(lo);
+      mlir::Value k = lb ? toIndex(lb) : b.create<mlir::arith::ConstantOp>(loc, b.getIndexType(), b.getIndexAttr(1));
+      return b.create<mlir::arith::SubIOp>(loc, l, k);
     };
     auto shift = [&](mlir::Value v, mlir::Value by) -> mlir::Value {
       if (!by) return v;
@@ -775,8 +815,10 @@ struct FoldCopyInOutPass : public mlir::PassWrapper<FoldCopyInOutPass, mlir::Ope
         newTripFlags.push_back(false);
         continue;
       }
-      auto const& a = aliasDims[aliasCursor++];
-      mlir::Value const by = lowerShift(d.lo);
+      unsigned const aliasDim = aliasCursor++;
+      auto const& a = aliasDims[aliasDim];
+      mlir::Value const viewLb = aliasDim < aliasLbs.size() ? aliasLbs[aliasDim] : mlir::Value{};
+      mlir::Value const by = lowerShift(d.lo, viewLb);
       if (a.triplet) {
         newIndices.push_back(shift(a.lo, by));
         newIndices.push_back(shift(a.hi, by));
